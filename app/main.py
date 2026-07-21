@@ -1,0 +1,36 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import settings
+from app.core.database import Base, engine
+from app.models import Organization, RefreshToken, User  # noqa: F401  (register mappers)
+from app.routers import auth, users
+
+app = FastAPI(
+    title="CRM SaaS API",
+    description="Backend for the CRM / Billing / Inventory SaaS. Auth & user management.",
+    version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    # For local dev we auto-create tables. In production, use Alembic migrations instead.
+    Base.metadata.create_all(bind=engine)
+
+
+@app.get("/health", tags=["health"])
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+app.include_router(auth.router)
+app.include_router(users.router)
