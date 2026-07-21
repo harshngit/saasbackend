@@ -106,10 +106,36 @@ Send the access token as `Authorization: Bearer <token>`.
 .\.venv\Scripts\python.exe test_smoke.py   # 37 end-to-end checks, uses a throwaway DB
 ```
 
-## Going to production
+## Deploy to Render
 
-1. Point `DATABASE_URL` at Postgres, e.g.
-   `postgresql+psycopg://user:pass@host:5432/crm_saas`
-2. Set a strong `JWT_SECRET` (`python -c "import secrets; print(secrets.token_hex(32))"`).
-3. Replace startup `create_all` with **Alembic** migrations.
+This repo ships a `render.yaml` Blueprint that provisions the **API + a free
+PostgreSQL database** together. SQLite is dev-only — Render's disk is ephemeral,
+so production uses Postgres (the app auto-switches based on `DATABASE_URL`).
+
+**Steps:**
+1. Push this repo to GitHub (done: `harshngit/saasbackend`).
+2. In Render: **New + → Blueprint** → connect this repo → Render reads `render.yaml`.
+3. When prompted, set the values marked `sync: false`:
+   - `SUPER_ADMIN_PASSWORD` — a strong password for the platform owner.
+   - SMTP fields (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `FRONTEND_RESET_URL`) —
+     optional; leave blank to just log reset emails.
+4. **Apply** → Render builds the web service, creates the Postgres DB, injects
+   `DATABASE_URL`, generates `JWT_SECRET`, and seeds the Super Admin on first boot.
+5. Open `https://<your-service>.onrender.com/docs`.
+
+**Good to know (free tier):**
+- The web service **sleeps after ~15 min idle**; the first request then takes
+  ~50s to wake (cold start).
+- Free Postgres is **removed after 30 days** — fine for testing, upgrade for real use.
+- After the app is live, tighten `CORS_ORIGINS` from `*` to your real front-end URL,
+  and change `SEED_ON_STARTUP` to `false` once the Super Admin exists.
+
+## Going to production (hardening)
+
+1. `DATABASE_URL` → managed Postgres (Render Blueprint does this automatically).
+   `postgres://` / `postgresql://` URLs are auto-rewritten to psycopg3.
+2. Strong `JWT_SECRET` (Blueprint generates one; or
+   `python -c "import secrets; print(secrets.token_hex(32))"`).
+3. Replace startup `create_all` with **Alembic** migrations before schema changes.
 4. Restrict `CORS_ORIGINS` to your real front-end origins.
+5. Turn `SEED_ON_STARTUP` off after the first deploy.

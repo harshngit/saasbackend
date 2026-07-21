@@ -37,9 +37,27 @@ class Settings(BaseSettings):
     super_admin_password: str = "Admin@123"
     super_admin_name: str = "Ravi Malhotra"
 
+    # Seed the Super Admin (and demo firm) automatically on first startup.
+    # Handy on hosts like Render where you can't easily run a one-off command.
+    seed_on_startup: bool = False
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def sqlalchemy_database_url(self) -> str:
+        """Normalize the DB URL so managed-Postgres URLs work with psycopg3.
+
+        Render/Heroku hand out `postgres://` or `postgresql://` URLs, which
+        SQLAlchemy maps to the (uninstalled) psycopg2 driver. Force psycopg3.
+        """
+        url = self.database_url
+        if url.startswith("postgres://"):
+            return "postgresql+psycopg://" + url[len("postgres://"):]
+        if url.startswith("postgresql://"):
+            return "postgresql+psycopg://" + url[len("postgresql://"):]
+        return url
 
 
 settings = Settings()

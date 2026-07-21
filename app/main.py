@@ -26,6 +26,12 @@ def on_startup() -> None:
     # For local dev we auto-create tables. In production, use Alembic migrations instead.
     Base.metadata.create_all(bind=engine)
 
+    # On hosts without a shell/pre-deploy step, seed the Super Admin on boot.
+    if settings.seed_on_startup:
+        from app.seed import main as seed_main
+
+        seed_main()
+
 
 @app.get("/health", tags=["health"])
 def health() -> dict[str, str]:

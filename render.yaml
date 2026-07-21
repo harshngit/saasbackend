@@ -1,0 +1,53 @@
+# Render Blueprint — provisions the API + a free PostgreSQL database in one go.
+# In Render: New + > Blueprint > connect this repo. Render reads this file.
+# Docs: https://render.com/docs/blueprint-spec
+
+databases:
+  - name: crm-saas-db
+    plan: free
+    databaseName: crm_saas
+    user: crm_saas
+
+services:
+  - type: web
+    name: crm-saas-backend
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      # Injected automatically from the database above — no manual copying.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: crm-saas-db
+          property: connectionString
+      # A strong secret is generated once and kept stable across deploys.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      # Create the Super Admin + demo firm on first boot (idempotent).
+      - key: SEED_ON_STARTUP
+        value: "true"
+      # Tighten to your real front-end origin(s) once the app is live.
+      - key: CORS_ORIGINS
+        value: "*"
+      # Super Admin credentials — CHANGE THE PASSWORD in the Render dashboard.
+      - key: SUPER_ADMIN_EMAIL
+        value: "superadmin@demo.com"
+      - key: SUPER_ADMIN_PASSWORD
+        sync: false   # set manually in the dashboard; never committed
+      # --- SMTP (optional; leave blank to log reset emails instead of sending) ---
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        value: "CRM SaaS <no-reply@crm-saas.local>"
+      - key: FRONTEND_RESET_URL
+        sync: false
