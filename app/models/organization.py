@@ -24,11 +24,15 @@ class Organization(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
 
-    # Business profile (extended later in the Company Profile module).
+    # Business profile.
+    business_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     gst_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     pan_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    financial_year: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     plan: Mapped[PlanTier] = mapped_column(Enum(PlanTier), default=PlanTier.FREE, nullable=False)
     status: Mapped[OrganizationStatus] = mapped_column(

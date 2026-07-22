@@ -44,19 +44,40 @@ print("\n== admin self-registration (new firm) ==")
 firm_email = f"owner_{uuid.uuid4().hex[:8]}@firm.com"
 r = client.post("/auth/register", json={
     "organization_name": "BlueWave Water Co.",
-    "admin_name": "Vikram Patel",
-    "email": firm_email,
-    "phone": "9876543210",
-    "password": "Secret@123",
+    "business_type": "Distributor",
     "gst_number": "29AABCU9603R1ZX",
+    "pan_number": "AABCU9603R",
+    "address": "12 MG Road, Bengaluru",
+    "phone": "9876543210",
+    "email": firm_email,
+    "financial_year": "2025-2026",
+    "admin_name": "Vikram Patel",
+    "password": "Secret@123",
 })
 check("register returns 201", r.status_code == 201, r.text)
 body = r.json()
-check("register returns admin role", body["user"]["role"] == "admin", body)
+check("register returns admin role (default)", body["user"]["role"] == "admin", body)
 check("register creates organization", body["organization"]["name"] == "BlueWave Water Co.", body)
+org_out = body["organization"]
+check("org persists business_type", org_out["business_type"] == "Distributor", org_out)
+check("org persists pan_number", org_out["pan_number"] == "AABCU9603R", org_out)
+check("org persists address", org_out["address"] == "12 MG Road, Bengaluru", org_out)
+check("org persists financial_year", org_out["financial_year"] == "2025-2026", org_out)
 check("register returns token pair", "access_token" in body["tokens"] and "refresh_token" in body["tokens"], body)
 admin_access = body["tokens"]["access_token"]
 admin_refresh = body["tokens"]["refresh_token"]
+
+print("\n== registration role rules ==")
+# Explicit role=admin is fine.
+r = client.post("/auth/register", json={
+    "organization_name": "RoleOk Co", "admin_name": "A", "email": f"roleok_{uuid.uuid4().hex[:8]}@f.com",
+    "password": "Secret@123", "role": "admin"})
+check("explicit role=admin -> 201", r.status_code == 201, r.text)
+# Any non-admin role must be rejected (staff are created by the Admin, not self-registered).
+r = client.post("/auth/register", json={
+    "organization_name": "RoleBad Co", "admin_name": "A", "email": f"rolebad_{uuid.uuid4().hex[:8]}@f.com",
+    "password": "Secret@123", "role": "sales_officer"})
+check("role=sales_officer at register -> 422", r.status_code == 422, r.text)
 
 print("\n== duplicate registration rejected ==")
 r = client.post("/auth/register", json={
@@ -175,6 +196,43 @@ other_user_id = r2.json()["user"]["id"]
 r = client.patch(f"/users/{other_user_id}/status",
     headers={"Authorization": f"Bearer {admin_access}"}, json={"is_active": False})
 check("cross-firm status change -> 404", r.status_code == 404, r.text)
+
+print("\n== auto-migration adds missing columns to an existing table ==")
+# Simulate an OLD database: a table created before `address` existed, then verify
+# auto_add_missing_columns() brings it up to date without dropping data.
+import os as _os  # noqa: E402
+
+from sqlalchemy import create_engine as _create_engine, inspect as _inspect, text as _text  # noqa: E402
+
+_mig_db = "_migrate_test.db"
+if _os.path.exists(_mig_db):
+    _os.remove(_mig_db)
+_eng = _create_engine(f"sqlite:///./{_mig_db}")
+with _eng.begin() as _c:
+    # Old-style organizations table: missing business_type/address/financial_year/logo_url.
+    _c.execute(_text("CREATE TABLE organizations (id VARCHAR(36) PRIMARY KEY, name VARCHAR(200))"))
+    _c.execute(_text("INSERT INTO organizations (id, name) VALUES ('o1', 'Legacy Co')"))
+
+import app.core.database as _dbmod  # noqa: E402
+
+_orig_engine = _dbmod.engine
+_dbmod.engine = _eng  # point the migrator at our simulated old DB
+try:
+    _dbmod.auto_add_missing_columns()
+    _cols = {c["name"] for c in _inspect(_eng).get_columns("organizations")}
+    check("migration added address column", "address" in _cols, _cols)
+    check("migration added business_type column", "business_type" in _cols, _cols)
+    with _eng.connect() as _c:
+        _row = _c.execute(_text("SELECT name FROM organizations WHERE id='o1'")).fetchone()
+    check("existing row preserved after migration", _row is not None and _row[0] == "Legacy Co", _row)
+finally:
+    _dbmod.engine = _orig_engine
+    _eng.dispose()
+    if _os.path.exists(_mig_db):
+        try:
+            _os.remove(_mig_db)
+        except PermissionError:
+            pass
 
 print(f"\n==================\n  {passed} passed, {failed} failed\n==================")
 

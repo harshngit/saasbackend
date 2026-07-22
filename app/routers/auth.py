@@ -36,9 +36,14 @@ def register_organization(payload: RegisterOrganization, db: Session = Depends(g
 
     org = Organization(
         name=payload.organization_name,
+        business_type=payload.business_type,
         gst_number=payload.gst_number,
+        pan_number=payload.pan_number,
+        address=payload.address,
         email=payload.email,
         phone=payload.phone,
+        financial_year=payload.financial_year,
+        logo_url=payload.logo_url,
         plan=PlanTier.FREE,
         status=OrganizationStatus.TRIAL,
     )

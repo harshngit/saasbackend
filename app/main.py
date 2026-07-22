@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import Base, auto_add_missing_columns, engine
 from app.models import Organization, RefreshToken, User  # noqa: F401  (register mappers)
 from app.routers import auth, users
 
@@ -25,6 +25,8 @@ app.add_middleware(
 def on_startup() -> None:
     # For local dev we auto-create tables. In production, use Alembic migrations instead.
     Base.metadata.create_all(bind=engine)
+    # Add any newly-introduced nullable columns to already-existing tables.
+    auto_add_missing_columns()
 
     # On hosts without a shell/pre-deploy step, seed the Super Admin on boot.
     if settings.seed_on_startup:

@@ -1,18 +1,39 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app.models.enums import UserRole
 from app.schemas.organization import OrganizationOut
 from app.schemas.user import UserOut
 
 
 class RegisterOrganization(BaseModel):
-    """Admin self-registration: creates a firm and its owner (Admin) account."""
+    """Admin self-registration: creates a firm and its owner (Admin) account.
 
+    Only Admins self-register. Staff (accountant / sales_officer / delivery_partner)
+    are created afterwards by the Admin via POST /users — so `role` is always admin.
+    """
+
+    # --- Company / firm profile ---
     organization_name: str = Field(min_length=1, max_length=200)
-    admin_name: str = Field(min_length=1, max_length=150)
-    email: EmailStr
-    phone: str | None = Field(default=None, max_length=20)
-    password: str = Field(min_length=8, max_length=128)
+    business_type: str | None = Field(default=None, max_length=100)
     gst_number: str | None = Field(default=None, max_length=20)
+    pan_number: str | None = Field(default=None, max_length=20)
+    address: str | None = Field(default=None, max_length=500)
+    phone: str | None = Field(default=None, max_length=20)
+    email: EmailStr
+    financial_year: str | None = Field(default=None, max_length=20, examples=["2025-2026"])
+    logo_url: str | None = Field(default=None, max_length=500)
+
+    # --- Owner (Admin) account ---
+    admin_name: str = Field(min_length=1, max_length=150)
+    password: str = Field(min_length=8, max_length=128)
+    role: UserRole = Field(default=UserRole.ADMIN, description="Always 'admin' for self-registration")
+
+    @field_validator("role")
+    @classmethod
+    def _role_must_be_admin(cls, v: UserRole) -> UserRole:
+        if v != UserRole.ADMIN:
+            raise ValueError("Self-registration can only create an admin. Staff are created by the Admin.")
+        return v
 
 
 class LoginRequest(BaseModel):
