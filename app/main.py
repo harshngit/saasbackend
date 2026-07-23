@@ -2,9 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
-from app.core.database import Base, auto_add_missing_columns, engine
+from app.core.database import Base, auto_add_missing_columns, engine, extend_pg_enum_types
 from app.models import Organization, RefreshToken, User  # noqa: F401  (register mappers)
-from app.routers import auth, users
+from app.routers import auth, organizations, superadmin, users
 
 app = FastAPI(
     title="CRM SaaS API",
@@ -25,6 +25,8 @@ app.add_middleware(
 def on_startup() -> None:
     # For local dev we auto-create tables. In production, use Alembic migrations instead.
     Base.metadata.create_all(bind=engine)
+    # Add new enum values to existing Postgres ENUM types (e.g. 'locked', 'basic').
+    extend_pg_enum_types()
     # Add any newly-introduced nullable columns to already-existing tables.
     auto_add_missing_columns()
 
@@ -42,3 +44,5 @@ def health() -> dict[str, str]:
 
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(organizations.router)
+app.include_router(superadmin.router)

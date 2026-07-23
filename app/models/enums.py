@@ -23,11 +23,24 @@ STAFF_ROLES = {UserRole.ACCOUNTANT, UserRole.SALES_OFFICER, UserRole.DELIVERY_PA
 class OrganizationStatus(str, enum.Enum):
     TRIAL = "trial"
     ACTIVE = "active"
+    LOCKED = "locked"        # trial expired; data-mutation blocked until upgrade
     INACTIVE = "inactive"
     SUSPENDED = "suspended"
 
 
 class PlanTier(str, enum.Enum):
     FREE = "free"
+    BASIC = "basic"
     PRO = "pro"
     ENTERPRISE = "enterprise"
+
+
+class UpgradeStatus(str, enum.Enum):
+    NONE = "none"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+# Statuses where data-mutation endpoints are blocked (read-only + upgrade allowed).
+LOCKED_STATUSES = {OrganizationStatus.LOCKED, OrganizationStatus.SUSPENDED, OrganizationStatus.INACTIVE}

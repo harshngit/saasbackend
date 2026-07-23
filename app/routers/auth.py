@@ -15,13 +15,14 @@ from app.schemas.auth import (
     LoginRequest,
     LogoutRequest,
     MessageResponse,
+    MeResponse,
     RefreshRequest,
     RegisterOrganization,
     ResetPasswordRequest,
     TokenPair,
 )
 from app.schemas.user import UserOut
-from app.services import auth_service, password_service
+from app.services import auth_service, org_service, password_service
 from app.services.email_service import send_password_reset
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -44,9 +45,8 @@ def register_organization(payload: RegisterOrganization, db: Session = Depends(g
         phone=payload.phone,
         financial_year=payload.financial_year,
         logo_url=payload.logo_url,
-        plan=PlanTier.FREE,
-        status=OrganizationStatus.TRIAL,
     )
+    org_service.start_trial(org)  # status=trial, plan=free, trial_ends_at=now+7d
     db.add(org)
     db.flush()  # assign org.id before creating the user
 
@@ -73,6 +73,9 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+
+    # Lazily lock the org if its trial has expired, so the response reflects reality.
+    org_service.apply_trial_expiry(db, user.organization)
 
     tokens = auth_service.issue_tokens(db, user)
     return auth_service.build_auth_response(user, tokens)
@@ -107,9 +110,12 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)) -> MessageResp
     return MessageResponse(detail="Logged out")
 
 
-@router.get("/me", response_model=UserOut)
-def me(user: User = Depends(get_current_user)) -> User:
-    return user
+@router.get("/me", response_model=MeResponse)
+def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> MeResponse:
+    # Include org state (status/plan/trial) so the UI can render banners/lock screens
+    # on refresh without a re-login. Also lazily locks an expired trial.
+    org = org_service.apply_trial_expiry(db, user.organization)
+    return MeResponse(user=user, organization=org)
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

@@ -1,3 +1,4 @@
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -39,8 +40,28 @@ class Organization(Base):
         Enum(OrganizationStatus), default=OrganizationStatus.TRIAL, nullable=False
     )
 
+    # --- Trial & upgrade lifecycle (all nullable so they auto-migrate on the live DB) ---
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Stored as the PlanTier *value* (e.g. "pro"); nullable until an upgrade is requested.
+    requested_plan: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    upgrade_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Stored as the UpgradeStatus value ("none"/"pending"/"approved"/"rejected").
+    upgrade_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    upgrade_reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     users: Mapped[list["User"]] = relationship(  # noqa: F821
         back_populates="organization", cascade="all, delete-orphan"
     )
+
+    @property
+    def trial_days_left(self) -> int | None:
+        """Whole days remaining in the trial (0 if past), or None if no trial set."""
+        if self.trial_ends_at is None:
+            return None
+        end = self.trial_ends_at
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        seconds = (end - datetime.now(timezone.utc)).total_seconds()
+        return max(0, math.ceil(seconds / 86400))

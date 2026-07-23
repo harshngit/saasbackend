@@ -63,6 +63,10 @@ check("org persists business_type", org_out["business_type"] == "Distributor", o
 check("org persists pan_number", org_out["pan_number"] == "AABCU9603R", org_out)
 check("org persists address", org_out["address"] == "12 MG Road, Bengaluru", org_out)
 check("org persists financial_year", org_out["financial_year"] == "2025-2026", org_out)
+check("new org starts on trial", org_out["status"] == "trial", org_out)
+check("trial_ends_at is set", org_out["trial_ends_at"] is not None, org_out)
+check("trial_days_left ~7", org_out["trial_days_left"] in (6, 7), org_out)
+check("upgrade_status none at register", org_out["upgrade_status"] == "none", org_out)
 check("register returns token pair", "access_token" in body["tokens"] and "refresh_token" in body["tokens"], body)
 admin_access = body["tokens"]["access_token"]
 admin_refresh = body["tokens"]["refresh_token"]
@@ -91,9 +95,10 @@ check("login returns 200", r.status_code == 200, r.text)
 check("login wrong password -> 401",
       client.post("/auth/login", json={"email": "admin@demo.com", "password": "nope"}).status_code == 401)
 
-print("\n== /auth/me with access token ==")
+print("\n== /auth/me returns user + organization ==")
 r = client.get("/auth/me", headers={"Authorization": f"Bearer {admin_access}"})
-check("me returns the admin", r.status_code == 200 and r.json()["email"] == firm_email, r.text)
+check("me returns the admin", r.status_code == 200 and r.json()["user"]["email"] == firm_email, r.text)
+check("me includes organization with status", r.json().get("organization", {}).get("status") == "trial", r.text)
 check("me without token -> 403", client.get("/auth/me").status_code == 403)
 check("me with junk token -> 401",
       client.get("/auth/me", headers={"Authorization": "Bearer garbage"}).status_code == 401)
@@ -196,6 +201,87 @@ other_user_id = r2.json()["user"]["id"]
 r = client.patch(f"/users/{other_user_id}/status",
     headers={"Authorization": f"Bearer {admin_access}"}, json={"is_active": False})
 check("cross-firm status change -> 404", r.status_code == 404, r.text)
+
+print("\n== trial expiry -> lock -> upgrade -> super-admin approve ==")
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from app.core.database import SessionLocal  # noqa: E402
+from app.models import Organization  # noqa: E402
+
+# Fresh firm for the lifecycle test.
+life_email = f"life_{uuid.uuid4().hex[:8]}@firm.com"
+reg = client.post("/auth/register", json={
+    "organization_name": "Lifecycle Co", "admin_name": "L", "email": life_email, "password": "Secret@123"}).json()
+life_org_id = reg["organization"]["id"]
+life_access = reg["tokens"]["access_token"]
+life_hdr = {"Authorization": f"Bearer {life_access}"}
+
+# During trial, a mutation works.
+r = client.post("/users", headers=life_hdr,
+    json={"name": "S", "email": f"s_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "sales_officer"})
+check("trial: staff creation allowed", r.status_code == 201, r.text)
+
+# Force the trial into the past, then a fresh login must flip it to locked.
+_db = SessionLocal()
+_org = _db.get(Organization, life_org_id)
+_org.trial_ends_at = datetime.now(timezone.utc) - timedelta(days=1)
+_db.commit()
+_db.close()
+
+r = client.post("/auth/login", json={"email": life_email, "password": "Secret@123"})
+check("expired trial login -> org locked", r.json()["organization"]["status"] == "locked", r.text)
+life_access = r.json()["tokens"]["access_token"]
+life_hdr = {"Authorization": f"Bearer {life_access}"}
+
+# Locked: mutation blocked, read-only + upgrade-request still allowed.
+r = client.post("/users", headers=life_hdr,
+    json={"name": "S2", "email": f"s2_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "sales_officer"})
+check("locked: staff creation -> 403", r.status_code == 403, r.text)
+check("locked: GET /organizations/me still works",
+      client.get("/organizations/me", headers=life_hdr).status_code == 200)
+check("locked: GET /users (read-only) still works",
+      client.get("/users", headers=life_hdr).status_code == 200)
+r = client.post("/organizations/upgrade-request", headers=life_hdr, json={"requested_plan": "pro"})
+check("locked: upgrade-request allowed", r.status_code == 200 and r.json()["upgrade_status"] == "pending", r.text)
+check("upgrade-request set requested_plan", r.json()["requested_plan"] == "pro", r.text)
+
+print("\n== super admin approval flow ==")
+sa = client.post("/auth/login", json={"email": "superadmin@demo.com", "password": "Admin@123"})
+check("super admin login", sa.status_code == 200, sa.text)
+sa_hdr = {"Authorization": f"Bearer {sa.json()['tokens']['access_token']}"}
+
+check("super admin lists organizations", client.get("/superadmin/organizations", headers=sa_hdr).status_code == 200)
+r = client.get("/superadmin/organizations", headers=sa_hdr, params={"status": "locked"})
+check("filter ?status=locked includes our org", any(o["id"] == life_org_id for o in r.json()), r.text)
+
+# A non-super-admin (the firm admin) must not reach /superadmin/*.
+r = client.get("/superadmin/organizations", headers=life_hdr)
+check("non-super-admin blocked from /superadmin -> 403", r.status_code == 403, r.text)
+
+# Approve the upgrade → active on the requested plan, and the admin is unlocked.
+r = client.patch(f"/superadmin/organizations/{life_org_id}/approve-upgrade", headers=sa_hdr)
+check("approve-upgrade -> active", r.status_code == 200 and r.json()["status"] == "active", r.text)
+check("approve set plan to requested (pro)", r.json()["plan"] == "pro", r.text)
+r = client.post("/users", headers=life_hdr,
+    json={"name": "S3", "email": f"s3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"})
+check("after approval: mutation unlocked -> 201", r.status_code == 201, r.text)
+
+print("\n== super admin reject + manual suspend ==")
+rej_email = f"rej_{uuid.uuid4().hex[:8]}@firm.com"
+rej = client.post("/auth/register", json={
+    "organization_name": "Reject Co", "admin_name": "R", "email": rej_email, "password": "Secret@123"}).json()
+rej_id = rej["organization"]["id"]
+client.post("/organizations/upgrade-request",
+    headers={"Authorization": f"Bearer {rej['tokens']['access_token']}"}, json={"requested_plan": "basic"})
+r = client.patch(f"/superadmin/organizations/{rej_id}/reject-upgrade", headers=sa_hdr, json={"reason": "Payment not verified"})
+check("reject-upgrade -> rejected + reason", r.status_code == 200 and r.json()["upgrade_status"] == "rejected"
+      and r.json()["upgrade_reject_reason"] == "Payment not verified", r.text)
+
+r = client.patch(f"/superadmin/organizations/{life_org_id}/status", headers=sa_hdr, json={"status": "suspended"})
+check("manual status override -> suspended", r.status_code == 200 and r.json()["status"] == "suspended", r.text)
+r = client.post("/users", headers=life_hdr,
+    json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"})
+check("suspended: mutation blocked -> 403", r.status_code == 403, r.text)
 
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify

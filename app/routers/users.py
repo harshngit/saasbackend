@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_roles
+from app.core.deps import require_roles, require_unlocked_org
 from app.core.security import hash_password
 from app.models import STAFF_ROLES, User, UserRole
 from app.schemas.auth import MessageResponse
@@ -16,6 +16,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 def create_staff(
     payload: StaffCreate,
     admin: User = Depends(require_roles(UserRole.ADMIN)),
+    _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> User:
     """Admin creates a staff user (Accountant / Sales Officer / Delivery Partner) in their firm."""
@@ -67,6 +68,7 @@ def update_staff_status(
     user_id: str,
     payload: UserStatusUpdate,
     admin: User = Depends(require_roles(UserRole.ADMIN)),
+    _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> User:
     """Activate / deactivate a user within the admin's firm (cannot target self)."""
@@ -87,6 +89,7 @@ def admin_reset_password(
     user_id: str,
     payload: AdminResetPassword,
     admin: User = Depends(require_roles(UserRole.ADMIN)),
+    _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> MessageResponse:
     """Admin sets a new password for a staff member in their firm (e.g. staff forgot it)."""

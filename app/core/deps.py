@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.security import ACCESS_TOKEN, decode_token
-from app.models import User, UserRole
+from app.models import LOCKED_STATUSES, User, UserRole
+from app.services import org_service
 
 bearer_scheme = HTTPBearer(auto_error=True)
 
@@ -38,6 +39,24 @@ def get_current_user(
     user = db.get(User, user_id)
     if user is None or not user.is_active:
         raise _CREDENTIALS_ERROR
+    return user
+
+
+def require_unlocked_org(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """Gate for data-mutation endpoints: block if the org's trial has expired /
+    it's locked or suspended. Super Admin (no org) is always allowed. Also lazily
+    flips an expired trial to locked."""
+    if user.role == UserRole.SUPER_ADMIN:
+        return user
+    org = org_service.apply_trial_expiry(db, user.organization)
+    if org is not None and org.status in LOCKED_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your trial has expired. Please upgrade your plan to continue.",
+        )
     return user
 
 

@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 30
 
+    # Free-trial length (days) applied at registration.
+    trial_days: int = 7
+
     cors_origins: str = "http://localhost,http://localhost:3000,http://localhost:8080"
 
     # --- Password reset ---

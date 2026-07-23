@@ -59,3 +59,62 @@ def auto_add_missing_columns() -> None:
             with engine.begin() as conn:
                 conn.execute(text(ddl))
             logger.info("Auto-migrated: added column %s.%s", table.name, column.name)
+
+
+# Enum columns (table, column) whose Postgres ENUM type may need new labels added.
+_ENUM_COLUMNS = [
+    ("organizations", "status"),
+    ("organizations", "plan"),
+    ("users", "role"),
+]
+
+
+def extend_pg_enum_types() -> None:
+    """Postgres-only: add any missing labels to the native ENUM types backing our
+    enum columns (e.g. a new 'LOCKED' status or 'BASIC' plan).
+
+    SQLAlchemy stores enum *names* (uppercase). We look up the real type name from
+    the catalog (so we don't hard-code it) and `ALTER TYPE ... ADD VALUE` for any
+    label the Python enum has but the DB type lacks. Fresh DBs already have them,
+    so this is a no-op there. On SQLite (dev) enums are plain text — nothing to do.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+
+    from app.models.enums import OrganizationStatus, PlanTier, UserRole
+
+    wanted = {
+        ("organizations", "status"): [e.name for e in OrganizationStatus],
+        ("organizations", "plan"): [e.name for e in PlanTier],
+        ("users", "role"): [e.name for e in UserRole],
+    }
+
+    # ADD VALUE cannot run inside a transaction block — use autocommit.
+    with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        for (table, column), labels in wanted.items():
+            type_name = conn.execute(
+                text(
+                    "SELECT t.typname FROM pg_attribute a "
+                    "JOIN pg_class c ON c.oid = a.attrelid "
+                    "JOIN pg_type t ON t.oid = a.atttypid "
+                    "WHERE c.relname = :table AND a.attname = :column"
+                ),
+                {"table": table, "column": column},
+            ).scalar()
+            if not type_name:
+                continue
+            existing = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT e.enumlabel FROM pg_enum e "
+                        "JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = :t"
+                    ),
+                    {"t": type_name},
+                )
+            }
+            for label in labels:
+                if label not in existing:
+                    conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE IF NOT EXISTS \'{label}\''))
+                    logger.info("Auto-migrated enum %s: added value %s", type_name, label)

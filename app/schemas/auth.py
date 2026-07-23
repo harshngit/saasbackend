@@ -55,6 +55,13 @@ class AuthResponse(BaseModel):
     tokens: TokenPair
 
 
+class MeResponse(BaseModel):
+    """GET /auth/me — current user plus their org (status/plan/trial) for the UI."""
+
+    user: UserOut
+    organization: OrganizationOut | None
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
 
