@@ -27,27 +27,48 @@ app.add_middleware(
 )
 
 
+import logging
+
+_log = logging.getLogger("crm.startup")
+
+# Bump when the deployed feature set changes, so /health and logs confirm the build.
+BUILD_TAG = "plans-subscription+demo-reset"
+
+
 @app.on_event("startup")
 def on_startup() -> None:
+    _log.info("Starting CRM API — build: %s", BUILD_TAG)
+
     # For local dev we auto-create tables. In production, use Alembic migrations instead.
     Base.metadata.create_all(bind=engine)
-    # Add new enum values to existing Postgres ENUM types (e.g. 'locked').
-    extend_pg_enum_types()
-    # Drop legacy columns the model no longer defines (e.g. the old `plan` enum).
-    drop_legacy_columns()
-    # Add any newly-introduced nullable columns to already-existing tables.
-    auto_add_missing_columns()
 
-    # On hosts without a shell/pre-deploy step, seed the Super Admin on boot.
+    # Each migration step is isolated: a failure is logged but must NOT crash the
+    # app (a crash loop makes Render revert to the previous deploy). SQLite dev is
+    # unaffected; these mainly matter for the live Postgres.
+    for label, step in (
+        ("extend_pg_enum_types", extend_pg_enum_types),
+        ("drop_legacy_columns", drop_legacy_columns),
+        ("auto_add_missing_columns", auto_add_missing_columns),
+    ):
+        try:
+            step()
+        except Exception:  # noqa: BLE001
+            _log.exception("Startup migration step failed: %s", label)
+
     if settings.seed_on_startup:
-        from app.seed import main as seed_main
+        try:
+            from app.seed import main as seed_main
 
-        seed_main()
+            seed_main()
+        except Exception:  # noqa: BLE001
+            _log.exception("Startup seed failed")
+
+    _log.info("CRM API startup complete — build: %s", BUILD_TAG)
 
 
 @app.get("/health", tags=["health"])
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "build": BUILD_TAG}
 
 
 app.include_router(auth.router)
