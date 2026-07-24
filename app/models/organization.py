@@ -2,11 +2,11 @@ import math
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, String
+from sqlalchemy import DateTime, Enum, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
-from app.models.enums import OrganizationStatus, PlanTier
+from app.models.enums import OrganizationStatus
 
 
 def _uuid() -> str:
@@ -35,17 +35,23 @@ class Organization(Base):
     financial_year: Mapped[str | None] = mapped_column(String(20), nullable=True)
     logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
-    plan: Mapped[PlanTier] = mapped_column(Enum(PlanTier), default=PlanTier.FREE, nullable=False)
     status: Mapped[OrganizationStatus] = mapped_column(
         Enum(OrganizationStatus), default=OrganizationStatus.TRIAL, nullable=False
     )
 
-    # --- Trial & upgrade lifecycle (all nullable so they auto-migrate on the live DB) ---
+    # --- Subscription & trial lifecycle (all nullable so they auto-migrate on the live DB) ---
+    plan_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plans.id"), nullable=True, index=True
+    )
+    requested_plan_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plans.id"), nullable=True
+    )
+    # "monthly" / "yearly" (BillingCycle value); which cycle the org is/wants to be billed on.
+    billing_cycle: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Stored as the PlanTier *value* (e.g. "pro"); nullable until an upgrade is requested.
-    requested_plan: Mapped[str | None] = mapped_column(String(20), nullable=True)
     upgrade_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Stored as the UpgradeStatus value ("none"/"pending"/"approved"/"rejected").
+    # UpgradeStatus value ("none"/"pending"/"approved"/"rejected").
     upgrade_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     upgrade_reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
@@ -53,6 +59,12 @@ class Organization(Base):
 
     users: Mapped[list["User"]] = relationship(  # noqa: F821
         back_populates="organization", cascade="all, delete-orphan"
+    )
+    plan: Mapped["Plan | None"] = relationship(  # noqa: F821
+        foreign_keys=[plan_id], lazy="joined"
+    )
+    requested_plan: Mapped["Plan | None"] = relationship(  # noqa: F821
+        foreign_keys=[requested_plan_id], lazy="joined"
     )
 
     @property

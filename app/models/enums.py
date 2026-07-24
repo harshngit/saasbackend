@@ -42,5 +42,10 @@ class UpgradeStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
+class BillingCycle(str, enum.Enum):
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
+
+
 # Statuses where data-mutation endpoints are blocked (read-only + upgrade allowed).
 LOCKED_STATUSES = {OrganizationStatus.LOCKED, OrganizationStatus.SUSPENDED, OrganizationStatus.INACTIVE}

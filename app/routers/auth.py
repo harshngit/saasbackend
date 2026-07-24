@@ -6,10 +6,13 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.config import settings
 from app.core.security import REFRESH_TOKEN, create_access_token, decode_token, hash_password, verify_password
-from app.models import Organization, OrganizationStatus, PlanTier, User, UserRole
+from app.models import Organization, User, UserRole
 from app.schemas.auth import (
     AuthResponse,
     ChangePasswordRequest,
+    CheckEmailRequest,
+    CheckEmailResponse,
+    DirectResetRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     LoginRequest,
@@ -46,7 +49,7 @@ def register_organization(payload: RegisterOrganization, db: Session = Depends(g
         financial_year=payload.financial_year,
         logo_url=payload.logo_url,
     )
-    org_service.start_trial(org)  # status=trial, plan=free, trial_ends_at=now+7d
+    org_service.start_trial(db, org)  # status=trial, default plan, trial_ends_at=now+7d
     db.add(org)
     db.flush()  # assign org.id before creating the user
 
@@ -149,6 +152,28 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     user.password_hash = hash_password(payload.new_password)
     db.commit()
     # Revoke existing sessions so a leaked old token can't be reused.
+    password_service.revoke_all_refresh_tokens(db, user.id)
+    return MessageResponse(detail="Password has been reset. Please log in.")
+
+
+@router.post("/check-email", response_model=CheckEmailResponse)
+def check_email(payload: CheckEmailRequest, db: Session = Depends(get_db)) -> CheckEmailResponse:
+    """DEMO: report whether an account exists for this email, so the UI can then
+    show the 'set new password' field. (Reveals account existence — demo only.)"""
+    user = db.query(User).filter(User.email == payload.email).first()
+    return CheckEmailResponse(exists=user is not None and user.is_active)
+
+
+@router.post("/reset-password-direct", response_model=MessageResponse)
+def reset_password_direct(payload: DirectResetRequest, db: Session = Depends(get_db)) -> MessageResponse:
+    """DEMO-ONLY: reset a password using just the email — NO ownership verification.
+    Insecure (anyone can reset anyone's password); replace with the token-based
+    forgot-password / reset-password flow before production."""
+    user = db.query(User).filter(User.email == payload.email).first()
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No account found for that email")
+    user.password_hash = hash_password(payload.new_password)
+    db.commit()
     password_service.revoke_all_refresh_tokens(db, user.id)
     return MessageResponse(detail="Password has been reset. Please log in.")
 

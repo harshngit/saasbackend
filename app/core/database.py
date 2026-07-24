@@ -81,11 +81,10 @@ def extend_pg_enum_types() -> None:
     if engine.dialect.name != "postgresql":
         return
 
-    from app.models.enums import OrganizationStatus, PlanTier, UserRole
+    from app.models.enums import OrganizationStatus, UserRole
 
     wanted = {
         ("organizations", "status"): [e.name for e in OrganizationStatus],
-        ("organizations", "plan"): [e.name for e in PlanTier],
         ("users", "role"): [e.name for e in UserRole],
     }
 
@@ -118,3 +117,30 @@ def extend_pg_enum_types() -> None:
                 if label not in existing:
                     conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE IF NOT EXISTS \'{label}\''))
                     logger.info("Auto-migrated enum %s: added value %s", type_name, label)
+
+
+# Columns removed from the model that must be dropped from an existing DB.
+# (Postgres only; on SQLite the dev file is simply recreated.)
+_DROPPED_COLUMNS = [
+    ("organizations", "plan"),           # replaced by plan_id (FK to plans)
+    ("organizations", "requested_plan"),  # replaced by requested_plan_id (FK to plans)
+]
+
+
+def drop_legacy_columns() -> None:
+    """Drop columns that the model no longer defines (Postgres only).
+
+    Needed when a NOT NULL enum column like `plan` is replaced by a FK — otherwise
+    new ORM inserts (which omit it) would violate the old NOT NULL constraint.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    inspector = inspect(engine)
+    for table, column in _DROPPED_COLUMNS:
+        if not inspector.has_table(table):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        if column in existing:
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN IF EXISTS "{column}"'))
+            logger.info("Auto-migrated: dropped legacy column %s.%s", table, column)

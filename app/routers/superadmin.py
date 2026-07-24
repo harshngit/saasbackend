@@ -3,8 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_roles
-from app.models import Organization, OrganizationStatus, User, UserRole
+from app.models import Organization, OrganizationStatus, Plan, UpgradeStatus, User, UserRole
 from app.schemas.organization import OrganizationOut, OrgStatusUpdate, RejectUpgrade
+from app.schemas.plan import PlanCreate, PlanOut, PlanUpdate
 from app.services import org_service
 
 # Every endpoint here is Super Admin only.
@@ -25,13 +26,58 @@ def _get_org(db: Session, org_id: str) -> Organization:
 @router.get("/organizations", response_model=list[OrganizationOut])
 def list_organizations(
     status_filter: OrganizationStatus | None = Query(default=None, alias="status"),
+    upgrade_status: UpgradeStatus | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> list[Organization]:
-    """List all organizations on the platform, optionally filtered by ?status=."""
+    """List all organizations, optionally filtered by ?status= and ?upgrade_status=."""
     query = db.query(Organization)
     if status_filter is not None:
         query = query.filter(Organization.status == status_filter)
+    if upgrade_status is not None:
+        query = query.filter(Organization.upgrade_status == upgrade_status.value)
     return query.order_by(Organization.created_at.desc()).all()
+
+
+# ----------------------------- Plan catalog management -----------------------------
+
+
+@router.get("/plans", response_model=list[PlanOut])
+def list_all_plans(db: Session = Depends(get_db)) -> list[Plan]:
+    """All plans (active + inactive) for the Super Admin management view."""
+    return db.query(Plan).order_by(Plan.price_monthly).all()
+
+
+@router.post("/plans", response_model=PlanOut, status_code=status.HTTP_201_CREATED)
+def create_plan(payload: PlanCreate, db: Session = Depends(get_db)) -> Plan:
+    plan = Plan(**payload.model_dump())
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+@router.put("/plans/{plan_id}", response_model=PlanOut)
+def update_plan(plan_id: str, payload: PlanUpdate, db: Session = Depends(get_db)) -> Plan:
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(plan, field, value)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+@router.patch("/plans/{plan_id}/deactivate", response_model=PlanOut)
+def deactivate_plan(plan_id: str, db: Session = Depends(get_db)) -> Plan:
+    """Hide a plan from new selection. Never hard-delete — existing subscribers keep it."""
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+    plan.is_active = False
+    db.commit()
+    db.refresh(plan)
+    return plan
 
 
 @router.get("/organizations/{org_id}", response_model=OrganizationOut)

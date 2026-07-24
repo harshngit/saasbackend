@@ -2,7 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.enums import OrganizationStatus, PlanTier, UpgradeStatus
+from app.models.enums import BillingCycle, OrganizationStatus, UpgradeStatus
+from app.schemas.plan import PlanOut
 
 
 class OrganizationOut(BaseModel):
@@ -18,12 +19,18 @@ class OrganizationOut(BaseModel):
     address: str | None
     financial_year: str | None
     logo_url: str | None
-    plan: PlanTier
     status: OrganizationStatus
+
+    # Subscription: plan_id + the joined plan detail (and requested plan, if pending).
+    plan_id: str | None = None
+    plan: PlanOut | None = None
+    requested_plan_id: str | None = None
+    requested_plan: PlanOut | None = None
+    billing_cycle: BillingCycle | None = None
+
     # Trial & upgrade lifecycle
     trial_ends_at: datetime | None = None
     trial_days_left: int | None = None
-    requested_plan: PlanTier | None = None
     upgrade_status: UpgradeStatus | None = None
     upgrade_requested_at: datetime | None = None
     upgrade_reject_reason: str | None = None
@@ -31,7 +38,8 @@ class OrganizationOut(BaseModel):
 
 
 class UpgradeRequest(BaseModel):
-    requested_plan: PlanTier
+    requested_plan_id: str
+    billing_cycle: BillingCycle = BillingCycle.MONTHLY
 
 
 class RejectUpgrade(BaseModel):

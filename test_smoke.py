@@ -67,6 +67,7 @@ check("new org starts on trial", org_out["status"] == "trial", org_out)
 check("trial_ends_at is set", org_out["trial_ends_at"] is not None, org_out)
 check("trial_days_left ~7", org_out["trial_days_left"] in (6, 7), org_out)
 check("upgrade_status none at register", org_out["upgrade_status"] == "none", org_out)
+check("new org on default Free plan", (org_out.get("plan") or {}).get("name") == "Free", org_out)
 check("register returns token pair", "access_token" in body["tokens"] and "refresh_token" in body["tokens"], body)
 admin_access = body["tokens"]["access_token"]
 admin_refresh = body["tokens"]["refresh_token"]
@@ -241,9 +242,18 @@ check("locked: GET /organizations/me still works",
       client.get("/organizations/me", headers=life_hdr).status_code == 200)
 check("locked: GET /users (read-only) still works",
       client.get("/users", headers=life_hdr).status_code == 200)
-r = client.post("/organizations/upgrade-request", headers=life_hdr, json={"requested_plan": "pro"})
+# Look up plan ids from the seeded catalog.
+_plans = client.get("/plans", headers=life_hdr).json()
+pro_id = next(p["id"] for p in _plans if p["name"] == "Pro")
+basic_id = next(p["id"] for p in _plans if p["name"] == "Basic")
+check("upgrade-request unknown plan -> 400",
+      client.post("/organizations/upgrade-request", headers=life_hdr,
+                  json={"requested_plan_id": "nope", "billing_cycle": "monthly"}).status_code == 400)
+r = client.post("/organizations/upgrade-request", headers=life_hdr,
+                json={"requested_plan_id": pro_id, "billing_cycle": "yearly"})
 check("locked: upgrade-request allowed", r.status_code == 200 and r.json()["upgrade_status"] == "pending", r.text)
-check("upgrade-request set requested_plan", r.json()["requested_plan"] == "pro", r.text)
+check("upgrade-request set requested plan (Pro)", (r.json().get("requested_plan") or {}).get("name") == "Pro", r.text)
+check("upgrade-request set billing_cycle", r.json()["billing_cycle"] == "yearly", r.text)
 
 print("\n== super admin approval flow ==")
 sa = client.post("/auth/login", json={"email": "superadmin@demo.com", "password": "Admin@123"})
@@ -261,7 +271,8 @@ check("non-super-admin blocked from /superadmin -> 403", r.status_code == 403, r
 # Approve the upgrade → active on the requested plan, and the admin is unlocked.
 r = client.patch(f"/superadmin/organizations/{life_org_id}/approve-upgrade", headers=sa_hdr)
 check("approve-upgrade -> active", r.status_code == 200 and r.json()["status"] == "active", r.text)
-check("approve set plan to requested (pro)", r.json()["plan"] == "pro", r.text)
+check("approve set plan to requested (Pro)", (r.json().get("plan") or {}).get("name") == "Pro", r.text)
+check("approve cleared requested_plan_id", r.json().get("requested_plan_id") is None, r.text)
 r = client.post("/users", headers=life_hdr,
     json={"name": "S3", "email": f"s3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"})
 check("after approval: mutation unlocked -> 201", r.status_code == 201, r.text)
@@ -272,7 +283,8 @@ rej = client.post("/auth/register", json={
     "organization_name": "Reject Co", "admin_name": "R", "email": rej_email, "password": "Secret@123"}).json()
 rej_id = rej["organization"]["id"]
 client.post("/organizations/upgrade-request",
-    headers={"Authorization": f"Bearer {rej['tokens']['access_token']}"}, json={"requested_plan": "basic"})
+    headers={"Authorization": f"Bearer {rej['tokens']['access_token']}"},
+    json={"requested_plan_id": basic_id, "billing_cycle": "monthly"})
 r = client.patch(f"/superadmin/organizations/{rej_id}/reject-upgrade", headers=sa_hdr, json={"reason": "Payment not verified"})
 check("reject-upgrade -> rejected + reason", r.status_code == 200 and r.json()["upgrade_status"] == "rejected"
       and r.json()["upgrade_reject_reason"] == "Payment not verified", r.text)
@@ -282,6 +294,49 @@ check("manual status override -> suspended", r.status_code == 200 and r.json()["
 r = client.post("/users", headers=life_hdr,
     json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"})
 check("suspended: mutation blocked -> 403", r.status_code == 403, r.text)
+
+print("\n== plan catalog (GET /plans + super admin management) ==")
+r = client.get("/plans", headers=sa_hdr)
+names = [p["name"] for p in r.json()]
+check("GET /plans returns seeded catalog", r.status_code == 200 and {"Free", "Basic", "Pro", "Enterprise"} <= set(names), names)
+check("GET /plans only active plans", all(p["is_active"] for p in r.json()), r.text)
+# Super admin creates a plan.
+r = client.post("/superadmin/plans", headers=sa_hdr,
+    json={"name": "Starter", "price_monthly": 199, "price_yearly": 1999, "features": ["Basic stuff"], "max_users": 5})
+check("super admin create plan -> 201", r.status_code == 201, r.text)
+starter_id = r.json()["id"]
+check("new plan appears in GET /plans", any(p["name"] == "Starter" for p in client.get("/plans", headers=sa_hdr).json()))
+# Edit its price.
+r = client.put(f"/superadmin/plans/{starter_id}", headers=sa_hdr, json={"price_monthly": 149})
+check("update plan price -> 200", r.status_code == 200 and r.json()["price_monthly"] == 149, r.text)
+# Non-super-admin cannot manage plans.
+check("non-super-admin create plan -> 403",
+      client.post("/superadmin/plans", headers=life_hdr, json={"name": "X", "price_monthly": 1, "price_yearly": 1}).status_code == 403)
+# Deactivate -> hidden from GET /plans but still in the super admin's full list.
+r = client.patch(f"/superadmin/plans/{starter_id}/deactivate", headers=sa_hdr)
+check("deactivate plan -> is_active false", r.status_code == 200 and r.json()["is_active"] is False, r.text)
+check("deactivated plan hidden from GET /plans",
+      all(p["name"] != "Starter" for p in client.get("/plans", headers=sa_hdr).json()))
+check("deactivated plan still in super admin list",
+      any(p["name"] == "Starter" for p in client.get("/superadmin/plans", headers=sa_hdr).json()))
+check("upgrade-request to a deactivated plan -> 400",
+      client.post("/organizations/upgrade-request", headers=life_hdr,
+                  json={"requested_plan_id": starter_id, "billing_cycle": "monthly"}).status_code == 400)
+
+print("\n== DEMO direct password reset (check-email + reset-password-direct) ==")
+demo_reset_email = f"dr_{uuid.uuid4().hex[:8]}@firm.com"
+client.post("/auth/register", json={
+    "organization_name": "DR Co", "admin_name": "D", "email": demo_reset_email, "password": "Old@12345"})
+check("check-email existing -> true", client.post("/auth/check-email", json={"email": demo_reset_email}).json()["exists"] is True)
+check("check-email unknown -> false", client.post("/auth/check-email", json={"email": "nobody@x.com"}).json()["exists"] is False)
+check("direct reset -> 200", client.post("/auth/reset-password-direct",
+      json={"email": demo_reset_email, "new_password": "New@12345"}).status_code == 200)
+check("old password fails after direct reset -> 401",
+      client.post("/auth/login", json={"email": demo_reset_email, "password": "Old@12345"}).status_code == 401)
+check("new password works after direct reset -> 200",
+      client.post("/auth/login", json={"email": demo_reset_email, "password": "New@12345"}).status_code == 200)
+check("direct reset unknown email -> 404",
+      client.post("/auth/reset-password-direct", json={"email": "nobody@x.com", "new_password": "New@12345"}).status_code == 404)
 
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify

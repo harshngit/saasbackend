@@ -92,3 +92,18 @@ class ResetPasswordRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(min_length=8, max_length=128)
+
+
+# --- DEMO-ONLY direct reset (no email verification). Insecure; replace with the
+#     token flow (forgot-password + reset-password) before production. ---
+class CheckEmailRequest(BaseModel):
+    email: EmailStr
+
+
+class CheckEmailResponse(BaseModel):
+    exists: bool
+
+
+class DirectResetRequest(BaseModel):
+    email: EmailStr
+    new_password: str = Field(min_length=8, max_length=128)
