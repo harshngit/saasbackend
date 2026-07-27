@@ -1,0 +1,28 @@
+name: Keep Render service warm
+
+# Render's free instance sleeps after ~15 min idle (first request then takes ~50s
+# to wake). This pings /health every 10 min so it stays awake and logins are fast.
+# Note: GitHub's scheduled runs are best-effort and can be delayed a few minutes.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch: {}       # allow manual runs from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint (with cold-start retries)
+        run: |
+          URL="https://crm-saas-backend-9nom.onrender.com/health"
+          for i in 1 2 3 4; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 "$URL" || echo "000")
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Service is warm."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::Health check did not return 200 (service may be waking or down)"
