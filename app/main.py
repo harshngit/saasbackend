@@ -9,8 +9,8 @@ from app.core.database import (
     engine,
     extend_pg_enum_types,
 )
-from app.models import Organization, Plan, RefreshToken, User  # noqa: F401  (register mappers)
-from app.routers import auth, organizations, plans, superadmin, users
+from app.models import Organization, Plan, RefreshToken, Role, User  # noqa: F401  (register mappers)
+from app.routers import auth, organizations, plans, roles, superadmin, users
 
 app = FastAPI(
     title="CRM SaaS API",
@@ -73,6 +73,7 @@ def health() -> dict[str, str]:
 
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(roles.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)

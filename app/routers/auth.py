@@ -25,7 +25,7 @@ from app.schemas.auth import (
     TokenPair,
 )
 from app.schemas.user import UserOut
-from app.services import auth_service, org_service, password_service
+from app.services import auth_service, org_service, password_service, role_service
 from app.services.email_service import send_password_reset
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -64,6 +64,9 @@ def register_organization(payload: RegisterOrganization, db: Session = Depends(g
     db.add(admin)
     db.commit()
     db.refresh(admin)
+
+    # Auto-seed the 3 default roles (Sales Officer / Delivery Partner / Accountant).
+    role_service.seed_default_roles(db, org.id)
 
     tokens = auth_service.issue_tokens(db, admin)
     return auth_service.build_auth_response(admin, tokens)

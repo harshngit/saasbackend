@@ -323,6 +323,69 @@ check("upgrade-request to a deactivated plan -> 400",
       client.post("/organizations/upgrade-request", headers=life_hdr,
                   json={"requested_plan_id": starter_id, "billing_cycle": "monthly"}).status_code == 400)
 
+print("\n== roles: default seeding + CRUD + catalog ==")
+# A fresh firm should auto-get the 3 default roles.
+roles_email = f"roles_{uuid.uuid4().hex[:8]}@firm.com"
+rr = client.post("/auth/register", json={
+    "organization_name": "Roles Co", "admin_name": "R", "email": roles_email, "password": "Secret@123"}).json()
+roles_hdr = {"Authorization": f"Bearer {rr['tokens']['access_token']}"}
+r = client.get("/roles", headers=roles_hdr)
+default_names = {x["name"] for x in r.json() if x["is_default"]}
+check("register auto-seeds 3 default roles",
+      r.status_code == 200 and {"Sales Officer", "Delivery Partner", "Accountant"} <= default_names, r.text)
+so = next(x for x in r.json() if x["name"] == "Sales Officer")
+check("Sales Officer has full customers access", so["permissions"].get("customers", {}).get("create") is True, so)
+check("Sales Officer has no payments access", "payments" not in so["permissions"], so)
+
+# Catalog
+r = client.get("/roles/catalog", headers=roles_hdr)
+check("catalog returns modules + actions",
+      r.status_code == 200 and len(r.json()["modules"]) == 17 and len(r.json()["actions"]) == 7, r.text)
+
+# Create custom role
+r = client.post("/roles", headers=roles_hdr, json={
+    "name": "Senior Sales Officer",
+    "permissions": {"customers": {"view": True, "create": True, "edit": True},
+                    "reports": {"view": True, "export": True},
+                    "settings": {}}})  # all-false module should be dropped
+check("create custom role -> 201", r.status_code == 201, r.text)
+custom = r.json()
+custom_id = custom["id"]
+check("custom role is not default", custom["is_default"] is False, custom)
+check("all-false module dropped (deny-by-default)", "settings" not in custom["permissions"], custom)
+check("granted actions normalized (7 keys)", set(custom["permissions"]["customers"].keys()) ==
+      {"view", "create", "edit", "delete", "approve", "export", "download"}, custom)
+check("duplicate role name -> 409",
+      client.post("/roles", headers=roles_hdr, json={"name": "Senior Sales Officer", "permissions": {}}).status_code == 409)
+
+# Update (edit a default role's permissions + rename custom)
+r = client.put(f"/roles/{custom_id}", headers=roles_hdr, json={"permissions": {"customers": {"view": True}}})
+check("update role permissions (full replace) -> 200",
+      r.status_code == 200 and r.json()["permissions"] == {"customers": {"view": True, "create": False, "edit": False, "delete": False, "approve": False, "export": False, "download": False}}, r.text)
+so_id = so["id"]
+r = client.put(f"/roles/{so_id}", headers=roles_hdr, json={"permissions": {"customers": {"view": True}}})
+check("editing a default role is allowed -> 200", r.status_code == 200, r.text)
+
+# Delete rules
+check("delete a default role -> 400",
+      client.delete(f"/roles/{so_id}", headers=roles_hdr).status_code == 400)
+check("delete custom role -> 204",
+      client.delete(f"/roles/{custom_id}", headers=roles_hdr).status_code == 204)
+
+# Staff (non-admin) cannot access /roles at all.
+staff_reg = client.post("/users", headers=roles_hdr, json={
+    "name": "St", "email": f"st_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "sales_officer"})
+st_tok = client.post("/auth/login", json={
+    "email": staff_reg.json()["email"], "password": "Staff@123"}).json()["tokens"]["access_token"]
+check("staff blocked from /roles -> 403",
+      client.get("/roles", headers={"Authorization": f"Bearer {st_tok}"}).status_code == 403)
+# Cross-org: another firm's admin cannot see this firm's roles by id
+other_reg = client.post("/auth/register", json={
+    "organization_name": "OtherRoles", "admin_name": "O", "email": f"or_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+other_hdr = {"Authorization": f"Bearer {other_reg['tokens']['access_token']}"}
+check("cross-org role fetch -> 404",
+      client.get(f"/roles/{so_id}", headers=other_hdr).status_code == 404)
+
 print("\n== DEMO direct password reset (check-email + reset-password-direct) ==")
 demo_reset_email = f"dr_{uuid.uuid4().hex[:8]}@firm.com"
 client.post("/auth/register", json={

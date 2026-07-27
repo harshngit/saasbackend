@@ -109,6 +109,11 @@ def main() -> None:
         default_plan = seed_plans(db)
         seed_super_admin(db)
         seed_demo_firm(db, default_plan)
+        # Ensure every org has its 3 default roles (backfill for existing orgs).
+        from app.services.role_service import seed_default_roles_for_all_orgs
+
+        seed_default_roles_for_all_orgs(db)
+        print("[seed] Default roles ensured for all orgs")
     finally:
         db.close()
     print("[seed] Done.")
