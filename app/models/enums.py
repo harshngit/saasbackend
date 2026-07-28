@@ -20,6 +20,33 @@ class UserRole(str, enum.Enum):
 STAFF_ROLES = {UserRole.ACCOUNTANT, UserRole.SALES_OFFICER, UserRole.DELIVERY_PARTNER}
 
 
+class SystemRole(str, enum.Enum):
+    """Top-level role for routing/access control (checked before the permission matrix)."""
+
+    SUPER_ADMIN = "super_admin"
+    ADMIN = "admin"
+    STAFF = "staff"
+
+
+# Map the legacy UserRole enum to a system role.
+def system_role_for(role: "UserRole | None") -> str:
+    if role == UserRole.SUPER_ADMIN:
+        return SystemRole.SUPER_ADMIN.value
+    if role == UserRole.ADMIN:
+        return SystemRole.ADMIN.value
+    return SystemRole.STAFF.value
+
+
+# Legacy staff UserRole -> the matching default role name (for backfill / legacy create).
+STAFF_ROLE_NAME = {
+    UserRole.ACCOUNTANT: "Accountant",
+    UserRole.SALES_OFFICER: "Sales Officer",
+    UserRole.DELIVERY_PARTNER: "Delivery Partner",
+}
+# Inverse: default role name -> legacy UserRole (None for custom roles).
+LEGACY_ROLE_BY_NAME = {name: role for role, name in STAFF_ROLE_NAME.items()}
+
+
 class OrganizationStatus(str, enum.Enum):
     TRIAL = "trial"
     ACTIVE = "active"

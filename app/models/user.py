@@ -34,9 +34,28 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False)
+
+    # Top-level role for routing/access control (super_admin / admin / staff).
+    system_role: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    # Staff's detailed org-scoped role (permission matrix). Null for admin/super_admin.
+    role_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("roles.id"), nullable=True, index=True
+    )
+    # Legacy fixed role enum — kept (nullable) for backward-compat in responses.
+    role: Mapped[UserRole | None] = mapped_column(Enum(UserRole), nullable=True)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     organization: Mapped["Organization | None"] = relationship(back_populates="users")  # noqa: F821
+    role_detail: Mapped["Role | None"] = relationship(foreign_keys=[role_id], lazy="joined")  # noqa: F821
+
+    @property
+    def effective_system_role(self) -> str:
+        """system_role if set, otherwise derived from the legacy role (transition safety)."""
+        if self.system_role:
+            return self.system_role
+        from app.models.enums import system_role_for
+
+        return system_role_for(self.role)

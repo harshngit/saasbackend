@@ -386,6 +386,75 @@ other_hdr = {"Authorization": f"Bearer {other_reg['tokens']['access_token']}"}
 check("cross-org role fetch -> 404",
       client.get(f"/roles/{so_id}", headers=other_hdr).status_code == 404)
 
+print("\n== Phase 2: users wired to roles (role_id, system_role, permissions) ==")
+p2_email = f"p2_{uuid.uuid4().hex[:8]}@firm.com"
+p2 = client.post("/auth/register", json={
+    "organization_name": "P2 Co", "admin_name": "P2 Admin", "email": p2_email, "password": "Secret@123"}).json()
+p2_hdr = {"Authorization": f"Bearer {p2['tokens']['access_token']}"}
+check("admin has system_role=admin", p2["user"]["system_role"] == "admin", p2["user"])
+
+# admin /auth/me → full_access true, empty permissions
+me = client.get("/auth/me", headers=p2_hdr).json()
+check("admin me full_access=true", me["full_access"] is True and me["permissions"] == {}, me)
+
+# Get role ids
+roles = client.get("/roles", headers=p2_hdr).json()
+sales_role = next(r for r in roles if r["name"] == "Sales Officer")
+
+# Create staff via role_id
+st_email = f"p2s_{uuid.uuid4().hex[:6]}@f.com"
+r = client.post("/users", headers=p2_hdr, json={
+    "name": "Staffy", "email": st_email, "password": "Staff@123", "role_id": sales_role["id"]})
+check("create staff via role_id -> 201", r.status_code == 201, r.text)
+staff = r.json()
+check("staff system_role=staff", staff["system_role"] == "staff", staff)
+check("staff role_id set", staff["role_id"] == sales_role["id"], staff)
+check("staff role_detail has permissions", staff["role_detail"]["permissions"].get("customers", {}).get("create") is True, staff)
+check("staff legacy role mapped (sales_officer)", staff["role"] == "sales_officer", staff)
+p2_staff_id = staff["id"]
+
+# role_id from another org → rejected
+other = client.post("/auth/register", json={
+    "organization_name": "P2 Other", "admin_name": "O", "email": f"p2o_{uuid.uuid4().hex[:6]}@f.com", "password": "Secret@123"}).json()
+other_roles = client.get("/roles", headers={"Authorization": f"Bearer {other['tokens']['access_token']}"}).json()
+foreign_role_id = other_roles[0]["id"]
+check("create staff with cross-org role_id -> 400",
+      client.post("/users", headers=p2_hdr, json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role_id": foreign_role_id}).status_code == 400)
+
+# Staff login → me shows their permissions + full_access false
+st_login = client.post("/auth/login", json={"email": st_email, "password": "Staff@123"}).json()
+st_hdr = {"Authorization": f"Bearer {st_login['tokens']['access_token']}"}
+st_me = client.get("/auth/me", headers=st_hdr).json()
+check("staff me full_access=false", st_me["full_access"] is False, st_me)
+check("staff me exposes permission matrix", st_me["permissions"].get("customers", {}).get("view") is True, st_me)
+check("staff blocked from /users -> 403", client.get("/users", headers=st_hdr).status_code == 403)
+
+# Filters
+check("filter ?role_id returns the staff",
+      any(u["id"] == p2_staff_id for u in client.get("/users", headers=p2_hdr, params={"role_id": sales_role["id"]}).json()))
+check("filter ?is_active=false empty (none deactivated yet)",
+      len(client.get("/users", headers=p2_hdr, params={"is_active": "false"}).json()) == 0)
+
+# GET one / PATCH profile / PATCH role
+check("GET /users/{id} -> 200", client.get(f"/users/{p2_staff_id}", headers=p2_hdr).status_code == 200)
+r = client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={"phone": "9000000000", "name": "Staffy Renamed"})
+check("PATCH /users/{id} profile -> 200", r.status_code == 200 and r.json()["phone"] == "9000000000" and r.json()["name"] == "Staffy Renamed", r.text)
+deliv_role = next(rr for rr in roles if rr["name"] == "Delivery Partner")
+r = client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": deliv_role["id"]})
+check("PATCH /users/{id}/role -> 200 new role", r.status_code == 200 and r.json()["role_id"] == deliv_role["id"] and r.json()["role"] == "delivery_partner", r.text)
+
+# Cross-org: another admin can't fetch this firm's user
+check("cross-org GET /users/{id} -> 404", client.get(f"/users/{p2_staff_id}", headers={"Authorization": f"Bearer {other['tokens']['access_token']}"}).status_code == 404)
+
+# Delete role rules with assignment
+# Sales Officer no longer has the staff (moved to Delivery Partner) but is default → 400
+check("delete default role -> 400", client.delete(f"/roles/{sales_role['id']}", headers=p2_hdr).status_code == 400)
+# Custom role with an assigned user → 400
+cr = client.post("/roles", headers=p2_hdr, json={"name": "Temp Role", "permissions": {"customers": {"view": True}}}).json()
+client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": cr["id"]})
+check("delete custom role with assigned user -> 400",
+      client.delete(f"/roles/{cr['id']}", headers=p2_hdr).status_code == 400)
+
 print("\n== DEMO direct password reset (check-email + reset-password-direct) ==")
 demo_reset_email = f"dr_{uuid.uuid4().hex[:8]}@firm.com"
 client.post("/auth/register", json={

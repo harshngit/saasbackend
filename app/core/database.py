@@ -127,6 +127,25 @@ _DROPPED_COLUMNS = [
 ]
 
 
+# Columns whose NOT NULL constraint must be relaxed (model made them nullable).
+_RELAX_NOT_NULL = [
+    ("users", "role"),  # legacy role enum is now optional (staff use role_id)
+]
+
+
+def relax_not_null_columns() -> None:
+    """Drop NOT NULL on columns the model no longer requires (Postgres only)."""
+    if engine.dialect.name != "postgresql":
+        return
+    for table, column in _RELAX_NOT_NULL:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" DROP NOT NULL'))
+            logger.info("Auto-migrated: dropped NOT NULL on %s.%s", table, column)
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not drop NOT NULL on %s.%s", table, column)
+
+
 def drop_legacy_columns() -> None:
     """Drop columns that the model no longer defines (Postgres only).
 

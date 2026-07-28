@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_roles
-from app.models import Plan, User, UserRole
+from app.core.deps import require_system_role
+from app.models import Plan, SystemRole, User
 from app.schemas.organization import OrganizationOut, UpgradeRequest
 from app.services import org_service
 
@@ -12,7 +12,7 @@ router = APIRouter(prefix="/organizations", tags=["organizations"])
 
 @router.get("/me", response_model=OrganizationOut)
 def my_organization(
-    admin: User = Depends(require_roles(UserRole.ADMIN)),
+    admin: User = Depends(require_system_role(SystemRole.ADMIN)),
     db: Session = Depends(get_db),
 ) -> object:
     """Current org state (status, plan, trial, upgrade status). Works even when locked."""
@@ -25,7 +25,7 @@ def my_organization(
 @router.post("/upgrade-request", response_model=OrganizationOut)
 def request_upgrade(
     payload: UpgradeRequest,
-    admin: User = Depends(require_roles(UserRole.ADMIN)),
+    admin: User = Depends(require_system_role(SystemRole.ADMIN)),
     db: Session = Depends(get_db),
 ) -> object:
     """Admin submits an upgrade request. Allowed even while locked — this is how a

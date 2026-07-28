@@ -60,6 +60,7 @@ def register_organization(payload: RegisterOrganization, db: Session = Depends(g
         phone=payload.phone,
         password_hash=hash_password(payload.password),
         role=UserRole.ADMIN,
+        system_role="admin",
     )
     db.add(admin)
     db.commit()
@@ -121,7 +122,11 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
     # Include org state (status/plan/trial) so the UI can render banners/lock screens
     # on refresh without a re-login. Also lazily locks an expired trial.
     org = org_service.apply_trial_expiry(db, user.organization)
-    return MeResponse(user=user, organization=org)
+
+    # Effective permissions for the frontend to show/hide UI.
+    full_access = user.effective_system_role in ("admin", "super_admin")
+    permissions = {} if full_access or user.role_detail is None else user.role_detail.permissions
+    return MeResponse(user=user, organization=org, full_access=full_access, permissions=permissions)
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

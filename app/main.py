@@ -8,6 +8,7 @@ from app.core.database import (
     drop_legacy_columns,
     engine,
     extend_pg_enum_types,
+    relax_not_null_columns,
 )
 from app.models import Organization, Plan, RefreshToken, Role, User  # noqa: F401  (register mappers)
 from app.routers import auth, organizations, plans, roles, superadmin, users
@@ -32,7 +33,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "plans-subscription+demo-reset"
+BUILD_TAG = "users-roles-phase2"
 
 
 @app.on_event("startup")
@@ -48,6 +49,7 @@ def on_startup() -> None:
     for label, step in (
         ("extend_pg_enum_types", extend_pg_enum_types),
         ("drop_legacy_columns", drop_legacy_columns),
+        ("relax_not_null_columns", relax_not_null_columns),
         ("auto_add_missing_columns", auto_add_missing_columns),
     ):
         try:

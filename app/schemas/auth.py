@@ -56,10 +56,14 @@ class AuthResponse(BaseModel):
 
 
 class MeResponse(BaseModel):
-    """GET /auth/me — current user plus their org (status/plan/trial) for the UI."""
+    """GET /auth/me — current user, their org, and their effective permissions."""
 
     user: UserOut
     organization: OrganizationOut | None
+    # True for admin/super_admin (full access in their scope); false for staff.
+    full_access: bool = False
+    # Staff's permission matrix (empty when full_access is true).
+    permissions: dict[str, dict[str, bool]] = {}
 
 
 class RefreshRequest(BaseModel):

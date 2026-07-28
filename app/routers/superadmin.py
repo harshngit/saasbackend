@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_roles
-from app.models import Organization, OrganizationStatus, Plan, UpgradeStatus, User, UserRole
+from app.core.deps import require_system_role
+from app.models import Organization, OrganizationStatus, Plan, SystemRole, UpgradeStatus, User
 from app.schemas.organization import OrganizationOut, OrgStatusUpdate, RejectUpgrade
 from app.schemas.plan import PlanCreate, PlanOut, PlanUpdate
 from app.services import org_service
@@ -12,7 +12,7 @@ from app.services import org_service
 router = APIRouter(
     prefix="/superadmin",
     tags=["superadmin"],
-    dependencies=[Depends(require_roles(UserRole.SUPER_ADMIN))],
+    dependencies=[Depends(require_system_role(SystemRole.SUPER_ADMIN))],
 )
 
 

@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.core.permissions import default_role_matrices, normalize_permissions
-from app.models import Organization, Role
+from app.models import STAFF_ROLE_NAME, Organization, Role, UserRole
 
 
 def seed_default_roles(db: Session, organization_id: str) -> None:
@@ -33,8 +33,51 @@ def seed_default_roles_for_all_orgs(db: Session) -> None:
         seed_default_roles(db, org_id)
 
 
+def backfill_user_roles(db: Session) -> None:
+    """Set system_role (and role_id for staff) on existing users that predate Phase 2."""
+    from app.models import User, system_role_for
+
+    changed = False
+    for user in db.query(User).all():
+        if not user.system_role:
+            user.system_role = system_role_for(user.role)
+            changed = True
+        if (
+            user.system_role == "staff"
+            and user.role_id is None
+            and user.organization_id is not None
+            and user.role is not None
+        ):
+            role = default_role_for_legacy(db, user.organization_id, user.role)
+            if role is not None:
+                user.role_id = role.id
+                changed = True
+    if changed:
+        db.commit()
+
+
 def name_taken(db: Session, organization_id: str, name: str, exclude_id: str | None = None) -> bool:
     query = db.query(Role).filter(Role.organization_id == organization_id, Role.name == name)
     if exclude_id is not None:
         query = query.filter(Role.id != exclude_id)
     return db.query(query.exists()).scalar()
+
+
+def get_role_in_org(db: Session, organization_id: str, role_id: str) -> Role | None:
+    """Return the role only if it belongs to this org (else None — no cross-org access)."""
+    role = db.get(Role, role_id)
+    if role is None or role.organization_id != organization_id:
+        return None
+    return role
+
+
+def default_role_for_legacy(db: Session, organization_id: str, legacy_role: UserRole) -> Role | None:
+    """Find the org's default role matching a legacy staff role enum."""
+    name = STAFF_ROLE_NAME.get(legacy_role)
+    if name is None:
+        return None
+    return (
+        db.query(Role)
+        .filter(Role.organization_id == organization_id, Role.name == name)
+        .first()
+    )

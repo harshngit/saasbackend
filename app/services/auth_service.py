@@ -15,7 +15,7 @@ def _hash_refresh(token: str) -> str:
 
 def issue_tokens(db: Session, user: User) -> TokenPair:
     """Create an access/refresh pair and persist the refresh token hash for revocation."""
-    access = create_access_token(user.id, user.role.value, user.organization_id)
+    access = create_access_token(user.id, user.effective_system_role, user.organization_id)
     refresh = create_refresh_token(user.id)
 
     db.add(

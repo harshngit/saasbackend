@@ -67,6 +67,7 @@ def seed_super_admin(db: Session) -> None:
         email=settings.super_admin_email,
         password_hash=hash_password(settings.super_admin_password),
         role=UserRole.SUPER_ADMIN,
+        system_role="super_admin",
     )
     db.add(admin)
     db.commit()
@@ -96,6 +97,7 @@ def seed_demo_firm(db: Session, default_plan: Plan | None) -> None:
             email="admin@demo.com",
             password_hash=hash_password("Admin@123"),
             role=UserRole.ADMIN,
+            system_role="admin",
         )
     )
     db.commit()
@@ -110,10 +112,13 @@ def main() -> None:
         seed_super_admin(db)
         seed_demo_firm(db, default_plan)
         # Ensure every org has its 3 default roles (backfill for existing orgs).
-        from app.services.role_service import seed_default_roles_for_all_orgs
+        from app.services.role_service import backfill_user_roles, seed_default_roles_for_all_orgs
 
         seed_default_roles_for_all_orgs(db)
         print("[seed] Default roles ensured for all orgs")
+        # Backfill system_role + role_id on users that predate Phase 2.
+        backfill_user_roles(db)
+        print("[seed] User system_role / role_id backfilled")
     finally:
         db.close()
     print("[seed] Done.")
