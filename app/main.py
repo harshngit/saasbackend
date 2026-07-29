@@ -20,13 +20,15 @@ app = FastAPI(
     version="0.1.0",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: with credentials enabled, the browser rejects a wildcard "*" origin — the
+# response must echo the *specific* request origin. So when CORS_ORIGINS is "*",
+# use an allow-all regex (Starlette then echoes the caller's origin) instead of a
+# literal "*". Otherwise use the explicit allow-list.
+_cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+if "*" in settings.cors_origin_list:
+    app.add_middleware(CORSMiddleware, allow_origin_regex=".*", **_cors_kwargs)
+else:
+    app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, **_cors_kwargs)
 
 
 import logging
@@ -34,7 +36,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "company-settings+username"
+BUILD_TAG = "cors-credentials-fix"
 
 
 @app.on_event("startup")
