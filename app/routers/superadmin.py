@@ -5,7 +5,7 @@ from app.core.database import get_db
 from app.core.deps import require_system_role
 from app.models import Organization, OrganizationStatus, Plan, SystemRole, UpgradeStatus, User
 from app.schemas.organization import OrganizationOut, OrgStatusUpdate, RejectUpgrade
-from app.schemas.plan import PlanCreate, PlanOut, PlanUpdate
+from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
 from app.services import org_service
 
 # Every endpoint here is Super Admin only.
@@ -68,9 +68,22 @@ def update_plan(plan_id: str, payload: PlanUpdate, db: Session = Depends(get_db)
     return plan
 
 
+@router.patch("/plans/{plan_id}/status", response_model=PlanOut)
+def set_plan_status(plan_id: str, payload: PlanStatusUpdate, db: Session = Depends(get_db)) -> Plan:
+    """Toggle a plan active/inactive (both directions). Inactive plans are hidden
+    from GET /plans but never hard-deleted, so existing subscribers keep working."""
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+    plan.is_active = payload.is_active
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
 @router.patch("/plans/{plan_id}/deactivate", response_model=PlanOut)
 def deactivate_plan(plan_id: str, db: Session = Depends(get_db)) -> Plan:
-    """Hide a plan from new selection. Never hard-delete — existing subscribers keep it."""
+    """(Kept for compatibility — prefer PATCH /plans/{id}/status.) Hide a plan."""
     plan = db.get(Plan, plan_id)
     if plan is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")

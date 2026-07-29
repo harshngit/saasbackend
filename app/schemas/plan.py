@@ -33,6 +33,10 @@ class PlanCreate(BaseModel):
     is_default: bool = False
 
 
+class PlanStatusUpdate(BaseModel):
+    is_active: bool
+
+
 class PlanUpdate(BaseModel):
     """Partial update — only provided fields are changed."""
 

@@ -322,6 +322,13 @@ check("deactivated plan still in super admin list",
 check("upgrade-request to a deactivated plan -> 400",
       client.post("/organizations/upgrade-request", headers=life_hdr,
                   json={"requested_plan_id": starter_id, "billing_cycle": "monthly"}).status_code == 400)
+# Status toggle: reactivate the deactivated plan, then it shows up again
+r = client.patch(f"/superadmin/plans/{starter_id}/status", headers=sa_hdr, json={"is_active": True})
+check("status toggle -> active", r.status_code == 200 and r.json()["is_active"] is True, r.text)
+check("reactivated plan visible in GET /plans",
+      any(p["name"] == "Starter" for p in client.get("/plans", headers=sa_hdr).json()))
+r = client.patch(f"/superadmin/plans/{starter_id}/status", headers=sa_hdr, json={"is_active": False})
+check("status toggle -> inactive", r.status_code == 200 and r.json()["is_active"] is False, r.text)
 
 print("\n== roles: default seeding + CRUD + catalog ==")
 # A fresh firm should auto-get the 3 default roles.
