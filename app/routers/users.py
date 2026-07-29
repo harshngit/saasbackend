@@ -36,6 +36,13 @@ def _email_taken(db: Session, email: str, exclude_id: str | None = None) -> bool
     return db.query(query.exists()).scalar()
 
 
+def _username_taken(db: Session, username: str, exclude_id: str | None = None) -> bool:
+    query = db.query(User).filter(User.username == username)
+    if exclude_id is not None:
+        query = query.filter(User.id != exclude_id)
+    return db.query(query.exists()).scalar()
+
+
 @router.post("", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def create_staff(
     payload: StaffCreate,
@@ -57,11 +64,14 @@ def create_staff(
 
     if _email_taken(db, payload.email):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+    if _username_taken(db, payload.username):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
 
     staff = User(
         organization_id=admin.organization_id,
         name=payload.name,
         email=payload.email,
+        username=payload.username,
         phone=payload.phone,
         password_hash=hash_password(payload.password),
         system_role=SystemRole.STAFF.value,
@@ -108,6 +118,8 @@ def update_user(
     data = payload.model_dump(exclude_unset=True)
     if "email" in data and data["email"] != target.email and _email_taken(db, data["email"], exclude_id=target.id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+    if "username" in data and data["username"] != target.username and _username_taken(db, data["username"], exclude_id=target.id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
     for field, value in data.items():
         setattr(target, field, value)
     db.commit()

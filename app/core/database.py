@@ -146,6 +146,25 @@ def relax_not_null_columns() -> None:
             logger.exception("Could not drop NOT NULL on %s.%s", table, column)
 
 
+# Columns whose type must be widened on an existing DB (e.g. VARCHAR -> TEXT).
+_WIDEN_TO_TEXT = [
+    ("organizations", "logo_url"),  # now holds base64 data: URLs, too big for VARCHAR(500)
+]
+
+
+def widen_columns_to_text() -> None:
+    """Widen columns to TEXT on an existing Postgres DB (SQLite is typeless already)."""
+    if engine.dialect.name != "postgresql":
+        return
+    for table, column in _WIDEN_TO_TEXT:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE TEXT'))
+            logger.info("Auto-migrated: widened %s.%s to TEXT", table, column)
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not widen %s.%s", table, column)
+
+
 def drop_legacy_columns() -> None:
     """Drop columns that the model no longer defines (Postgres only).
 

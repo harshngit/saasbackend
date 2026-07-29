@@ -2,7 +2,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String
+from sqlalchemy import DateTime, Enum, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -33,7 +33,9 @@ class Organization(Base):
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     address: Mapped[str | None] = mapped_column(String(500), nullable=True)
     financial_year: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # logo/signature can hold a data: URL (base64) or an external URL — use Text (no length cap).
+    logo_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    signature_url: Mapped[str | None] = mapped_column(Text, nullable=True)  # used on invoices
 
     status: Mapped[OrganizationStatus] = mapped_column(
         Enum(OrganizationStatus), default=OrganizationStatus.TRIAL, nullable=False

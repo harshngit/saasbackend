@@ -108,7 +108,7 @@ print("\n== admin creates staff ==")
 staff_email = f"sales_{uuid.uuid4().hex[:8]}@firm.com"
 r = client.post("/users",
     headers={"Authorization": f"Bearer {admin_access}"},
-    json={"name": "Ramesh", "email": staff_email, "password": "Staff@123", "role": "sales_officer"})
+    json={"name": "Ramesh", "email": staff_email, "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "sales_officer"})
 check("create sales_officer -> 201", r.status_code == 201, r.text)
 staff_id = r.json().get("id")
 check("staff belongs to admin's org", r.json().get("organization_id") == body["organization"]["id"], r.text)
@@ -116,7 +116,7 @@ check("staff belongs to admin's org", r.json().get("organization_id") == body["o
 print("\n== admin cannot create another admin/super_admin ==")
 r = client.post("/users",
     headers={"Authorization": f"Bearer {admin_access}"},
-    json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "admin"})
+    json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "admin"})
 check("create admin role -> 400", r.status_code == 400, r.text)
 
 print("\n== staff cannot access admin-only endpoints ==")
@@ -185,7 +185,7 @@ admin_access = client.post("/auth/login", json={"email": firm_email, "password":
 print("\n== admin resets a staff member's password ==")
 staff2_email = f"deliv_{uuid.uuid4().hex[:8]}@firm.com"
 r = client.post("/users", headers={"Authorization": f"Bearer {admin_access}"},
-    json={"name": "Suresh", "email": staff2_email, "password": "Staff@123", "role": "delivery_partner"})
+    json={"name": "Suresh", "email": staff2_email, "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "delivery_partner"})
 staff2_id = r.json()["id"]
 r = client.post(f"/users/{staff2_id}/reset-password",
     headers={"Authorization": f"Bearer {admin_access}"}, json={"new_password": "FreshPass@123"})
@@ -219,7 +219,7 @@ life_hdr = {"Authorization": f"Bearer {life_access}"}
 
 # During trial, a mutation works.
 r = client.post("/users", headers=life_hdr,
-    json={"name": "S", "email": f"s_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "sales_officer"})
+    json={"name": "S", "email": f"s_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "sales_officer"})
 check("trial: staff creation allowed", r.status_code == 201, r.text)
 
 # Force the trial into the past, then a fresh login must flip it to locked.
@@ -236,7 +236,7 @@ life_hdr = {"Authorization": f"Bearer {life_access}"}
 
 # Locked: mutation blocked, read-only + upgrade-request still allowed.
 r = client.post("/users", headers=life_hdr,
-    json={"name": "S2", "email": f"s2_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "sales_officer"})
+    json={"name": "S2", "email": f"s2_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "sales_officer"})
 check("locked: staff creation -> 403", r.status_code == 403, r.text)
 check("locked: GET /organizations/me still works",
       client.get("/organizations/me", headers=life_hdr).status_code == 200)
@@ -274,7 +274,7 @@ check("approve-upgrade -> active", r.status_code == 200 and r.json()["status"] =
 check("approve set plan to requested (Pro)", (r.json().get("plan") or {}).get("name") == "Pro", r.text)
 check("approve cleared requested_plan_id", r.json().get("requested_plan_id") is None, r.text)
 r = client.post("/users", headers=life_hdr,
-    json={"name": "S3", "email": f"s3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"})
+    json={"name": "S3", "email": f"s3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "accountant"})
 check("after approval: mutation unlocked -> 201", r.status_code == 201, r.text)
 
 print("\n== super admin reject + manual suspend ==")
@@ -292,7 +292,7 @@ check("reject-upgrade -> rejected + reason", r.status_code == 200 and r.json()["
 r = client.patch(f"/superadmin/organizations/{life_org_id}/status", headers=sa_hdr, json={"status": "suspended"})
 check("manual status override -> suspended", r.status_code == 200 and r.json()["status"] == "suspended", r.text)
 r = client.post("/users", headers=life_hdr,
-    json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"})
+    json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "accountant"})
 check("suspended: mutation blocked -> 403", r.status_code == 403, r.text)
 
 print("\n== plan catalog (GET /plans + super admin management) ==")
@@ -381,7 +381,7 @@ check("delete custom role -> 204",
 
 # Staff (non-admin) cannot access /roles at all.
 staff_reg = client.post("/users", headers=roles_hdr, json={
-    "name": "St", "email": f"st_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "sales_officer"})
+    "name": "St", "email": f"st_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "sales_officer"})
 st_tok = client.post("/auth/login", json={
     "email": staff_reg.json()["email"], "password": "Staff@123"}).json()["tokens"]["access_token"]
 check("staff blocked from /roles -> 403",
@@ -411,7 +411,7 @@ sales_role = next(r for r in roles if r["name"] == "Sales Officer")
 # Create staff via role_id
 st_email = f"p2s_{uuid.uuid4().hex[:6]}@f.com"
 r = client.post("/users", headers=p2_hdr, json={
-    "name": "Staffy", "email": st_email, "password": "Staff@123", "role_id": sales_role["id"]})
+    "name": "Staffy", "email": st_email, "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role_id": sales_role["id"]})
 check("create staff via role_id -> 201", r.status_code == 201, r.text)
 staff = r.json()
 check("staff system_role=staff", staff["system_role"] == "staff", staff)
@@ -426,7 +426,7 @@ other = client.post("/auth/register", json={
 other_roles = client.get("/roles", headers={"Authorization": f"Bearer {other['tokens']['access_token']}"}).json()
 foreign_role_id = other_roles[0]["id"]
 check("create staff with cross-org role_id -> 400",
-      client.post("/users", headers=p2_hdr, json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role_id": foreign_role_id}).status_code == 400)
+      client.post("/users", headers=p2_hdr, json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role_id": foreign_role_id}).status_code == 400)
 
 # Staff login → me shows their permissions + full_access false
 st_login = client.post("/auth/login", json={"email": st_email, "password": "Staff@123"}).json()
@@ -461,6 +461,46 @@ cr = client.post("/roles", headers=p2_hdr, json={"name": "Temp Role", "permissio
 client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": cr["id"]})
 check("delete custom role with assigned user -> 400",
       client.delete(f"/roles/{cr['id']}", headers=p2_hdr).status_code == 400)
+
+print("\n== minimal register + Company Settings + staff username ==")
+import io  # noqa: E402
+
+# Register with ONLY the 5 basic fields (company profile fields omitted).
+min_email = f"min_{uuid.uuid4().hex[:8]}@firm.com"
+mr = client.post("/auth/register", json={
+    "organization_name": "Minimal Co", "admin_name": "M", "email": min_email,
+    "phone": "9998887776", "password": "Secret@123"})
+check("register with only basic fields -> 201", mr.status_code == 201, mr.text)
+min_hdr = {"Authorization": f"Bearer {mr.json()['tokens']['access_token']}"}
+check("company fields empty after minimal register", mr.json()["organization"]["gst_number"] in (None, ""), mr.json()["organization"])
+
+# Company Settings GET / PUT
+r = client.get("/organizations/settings", headers=min_hdr)
+check("GET /organizations/settings -> 200", r.status_code == 200 and r.json()["name"] == "Minimal Co", r.text)
+r = client.put("/organizations/settings", headers=min_hdr,
+               json={"gst_number": "29ABCDE1234F1Z5", "business_type": "Retailer", "financial_year": "2025-2026"})
+check("PUT settings partial update -> 200",
+      r.status_code == 200 and r.json()["gst_number"] == "29ABCDE1234F1Z5" and r.json()["business_type"] == "Retailer", r.text)
+check("staff blocked from settings -> 403", client.get("/organizations/settings", headers=st_hdr).status_code == 403)
+
+# Logo upload -> data URL
+png = b"\x89PNG\r\n\x1a\n" + b"0" * 40
+r = client.post("/organizations/settings/logo", headers=min_hdr, files={"file": ("logo.png", io.BytesIO(png), "image/png")})
+check("upload logo -> data URL", r.status_code == 200 and r.json()["url"].startswith("data:image/png;base64,"), r.text)
+check("upload non-image -> 400",
+      client.post("/organizations/settings/logo", headers=min_hdr, files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
+check("settings reflects uploaded logo",
+      client.get("/organizations/settings", headers=min_hdr).json()["logo_url"].startswith("data:image/png"))
+
+# Staff username: required + unique
+uname = f"staffuser_{uuid.uuid4().hex[:6]}"
+r = client.post("/users", headers=min_hdr, json={
+    "name": "U", "email": f"u1_{uuid.uuid4().hex[:6]}@f.com", "username": uname, "password": "Staff@123", "role": "accountant"})
+check("create staff with username -> 201", r.status_code == 201 and r.json()["username"] == uname, r.text)
+check("duplicate username -> 409",
+      client.post("/users", headers=min_hdr, json={"name": "U2", "email": f"u2_{uuid.uuid4().hex[:6]}@f.com", "username": uname, "password": "Staff@123", "role": "accountant"}).status_code == 409)
+check("missing username -> 422",
+      client.post("/users", headers=min_hdr, json={"name": "U3", "email": f"u3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"}).status_code == 422)
 
 print("\n== DEMO direct password reset (check-email + reset-password-direct) ==")
 demo_reset_email = f"dr_{uuid.uuid4().hex[:8]}@firm.com"

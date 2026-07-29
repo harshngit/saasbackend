@@ -32,6 +32,9 @@ class User(Base):
 
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Unique platform-wide login/identifier for staff (in addition to email). Nullable
+    # so existing users / admins created before this field remain valid.
+    username: Mapped[str | None] = mapped_column(String(50), nullable=True, unique=True, index=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
 

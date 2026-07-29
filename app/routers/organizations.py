@@ -1,13 +1,41 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import base64
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_system_role
-from app.models import Plan, SystemRole, User
+from app.models import Organization, Plan, SystemRole, User
+from app.schemas.company import CompanySettingsOut, CompanySettingsUpdate, UploadResponse
 from app.schemas.organization import OrganizationOut, UpgradeRequest
 from app.services import org_service
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
+
+_ADMIN = require_system_role(SystemRole.ADMIN)
+_MAX_UPLOAD_BYTES = 1024 * 1024  # 1 MB cap for logo/signature images
+
+
+def _admin_org(admin: User, db: Session) -> Organization:
+    org = admin.organization
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No organization")
+    return org
+
+
+def _store_image(file: UploadFile) -> str:
+    """Read an uploaded image and return it as a base64 data: URL.
+
+    Works on Render's ephemeral disk (persisted in the DB). Swap for S3/Cloudinary
+    later without changing the API contract (this still returns a URL string).
+    """
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
+    content = file.file.read()
+    if len(content) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image too large (max 1 MB)")
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{file.content_type};base64,{encoded}"
 
 
 @router.get("/me", response_model=OrganizationOut)
@@ -41,3 +69,51 @@ def request_upgrade(
             detail="Selected plan does not exist or is no longer available",
         )
     return org_service.request_upgrade(db, org, plan, payload.billing_cycle)
+
+
+# ------------------------------- Company Settings -------------------------------
+
+
+@router.get("/settings", response_model=CompanySettingsOut)
+def get_company_settings(admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> Organization:
+    """Full company profile for the Company Settings page (Admin only)."""
+    return _admin_org(admin, db)
+
+
+@router.put("/settings", response_model=CompanySettingsOut)
+def update_company_settings(
+    payload: CompanySettingsUpdate,
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> Organization:
+    """Partial update of the company profile (send only changed fields)."""
+    org = _admin_org(admin, db)
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(org, field, value)
+    db.commit()
+    db.refresh(org)
+    return org
+
+
+@router.post("/settings/logo", response_model=UploadResponse)
+def upload_logo(
+    file: UploadFile = File(...),
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> UploadResponse:
+    org = _admin_org(admin, db)
+    org.logo_url = _store_image(file)
+    db.commit()
+    return UploadResponse(url=org.logo_url)
+
+
+@router.post("/settings/signature", response_model=UploadResponse)
+def upload_signature(
+    file: UploadFile = File(...),
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> UploadResponse:
+    org = _admin_org(admin, db)
+    org.signature_url = _store_image(file)
+    db.commit()
+    return UploadResponse(url=org.signature_url)

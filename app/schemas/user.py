@@ -23,6 +23,7 @@ class UserOut(BaseModel):
     organization_id: str | None
     name: str
     email: EmailStr
+    username: str | None
     phone: str | None
     system_role: str | None            # super_admin / admin / staff
     role_id: str | None
@@ -38,6 +39,7 @@ class StaffCreate(BaseModel):
 
     name: str = Field(min_length=1, max_length=150)
     email: EmailStr
+    username: str = Field(min_length=3, max_length=50)
     phone: str | None = Field(default=None, max_length=20)
     password: str = Field(min_length=8, max_length=128)
     role_id: str | None = None
@@ -55,6 +57,7 @@ class UserUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=150)
     email: EmailStr | None = None
+    username: str | None = Field(default=None, min_length=3, max_length=50)
     phone: str | None = Field(default=None, max_length=20)
 
 
