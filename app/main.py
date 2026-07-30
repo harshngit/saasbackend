@@ -11,8 +11,28 @@ from app.core.database import (
     relax_not_null_columns,
     widen_columns_to_text,
 )
-from app.models import Customer, Organization, Plan, RefreshToken, Role, User  # noqa: F401  (register mappers)
-from app.routers import auth, customers, organizations, plans, roles, superadmin, users
+from app.models import (  # noqa: F401  (register mappers)
+    Category,
+    Customer,
+    Organization,
+    Plan,
+    Product,
+    ProductVariant,
+    RefreshToken,
+    Role,
+    User,
+)
+from app.routers import (
+    auth,
+    categories,
+    customers,
+    organizations,
+    plans,
+    products,
+    roles,
+    superadmin,
+    users,
+)
 
 app = FastAPI(
     title="CRM SaaS API",
@@ -36,7 +56,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "customers-module"
+BUILD_TAG = "categories-products-module"
 
 
 @app.on_event("startup")
@@ -81,6 +101,8 @@ app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(roles.router)
 app.include_router(customers.router)
+app.include_router(categories.router)
+app.include_router(products.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)

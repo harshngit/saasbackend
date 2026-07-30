@@ -462,6 +462,87 @@ client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": cr["
 check("delete custom role with assigned user -> 400",
       client.delete(f"/roles/{cr['id']}", headers=p2_hdr).status_code == 400)
 
+print("\n== Categories + Products module (CRUD, variants, bulk-delete, permissions) ==")
+cp_email = f"cp_{uuid.uuid4().hex[:8]}@firm.com"
+cpr = client.post("/auth/register", json={
+    "organization_name": "Catalog Co", "admin_name": "K", "email": cp_email, "password": "Secret@123"}).json()
+cp_hdr = {"Authorization": f"Bearer {cpr['tokens']['access_token']}"}
+
+# --- Categories ---
+r = client.post("/categories", headers=cp_hdr, json={"name": "Beverages", "description": "Drinks", "image": "data:image/png;base64,AAA"})
+check("create category -> 201", r.status_code == 201, r.text)
+cat_id = r.json()["id"]
+check("duplicate category name -> 409", client.post("/categories", headers=cp_hdr, json={"name": "Beverages"}).status_code == 409)
+r2 = client.post("/categories", headers=cp_hdr, json={"name": "Snacks"})
+cat2_id = r2.json()["id"]
+check("list categories -> 2", len(client.get("/categories", headers=cp_hdr).json()) == 2)
+check("get category -> 200", client.get(f"/categories/{cat_id}", headers=cp_hdr).status_code == 200)
+r = client.patch(f"/categories/{cat_id}", headers=cp_hdr, json={"description": "All drinks"})
+check("update category -> 200", r.status_code == 200 and r.json()["description"] == "All drinks", r.text)
+
+# --- Products with variants ---
+r = client.post("/products", headers=cp_hdr, json={
+    "name": "Thums Up", "description": "Soft drink", "price": "40", "brand": "Coca-Cola", "sku": "TU-001",
+    "category_id": cat_id, "cover_image": "data:image/png;base64,BBB", "images": ["data:image/png;base64,CCC"],
+    "variations": [
+        {"name": "200ml", "price": "20", "inventory": 100, "weight": 0.2},
+        {"name": "500ml", "price": "40", "inventory": 50},
+        {"name": "1L", "price": "70", "inventory": 30},
+    ]})
+check("create product with variants -> 201", r.status_code == 201, r.text)
+prod = r.json()
+prod_id = prod["id"]
+check("price coerced from string to number", prod["price"] == 40.0, prod)
+check("product has 3 variants", len(prod["variations"]) == 3, prod)
+check("variant price coerced", prod["variations"][0]["price"] == 20.0, prod)
+check("total_stock = sum of variant inventory", prod["total_stock"] == 180, prod)
+check("product linked to category", prod["category_id"] == cat_id, prod)
+
+# no-variant product uses total_inventory
+r = client.post("/products", headers=cp_hdr, json={"name": "Water Bottle", "price": 10, "total_inventory": 500})
+check("no-variant product total_stock=total_inventory", r.json()["total_stock"] == 500, r.text)
+prod2_id = r.json()["id"]
+
+# list omits images (light), detail includes them
+lst = client.get("/products", headers=cp_hdr).json()
+check("product list -> 2 items", len(lst) == 2, lst)
+check("list item has NO images field", "images" not in lst[0], lst[0])
+check("detail has images field", "images" in client.get(f"/products/{prod_id}", headers=cp_hdr).json())
+check("search product by brand", any(p["id"] == prod_id for p in client.get("/products", headers=cp_hdr, params={"search": "Coca"}).json()))
+check("filter by category", all(p["category_id"] == cat_id for p in client.get("/products", headers=cp_hdr, params={"category_id": cat_id}).json()))
+
+# update product: replace variants
+r = client.patch(f"/products/{prod_id}", headers=cp_hdr, json={"price": 45, "variations": [{"name": "2L", "price": 120, "inventory": 10}]})
+check("update replaces variants -> 1 variant", r.status_code == 200 and len(r.json()["variations"]) == 1 and r.json()["total_stock"] == 10, r.text)
+check("invalid category_id on product -> 400",
+      client.patch(f"/products/{prod_id}", headers=cp_hdr, json={"category_id": "nope"}).status_code == 400)
+
+# deleting a category nulls its products' category_id (SET NULL)
+client.delete(f"/categories/{cat_id}", headers=cp_hdr)
+check("product category_id nulled after category delete", client.get(f"/products/{prod_id}", headers=cp_hdr).json()["category_id"] is None)
+
+# bulk delete products
+r = client.post("/products/bulk-delete", headers=cp_hdr, json={"ids": [prod_id, prod2_id]})
+check("bulk-delete products -> 2", r.status_code == 200 and r.json()["deleted"] == 2, r.text)
+check("products gone after bulk delete", len(client.get("/products", headers=cp_hdr).json()) == 0)
+# bulk delete categories
+r = client.post("/categories/bulk-delete", headers=cp_hdr, json={"ids": [cat2_id]})
+check("bulk-delete categories -> 1", r.json()["deleted"] == 1, r.text)
+
+# --- permission enforcement + tenant isolation ---
+cp_roles = client.get("/roles", headers=cp_hdr).json()
+acc_r = next(x for x in cp_roles if x["name"] == "Accountant")
+acc_em = f"cpacc_{uuid.uuid4().hex[:6]}@f.com"
+client.post("/users", headers=cp_hdr, json={"name": "A", "email": acc_em, "username": f"cpa_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": acc_r["id"]})
+acc_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': acc_em, 'password': 'Staff@123'}).json()['tokens']['access_token']}"}
+check("accountant (no products access) view products -> 403", client.get("/products", headers=acc_h).status_code == 403)
+so_r = next(x for x in cp_roles if x["name"] == "Sales Officer")
+so_em = f"cpso_{uuid.uuid4().hex[:6]}@f.com"
+client.post("/users", headers=cp_hdr, json={"name": "S", "email": so_em, "username": f"cps_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": so_r["id"]})
+so_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_em, 'password': 'Staff@123'}).json()['tokens']['access_token']}"}
+check("sales officer (view-only products) view -> 200", client.get("/products", headers=so_h).status_code == 200)
+check("sales officer CANNOT create product -> 403", client.post("/products", headers=so_h, json={"name": "x"}).status_code == 403)
+
 print("\n== Customers module (CRUD + tenant isolation + PERMISSION enforcement) ==")
 cust_email = f"cust_{uuid.uuid4().hex[:8]}@firm.com"
 cr = client.post("/auth/register", json={

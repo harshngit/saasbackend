@@ -1,7 +1,7 @@
 import logging
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -15,6 +15,16 @@ connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite")
 
 engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+if DATABASE_URL.startswith("sqlite"):
+    # SQLite ignores foreign keys unless told to enforce them. Turn it on so
+    # dev matches Postgres (ON DELETE SET NULL / CASCADE actually fire).
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_fks(dbapi_connection, _record):  # noqa: ANN001
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 class Base(DeclarativeBase):

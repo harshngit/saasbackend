@@ -11,10 +11,12 @@ from app.models.enums import (
     UserRole,
     system_role_for,
 )
+from app.models.category import Category
 from app.models.customer import Customer
 from app.models.organization import Organization
 from app.models.password_reset_token import PasswordResetToken
 from app.models.plan import Plan
+from app.models.product import Product, ProductVariant
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role
 from app.models.user import User
@@ -24,6 +26,9 @@ __all__ = [
     "Plan",
     "Role",
     "Customer",
+    "Category",
+    "Product",
+    "ProductVariant",
     "User",
     "RefreshToken",
     "PasswordResetToken",
