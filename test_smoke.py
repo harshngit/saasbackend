@@ -462,6 +462,57 @@ client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": cr["
 check("delete custom role with assigned user -> 400",
       client.delete(f"/roles/{cr['id']}", headers=p2_hdr).status_code == 400)
 
+print("\n== Customers module (CRUD + tenant isolation + PERMISSION enforcement) ==")
+cust_email = f"cust_{uuid.uuid4().hex[:8]}@firm.com"
+cr = client.post("/auth/register", json={
+    "organization_name": "Cust Co", "admin_name": "C", "email": cust_email, "password": "Secret@123"}).json()
+cust_hdr = {"Authorization": f"Bearer {cr['tokens']['access_token']}"}
+cust_org = cr["organization"]["id"]
+
+r = client.post("/customers", headers=cust_hdr, json={
+    "name": "Acme contact", "business_name": "Acme Corp", "phone": "9812345678",
+    "gst_number": "29AAAAA0000A1Z5", "credit_limit": 50000, "category": "Wholesale"})
+check("admin create customer -> 201", r.status_code == 201, r.text)
+cust_id = r.json()["id"]
+check("customer scoped to org", r.json()["organization_id"] == cust_org, r.text)
+check("list customers -> 200", client.get("/customers", headers=cust_hdr).status_code == 200)
+check("search by name finds it", any(c["id"] == cust_id for c in client.get("/customers", headers=cust_hdr, params={"search": "Acme"}).json()))
+check("search miss -> empty", len(client.get("/customers", headers=cust_hdr, params={"search": "zzznope"}).json()) == 0)
+check("get customer -> 200", client.get(f"/customers/{cust_id}", headers=cust_hdr).status_code == 200)
+r = client.patch(f"/customers/{cust_id}", headers=cust_hdr, json={"credit_limit": 75000, "category": "Retail"})
+check("update customer -> 200", r.status_code == 200 and r.json()["credit_limit"] == 75000 and r.json()["category"] == "Retail", r.text)
+
+# Assign a sales officer (must be a same-org user)
+c_roles = client.get("/roles", headers=cust_hdr).json()
+so_role = next(x for x in c_roles if x["name"] == "Sales Officer")
+acc_role = next(x for x in c_roles if x["name"] == "Accountant")
+so_email = f"cso_{uuid.uuid4().hex[:6]}@f.com"
+so_user = client.post("/users", headers=cust_hdr, json={
+    "name": "SO", "email": so_email, "username": f"cso_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": so_role["id"]}).json()
+r = client.patch(f"/customers/{cust_id}", headers=cust_hdr, json={"assigned_sales_officer_id": so_user["id"]})
+check("assign sales officer -> nested name", r.status_code == 200 and r.json()["assigned_sales_officer"]["name"] == "SO", r.text)
+check("assign cross-firm user -> 400",
+      client.patch(f"/customers/{cust_id}", headers=cust_hdr, json={"assigned_sales_officer_id": "nonexistent"}).status_code == 400)
+
+# PERMISSION enforcement — Accountant is view-only, Sales Officer is full on customers
+acc_email = f"cacc_{uuid.uuid4().hex[:6]}@f.com"
+client.post("/users", headers=cust_hdr, json={
+    "name": "Acc", "email": acc_email, "username": f"cacc_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": acc_role["id"]})
+acc_hdr = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': acc_email, 'password': 'Staff@123'}).json()['tokens']['access_token']}"}
+check("accountant CAN view customers -> 200", client.get("/customers", headers=acc_hdr).status_code == 200)
+check("accountant CANNOT create customer -> 403", client.post("/customers", headers=acc_hdr, json={"name": "x"}).status_code == 403)
+so_hdr = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_email, 'password': 'Staff@123'}).json()['tokens']['access_token']}"}
+check("sales officer CAN create customer -> 201", client.post("/customers", headers=so_hdr, json={"name": "SO made"}).status_code == 201)
+
+# Tenant isolation
+c_other = client.post("/auth/register", json={
+    "organization_name": "Cust Other", "admin_name": "O", "email": f"cothr_{uuid.uuid4().hex[:6]}@f.com", "password": "Secret@123"}).json()
+c_other_hdr = {"Authorization": f"Bearer {c_other['tokens']['access_token']}"}
+check("cross-org get customer -> 404", client.get(f"/customers/{cust_id}", headers=c_other_hdr).status_code == 404)
+check("cross-org list excludes it", all(c["id"] != cust_id for c in client.get("/customers", headers=c_other_hdr).json()))
+check("delete customer -> 204", client.delete(f"/customers/{cust_id}", headers=cust_hdr).status_code == 204)
+check("get deleted customer -> 404", client.get(f"/customers/{cust_id}", headers=cust_hdr).status_code == 404)
+
 print("\n== minimal register + Company Settings + staff username ==")
 import io  # noqa: E402
 

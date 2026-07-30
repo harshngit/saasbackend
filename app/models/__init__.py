@@ -11,6 +11,7 @@ from app.models.enums import (
     UserRole,
     system_role_for,
 )
+from app.models.customer import Customer
 from app.models.organization import Organization
 from app.models.password_reset_token import PasswordResetToken
 from app.models.plan import Plan
@@ -22,6 +23,7 @@ __all__ = [
     "Organization",
     "Plan",
     "Role",
+    "Customer",
     "User",
     "RefreshToken",
     "PasswordResetToken",

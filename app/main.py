@@ -11,8 +11,8 @@ from app.core.database import (
     relax_not_null_columns,
     widen_columns_to_text,
 )
-from app.models import Organization, Plan, RefreshToken, Role, User  # noqa: F401  (register mappers)
-from app.routers import auth, organizations, plans, roles, superadmin, users
+from app.models import Customer, Organization, Plan, RefreshToken, Role, User  # noqa: F401  (register mappers)
+from app.routers import auth, customers, organizations, plans, roles, superadmin, users
 
 app = FastAPI(
     title="CRM SaaS API",
@@ -36,7 +36,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "cors-credentials-fix"
+BUILD_TAG = "customers-module"
 
 
 @app.on_event("startup")
@@ -80,6 +80,7 @@ def health() -> dict[str, str]:
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(roles.router)
+app.include_router(customers.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)
