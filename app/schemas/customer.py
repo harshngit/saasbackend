@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class AssigneeBrief(BaseModel):
@@ -46,6 +46,11 @@ class CustomerCreate(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     notes: str | None = None
 
+    @field_validator("assigned_sales_officer_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        return None if v == "" else v
+
 
 class CustomerUpdate(BaseModel):
     """Partial update — send only changed fields."""
@@ -62,3 +67,8 @@ class CustomerUpdate(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     notes: str | None = None
     is_active: bool | None = None
+
+    @field_validator("assigned_sales_officer_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        return None if v == "" else v

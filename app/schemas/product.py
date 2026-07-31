@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class VariantIn(BaseModel):
@@ -88,6 +88,11 @@ class ProductCreate(BaseModel):
     total_inventory: int = Field(default=0, ge=0)
     variations: list[VariantIn] = Field(default_factory=list)
 
+    @field_validator("category_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        return None if v == "" else v
+
 
 class ProductUpdate(BaseModel):
     """Partial update. If `variations` is provided, it fully replaces the variant set."""
@@ -105,3 +110,8 @@ class ProductUpdate(BaseModel):
     total_inventory: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
     variations: list[VariantIn] | None = None
+
+    @field_validator("category_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        return None if v == "" else v
