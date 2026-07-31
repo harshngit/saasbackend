@@ -20,16 +20,21 @@ from app.models import (  # noqa: F401  (register mappers)
     ProductVariant,
     RefreshToken,
     Role,
+    StockMovement,
+    Supplier,
+    SupplierPayment,
     User,
 )
 from app.routers import (
     auth,
     categories,
     customers,
+    inventory,
     organizations,
     plans,
     products,
     roles,
+    suppliers,
     superadmin,
     users,
 )
@@ -56,7 +61,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "blank-fk-null-fix"
+BUILD_TAG = "suppliers-inventory-modules"
 
 
 @app.on_event("startup")
@@ -103,6 +108,8 @@ app.include_router(roles.router)
 app.include_router(customers.router)
 app.include_router(categories.router)
 app.include_router(products.router)
+app.include_router(inventory.router)
+app.include_router(suppliers.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)

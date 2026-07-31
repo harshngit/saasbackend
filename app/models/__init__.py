@@ -19,6 +19,8 @@ from app.models.plan import Plan
 from app.models.product import Product, ProductVariant
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role
+from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
+from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 
 __all__ = [
@@ -29,6 +31,10 @@ __all__ = [
     "Category",
     "Product",
     "ProductVariant",
+    "Supplier",
+    "SupplierPayment",
+    "StockMovement",
+    "STOCK_MOVEMENT_TYPES",
     "User",
     "RefreshToken",
     "PasswordResetToken",

@@ -556,6 +556,97 @@ so_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_
 check("sales officer (view-only products) view -> 200", client.get("/products", headers=so_h).status_code == 200)
 check("sales officer CANNOT create product -> 403", client.post("/products", headers=so_h, json={"name": "x"}).status_code == 403)
 
+print("\n== Suppliers module (CRUD + payments + balance sync) ==")
+sup_email = f"sup_{uuid.uuid4().hex[:8]}@firm.com"
+spr = client.post("/auth/register", json={
+    "organization_name": "Supplier Co", "admin_name": "S", "email": sup_email, "password": "Secret@123"}).json()
+sup_hdr = {"Authorization": f"Bearer {spr['tokens']['access_token']}"}
+
+r = client.post("/suppliers", headers=sup_hdr, json={
+    "name": "Global Traders", "contact_person": "Ravi", "phone": "9811111111",
+    "gst_number": "29AAAAA1111A1Z5", "category": "Raw Material", "city": "Delhi", "opening_balance": 5000})
+check("create supplier -> 201", r.status_code == 201, r.text)
+sup = r.json()
+sup_id = sup["id"]
+check("opening_balance sets outstanding", sup["outstanding_payable"] == 5000, sup)
+check("list suppliers -> 200", client.get("/suppliers", headers=sup_hdr).status_code == 200)
+check("get supplier detail -> 200", client.get(f"/suppliers/{sup_id}", headers=sup_hdr).status_code == 200)
+r = client.put(f"/suppliers/{sup_id}", headers=sup_hdr, json={"category": "Packaging"})
+check("edit supplier (PUT) -> 200", r.status_code == 200 and r.json()["category"] == "Packaging", r.text)
+
+# Record payments -> balances stay in sync
+r = client.post(f"/suppliers/{sup_id}/payments", headers=sup_hdr, json={"amount": 2000, "payment_mode": "upi", "reference": "TXN1"})
+check("record payment -> total_paid 2000, outstanding 3000",
+      r.status_code == 201 and r.json()["total_paid"] == 2000 and r.json()["outstanding_payable"] == 3000, r.text)
+r = client.post(f"/suppliers/{sup_id}/payments", headers=sup_hdr, json={"amount": 1000, "payment_mode": "cash"})
+check("second payment -> outstanding 2000", r.json()["outstanding_payable"] == 2000, r.text)
+pays = client.get(f"/suppliers/{sup_id}/payments", headers=sup_hdr).json()
+check("payment history -> 2", len(pays) == 2, pays)
+
+# Void a payment -> balance restored
+void_pid = pays[0]["id"]
+r = client.delete(f"/suppliers/{sup_id}/payments/{void_pid}", headers=sup_hdr)
+check("void payment -> balance restored", r.status_code == 200 and r.json()["total_paid"] == 2000, r.text)  # 3000 - 1000
+check("payment history -> 1 after void", len(client.get(f"/suppliers/{sup_id}/payments", headers=sup_hdr).json()) == 1)
+
+# status toggle + delete
+r = client.patch(f"/suppliers/{sup_id}/status", headers=sup_hdr, json={"is_active": False})
+check("deactivate supplier -> 200", r.status_code == 200 and r.json()["is_active"] is False, r.text)
+# tenant isolation
+sup_other = client.post("/auth/register", json={
+    "organization_name": "Sup Other", "admin_name": "O", "email": f"so_{uuid.uuid4().hex[:6]}@f.com", "password": "Secret@123"}).json()
+so_hdr2 = {"Authorization": f"Bearer {sup_other['tokens']['access_token']}"}
+check("cross-org supplier get -> 404", client.get(f"/suppliers/{sup_id}", headers=so_hdr2).status_code == 404)
+check("delete supplier -> 204", client.delete(f"/suppliers/{sup_id}", headers=sup_hdr).status_code == 204)
+check("get deleted supplier -> 404", client.get(f"/suppliers/{sup_id}", headers=sup_hdr).status_code == 404)
+
+print("\n== Inventory module (stock board + adjustments + history) ==")
+inv_email = f"inv_{uuid.uuid4().hex[:8]}@firm.com"
+ipr = client.post("/auth/register", json={
+    "organization_name": "Inv Co", "admin_name": "I", "email": inv_email, "password": "Secret@123"}).json()
+inv_hdr = {"Authorization": f"Bearer {ipr['tokens']['access_token']}"}
+
+# a no-variant product and a variant product
+p_novar = client.post("/products", headers=inv_hdr, json={"name": "Salt", "total_inventory": 100}).json()
+p_var = client.post("/products", headers=inv_hdr, json={"name": "Cola", "variations": [
+    {"name": "500ml", "inventory": 50}, {"name": "1L", "inventory": 20}]}).json()
+var_id = p_var["variations"][0]["id"]
+
+# stock board
+board = client.get("/inventory", headers=inv_hdr).json()
+check("stock board -> 2 products", len(board) == 2, board)
+salt = next(x for x in board if x["name"] == "Salt")
+check("board shows available stock", salt["total_stock"] == 100, salt)
+
+# purchase received (+50) on no-variant product
+r = client.post("/inventory/adjustments", headers=inv_hdr, json={
+    "product_id": p_novar["id"], "movement_type": "purchase_in", "quantity": 50, "note": "PO#1"})
+check("purchase_in +50 -> stock 150", r.status_code == 201 and r.json()["total_stock"] == 150, r.text)
+# damaged (-10)
+r = client.post("/inventory/adjustments", headers=inv_hdr, json={
+    "product_id": p_novar["id"], "movement_type": "damaged", "quantity": -10})
+check("damaged -10 -> stock 140", r.json()["total_stock"] == 140, r.text)
+# insufficient stock guard
+check("remove more than available -> 400",
+      client.post("/inventory/adjustments", headers=inv_hdr, json={"product_id": p_novar["id"], "movement_type": "sale_out", "quantity": -9999}).status_code == 400)
+# invalid movement type -> 422
+check("invalid movement_type -> 422",
+      client.post("/inventory/adjustments", headers=inv_hdr, json={"product_id": p_novar["id"], "movement_type": "bogus", "quantity": 1}).status_code == 422)
+
+# variant adjustment
+r = client.post("/inventory/adjustments", headers=inv_hdr, json={
+    "product_id": p_var["id"], "variant_id": var_id, "movement_type": "sale_out", "quantity": -5})
+check("variant sale_out -5 -> total_stock 65", r.json()["total_stock"] == 65, r.text)  # (50-5)+20
+
+# movement history
+detail = client.get(f"/inventory/{p_novar['id']}", headers=inv_hdr).json()
+check("stock detail has movement history", len(detail["movements"]) == 2, detail)
+check("movement records balance_after", detail["movements"][0]["balance_after"] in (140, 150), detail)
+
+# PATCH set absolute stock
+r = client.patch(f"/inventory/{p_novar['id']}", headers=inv_hdr, json={"quantity": 200, "note": "stock count"})
+check("set stock to 200 -> 200 total_stock", r.status_code == 200 and r.json()["total_stock"] == 200, r.text)
+
 print("\n== Customers module (CRUD + tenant isolation + PERMISSION enforcement) ==")
 cust_email = f"cust_{uuid.uuid4().hex[:8]}@firm.com"
 cr = client.post("/auth/register", json={
