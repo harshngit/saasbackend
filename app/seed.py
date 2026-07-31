@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import Base, SessionLocal, engine
 from app.core.security import hash_password
-from app.models import Organization, OrganizationStatus, Plan, User, UserRole
+from app.models import Organization, OrganizationStatus, Plan, UpgradeStatus, User, UserRole
 
 # Starter catalog. The Super Admin can edit / deactivate / add more via the API.
 _DEFAULT_PLANS = [
@@ -104,6 +104,57 @@ def seed_demo_firm(db: Session, default_plan: Plan | None) -> None:
     print("[seed] Created demo firm 'SAAS Distributors' with admin@demo.com")
 
 
+def seed_testing_paid_user(db: Session) -> None:
+    """Ensure the user testing@gmail.com exists and is marked as paid (Pro plan, active status)."""
+    testing_email = "testing@gmail.com"
+    pro_plan = db.query(Plan).filter(Plan.name == "Pro").first()
+    pro_plan_id = pro_plan.id if pro_plan else None
+
+    # Check if user already exists
+    user = db.query(User).filter(User.email == testing_email).first()
+    if user is not None:
+        # Update existing user's password to 12345678
+        user.password_hash = hash_password("12345678")
+        if user.organization:
+            user.organization.status = OrganizationStatus.ACTIVE
+            user.organization.plan_id = pro_plan_id
+            user.organization.trial_ends_at = None
+            user.organization.upgrade_status = UpgradeStatus.APPROVED.value
+            user.organization.requested_plan_id = None
+        db.commit()
+        print(f"[seed] Updated existing user {testing_email} and organization to Paid (Pro)")
+    else:
+        # Create new organization and user
+        org = Organization(
+            name="Testing Paid Org",
+            gst_number="27AABCU9603R1ZM",
+            email=testing_email,
+            status=OrganizationStatus.ACTIVE,
+            plan_id=pro_plan_id,
+            upgrade_status=UpgradeStatus.APPROVED.value,
+        )
+        db.add(org)
+        db.flush()
+
+        user = User(
+            organization_id=org.id,
+            name="Testing User",
+            email=testing_email,
+            password_hash=hash_password("12345678"),
+            role=UserRole.ADMIN,
+            system_role="admin",
+        )
+        db.add(user)
+        db.commit()
+        
+        # Ensure default roles for the new organization
+        from app.services.role_service import seed_default_roles
+        seed_default_roles(db, org.id)
+        
+        print(f"[seed] Created new user {testing_email} and organization as Paid (Pro)")
+
+
+
 def main() -> None:
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -111,6 +162,7 @@ def main() -> None:
         default_plan = seed_plans(db)
         seed_super_admin(db)
         seed_demo_firm(db, default_plan)
+        seed_testing_paid_user(db)
         # Ensure every org has its 3 default roles (backfill for existing orgs).
         from app.services.role_service import backfill_user_roles, seed_default_roles_for_all_orgs
 
