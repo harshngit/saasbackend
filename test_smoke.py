@@ -291,6 +291,19 @@ check("reject-upgrade -> rejected + reason", r.status_code == 200 and r.json()["
 
 r = client.patch(f"/superadmin/organizations/{life_org_id}/status", headers=sa_hdr, json={"status": "suspended"})
 check("manual status override -> suspended", r.status_code == 200 and r.json()["status"] == "suspended", r.text)
+
+# Super Admin delete organization (cascades users etc.)
+del_reg = client.post("/auth/register", json={
+    "organization_name": "Delete Me Co", "admin_name": "D", "email": f"del_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+del_org_id = del_reg["organization"]["id"]
+del_user_id = del_reg["user"]["id"]
+check("super admin delete org -> 204", client.delete(f"/superadmin/organizations/{del_org_id}", headers=sa_hdr).status_code == 204)
+check("deleted org gone -> 404", client.get(f"/superadmin/organizations/{del_org_id}", headers=sa_hdr).status_code == 404)
+from app.models import User as _User  # noqa: E402
+_vdb = SessionLocal()
+check("org delete cascaded its users", _vdb.get(_User, del_user_id) is None)
+_vdb.close()
+check("non-super-admin cannot delete org -> 403", client.delete(f"/superadmin/organizations/{life_org_id}", headers=life_hdr).status_code == 403)
 r = client.post("/users", headers=life_hdr,
     json={"name": "X", "email": f"x_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "accountant"})
 check("suspended: mutation blocked -> 403", r.status_code == 403, r.text)

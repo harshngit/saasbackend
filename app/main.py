@@ -56,7 +56,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "categories-products-module"
+BUILD_TAG = "superadmin-delete-org"
 
 
 @app.on_event("startup")

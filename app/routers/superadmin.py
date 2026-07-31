@@ -116,3 +116,12 @@ def override_status(org_id: str, payload: OrgStatusUpdate, db: Session = Depends
     """Manual status override (e.g. suspend an abusive account, or reactivate)."""
     org = _get_org(db, org_id)
     return org_service.set_status(db, org, payload.status)
+
+
+@router.delete("/organizations/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_organization(org_id: str, db: Session = Depends(get_db)) -> None:
+    """Permanently delete an organization and all its data (users, customers,
+    products, roles, etc. cascade). Irreversible — Super Admin only."""
+    org = _get_org(db, org_id)
+    db.delete(org)
+    db.commit()
