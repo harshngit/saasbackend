@@ -6,7 +6,13 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_system_role
 from app.models import Organization, Plan, SystemRole, User
-from app.schemas.company import CompanySettingsOut, CompanySettingsUpdate, UploadResponse
+from app.schemas.company import (
+    CompanySettingsOut,
+    CompanySettingsUpdate,
+    FieldSettingsOut,
+    FieldSettingsUpdate,
+    UploadResponse,
+)
 from app.schemas.organization import OrganizationOut, UpgradeRequest
 from app.services import org_service
 
@@ -117,3 +123,84 @@ def upload_signature(
     org.signature_url = _store_image(file)
     db.commit()
     return UploadResponse(url=org.signature_url)
+
+
+# ------------------------------- Field Settings -------------------------------
+
+AVAILABLE_FIELDS = {
+    "company": {
+        "mandatory": ["name"],
+        "optional": ["business_type", "gst_number", "pan_number", "address", "phone", "email", "financial_year", "logo_url", "signature_url"]
+    },
+    "customer": {
+        "mandatory": ["name"],
+        "optional": ["business_name", "phone", "email", "gst_number", "billing_address", "delivery_address", "category", "notes", "credit_limit", "opening_balance"]
+    },
+    "product": {
+        "mandatory": ["name", "price"],
+        "optional": ["brand", "description", "category_id", "tax_rate", "min_stock", "barcode"]
+    },
+    "sales": {
+        "mandatory": ["customer_id", "items"],
+        "optional": ["discount", "tax", "notes", "source", "assigned_delivery_partner_id"]
+    },
+    "purchase": {
+        "mandatory": ["invoice_number", "supplier_id", "items"],
+        "optional": ["invoice_date", "discount", "tax", "notes", "attachment_url"]
+    },
+    "expenses": {
+        "mandatory": ["category", "amount"],
+        "optional": ["description", "receipt_url", "payment_mode", "expense_date"]
+    }
+}
+
+
+@router.get("/settings/fields", response_model=FieldSettingsOut)
+def get_field_settings(
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Retrieve the current configurable fields setting and available fields metadata."""
+    org = _admin_org(admin, db)
+    current_settings = org.field_settings or {}
+    
+    # Initialize dictionary structure with defaults if not present
+    initialized_settings = {}
+    for module, fields_info in AVAILABLE_FIELDS.items():
+        initialized_settings[module] = {}
+        saved_module = current_settings.get(module, {})
+        for opt_field in fields_info["optional"]:
+            initialized_settings[module][opt_field] = saved_module.get(opt_field, False)
+            
+    return {
+        "field_settings": initialized_settings,
+        "available_fields": AVAILABLE_FIELDS
+    }
+
+
+@router.put("/settings/fields", response_model=FieldSettingsOut)
+def update_field_settings(
+    payload: FieldSettingsUpdate,
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Update enabling/disabling status of optional fields for each module."""
+    org = _admin_org(admin, db)
+    
+    # Clean/validate payload to ensure only valid optional fields are updated
+    cleaned_settings = {}
+    for module, fields_info in AVAILABLE_FIELDS.items():
+        cleaned_settings[module] = {}
+        payload_module = payload.field_settings.get(module, {})
+        for opt_field in fields_info["optional"]:
+            cleaned_settings[module][opt_field] = payload_module.get(opt_field, False)
+            
+    org.field_settings = cleaned_settings
+    db.commit()
+    db.refresh(org)
+    
+    return {
+        "field_settings": org.field_settings,
+        "available_fields": AVAILABLE_FIELDS
+    }
+

@@ -1135,6 +1135,30 @@ if notifs:
     r = client.patch("/notifications/read-all", headers=fin_hdr)
     check("PATCH read all notifications -> 200", r.status_code == 200, r.text)
 
+# 6. Configurable Fields Settings by Admin
+r = client.get("/organizations/settings/fields", headers=fin_hdr)
+check("GET field settings -> 200", r.status_code == 200, r.text)
+field_data = r.json()
+check("field settings defaults company.business_type to False", field_data["field_settings"]["company"]["business_type"] is False)
+check("available_fields metadata has customer optional fields", "gst_number" in field_data["available_fields"]["customer"]["optional"])
+
+# Update field settings
+r = client.put("/organizations/settings/fields", headers=fin_hdr, json={
+    "field_settings": {
+        "company": {"business_type": True},
+        "customer": {"gst_number": True, "phone": True}
+    }
+})
+check("PUT field settings -> 200", r.status_code == 200, r.text)
+updated_data = r.json()
+check("updated field settings reflects company.business_type as True", updated_data["field_settings"]["company"]["business_type"] is True)
+check("updated field settings reflects customer.gst_number as True", updated_data["field_settings"]["customer"]["gst_number"] is True)
+check("updated field settings reflects customer.email as False (default)", updated_data["field_settings"]["customer"]["email"] is False)
+
+# Fetch again to verify persistence
+r = client.get("/organizations/settings/fields", headers=fin_hdr)
+check("persisted GET field settings returns correct values", r.json()["field_settings"]["customer"]["gst_number"] is True)
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

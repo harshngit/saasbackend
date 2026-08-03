@@ -17,6 +17,7 @@ class CompanySettingsOut(BaseModel):
     financial_year: str | None
     logo_url: str | None
     signature_url: str | None
+    field_settings: dict | None = None
 
 
 class CompanySettingsUpdate(BaseModel):
@@ -37,3 +38,13 @@ class CompanySettingsUpdate(BaseModel):
 
 class UploadResponse(BaseModel):
     url: str
+
+
+class FieldSettingsOut(BaseModel):
+    field_settings: dict[str, dict[str, bool]]
+    available_fields: dict[str, dict[str, list[str]]]
+
+
+class FieldSettingsUpdate(BaseModel):
+    field_settings: dict[str, dict[str, bool]]
+

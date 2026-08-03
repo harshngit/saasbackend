@@ -2,7 +2,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -56,6 +56,8 @@ class Organization(Base):
     # UpgradeStatus value ("none"/"pending"/"approved"/"rejected").
     upgrade_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     upgrade_reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    field_settings: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
