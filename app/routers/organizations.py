@@ -125,12 +125,54 @@ def upload_signature(
     return UploadResponse(url=org.signature_url)
 
 
+@router.post("/settings/upload-file", response_model=UploadResponse)
+def upload_settings_file(
+    file: UploadFile = File(...),
+    admin: User = Depends(_ADMIN),
+) -> UploadResponse:
+    """Generic file uploader for company settings assets (images, PDFs, documents up to 5 MB)."""
+    content_type = file.content_type or ""
+    is_allowed = (
+        content_type.startswith("image/")
+        or content_type == "application/pdf"
+        or content_type.startswith("application/vnd")
+        or content_type.endswith("document")
+        or content_type == "application/octet-stream"
+    )
+    if not is_allowed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported file format")
+    
+    content = file.file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File too large (max 5 MB)")
+        
+    encoded = base64.b64encode(content).decode("ascii")
+    url = f"data:{content_type};base64,{encoded}"
+    return UploadResponse(url=url)
+
+
 # ------------------------------- Field Settings -------------------------------
 
 AVAILABLE_FIELDS = {
     "company": {
-        "mandatory": ["name"],
-        "optional": ["business_type", "gst_number", "pan_number", "address", "phone", "email", "financial_year", "logo_url", "signature_url"]
+        "mandatory": [
+            "name", "legal_name", "business_type", "industry", "primary_mobile", "email",
+            "registered_address", "city", "state", "country", "pin_code",
+            "logo_url", "signature_url", "payment_qr_url",
+            "currency", "timezone", "language", "tax_configuration", "invoice_settings",
+            "auth_person_name", "auth_person_designation", "auth_person_mobile", "auth_person_email"
+        ],
+        "optional": [
+            "date_of_incorporation", "cin_number", "gstin_pan", "description",
+            "alternate_mobile", "landline", "website", "customer_support_number",
+            "branch_address", "stamp_url", "letterhead_url", "banner_url",
+            "upi_id", "bank_account_details", "bank_account_holder", "bank_ifsc", "bank_name",
+            "facebook_url", "instagram_url", "linkedin_url", "twitter_url", "youtube_url", "whatsapp_number",
+            "financial_year",
+            "doc_gst_url", "doc_pan_url", "doc_coi_url", "doc_trade_license_url", "doc_msme_url", "doc_fssai_url", "doc_other_url",
+            "auth_person_photo_url", "auth_person_signature_url",
+            "employee_count", "business_hours", "mission_vision", "notes"
+        ]
     },
     "customer": {
         "mandatory": ["name"],

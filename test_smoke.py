@@ -1139,25 +1139,52 @@ if notifs:
 r = client.get("/organizations/settings/fields", headers=fin_hdr)
 check("GET field settings -> 200", r.status_code == 200, r.text)
 field_data = r.json()
-check("field settings defaults company.business_type to False", field_data["field_settings"]["company"]["business_type"] is False)
+check("field settings defaults company.date_of_incorporation to False", field_data["field_settings"]["company"]["date_of_incorporation"] is False)
 check("available_fields metadata has customer optional fields", "gst_number" in field_data["available_fields"]["customer"]["optional"])
 
 # Update field settings
 r = client.put("/organizations/settings/fields", headers=fin_hdr, json={
     "field_settings": {
-        "company": {"business_type": True},
+        "company": {"date_of_incorporation": True},
         "customer": {"gst_number": True, "phone": True}
     }
 })
 check("PUT field settings -> 200", r.status_code == 200, r.text)
 updated_data = r.json()
-check("updated field settings reflects company.business_type as True", updated_data["field_settings"]["company"]["business_type"] is True)
+check("updated field settings reflects company.date_of_incorporation as True", updated_data["field_settings"]["company"]["date_of_incorporation"] is True)
 check("updated field settings reflects customer.gst_number as True", updated_data["field_settings"]["customer"]["gst_number"] is True)
 check("updated field settings reflects customer.email as False (default)", updated_data["field_settings"]["customer"]["email"] is False)
 
 # Fetch again to verify persistence
 r = client.get("/organizations/settings/fields", headers=fin_hdr)
 check("persisted GET field settings returns correct values", r.json()["field_settings"]["customer"]["gst_number"] is True)
+
+# Test updating new Company Master fields
+r = client.put("/organizations/settings", headers=fin_hdr, json={
+    "legal_name": "Finance Legal Private Limited",
+    "website": "https://financeco.com",
+    "auth_person_name": "Mr. Vikram Patel",
+    "auth_person_email": "vikram@financeco.com",
+    "currency": "INR"
+})
+check("update Company Settings with extended fields -> 200", r.status_code == 200 and r.json()["legal_name"] == "Finance Legal Private Limited" and r.json()["website"] == "https://financeco.com" and r.json()["auth_person_name"] == "Mr. Vikram Patel" and r.json()["currency"] == "INR", r.text)
+
+# Test website validation rule (must start with https://)
+r = client.put("/organizations/settings", headers=fin_hdr, json={
+    "website": "http://invalid-website.com"
+})
+check("website validation error -> 422", r.status_code == 422, r.text)
+
+# Test email validation rule
+r = client.put("/organizations/settings", headers=fin_hdr, json={
+    "email": "invalidemail"
+})
+check("email validation error -> 422", r.status_code == 422, r.text)
+
+# Generic file upload uploader test
+import io
+r = client.post("/organizations/settings/upload-file", headers=fin_hdr, files={"file": ("certificate.pdf", io.BytesIO(b"%PDF-1.4 ..."), "application/pdf")})
+check("generic upload PDF file -> 200", r.status_code == 200 and r.json()["url"].startswith("data:application/pdf;base64,"), r.text)
 
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
