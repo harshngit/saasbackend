@@ -556,6 +556,56 @@ so_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_
 check("sales officer (view-only products) view -> 200", client.get("/products", headers=so_h).status_code == 200)
 check("sales officer CANNOT create product -> 403", client.post("/products", headers=so_h, json={"name": "x"}).status_code == 403)
 
+print("\n== Reports module (aggregations + export) ==")
+rep_email = f"rep_{uuid.uuid4().hex[:8]}@firm.com"
+rpr = client.post("/auth/register", json={
+    "organization_name": "Reports Co", "admin_name": "R", "email": rep_email, "password": "Secret@123"}).json()
+rep_hdr = {"Authorization": f"Bearer {rpr['tokens']['access_token']}"}
+# seed some data: customer + product + order (approved = sale) + expense + supplier + purchase
+rc = client.post("/customers", headers=rep_hdr, json={"name": "Hotel X"}).json()
+rp = client.post("/products", headers=rep_hdr, json={"name": "Item", "total_inventory": 100}).json()
+ro = client.post("/orders", headers=rep_hdr, json={"customer_id": rc["id"], "tax": 90, "items": [{"product_id": rp["id"], "quantity": 5, "unit_price": 200}]}).json()
+client.patch(f"/orders/{ro['id']}/approve", headers=rep_hdr)
+client.post(f"/customers/{rc['id']}/payments", headers=rep_hdr, json={"amount": 400, "payment_mode": "cash"})
+client.post("/expenses", headers=rep_hdr, json={"category": "Rent", "amount": 300})
+rs = client.post("/suppliers", headers=rep_hdr, json={"name": "Sup"}).json()
+ri = client.post("/purchases", headers=rep_hdr, json={"invoice_number": "P1", "supplier_id": rs["id"], "tax": 40, "items": [{"product_id": rp["id"], "quantity": 10, "purchase_price": 50}]}).json()
+client.patch(f"/purchases/{ri['id']}/approve", headers=rep_hdr)
+
+# sales report
+r = client.get("/reports/sales", headers=rep_hdr)
+check("sales report -> summary+rows", r.status_code == 200 and r.json()["summary"]["total_sales"] == 1090 and len(r.json()["rows"]) == 1, r.text)
+# customer-outstanding (order billed 1000+90tax=1090, paid 400 -> 690)
+r = client.get("/reports/customer-outstanding", headers=rep_hdr)
+check("customer-outstanding report", r.status_code == 200 and r.json()["summary"]["total_outstanding"] == 690, r.text)
+# supplier-outstanding (purchase 500+40=540)
+r = client.get("/reports/supplier-outstanding", headers=rep_hdr)
+check("supplier-outstanding report", r.json()["summary"]["total_payable"] == 540, r.text)
+# payment-collection / cash-collection
+check("payment-collection total 400", client.get("/reports/payment-collection", headers=rep_hdr).json()["summary"]["total_collected"] == 400)
+check("cash-collection total 400", client.get("/reports/cash-collection", headers=rep_hdr).json()["summary"]["total_cash"] == 400)
+# expense
+check("expense report entries", client.get("/reports/expense", headers=rep_hdr).json()["summary"]["entries"] == 1)
+# gst-summary (output 90 from order tax, input 40 from purchase tax)
+r = client.get("/reports/gst-summary", headers=rep_hdr).json()
+check("gst-summary output/input/net", r["summary"]["output_gst"] == 90 and r["summary"]["input_gst"] == 40 and r["summary"]["net_gst"] == 50, r)
+# profit-loss (sales 1000 - purchases 540 - expenses(approved=0, expense is pending) )
+r = client.get("/reports/profit-loss", headers=rep_hdr).json()
+check("profit-loss computes net", r["summary"]["total_sales"] == 1090 and "net_profit" in r["summary"], r)
+# daily-transaction
+check("daily-transaction has rows", len(client.get("/reports/daily-transaction", headers=rep_hdr).json()["rows"]) >= 3)
+# purchase report
+check("purchase report total 540", client.get("/reports/purchase", headers=rep_hdr).json()["summary"]["total_purchases"] == 540)
+# unknown type -> 404, bad dates -> 400
+check("unknown report type -> 404", client.get("/reports/bogus", headers=rep_hdr).status_code == 404)
+check("bad date range -> 400", client.get("/reports/sales", headers=rep_hdr, params={"date_from": "2026-12-31", "date_to": "2026-01-01"}).status_code == 400)
+# export
+xl = client.get("/reports/sales/export", headers=rep_hdr, params={"format": "excel"})
+check("export excel -> xlsx bytes", xl.status_code == 200 and xl.headers["content-type"].startswith("application/vnd.openxml") and xl.content[:2] == b"PK", xl.status_code)
+pf = client.get("/reports/sales/export", headers=rep_hdr, params={"format": "pdf"})
+check("export pdf -> pdf bytes", pf.status_code == 200 and pf.content[:4] == b"%PDF", pf.status_code)
+check("export bad format -> 400", client.get("/reports/sales/export", headers=rep_hdr, params={"format": "word"}).status_code == 400)
+
 print("\n== Purchases + Expenses + Customer Payments (financial modules) ==")
 fin_email = f"fin_{uuid.uuid4().hex[:8]}@firm.com"
 fpr = client.post("/auth/register", json={

@@ -40,6 +40,7 @@ from app.routers import (
     plans,
     products,
     purchases,
+    reports,
     roles,
     sales_orders,
     suppliers,
@@ -69,7 +70,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "purchases-expenses-payments-fix"
+BUILD_TAG = "reports-module"
 
 
 @app.on_event("startup")
@@ -123,6 +124,7 @@ app.include_router(sales_orders.router)
 app.include_router(purchases.router)
 app.include_router(expenses.router)
 app.include_router(attendance.router)
+app.include_router(reports.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)
