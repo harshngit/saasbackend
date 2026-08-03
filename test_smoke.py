@@ -995,6 +995,146 @@ check("new password works after direct reset -> 200",
 check("direct reset unknown email -> 404",
       client.post("/auth/reset-password-direct", json={"email": "nobody@x.com", "new_password": "New@12345"}).status_code == 404)
 
+print("\n== Phase 3: New Modules - Purchase Invoices, Sales Invoices, Vehicle Stock, Deliveries, Notifications ==")
+
+# 1. Purchase Invoices PUT support and list
+r = client.get("/purchase-invoices", headers=fin_hdr)
+check("list purchase-invoices -> 200", r.status_code == 200, r.text)
+# Create a purchase invoice to edit
+pur_new = client.post("/purchase-invoices", headers=fin_hdr, json={
+    "invoice_number": f"PI-{uuid.uuid4().hex[:6]}",
+    "supplier_id": fsup["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 5, "purchase_price": 50, "tax": 5}]
+}).json()
+r = client.put(f"/purchase-invoices/{pur_new['id']}", headers=fin_hdr, json={
+    "invoice_number": pur_new["invoice_number"],
+    "notes": "Updated notes"
+})
+check("PUT edit purchase invoice -> 200", r.status_code == 200 and r.json()["notes"] == "Updated notes", r.text)
+
+# 2. Sales Invoices
+# Create an order
+o_inv = client.post("/orders", headers=fin_hdr, json={
+    "customer_id": fcust["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 3, "unit_price": 100}]
+}).json()
+# Approve order
+client.patch(f"/orders/{o_inv['id']}/approve", headers=fin_hdr)
+# Generate invoice from order
+r = client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr)
+check("generate invoice from order -> 201", r.status_code == 201, r.text)
+invoice_obj = r.json()
+# Duplicate generation should fail
+check("duplicate generate invoice -> 400", client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr).status_code == 400)
+# Get and List
+check("GET invoice detail -> 200", client.get(f"/invoices/{invoice_obj['id']}", headers=fin_hdr).status_code == 200)
+check("GET invoices list -> 200", len(client.get("/invoices", headers=fin_hdr).json()) >= 1)
+# PDF download
+r = client.get(f"/invoices/{invoice_obj['id']}/pdf", headers=fin_hdr)
+check("GET invoice PDF -> 200", r.status_code == 200 and r.headers.get("content-type") == "application/pdf", r.headers)
+
+# Direct Sales Invoice
+# First check stock of product
+old_stock = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
+direct_inv = client.post("/invoices", headers=fin_hdr, json={
+    "customer_id": fcust["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 2, "unit_price": 120, "tax": 10}],
+    "discount": 10,
+    "tax": 10
+}).json()
+new_stock = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
+check("direct invoice deducts stock", new_stock == old_stock - 2, f"Old: {old_stock}, New: {new_stock}")
+
+# Credit Note
+r = client.post(f"/invoices/{direct_inv['id']}/credit-note", headers=fin_hdr, json={"reason": "defective"})
+check("create credit note -> 200", r.status_code == 200 and r.json()["status"] == "returned", r.text)
+stock_after_cn = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
+check("credit note returns stock back", stock_after_cn == old_stock, f"Expected: {old_stock}, Got: {stock_after_cn}")
+
+# 3. Vehicle Stock
+dp_email = f"dp_{uuid.uuid4().hex[:8]}@firm.com"
+r = client.post("/users",
+    headers=fin_hdr,
+    json={"name": "Delivery Partner User", "email": dp_email, "password": "Partner@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "delivery_partner"})
+check("create delivery partner -> 201", r.status_code == 201, r.text)
+dp_user = r.json()
+# log them in
+r = client.post("/auth/login", json={"email": dp_email, "password": "Partner@123"})
+dp_access = r.json()["tokens"]["access_token"]
+dp_hdr = {"Authorization": f"Bearer {dp_access}"}
+
+# Load Vehicle (start of day)
+# Restock first
+client.post("/purchase-invoices", headers=fin_hdr, json={
+    "invoice_number": f"PI-{uuid.uuid4().hex[:6]}",
+    "supplier_id": fsup["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 50, "purchase_price": 50}]
+})
+# Find and approve the last purchase
+last_p = client.get("/purchase-invoices", headers=fin_hdr).json()[0]
+client.patch(f"/purchase-invoices/{last_p['id']}/approve", headers=fin_hdr)
+
+r = client.post("/vehicle-stock/loading", headers=fin_hdr, json={
+    "delivery_partner_id": dp_user["id"],
+    "items": [{"product_id": fprod["id"], "loaded_qty": 10}]
+})
+check("load vehicle stock -> 201", r.status_code == 201, r.text)
+loading_obj = r.json()
+
+# Current Stock
+r = client.get(f"/vehicle-stock/current/{dp_user['id']}", headers=fin_hdr)
+check("current vehicle stock -> 200", r.status_code == 200 and r.json()["status"] == "active", r.text)
+
+# Extra Load mid-day
+r = client.post(f"/vehicle-stock/{loading_obj['id']}/extra-load", headers=fin_hdr, json={
+    "items": [{"product_id": fprod["id"], "quantity": 5}]
+})
+check("extra load vehicle -> 200", r.status_code == 200 and r.json()["items"][0]["extra_qty"] == 5, r.text)
+
+# End of Day returns
+r = client.post(f"/vehicle-stock/{loading_obj['id']}/end-of-day", headers=fin_hdr, json={
+    "items": [{"product_id": fprod["id"], "returned_qty": 3}]
+})
+check("end of day returns -> 200 closed", r.status_code == 200 and r.json()["status"] == "closed", r.text)
+
+# 4. Deliveries
+# Create order, assign delivery partner
+o_del = client.post("/orders", headers=fin_hdr, json={
+    "customer_id": fcust["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 1, "unit_price": 100}]
+}).json()
+client.patch(f"/orders/{o_del['id']}/approve", headers=fin_hdr)
+client.patch(f"/orders/{o_del['id']}/assign-delivery-partner", headers=fin_hdr, json={"delivery_partner_id": dp_user["id"]})
+
+# GET assigned deliveries
+r = client.get("/deliveries/assigned", headers=dp_hdr)
+check("list assigned deliveries -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+# GET delivery details
+r = client.get(f"/deliveries/{o_del['id']}", headers=dp_hdr)
+check("get delivery details -> 200", r.status_code == 200 and r.json()["customer"]["name"] == "Regular Buyer", r.text)
+
+# Update delivery status
+r = client.patch(f"/deliveries/{o_del['id']}/status", headers=dp_hdr, json={"status": "Delivered"})
+check("update delivery status to Delivered -> 200", r.status_code == 200 and r.json()["order_status"] == "delivered", r.text)
+
+# Download delivery receipt
+r = client.get(f"/deliveries/{o_del['id']}/receipt", headers=dp_hdr)
+check("GET delivery receipt PDF -> 200", r.status_code == 200 and r.headers.get("content-type") == "application/pdf", r.headers)
+
+# 5. Notifications
+r = client.get("/notifications", headers=fin_hdr)
+check("list notifications -> 200", r.status_code == 200, r.text)
+notifs = r.json()
+if notifs:
+    notif_id = notifs[0]["id"]
+    r = client.get("/notifications/unread-count", headers=fin_hdr)
+    check("GET notifications unread-count", r.status_code == 200 and "unread" in r.json(), r.text)
+    r = client.patch(f"/notifications/{notif_id}/read", headers=fin_hdr)
+    check("PATCH read single notification -> 200", r.status_code == 200 and r.json()["is_read"] is True, r.text)
+    r = client.patch("/notifications/read-all", headers=fin_hdr)
+    check("PATCH read all notifications -> 200", r.status_code == 200, r.text)
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

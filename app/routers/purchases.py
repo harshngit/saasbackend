@@ -26,7 +26,7 @@ from app.schemas.purchase import (
     PurchaseUpdate,
 )
 
-router = APIRouter(prefix="/purchases", tags=["purchases"])
+router = APIRouter(prefix="", tags=["purchases"])
 
 _view = require_permission("purchases", "view")
 _create = require_permission("purchases", "create")
@@ -40,8 +40,8 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned(db: Session, invoice_id: str, org_id: str) -> PurchaseInvoice:
-    inv = db.get(PurchaseInvoice, invoice_id)
+def _owned(db: Session, id: str, org_id: str) -> PurchaseInvoice:
+    inv = db.get(PurchaseInvoice, id)
     if inv is None or inv.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Purchase invoice not found")
     return inv
@@ -121,21 +121,22 @@ def list_purchases(
     return q.order_by(PurchaseInvoice.created_at.desc()).all()
 
 
-@router.get("/{invoice_id}", response_model=PurchaseOut)
-def get_purchase(invoice_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> PurchaseInvoice:
-    return _owned(db, invoice_id, _org_id(user))
+@router.get("/{id}", response_model=PurchaseOut)
+def get_purchase(id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> PurchaseInvoice:
+    return _owned(db, id, _org_id(user))
 
 
-@router.patch("/{invoice_id}", response_model=PurchaseOut)
+@router.put("/{id}", response_model=PurchaseOut)
+@router.patch("/{id}", response_model=PurchaseOut)
 def update_purchase(
-    invoice_id: str,
+    id: str,
     payload: PurchaseUpdate,
     user: User = Depends(_edit),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
     org_id = _org_id(user)
-    inv = _owned(db, invoice_id, org_id)
+    inv = _owned(db, id, org_id)
     if inv.status != "pending":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending invoices can be edited")
     data = payload.model_dump(exclude_unset=True)
@@ -150,16 +151,16 @@ def update_purchase(
     return inv
 
 
-@router.patch("/{invoice_id}/approve", response_model=PurchaseOut)
+@router.patch("/{id}/approve", response_model=PurchaseOut)
 def approve_purchase(
-    invoice_id: str,
+    id: str,
     user: User = Depends(_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
     """Approve → add stock (purchase_in) and increase the supplier's total_purchases."""
     org_id = _org_id(user)
-    inv = _owned(db, invoice_id, org_id)
+    inv = _owned(db, id, org_id)
     if inv.status != "pending":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Only pending invoices can be approved (this is '{inv.status}')")
     for item in inv.items:
@@ -192,14 +193,14 @@ def approve_purchase(
     return inv
 
 
-@router.patch("/{invoice_id}/payment-status", response_model=PurchaseOut)
+@router.patch("/{id}/payment-status", response_model=PurchaseOut)
 def set_payment_status(
-    invoice_id: str,
+    id: str,
     payload: PaymentStatusUpdate,
     user: User = Depends(_edit),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
-    inv = _owned(db, invoice_id, _org_id(user))
+    inv = _owned(db, id, _org_id(user))
     if payload.payment_status not in PAYMENT_STATUSES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"payment_status must be one of {sorted(PAYMENT_STATUSES)}")
     inv.payment_status = payload.payment_status
@@ -210,9 +211,9 @@ def set_payment_status(
     return inv
 
 
-@router.patch("/{invoice_id}/cancel", response_model=PurchaseOut)
+@router.patch("/{id}/cancel", response_model=PurchaseOut)
 def cancel_purchase(
-    invoice_id: str,
+    id: str,
     payload: CancelBody,
     user: User = Depends(_approve),
     _unlocked: User = Depends(require_unlocked_org),
@@ -220,7 +221,7 @@ def cancel_purchase(
 ) -> PurchaseInvoice:
     """Cancel. If approved, reverse the stock-in and the supplier's total_purchases."""
     org_id = _org_id(user)
-    inv = _owned(db, invoice_id, org_id)
+    inv = _owned(db, id, org_id)
     if inv.status == "cancelled":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already cancelled")
     if inv.stock_added:
@@ -259,25 +260,25 @@ def cancel_purchase(
     return inv
 
 
-@router.post("/{invoice_id}/documents", response_model=PurchaseOut)
+@router.post("/{id}/documents", response_model=PurchaseOut)
 def upload_document(
-    invoice_id: str,
+    id: str,
     file: UploadFile = File(...),
     user: User = Depends(_edit),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
     """Attach a supporting document (invoice scan/photo — image or PDF, max 10 MB)."""
-    inv = _owned(db, invoice_id, _org_id(user))
+    inv = _owned(db, id, _org_id(user))
     inv.attachment_url = store_upload(file)
     db.commit()
     db.refresh(inv)
     return inv
 
 
-@router.post("/{invoice_id}/returns", response_model=PurchaseOut)
+@router.post("/{id}/returns", response_model=PurchaseOut)
 def purchase_return(
-    invoice_id: str,
+    id: str,
     payload: PurchaseReturnBody,
     user: User = Depends(_approve),
     _unlocked: User = Depends(require_unlocked_org),
@@ -285,7 +286,7 @@ def purchase_return(
 ) -> PurchaseInvoice:
     """Return items to the supplier: removes stock and reduces the supplier's payable."""
     org_id = _org_id(user)
-    inv = _owned(db, invoice_id, org_id)
+    inv = _owned(db, id, org_id)
     if inv.status != "approved":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only approved invoices can be returned")
     reversed_value = 0.0
@@ -324,14 +325,14 @@ def purchase_return(
     return inv
 
 
-@router.delete("/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_purchase(
-    invoice_id: str,
+    id: str,
     user: User = Depends(require_permission("purchases", "delete")),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> None:
-    inv = _owned(db, invoice_id, _org_id(user))
+    inv = _owned(db, id, _org_id(user))
     if inv.status == "approved":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel an approved invoice before deleting")
     db.delete(inv)

@@ -35,8 +35,10 @@ from app.routers import (
     auth,
     categories,
     customers,
+    deliveries,
     expenses,
     inventory,
+    invoices,
     notifications,
     organizations,
     plans,
@@ -48,6 +50,7 @@ from app.routers import (
     suppliers,
     superadmin,
     users,
+    vehicle_stock,
 )
 
 app = FastAPI(
@@ -123,7 +126,11 @@ app.include_router(products.router)
 app.include_router(inventory.router)
 app.include_router(suppliers.router)
 app.include_router(sales_orders.router)
-app.include_router(purchases.router)
+app.include_router(purchases.router, prefix="/purchase-invoices")
+app.include_router(purchases.router, prefix="/purchases")
+app.include_router(invoices.router)
+app.include_router(vehicle_stock.router)
+app.include_router(deliveries.router)
 app.include_router(expenses.router)
 app.include_router(attendance.router)
 app.include_router(reports.router)

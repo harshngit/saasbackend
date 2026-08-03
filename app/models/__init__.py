@@ -32,6 +32,8 @@ from app.models.role import Role
 from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
+from app.models.invoice import Invoice, InvoiceItem
+from app.models.vehicle_stock import VehicleLoading, VehicleLoadingItem
 
 __all__ = [
     "Organization",
@@ -59,6 +61,10 @@ __all__ = [
     "EXPENSE_STATUSES",
     "EXPENSE_CATEGORIES",
     "Notification",
+    "Invoice",
+    "InvoiceItem",
+    "VehicleLoading",
+    "VehicleLoadingItem",
     "User",
     "RefreshToken",
     "PasswordResetToken",
