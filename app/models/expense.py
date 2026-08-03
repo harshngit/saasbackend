@@ -41,6 +41,17 @@ class Expense(Base):
     approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # Extended Expense Profile Fields
+    expense_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    expense_number: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    expense_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    expense_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    financial_year: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    paid_from_account_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    expense_account_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    payment_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    approval_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False

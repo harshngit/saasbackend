@@ -49,6 +49,14 @@ class Customer(Base):
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Customer Profile Fields
+    customer_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    customer_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    primary_contact_person: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    maps_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maps_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)

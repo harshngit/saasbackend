@@ -1186,6 +1186,127 @@ import io
 r = client.post("/organizations/settings/upload-file", headers=fin_hdr, files={"file": ("certificate.pdf", io.BytesIO(b"%PDF-1.4 ..."), "application/pdf")})
 check("generic upload PDF file -> 200", r.status_code == 200 and r.json()["url"].startswith("data:application/pdf;base64,"), r.text)
 
+print("\n== Leads CRUD ==")
+lead_payload = {
+    "lead_id": "L-12345",
+    "lead_source": "Website",
+    "customer_id": fcust["id"],
+    "mobile_number": "9876543210",
+    "lead_status": "new"
+}
+r = client.post("/leads", headers=fin_hdr, json=lead_payload)
+check("POST /leads -> 201", r.status_code == 201, r.text)
+lead_obj = r.json()
+check("lead_id matches", lead_obj["lead_id"] == "L-12345")
+check("lead customer name", lead_obj["customer"]["name"] == "Regular Buyer")
+
+r = client.get("/leads", headers=fin_hdr)
+check("GET /leads list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+r = client.get(f"/leads/{lead_obj['id']}", headers=fin_hdr)
+check("GET /leads/{id} detail -> 200", r.status_code == 200, r.text)
+
+r = client.put(f"/leads/{lead_obj['id']}", headers=fin_hdr, json={"lead_status": "contacted"})
+check("PUT /leads/{id} edit -> 200", r.status_code == 200 and r.json()["lead_status"] == "contacted", r.text)
+
+r = client.delete(f"/leads/{lead_obj['id']}", headers=fin_hdr)
+check("DELETE /leads/{id} -> 204", r.status_code == 204)
+check("GET deleted lead -> 404", client.get(f"/leads/{lead_obj['id']}", headers=fin_hdr).status_code == 404)
+
+
+print("\n== Quotations CRUD ==")
+quot_payload = {
+    "quotation_number": "Q-2026-001",
+    "customer_id": fcust["id"],
+    "currency": "INR",
+    "items": [{"product_id": fprod["id"], "quantity": 10, "uom": "boxes", "unit_price": 95}]
+}
+r = client.post("/quotations", headers=fin_hdr, json=quot_payload)
+check("POST /quotations -> 201", r.status_code == 201, r.text)
+quot_obj = r.json()
+check("quotation_number matches", quot_obj["quotation_number"] == "Q-2026-001")
+check("quotation item size is 1", len(quot_obj["items"]) == 1)
+
+r = client.get("/quotations", headers=fin_hdr)
+check("GET /quotations list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+r = client.get(f"/quotations/{quot_obj['id']}", headers=fin_hdr)
+check("GET /quotations/{id} detail -> 200", r.status_code == 200, r.text)
+
+r = client.delete(f"/quotations/{quot_obj['id']}", headers=fin_hdr)
+check("DELETE /quotations/{id} -> 204", r.status_code == 204)
+
+
+print("\n== Delivery Notes CRUD ==")
+del_note_payload = {
+    "delivery_note_number": "DN-2026-001",
+    "customer_id": fcust["id"],
+    "warehouse": "Main WH",
+    "delivery_address": "Test street",
+    "items": [{"product_id": fprod["id"], "delivered_quantity": 5}]
+}
+r = client.post("/deliveries/notes", headers=fin_hdr, json=del_note_payload)
+check("POST /deliveries/notes -> 201", r.status_code == 201, r.text)
+dn_obj = r.json()
+check("delivery_note_number matches", dn_obj["delivery_note_number"] == "DN-2026-001")
+
+r = client.get("/deliveries/notes", headers=fin_hdr)
+check("GET /deliveries/notes list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+r = client.get(f"/deliveries/notes/{dn_obj['id']}", headers=fin_hdr)
+check("GET /deliveries/notes/{id} detail -> 200", r.status_code == 200, r.text)
+
+
+print("\n== Payment Receipts CRUD ==")
+inv_ref = client.post("/invoices", headers=fin_hdr, json={
+    "customer_id": fcust["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 1, "unit_price": 100}]
+}).json()
+
+receipt_payload = {
+    "receipt_number": "REC-2026-001",
+    "customer_id": fcust["id"],
+    "invoice_reference_id": inv_ref["id"],
+    "amount_received": 100,
+    "payment_method": "UPI"
+}
+r = client.post("/payment-receipts", headers=fin_hdr, json=receipt_payload)
+check("POST /payment-receipts -> 201", r.status_code == 201, r.text)
+rec_obj = r.json()
+check("receipt_number matches", rec_obj["receipt_number"] == "REC-2026-001")
+
+r = client.get("/payment-receipts", headers=fin_hdr)
+check("GET /payment-receipts list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+r = client.get(f"/payment-receipts/{rec_obj['id']}", headers=fin_hdr)
+check("GET /payment-receipts/{id} detail -> 200", r.status_code == 200, r.text)
+
+
+print("\n== Sales Returns / Credit Notes CRUD ==")
+old_stock = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
+
+sales_ret_payload = {
+    "return_number": "RET-2026-001",
+    "customer_id": fcust["id"],
+    "invoice_reference_id": inv_ref["id"],
+    "return_reason": "Defective product",
+    "return_status": "Approved",
+    "items": [{"product_id": fprod["id"], "quantity_returned": 2}]
+}
+r = client.post("/sales-returns", headers=fin_hdr, json=sales_ret_payload)
+check("POST /sales-returns -> 201", r.status_code == 201, r.text)
+ret_obj = r.json()
+check("return_number matches", ret_obj["return_number"] == "RET-2026-001")
+
+new_stock = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
+check("sales return reverses stock", new_stock == old_stock + 2, f"Old: {old_stock}, New: {new_stock}")
+
+r = client.get("/sales-returns", headers=fin_hdr)
+check("GET /sales-returns list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+r = client.get(f"/sales-returns/{ret_obj['id']}", headers=fin_hdr)
+check("GET /sales-returns/{id} detail -> 200", r.status_code == 200, r.text)
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

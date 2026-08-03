@@ -47,6 +47,17 @@ class User(Base):
     # Legacy fixed role enum — kept (nullable) for backward-compat in responses.
     role: Mapped[UserRole | None] = mapped_column(Enum(UserRole), nullable=True)
 
+    # Employee Profile Fields
+    employee_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    first_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    designation: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    employment_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    date_of_joining: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    employee_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    identify_proofs: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)

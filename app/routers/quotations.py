@@ -1,0 +1,130 @@
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
+from app.core.deps import require_permission, require_unlocked_org
+from app.models import (
+    Customer,
+    Product,
+    ProductVariant,
+    Quotation,
+    QuotationItem,
+    User,
+)
+from app.schemas.quotation import QuotationCreate, QuotationOut
+
+router = APIRouter(prefix="/quotations", tags=["quotations"])
+
+_view = require_permission("quotations", "view")
+_create = require_permission("quotations", "create")
+_edit = require_permission("quotations", "edit")
+_delete = require_permission("quotations", "delete")
+
+
+def _org_id(user: User) -> str:
+    if not user.organization_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No organization on this account")
+    return user.organization_id
+
+
+def _owned(db: Session, id: str, org_id: str) -> Quotation:
+    q = db.get(Quotation, id)
+    if q is None or q.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quotation not found")
+    return q
+
+
+@router.post("", response_model=QuotationOut, status_code=status.HTTP_201_CREATED)
+def create_quotation(
+    payload: QuotationCreate,
+    user: User = Depends(_create),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> Quotation:
+    org_id = _org_id(user)
+
+    # Validate customer
+    customer = db.get(Customer, payload.customer_id)
+    if customer is None or customer.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+
+    # Validate salesperson if provided
+    if payload.salesperson_id:
+        sales = db.get(User, payload.salesperson_id)
+        if sales is None or sales.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid salesperson_id")
+
+    quotation = Quotation(
+        organization_id=org_id,
+        quotation_number=payload.quotation_number,
+        quotation_date=payload.quotation_date or datetime.now(timezone.utc),
+        valid_until=payload.valid_until,
+        customer_id=payload.customer_id,
+        billing_address=payload.billing_address or customer.billing_address,
+        salesperson_id=payload.salesperson_id,
+        currency=payload.currency,
+    )
+
+    for item in payload.items:
+        product = db.get(Product, item.product_id)
+        if product is None or product.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Product {item.product_id} not found")
+
+        variant_name = ""
+        if item.variant_id:
+            variant = db.get(ProductVariant, item.variant_id)
+            if variant is None or variant.product_id != product.id:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid variant_id")
+            variant_name = f" ({variant.name})"
+
+        quotation.items.append(
+            QuotationItem(
+                product_id=product.id,
+                variant_id=item.variant_id,
+                product_name=f"{product.name}{variant_name}",
+                quantity=item.quantity,
+                uom=item.uom,
+                unit_price=item.unit_price,
+            )
+        )
+
+    db.add(quotation)
+    db.commit()
+    db.refresh(quotation)
+    return quotation
+
+
+@router.get("", response_model=list[QuotationOut])
+def list_quotations(
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[Quotation]:
+    return (
+        db.query(Quotation)
+        .filter(Quotation.organization_id == _org_id(user))
+        .order_by(Quotation.created_at.desc())
+        .all()
+    )
+
+
+@router.get("/{id}", response_model=QuotationOut)
+def get_quotation_detail(
+    id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> Quotation:
+    return _owned(db, id, _org_id(user))
+
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_quotation(
+    id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    q = _owned(db, id, _org_id(user))
+    db.delete(q)
+    db.commit()

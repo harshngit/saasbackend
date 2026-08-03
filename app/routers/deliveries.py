@@ -8,10 +8,14 @@ from app.core.deps import get_current_user, require_permission, require_unlocked
 from app.core.pdf_docs import delivery_receipt_pdf
 from app.models import (
     Customer,
+    Product,
+    ProductVariant,
     SalesOrder,
     User,
     VehicleLoading,
     VehicleLoadingItem,
+    Delivery,
+    DeliveryItem,
 )
 from app.schemas.delivery import DeliveryStatusUpdate
 from app.schemas.sales_order import OrderItemOut, OrderOut
@@ -56,6 +60,91 @@ def list_assigned_deliveries(
         )
     )
     return q.order_by(SalesOrder.created_at.desc()).all()
+
+
+# ------------------------------- Delivery Notes (Ext) -------------------------------
+
+from app.schemas.delivery import DeliveryNoteCreate, DeliveryNoteOut
+
+
+@router.post("/notes", response_model=DeliveryNoteOut, status_code=status.HTTP_201_CREATED)
+def create_delivery_note(
+    payload: DeliveryNoteCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Delivery:
+    org_id = _org_id(user)
+
+    # Validate customer
+    if payload.customer_id:
+        cust = db.get(Customer, payload.customer_id)
+        if cust is None or cust.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+
+    # Validate order
+    if payload.sales_order_id:
+        order = db.get(SalesOrder, payload.sales_order_id)
+        if order is None or order.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid sales_order_id")
+
+    delivery = Delivery(
+        organization_id=org_id,
+        delivery_note_number=payload.delivery_note_number,
+        delivery_date=payload.delivery_date or datetime.now(timezone.utc),
+        sales_order_id=payload.sales_order_id,
+        customer_id=payload.customer_id,
+        warehouse=payload.warehouse,
+        delivery_address=payload.delivery_address,
+        delivery_status=payload.delivery_status or "pending",
+    )
+
+    for item in payload.items:
+        # Resolve product name
+        prod = db.get(Product, item.product_id) if item.product_id else None
+        prod_name = prod.name if prod else "Unknown Item"
+        if item.variant_id:
+            variant = db.get(ProductVariant, item.variant_id)
+            if variant:
+                prod_name = f"{prod_name} ({variant.name})"
+
+        delivery.items.append(
+            DeliveryItem(
+                product_id=item.product_id,
+                variant_id=item.variant_id,
+                product_name=prod_name,
+                delivered_quantity=item.delivered_quantity,
+            )
+        )
+
+    db.add(delivery)
+    db.commit()
+    db.refresh(delivery)
+    return delivery
+
+
+@router.get("/notes", response_model=list[DeliveryNoteOut])
+def list_delivery_notes(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[Delivery]:
+    return (
+        db.query(Delivery)
+        .filter(Delivery.organization_id == _org_id(user))
+        .order_by(Delivery.delivery_date.desc())
+        .all()
+    )
+
+
+@router.get("/notes/{id}", response_model=DeliveryNoteOut)
+def get_delivery_note_detail(
+    id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Delivery:
+    d = db.get(Delivery, id)
+    if d is None or d.organization_id != _org_id(user):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery note not found")
+    return d
 
 
 @router.get("/{id}")
@@ -195,3 +284,5 @@ def get_delivery_receipt(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{order.order_number}.pdf"'},
     )
+
+

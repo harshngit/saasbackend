@@ -111,6 +111,16 @@ class Organization(Base):
     mission_vision: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Specified Columns (Backward-Compat / Sheet Specific)
+    pin_zip_code: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    company_logo: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorized_signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    google_pay_phonepe_paytm_qr_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    time_zone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    owner_director_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    designation: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    mobile_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     status: Mapped[OrganizationStatus] = mapped_column(
         Enum(OrganizationStatus), default=OrganizationStatus.TRIAL, nullable=False
     )

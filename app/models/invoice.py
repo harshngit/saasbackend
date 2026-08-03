@@ -23,6 +23,13 @@ class Invoice(Base):
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
     invoice_number: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    sales_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    sales_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    sales_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sales_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    invoice_status: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    payment_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
     order_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("sales_orders.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -75,5 +82,7 @@ class InvoiceItem(Base):
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     tax: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    tax_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     invoice: Mapped["Invoice"] = relationship(back_populates="items")

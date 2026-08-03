@@ -44,6 +44,10 @@ class Product(Base):
     # Used only when the product has no variants; otherwise stock is per-variant.
     total_inventory: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # Product Profile Fields
+    product_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    inventory_tracking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)

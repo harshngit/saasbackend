@@ -34,6 +34,11 @@ from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
 from app.models.vehicle_stock import VehicleLoading, VehicleLoadingItem
+from app.models.lead import Lead
+from app.models.quotation import Quotation, QuotationItem
+from app.models.delivery import Delivery, DeliveryItem
+from app.models.payment_receipt import PaymentReceipt
+from app.models.sales_return import SalesReturn, ReturnItem
 
 __all__ = [
     "Organization",
@@ -79,4 +84,12 @@ __all__ = [
     "UpgradeStatus",
     "BillingCycle",
     "LOCKED_STATUSES",
+    "Lead",
+    "Quotation",
+    "QuotationItem",
+    "Delivery",
+    "DeliveryItem",
+    "PaymentReceipt",
+    "SalesReturn",
+    "ReturnItem",
 ]

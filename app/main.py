@@ -51,6 +51,10 @@ from app.routers import (
     superadmin,
     users,
     vehicle_stock,
+    leads,
+    quotations,
+    payment_receipts,
+    sales_returns,
 )
 
 app = FastAPI(
@@ -138,3 +142,8 @@ app.include_router(notifications.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)
+app.include_router(leads.router)
+app.include_router(quotations.router)
+app.include_router(payment_receipts.router)
+app.include_router(sales_returns.router)
+

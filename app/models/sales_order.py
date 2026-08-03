@@ -36,6 +36,12 @@ class SalesOrder(Base):
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
     order_number: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    sales_order_number: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    order_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    salesperson_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    order_status: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
 
     customer_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True
@@ -89,5 +95,6 @@ class SalesOrderItem(Base):
     unit_price: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)  # line-level
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
 
     order: Mapped["SalesOrder"] = relationship(back_populates="items")

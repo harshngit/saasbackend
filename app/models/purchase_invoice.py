@@ -45,6 +45,19 @@ class PurchaseInvoice(Base):
     stock_added: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
+    # Extended Purchase Profile Fields
+    purchase_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    purchase_number: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    purchase_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    purchase_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    financial_year: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    purchase_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    warehouse_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    receiving_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    purchase_account_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    approval_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
@@ -75,5 +88,6 @@ class PurchaseInvoiceItem(Base):
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     tax: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
 
     invoice: Mapped["PurchaseInvoice"] = relationship(back_populates="items")
