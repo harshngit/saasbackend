@@ -556,6 +556,89 @@ so_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_
 check("sales officer (view-only products) view -> 200", client.get("/products", headers=so_h).status_code == 200)
 check("sales officer CANNOT create product -> 403", client.post("/products", headers=so_h, json={"name": "x"}).status_code == 403)
 
+print("\n== Sales Orders (lifecycle + stock deduction/restore) ==")
+so_email = f"so_{uuid.uuid4().hex[:8]}@firm.com"
+sopr = client.post("/auth/register", json={
+    "organization_name": "Orders Co", "admin_name": "O", "email": so_email, "password": "Secret@123"}).json()
+so_hdr = {"Authorization": f"Bearer {sopr['tokens']['access_token']}"}
+# a customer + a product with stock
+cust = client.post("/customers", headers=so_hdr, json={"name": "Hotel Grand"}).json()
+prod = client.post("/products", headers=so_hdr, json={"name": "Rice Bag", "price": 500, "total_inventory": 100}).json()
+
+# create order
+r = client.post("/orders", headers=so_hdr, json={
+    "customer_id": cust["id"], "discount": 50, "tax": 20,
+    "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 500, "discount": 100}]})
+check("create order -> 201", r.status_code == 201, r.text)
+order = r.json()
+order_id = order["id"]
+check("order_number generated", order["order_number"].startswith("SO-"), order)
+check("order status pending", order["status"] == "pending", order)
+check("line_total = 10*500-100 = 4900", order["items"][0]["line_total"] == 4900, order)
+check("order total = 4900-50+20 = 4870", order["total"] == 4870, order)
+check("stock NOT yet deducted (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+
+# reject flow blocked after approve; test approve deducts stock
+r = client.patch(f"/orders/{order_id}/approve", headers=so_hdr)
+check("approve order -> confirmed", r.status_code == 200 and r.json()["status"] == "confirmed", r.text)
+check("stock deducted after approve (100-10=90)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 90)
+check("approve again -> 400", client.patch(f"/orders/{order_id}/approve", headers=so_hdr).status_code == 400)
+
+# assign delivery partner
+dp_email = f"dp_{uuid.uuid4().hex[:6]}@f.com"
+roles_so = client.get("/roles", headers=so_hdr).json()
+dp_role = next(x for x in roles_so if x["name"] == "Delivery Partner")["id"]
+dp = client.post("/users", headers=so_hdr, json={"name": "DP", "email": dp_email, "username": f"dp_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": dp_role}).json()
+r = client.patch(f"/orders/{order_id}/assign-delivery-partner", headers=so_hdr, json={"delivery_partner_id": dp["id"]})
+check("assign delivery partner -> out_for_delivery", r.status_code == 200 and r.json()["status"] == "out_for_delivery" and r.json()["assigned_delivery_partner_id"] == dp["id"], r.text)
+
+# cancel restores stock
+r = client.patch(f"/orders/{order_id}/cancel", headers=so_hdr, json={"reason": "customer changed mind"})
+check("cancel order -> cancelled", r.status_code == 200 and r.json()["status"] == "cancelled", r.text)
+check("stock restored after cancel (back to 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+
+# reject a fresh pending order
+r2 = client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]})
+oid2 = r2.json()["id"]
+check("item unit_price defaults to product price", r2.json()["items"][0]["unit_price"] == 500, r2.text)
+r = client.patch(f"/orders/{oid2}/reject", headers=so_hdr, json={"reason": "out of area"})
+check("reject pending order -> rejected", r.status_code == 200 and r.json()["status"] == "rejected", r.text)
+# filters + tenant isolation
+check("list orders by status=cancelled", any(o["id"] == order_id for o in client.get("/orders", headers=so_hdr, params={"status": "cancelled"}).json()))
+o_other = client.post("/auth/register", json={"organization_name": "O2", "admin_name": "X", "email": f"o2_{uuid.uuid4().hex[:6]}@f.com", "password": "Secret@123"}).json()
+check("cross-org order get -> 404", client.get(f"/orders/{order_id}", headers={"Authorization": f"Bearer {o_other['tokens']['access_token']}"}).status_code == 404)
+# insufficient stock on approve
+big = client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 99999}]}).json()
+check("approve with insufficient stock -> 400", client.patch(f"/orders/{big['id']}/approve", headers=so_hdr).status_code == 400)
+
+print("\n== Attendance (4 checkpoints + me + admin view) ==")
+att_email = f"att_{uuid.uuid4().hex[:8]}@firm.com"
+apr = client.post("/auth/register", json={
+    "organization_name": "Att Co", "admin_name": "A", "email": att_email, "password": "Secret@123"}).json()
+att_admin_hdr = {"Authorization": f"Bearer {apr['tokens']['access_token']}"}
+# create a sales officer staff (has attendance perm)
+att_roles = client.get("/roles", headers=att_admin_hdr).json()
+so_role_id = next(x for x in att_roles if x["name"] == "Sales Officer")["id"]
+staff_att_email = f"atts_{uuid.uuid4().hex[:6]}@f.com"
+staff_att = client.post("/users", headers=att_admin_hdr, json={"name": "Field Staff", "email": staff_att_email, "username": f"atts_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": so_role_id}).json()
+staff_att_hdr = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': staff_att_email, 'password': 'Staff@123'}).json()['tokens']['access_token']}"}
+
+# out-of-order rejected
+check("departure before check-in -> 400", client.post("/attendance/check-in", headers=staff_att_hdr, json={"type": "departure"}).status_code == 400)
+r = client.post("/attendance/check-in", headers=staff_att_hdr, json={"type": "office_check_in"})
+check("office_check_in -> 201", r.status_code == 201 and r.json()["office_check_in"] is not None, r.text)
+check("duplicate check-in same type -> 400", client.post("/attendance/check-in", headers=staff_att_hdr, json={"type": "office_check_in"}).status_code == 400)
+check("departure -> 201", client.post("/attendance/check-in", headers=staff_att_hdr, json={"type": "departure"}).status_code == 201)
+check("invalid type -> 422", client.post("/attendance/check-in", headers=staff_att_hdr, json={"type": "lunch"}).status_code == 422)
+# me
+me_att = client.get("/attendance/me", headers=staff_att_hdr).json()
+check("attendance/me -> 1 row with checkpoints", len(me_att) == 1 and me_att[0]["departure"] is not None, me_att)
+# admin view
+adm_att = client.get("/attendance", headers=att_admin_hdr, params={"user_id": staff_att["id"]}).json()
+check("admin attendance view sees staff row", len(adm_att) == 1 and adm_att[0]["user_id"] == staff_att["id"], adm_att)
+check("staff cannot access admin attendance -> 403", client.get("/attendance", headers=staff_att_hdr).status_code == 403)
+check("bad date range -> 400", client.get("/attendance/me", headers=staff_att_hdr, params={"date_from": "2026-12-31", "date_to": "2026-01-01"}).status_code == 400)
+
 print("\n== Suppliers module (CRUD + payments + balance sync) ==")
 sup_email = f"sup_{uuid.uuid4().hex[:8]}@firm.com"
 spr = client.post("/auth/register", json={

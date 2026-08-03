@@ -12,6 +12,7 @@ from app.core.database import (
     widen_columns_to_text,
 )
 from app.models import (  # noqa: F401  (register mappers)
+    Attendance,
     Category,
     Customer,
     Organization,
@@ -20,12 +21,15 @@ from app.models import (  # noqa: F401  (register mappers)
     ProductVariant,
     RefreshToken,
     Role,
+    SalesOrder,
+    SalesOrderItem,
     StockMovement,
     Supplier,
     SupplierPayment,
     User,
 )
 from app.routers import (
+    attendance,
     auth,
     categories,
     customers,
@@ -34,6 +38,7 @@ from app.routers import (
     plans,
     products,
     roles,
+    sales_orders,
     suppliers,
     superadmin,
     users,
@@ -61,7 +66,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "suppliers-inventory-modules"
+BUILD_TAG = "sales-orders-attendance"
 
 
 @app.on_event("startup")
@@ -110,6 +115,8 @@ app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(inventory.router)
 app.include_router(suppliers.router)
+app.include_router(sales_orders.router)
+app.include_router(attendance.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)
