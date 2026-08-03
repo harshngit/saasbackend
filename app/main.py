@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import (
     Base,
+    add_columns_with_default,
     auto_add_missing_columns,
     drop_legacy_columns,
     engine,
@@ -68,7 +69,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "purchases-expenses-payments"
+BUILD_TAG = "purchases-expenses-payments-fix"
 
 
 @app.on_event("startup")
@@ -86,6 +87,7 @@ def on_startup() -> None:
         ("drop_legacy_columns", drop_legacy_columns),
         ("relax_not_null_columns", relax_not_null_columns),
         ("widen_columns_to_text", widen_columns_to_text),
+        ("add_columns_with_default", add_columns_with_default),
         ("auto_add_missing_columns", auto_add_missing_columns),
     ):
         try:

@@ -175,6 +175,33 @@ def widen_columns_to_text() -> None:
             logger.exception("Could not widen %s.%s", table, column)
 
 
+# NOT NULL columns added to already-existing tables — added WITH a default so
+# existing rows backfill (auto_add_missing_columns skips NOT NULL columns).
+_ADD_WITH_DEFAULT = [
+    ("customers", "opening_balance", "0"),
+    ("customers", "total_billed", "0"),
+    ("customers", "total_received", "0"),
+]
+
+
+def add_columns_with_default() -> None:
+    """Add NOT NULL numeric columns to existing tables, backfilling rows with a default."""
+    inspector = inspect(engine)
+    coltype = "DOUBLE PRECISION" if engine.dialect.name == "postgresql" else "FLOAT"
+    for table, column, default in _ADD_WITH_DEFAULT:
+        if not inspector.has_table(table):
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        if column in existing:
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {coltype} NOT NULL DEFAULT {default}'))
+            logger.info("Auto-migrated: added %s.%s (NOT NULL default %s)", table, column, default)
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not add column %s.%s", table, column)
+
+
 def drop_legacy_columns() -> None:
     """Drop columns that the model no longer defines (Postgres only).
 
