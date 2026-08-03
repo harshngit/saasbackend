@@ -1,11 +1,19 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, User
-from app.schemas.customer import CustomerCreate, CustomerOut, CustomerUpdate
+from app.models import Customer, CustomerPayment, User
+from app.schemas.customer import (
+    CustomerCreate,
+    CustomerOut,
+    CustomerPaymentCreate,
+    CustomerPaymentOut,
+    CustomerUpdate,
+)
 
 router = APIRouter(prefix="/customers", tags=["customers"])
 
@@ -14,6 +22,9 @@ _view = require_permission("customers", "view")
 _create = require_permission("customers", "create")
 _edit = require_permission("customers", "edit")
 _delete = require_permission("customers", "delete")
+_pay_view = require_permission("payments", "view")
+_pay_create = require_permission("payments", "create")
+_pay_delete = require_permission("payments", "delete")
 
 
 def _org_id(user: User) -> str:
@@ -50,6 +61,7 @@ def create_customer(
     org_id = _org_id(user)
     _validate_assignee(db, org_id, payload.assigned_sales_officer_id)
     customer = Customer(organization_id=org_id, **payload.model_dump())
+    customer.recompute_outstanding()  # opening_balance -> outstanding
     db.add(customer)
     db.commit()
     db.refresh(customer)
@@ -106,6 +118,63 @@ def update_customer(
         _validate_assignee(db, org_id, data["assigned_sales_officer_id"])
     for field, value in data.items():
         setattr(customer, field, value)
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+
+@router.post("/{customer_id}/payments", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
+def record_customer_payment(
+    customer_id: str,
+    payload: CustomerPaymentCreate,
+    user: User = Depends(_pay_create),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> Customer:
+    """Record a payment received from a customer. Returns the customer with updated balances."""
+    org_id = _org_id(user)
+    customer = _owned_customer(db, customer_id, org_id)
+    db.add(CustomerPayment(
+        customer_id=customer.id, organization_id=org_id, order_id=payload.order_id,
+        amount=payload.amount, payment_mode=payload.payment_mode, reference=payload.reference,
+        note=payload.note, received_on=payload.received_on or datetime.now(timezone.utc),
+    ))
+    customer.total_received = round((customer.total_received or 0) + payload.amount, 2)
+    customer.recompute_outstanding()
+    db.commit()
+    db.refresh(customer)
+    return customer
+
+
+@router.get("/{customer_id}/payments", response_model=list[CustomerPaymentOut])
+def list_customer_payments(
+    customer_id: str, user: User = Depends(_pay_view), db: Session = Depends(get_db)
+) -> list[CustomerPayment]:
+    _owned_customer(db, customer_id, _org_id(user))
+    return (
+        db.query(CustomerPayment)
+        .filter(CustomerPayment.customer_id == customer_id)
+        .order_by(CustomerPayment.received_on.desc())
+        .all()
+    )
+
+
+@router.delete("/{customer_id}/payments/{payment_id}", response_model=CustomerOut)
+def void_customer_payment(
+    customer_id: str,
+    payment_id: str,
+    user: User = Depends(_pay_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> Customer:
+    org_id = _org_id(user)
+    customer = _owned_customer(db, customer_id, org_id)
+    payment = db.get(CustomerPayment, payment_id)
+    if payment is None or payment.customer_id != customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+    customer.total_received = round((customer.total_received or 0) - payment.amount, 2)
+    customer.recompute_outstanding()
+    db.delete(payment)
     db.commit()
     db.refresh(customer)
     return customer

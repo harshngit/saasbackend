@@ -13,8 +13,15 @@ from app.models.enums import (
 )
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.category import Category
-from app.models.customer import Customer
+from app.models.customer import Customer, CustomerPayment
+from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense
 from app.models.organization import Organization
+from app.models.purchase_invoice import (
+    PAYMENT_STATUSES,
+    PURCHASE_STATUSES,
+    PurchaseInvoice,
+    PurchaseInvoiceItem,
+)
 from app.models.sales_order import ORDER_STATUSES, SalesOrder, SalesOrderItem
 from app.models.password_reset_token import PasswordResetToken
 from app.models.plan import Plan
@@ -42,6 +49,14 @@ __all__ = [
     "ORDER_STATUSES",
     "Attendance",
     "ATTENDANCE_TYPES",
+    "CustomerPayment",
+    "PurchaseInvoice",
+    "PurchaseInvoiceItem",
+    "PURCHASE_STATUSES",
+    "PAYMENT_STATUSES",
+    "Expense",
+    "EXPENSE_STATUSES",
+    "EXPENSE_CATEGORIES",
     "User",
     "RefreshToken",
     "PasswordResetToken",

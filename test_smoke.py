@@ -556,6 +556,65 @@ so_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_
 check("sales officer (view-only products) view -> 200", client.get("/products", headers=so_h).status_code == 200)
 check("sales officer CANNOT create product -> 403", client.post("/products", headers=so_h, json={"name": "x"}).status_code == 403)
 
+print("\n== Purchases + Expenses + Customer Payments (financial modules) ==")
+fin_email = f"fin_{uuid.uuid4().hex[:8]}@firm.com"
+fpr = client.post("/auth/register", json={
+    "organization_name": "Finance Co", "admin_name": "F", "email": fin_email, "password": "Secret@123"}).json()
+fin_hdr = {"Authorization": f"Bearer {fpr['tokens']['access_token']}"}
+
+# --- Purchases: approve adds stock + bumps supplier.total_purchases ---
+fsup = client.post("/suppliers", headers=fin_hdr, json={"name": "Bulk Supplier", "opening_balance": 0}).json()
+fprod = client.post("/products", headers=fin_hdr, json={"name": "Sugar", "total_inventory": 20}).json()
+r = client.post("/purchases", headers=fin_hdr, json={
+    "invoice_number": "INV-100", "supplier_id": fsup["id"], "discount": 100, "tax": 50,
+    "items": [{"product_id": fprod["id"], "quantity": 30, "purchase_price": 40, "tax": 10}]})
+check("create purchase -> 201", r.status_code == 201, r.text)
+pur = r.json()
+pur_id = pur["id"]
+check("purchase total = 30*40-100+50 = 1150", pur["total"] == 1150, pur)
+check("purchase pending, stock not added (20)", client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"] == 20)
+r = client.patch(f"/purchases/{pur_id}/approve", headers=fin_hdr)
+check("approve purchase -> approved", r.status_code == 200 and r.json()["status"] == "approved", r.text)
+check("stock added after approve (20+30=50)", client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"] == 50)
+check("supplier.total_purchases bumped to 1150",
+      client.get(f"/suppliers/{fsup['id']}", headers=fin_hdr).json()["total_purchases"] == 1150)
+check("supplier outstanding = 1150 (0 opening + 1150 purchases - 0 paid)",
+      client.get(f"/suppliers/{fsup['id']}", headers=fin_hdr).json()["outstanding_payable"] == 1150)
+# cancel reverses
+r = client.patch(f"/purchases/{pur_id}/cancel", headers=fin_hdr, json={"reason": "wrong order"})
+check("cancel purchase reverses stock (back to 20)", client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"] == 20)
+check("cancel reverses supplier.total_purchases to 0",
+      client.get(f"/suppliers/{fsup['id']}", headers=fin_hdr).json()["total_purchases"] == 0)
+
+# --- Expenses: submit -> approve/reject ---
+r = client.post("/expenses", headers=fin_hdr, json={"category": "Petrol/Diesel", "amount": 800, "description": "Fuel", "payment_mode": "cash"})
+check("create expense -> pending", r.status_code == 201 and r.json()["status"] == "pending", r.text)
+exp_id = r.json()["id"]
+check("expense categories endpoint", len(client.get("/expenses/categories", headers=fin_hdr).json()["categories"]) > 5)
+r = client.patch(f"/expenses/{exp_id}/approve", headers=fin_hdr)
+check("approve expense -> approved", r.status_code == 200 and r.json()["status"] == "approved", r.text)
+check("approve again -> 400", client.patch(f"/expenses/{exp_id}/approve", headers=fin_hdr).status_code == 400)
+r2 = client.post("/expenses", headers=fin_hdr, json={"category": "Food and Travel", "amount": 200}).json()
+r = client.patch(f"/expenses/{r2['id']}/reject", headers=fin_hdr, json={"reason": "no receipt"})
+check("reject expense -> rejected + reason", r.status_code == 200 and r.json()["status"] == "rejected" and r.json()["reject_reason"] == "no receipt", r.text)
+check("filter expenses by status=approved", all(e["status"] == "approved" for e in client.get("/expenses", headers=fin_hdr, params={"status": "approved"}).json()))
+
+# --- Customer Payments + receivables from orders ---
+fcust = client.post("/customers", headers=fin_hdr, json={"name": "Regular Buyer", "opening_balance": 500}).json()
+check("customer opening_balance -> outstanding 500", fcust["outstanding_balance"] == 500, fcust)
+# order for this customer, approve -> billed
+o = client.post("/orders", headers=fin_hdr, json={"customer_id": fcust["id"], "items": [{"product_id": fprod["id"], "quantity": 2, "unit_price": 100}]}).json()
+client.patch(f"/orders/{o['id']}/approve", headers=fin_hdr)
+after_order = client.get(f"/customers/{fcust['id']}", headers=fin_hdr).json()
+check("order approve bills customer (outstanding 500+200=700)", after_order["outstanding_balance"] == 700, after_order)
+# record payment
+r = client.post(f"/customers/{fcust['id']}/payments", headers=fin_hdr, json={"amount": 300, "payment_mode": "upi"})
+check("customer payment -> received 300, outstanding 400", r.status_code == 201 and r.json()["total_received"] == 300 and r.json()["outstanding_balance"] == 400, r.text)
+pays = client.get(f"/customers/{fcust['id']}/payments", headers=fin_hdr).json()
+check("customer payment history -> 1", len(pays) == 1, pays)
+r = client.delete(f"/customers/{fcust['id']}/payments/{pays[0]['id']}", headers=fin_hdr)
+check("void customer payment -> outstanding back to 700", r.status_code == 200 and r.json()["outstanding_balance"] == 700, r.text)
+
 print("\n== Sales Orders (lifecycle + stock deduction/restore) ==")
 so_email = f"so_{uuid.uuid4().hex[:8]}@firm.com"
 sopr = client.post("/auth/register", json={

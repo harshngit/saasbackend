@@ -25,6 +25,9 @@ class CustomerOut(BaseModel):
     assigned_sales_officer_id: str | None
     assigned_sales_officer: AssigneeBrief | None
     credit_limit: float
+    opening_balance: float
+    total_billed: float
+    total_received: float
     outstanding_balance: float
     category: str | None
     notes: str | None
@@ -43,6 +46,7 @@ class CustomerCreate(BaseModel):
     delivery_address: str | None = None
     assigned_sales_officer_id: str | None = None
     credit_limit: float = Field(default=0, ge=0)
+    opening_balance: float = Field(default=0, ge=0)  # prior dues, if any
     category: str | None = Field(default=None, max_length=100)
     notes: str | None = None
 
@@ -50,6 +54,29 @@ class CustomerCreate(BaseModel):
     @classmethod
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
+
+
+class CustomerPaymentCreate(BaseModel):
+    amount: float = Field(gt=0)
+    payment_mode: str = Field(default="cash", max_length=30)
+    reference: str | None = Field(default=None, max_length=150)
+    note: str | None = None
+    order_id: str | None = None
+    received_on: datetime | None = None
+
+
+class CustomerPaymentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    customer_id: str
+    order_id: str | None
+    amount: float
+    payment_mode: str
+    reference: str | None
+    note: str | None
+    received_on: datetime
+    created_at: datetime
 
 
 class CustomerUpdate(BaseModel):

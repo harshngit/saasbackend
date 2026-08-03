@@ -188,6 +188,12 @@ def approve_order(
     order.status = "confirmed"
     order.stock_deducted = True
     order.approved_at = datetime.now(timezone.utc)
+    # Add to the customer's receivables (billed).
+    if order.customer_id:
+        customer = db.get(Customer, order.customer_id)
+        if customer:
+            customer.total_billed = round((customer.total_billed or 0) + order.total, 2)
+            customer.recompute_outstanding()
     db.commit()
     db.refresh(order)
     return order
@@ -248,6 +254,12 @@ def cancel_order(
     if order.stock_deducted:
         _move_stock(db, order, sign=+1, movement_type="sales_return", user_id=user.id)
         order.stock_deducted = False
+        # Reverse the customer's receivable for this order.
+        if order.customer_id:
+            customer = db.get(Customer, order.customer_id)
+            if customer:
+                customer.total_billed = round((customer.total_billed or 0) - order.total, 2)
+                customer.recompute_outstanding()
     order.status = "cancelled"
     if payload.reason:
         order.reject_reason = payload.reason
