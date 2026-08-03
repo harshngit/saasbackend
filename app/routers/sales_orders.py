@@ -22,6 +22,7 @@ from app.schemas.sales_order import (
     OrderOut,
     RejectBody,
 )
+from app.services import notification_service
 
 router = APIRouter(prefix="/orders", tags=["sales_orders"])
 
@@ -168,6 +169,10 @@ def create_order(
     order.subtotal = round(subtotal, 2)
     order.total = round(subtotal - payload.discount + payload.tax, 2)
     db.add(order)
+    db.flush()
+    notification_service.notify_org_admins(
+        db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
+        type="order", link=order.id)
     db.commit()
     db.refresh(order)
     return order

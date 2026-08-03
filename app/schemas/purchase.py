@@ -89,3 +89,19 @@ class PaymentStatusUpdate(BaseModel):
 
 class CancelBody(BaseModel):
     reason: str | None = None
+
+
+class ReturnItem(BaseModel):
+    product_id: str
+    variant_id: str | None = None
+    quantity: int = Field(gt=0)
+
+    @field_validator("variant_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        return None if v == "" else v
+
+
+class PurchaseReturnBody(BaseModel):
+    items: list[ReturnItem] = Field(min_length=1)
+    reason: str | None = None

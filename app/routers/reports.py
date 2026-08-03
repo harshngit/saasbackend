@@ -45,6 +45,11 @@ def _to_xlsx(report: dict) -> bytes:
     return buf.getvalue()
 
 
+def _s(text) -> str:
+    """Make text safe for fpdf's latin-1 core fonts (replace unencodable chars)."""
+    return str("" if text is None else text).encode("latin-1", "replace").decode("latin-1")
+
+
 def _to_pdf(report: dict) -> bytes:
     from fpdf import FPDF
     from fpdf.enums import XPos, YPos
@@ -52,12 +57,12 @@ def _to_pdf(report: dict) -> bytes:
     pdf = FPDF(orientation="L")
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, f"Report: {report['type']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 10, _s(f"Report: {report['type']}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", size=9)
     if report.get("date_from") or report.get("date_to"):
-        pdf.cell(0, 6, f"Period: {report.get('date_from') or '-'} to {report.get('date_to') or '-'}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 6, _s(f"Period: {report.get('date_from') or '-'} to {report.get('date_to') or '-'}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     for key, value in report["summary"].items():
-        pdf.cell(0, 6, f"{key}: {value}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 6, _s(f"{key}: {value}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(3)
     rows = report["rows"]
     if rows:
@@ -65,13 +70,12 @@ def _to_pdf(report: dict) -> bytes:
         col_w = max(20, min(60, 270 // max(1, len(headers))))
         pdf.set_font("Helvetica", "B", 8)
         for h in headers:
-            pdf.cell(col_w, 6, str(h)[:22], border=1)
+            pdf.cell(col_w, 6, _s(str(h)[:22]), border=1)
         pdf.ln()
         pdf.set_font("Helvetica", size=8)
         for r in rows[:500]:
             for h in headers:
-                val = r.get(h)
-                pdf.cell(col_w, 6, ("" if val is None else str(val))[:22], border=1)
+                pdf.cell(col_w, 6, _s(str(r.get(h) if r.get(h) is not None else ""))[:22], border=1)
             pdf.ln()
     return bytes(pdf.output())
 

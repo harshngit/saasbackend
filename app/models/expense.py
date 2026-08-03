@@ -6,7 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 
-EXPENSE_STATUSES = {"pending", "approved", "rejected"}
+EXPENSE_STATUSES = {"pending", "approved", "rejected", "clarification_requested"}
 # Suggested categories (free-form; frontend can offer these).
 EXPENSE_CATEGORIES = [
     "Petrol/Diesel", "Food and Travel", "Office Expenses", "Rent", "Utilities",

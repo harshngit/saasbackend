@@ -556,6 +556,56 @@ so_h = {"Authorization": f"Bearer {client.post('/auth/login', json={'email': so_
 check("sales officer (view-only products) view -> 200", client.get("/products", headers=so_h).status_code == 200)
 check("sales officer CANNOT create product -> 403", client.post("/products", headers=so_h, json={"name": "x"}).status_code == 403)
 
+print("\n== Notifications + receipts + uploads + purchase-return ==")
+import io  # noqa: E402
+nt_email = f"nt_{uuid.uuid4().hex[:8]}@firm.com"
+ntr = client.post("/auth/register", json={
+    "organization_name": "Notif Co", "admin_name": "N", "email": nt_email, "password": "Secret@123"}).json()
+nt_hdr = {"Authorization": f"Bearer {ntr['tokens']['access_token']}"}
+
+# order creation notifies the admin
+ncust = client.post("/customers", headers=nt_hdr, json={"name": "C"}).json()
+nprod = client.post("/products", headers=nt_hdr, json={"name": "P", "total_inventory": 50}).json()
+client.post("/orders", headers=nt_hdr, json={"customer_id": ncust["id"], "items": [{"product_id": nprod["id"], "quantity": 2, "unit_price": 100}]})
+check("unread-count after order = 1", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 1)
+notes = client.get("/notifications", headers=nt_hdr).json()
+check("notifications list has the order note", len(notes) == 1 and notes[0]["type"] == "order", notes)
+nid = notes[0]["id"]
+check("mark read -> is_read true", client.patch(f"/notifications/{nid}/read", headers=nt_hdr).json()["is_read"] is True)
+check("unread-count now 0", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 0)
+# submit an expense -> another notification, then read-all
+client.post("/expenses", headers=nt_hdr, json={"category": "Rent", "amount": 100})
+check("unread 1 after expense", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 1)
+check("read-all works", client.patch("/notifications/read-all", headers=nt_hdr).status_code == 200)
+check("unread 0 after read-all", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 0)
+
+# customer payment + receipt PDF
+client.post(f"/customers/{ncust['id']}/payments", headers=nt_hdr, json={"amount": 150})
+pid_ = client.get(f"/customers/{ncust['id']}/payments", headers=nt_hdr).json()[0]["id"]
+rc = client.get(f"/customers/{ncust['id']}/payments/receipt/{pid_}", headers=nt_hdr)
+check("payment receipt PDF", rc.status_code == 200 and rc.content[:4] == b"%PDF", rc.status_code)
+
+# expense receipt upload (PDF allowed) + request-clarification
+ex = client.post("/expenses", headers=nt_hdr, json={"category": "Fuel", "amount": 500}).json()
+r = client.post(f"/expenses/{ex['id']}/receipt", headers=nt_hdr, files={"file": ("bill.pdf", io.BytesIO(b"%PDF-1.4 fake"), "application/pdf")})
+check("expense receipt upload (PDF) -> 200", r.status_code == 200 and r.json()["receipt_url"].startswith("data:application/pdf"), r.text)
+check("upload non-allowed type -> 400",
+      client.post(f"/expenses/{ex['id']}/receipt", headers=nt_hdr, files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
+r = client.patch(f"/expenses/{ex['id']}/request-clarification", headers=nt_hdr, json={"reason": "attach GST bill"})
+check("request-clarification -> status", r.status_code == 200 and r.json()["status"] == "clarification_requested", r.text)
+
+# purchase document upload + return
+nsup = client.post("/suppliers", headers=nt_hdr, json={"name": "Sup"}).json()
+pinv = client.post("/purchases", headers=nt_hdr, json={"invoice_number": "PX", "supplier_id": nsup["id"], "items": [{"product_id": nprod["id"], "quantity": 20, "purchase_price": 10}]}).json()
+r = client.post(f"/purchases/{pinv['id']}/documents", headers=nt_hdr, files={"file": ("scan.jpg", io.BytesIO(b"\xff\xd8\xff"), "image/jpeg")})
+check("purchase document upload -> 200", r.status_code == 200 and r.json()["attachment_url"].startswith("data:image/jpeg"), r.text)
+client.patch(f"/purchases/{pinv['id']}/approve", headers=nt_hdr)  # stock 50 -> 70, supplier purchases +200
+check("stock after purchase approve = 70", client.get(f"/inventory/{nprod['id']}", headers=nt_hdr).json()["total_stock"] == 70)
+r = client.post(f"/purchases/{pinv['id']}/returns", headers=nt_hdr, json={"items": [{"product_id": nprod["id"], "quantity": 5}], "reason": "damaged"})
+check("purchase return -> 200", r.status_code == 200, r.text)
+check("stock after return = 65", client.get(f"/inventory/{nprod['id']}", headers=nt_hdr).json()["total_stock"] == 65)
+check("supplier payable reduced by 50 (200-50=150)", client.get(f"/suppliers/{nsup['id']}", headers=nt_hdr).json()["total_purchases"] == 150)
+
 print("\n== Reports module (aggregations + export) ==")
 rep_email = f"rep_{uuid.uuid4().hex[:8]}@firm.com"
 rpr = client.post("/auth/register", json={

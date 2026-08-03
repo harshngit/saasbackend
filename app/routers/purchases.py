@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
+from app.core.files import store_upload
 from app.models import (
     PAYMENT_STATUSES,
     Product,
@@ -21,6 +22,7 @@ from app.schemas.purchase import (
     PurchaseCreate,
     PurchaseItemIn,
     PurchaseOut,
+    PurchaseReturnBody,
     PurchaseUpdate,
 )
 
@@ -252,6 +254,71 @@ def cancel_purchase(
                 supplier.total_purchases = round((supplier.total_purchases or 0) - inv.total, 2)
         inv.stock_added = False
     inv.status = "cancelled"
+    db.commit()
+    db.refresh(inv)
+    return inv
+
+
+@router.post("/{invoice_id}/documents", response_model=PurchaseOut)
+def upload_document(
+    invoice_id: str,
+    file: UploadFile = File(...),
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> PurchaseInvoice:
+    """Attach a supporting document (invoice scan/photo — image or PDF, max 10 MB)."""
+    inv = _owned(db, invoice_id, _org_id(user))
+    inv.attachment_url = store_upload(file)
+    db.commit()
+    db.refresh(inv)
+    return inv
+
+
+@router.post("/{invoice_id}/returns", response_model=PurchaseOut)
+def purchase_return(
+    invoice_id: str,
+    payload: PurchaseReturnBody,
+    user: User = Depends(_approve),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> PurchaseInvoice:
+    """Return items to the supplier: removes stock and reduces the supplier's payable."""
+    org_id = _org_id(user)
+    inv = _owned(db, invoice_id, org_id)
+    if inv.status != "approved":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only approved invoices can be returned")
+    reversed_value = 0.0
+    for ri in payload.items:
+        match = next((i for i in inv.items if i.product_id == ri.product_id and i.variant_id == ri.variant_id), None)
+        price = match.purchase_price if match else 0
+        if ri.variant_id:
+            variant = db.get(ProductVariant, ri.variant_id)
+            if variant is None:
+                continue
+            new_bal = (variant.inventory or 0) - ri.quantity
+            if new_bal < 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot return more than in stock")
+            variant.inventory = new_bal
+        else:
+            product = db.get(Product, ri.product_id) if ri.product_id else None
+            if product is None:
+                continue
+            new_bal = (product.total_inventory or 0) - ri.quantity
+            if new_bal < 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot return more than in stock")
+            product.total_inventory = new_bal
+        db.add(StockMovement(
+            organization_id=org_id, product_id=ri.product_id, variant_id=ri.variant_id,
+            movement_type="purchase_return", quantity=-ri.quantity, balance_after=new_bal,
+            note=f"Return on {inv.invoice_number}" + (f" — {payload.reason}" if payload.reason else ""),
+            created_by=user.id,
+        ))
+        reversed_value += price * ri.quantity
+    if inv.supplier_id and reversed_value:
+        supplier = db.get(Supplier, inv.supplier_id)
+        if supplier:
+            supplier.total_purchases = round((supplier.total_purchases or 0) - reversed_value, 2)
     db.commit()
     db.refresh(inv)
     return inv

@@ -16,6 +16,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Attendance,
     Category,
     Customer,
+    Notification,
     Organization,
     Plan,
     Product,
@@ -36,6 +37,7 @@ from app.routers import (
     customers,
     expenses,
     inventory,
+    notifications,
     organizations,
     plans,
     products,
@@ -70,7 +72,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "reports-module"
+BUILD_TAG = "notifications-receipts-uploads"
 
 
 @app.on_event("startup")
@@ -125,6 +127,7 @@ app.include_router(purchases.router)
 app.include_router(expenses.router)
 app.include_router(attendance.router)
 app.include_router(reports.router)
+app.include_router(notifications.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(superadmin.router)

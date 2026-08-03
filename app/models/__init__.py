@@ -15,6 +15,7 @@ from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.category import Category
 from app.models.customer import Customer, CustomerPayment
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense
+from app.models.notification import Notification
 from app.models.organization import Organization
 from app.models.purchase_invoice import (
     PAYMENT_STATUSES,
@@ -57,6 +58,7 @@ __all__ = [
     "Expense",
     "EXPENSE_STATUSES",
     "EXPENSE_CATEGORIES",
+    "Notification",
     "User",
     "RefreshToken",
     "PasswordResetToken",

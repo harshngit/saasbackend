@@ -1,11 +1,12 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
+from app.core.pdf_docs import payment_receipt_pdf
 from app.models import Customer, CustomerPayment, User
 from app.schemas.customer import (
     CustomerCreate,
@@ -156,6 +157,26 @@ def list_customer_payments(
         .filter(CustomerPayment.customer_id == customer_id)
         .order_by(CustomerPayment.received_on.desc())
         .all()
+    )
+
+
+@router.get("/{customer_id}/payments/receipt/{payment_id}")
+def payment_receipt(
+    customer_id: str,
+    payment_id: str,
+    user: User = Depends(_pay_view),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Download a PDF receipt for a customer payment."""
+    org_id = _org_id(user)
+    customer = _owned_customer(db, customer_id, org_id)
+    payment = db.get(CustomerPayment, payment_id)
+    if payment is None or payment.customer_id != customer_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+    pdf = payment_receipt_pdf(user.organization, customer, payment)
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="receipt-{payment_id[:8]}.pdf"'},
     )
 
 
