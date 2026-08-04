@@ -1307,6 +1307,128 @@ check("GET /sales-returns list -> 200", r.status_code == 200 and len(r.json()) >
 r = client.get(f"/sales-returns/{ret_obj['id']}", headers=fin_hdr)
 check("GET /sales-returns/{id} detail -> 200", r.status_code == 200, r.text)
 
+print("\n== Employee profile on users ==")
+emp_email = f"emp_{uuid.uuid4().hex[:8]}@firm.com"
+r = client.post("/users", headers=fin_hdr, json={
+    "name": "Ravi Kumar", "email": emp_email, "username": f"emp_{uuid.uuid4().hex[:8]}",
+    "password": "Staff@123", "role": "sales_officer",
+    "employee_id": "EMP-9001", "first_name": "Ravi", "last_name": "Kumar",
+    "designation": "Field Sales Executive", "employment_type": "Full Time",
+    "date_of_joining": "2026-01-15T00:00:00Z", "employee_status": "On-Leave",
+})
+check("create employee with profile -> 201", r.status_code == 201, r.text)
+emp = r.json()
+check("employee_id stored", emp["employee_id"] == "EMP-9001", emp)
+check("first/last name stored", emp["first_name"] == "Ravi" and emp["last_name"] == "Kumar", emp)
+check("designation stored", emp["designation"] == "Field Sales Executive", emp)
+check("employment_type normalized 'Full Time' -> full_time", emp["employment_type"] == "full_time", emp)
+check("employee_status normalized 'On-Leave' -> on_leave", emp["employee_status"] == "on_leave", emp)
+check("date_of_joining stored", (emp["date_of_joining"] or "").startswith("2026-01-15"), emp)
+
+# employee_id is auto-assigned when omitted, and unique per firm
+r = client.post("/users", headers=fin_hdr, json={
+    "name": "Auto Coded", "email": f"auto_{uuid.uuid4().hex[:8]}@firm.com",
+    "username": f"auto_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant"})
+auto_emp = r.json()
+check("employee_id auto-assigned EMP-####",
+      r.status_code == 201 and (auto_emp["employee_id"] or "").startswith("EMP-"), r.text)
+check("employee_status defaults to active", auto_emp["employee_status"] == "active", auto_emp)
+check("duplicate employee_id -> 409", client.post("/users", headers=fin_hdr, json={
+    "name": "Dupe", "email": f"dup_{uuid.uuid4().hex[:8]}@firm.com",
+    "username": f"dup_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant",
+    "employee_id": "EMP-9001"}).status_code == 409)
+check("invalid employment_type -> 422", client.post("/users", headers=fin_hdr, json={
+    "name": "Bad", "email": f"bad_{uuid.uuid4().hex[:8]}@firm.com",
+    "username": f"bad_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant",
+    "employment_type": "freelance-ish"}).status_code == 422)
+
+# Filters
+check("filter by employee_status=on_leave",
+      any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"employee_status": "on_leave"}).json()))
+check("filter by employment_type=full_time",
+      any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"employment_type": "full_time"}).json()))
+check("filter by designation",
+      [u["id"] for u in client.get("/users", headers=fin_hdr, params={"designation": "Field Sales Executive"}).json()] == [emp["id"]])
+check("search by employee_id",
+      any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"search": "EMP-9001"}).json()))
+check("search by name",
+      any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"search": "Ravi"}).json()))
+
+# Edit the profile
+r = client.patch(f"/users/{emp['id']}", headers=fin_hdr,
+                 json={"designation": "Senior Sales Executive", "employee_status": "active", "phone": "9812345678"})
+check("PATCH employee profile -> 200",
+      r.status_code == 200 and r.json()["designation"] == "Senior Sales Executive"
+      and r.json()["employee_status"] == "active" and r.json()["phone"] == "9812345678", r.text)
+check("PATCH to a taken employee_id -> 409",
+      client.patch(f"/users/{auto_emp['id']}", headers=fin_hdr, json={"employee_id": "EMP-9001"}).status_code == 409)
+check("PATCH keeping own employee_id -> 200",
+      client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={"employee_id": "EMP-9001"}).status_code == 200)
+
+# Options endpoint for the employee form
+r = client.get("/users/meta/employee-options", headers=fin_hdr)
+opts = r.json()
+check("GET employee-options -> 200", r.status_code == 200, r.text)
+check("options list employment types", "full_time" in opts["employment_types"] and "contract" in opts["employment_types"], opts)
+check("options list employee statuses", "on_leave" in opts["employee_statuses"], opts)
+check("options include designations in use", "Senior Sales Executive" in opts["designations"], opts)
+
+# Identity proof upload
+r = client.post(f"/users/{emp['id']}/identity-proof", headers=fin_hdr,
+                files={"file": ("aadhaar.pdf", io.BytesIO(b"%PDF-1.4 id"), "application/pdf")})
+check("upload identity proof -> data URL",
+      r.status_code == 200 and r.json()["url"].startswith("data:application/pdf;base64,"), r.text)
+check("user detail reflects identity proof",
+      (client.get(f"/users/{emp['id']}", headers=fin_hdr).json()["identify_proofs"] or "").startswith("data:application/pdf"))
+check("identity proof rejects non-document -> 400",
+      client.post(f"/users/{emp['id']}/identity-proof", headers=fin_hdr,
+                  files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
+check("employee profile visible on /auth/me",
+      "employee_id" in client.get("/auth/me", headers=fin_hdr).json()["user"])
+
+print("\n== DELETE user ==")
+check("delete own account -> 400",
+      client.delete(f"/users/{client.get('/auth/me', headers=fin_hdr).json()['user']['id']}", headers=fin_hdr).status_code == 400)
+check("cross-org delete -> 404",
+      client.delete(f"/users/{emp['id']}", headers=min_hdr).status_code == 404)
+check("staff cannot delete users -> 403", client.delete(f"/users/{emp['id']}", headers=st_hdr).status_code == 403)
+
+r = client.delete(f"/users/{auto_emp['id']}", headers=fin_hdr)
+check("DELETE /users/{id} -> 204", r.status_code == 204, r.text)
+check("GET deleted user -> 404", client.get(f"/users/{auto_emp['id']}", headers=fin_hdr).status_code == 404)
+check("deleted user gone from list",
+      all(u["id"] != auto_emp["id"] for u in client.get("/users", headers=fin_hdr).json()))
+
+# A delivery partner holding stock cannot be deleted until the loading is closed.
+dp2_email = f"dp2_{uuid.uuid4().hex[:8]}@firm.com"
+dp2 = client.post("/users", headers=fin_hdr, json={
+    "name": "DP Two", "email": dp2_email, "username": f"dp2_{uuid.uuid4().hex[:8]}",
+    "password": "Partner@123", "role": "delivery_partner"}).json()
+client.post("/purchase-invoices", headers=fin_hdr, json={
+    "invoice_number": f"PI-{uuid.uuid4().hex[:6]}", "supplier_id": fsup["id"],
+    "items": [{"product_id": fprod["id"], "quantity": 20, "purchase_price": 50}]})
+client.patch(f"/purchase-invoices/{client.get('/purchase-invoices', headers=fin_hdr).json()[0]['id']}/approve", headers=fin_hdr)
+dp2_load = client.post("/vehicle-stock/loading", headers=fin_hdr, json={
+    "delivery_partner_id": dp2["id"], "items": [{"product_id": fprod["id"], "loaded_qty": 4}]}).json()
+check("delete partner with open loading -> 409",
+      client.delete(f"/users/{dp2['id']}", headers=fin_hdr).status_code == 409)
+client.post(f"/vehicle-stock/{dp2_load['id']}/end-of-day", headers=fin_hdr,
+            json={"items": [{"product_id": fprod["id"], "returned_qty": 4}]})
+check("delete partner after closing loading -> 204",
+      client.delete(f"/users/{dp2['id']}", headers=fin_hdr).status_code == 204)
+
+# Deleting a user keeps the business history, with the link nulled out.
+check("order survives its delivery partner's deletion",
+      client.get(f"/orders/{o_del['id']}", headers=fin_hdr).status_code == 200)
+r = client.delete(f"/users/{dp_user['id']}", headers=fin_hdr)
+check("delete the original delivery partner -> 204", r.status_code == 204, r.text)
+o_after = client.get(f"/orders/{o_del['id']}", headers=fin_hdr)
+check("order still readable after partner deleted", o_after.status_code == 200, o_after.text)
+check("order's assigned_delivery_partner_id nulled",
+      o_after.json().get("assigned_delivery_partner_id") is None, o_after.text)
+check("deleted user can no longer log in -> 401",
+      client.post("/auth/login", json={"email": dp_email, "password": "Partner@123"}).status_code == 401)
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

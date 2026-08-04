@@ -79,7 +79,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "notifications-receipts-uploads"
+BUILD_TAG = "employee-profile-user-delete"
 
 
 @app.on_event("startup")

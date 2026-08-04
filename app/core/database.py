@@ -159,6 +159,7 @@ def relax_not_null_columns() -> None:
 # Columns whose type must be widened on an existing DB (e.g. VARCHAR -> TEXT).
 _WIDEN_TO_TEXT = [
     ("organizations", "logo_url"),  # now holds base64 data: URLs, too big for VARCHAR(500)
+    ("users", "identify_proofs"),   # same: holds an uploaded ID document as a data: URL
 ]
 
 

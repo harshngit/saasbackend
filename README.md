@@ -81,12 +81,39 @@ Once the server is running, open:
 | POST   | `/auth/forgot-password` | Public  | Email a reset link (always 200, no leak)   |
 | POST   | `/auth/reset-password`  | Public  | Set a new password using the emailed token |
 | POST   | `/auth/change-password` | Authenticated | Change own password (needs current)  |
-| POST   | `/users`         | Admin          | Create a staff user in the firm            |
-| GET    | `/users`         | Admin          | List users in the firm                     |
+| POST   | `/users`         | Admin          | Create a staff user + employee profile     |
+| GET    | `/users`         | Admin          | List/search employees (role, status, designation, employment type) |
+| GET    | `/users/{id}`    | Admin          | One employee                               |
+| PATCH  | `/users/{id}`    | Admin          | Edit account details + employee profile    |
+| DELETE | `/users/{id}`    | Admin          | Permanently remove an employee             |
+| PATCH  | `/users/{id}/role` | Admin        | Reassign the staff member's role           |
 | PATCH  | `/users/{id}/status` | Admin      | Activate / deactivate a firm user          |
 | POST   | `/users/{id}/reset-password` | Admin | Admin sets a staff member's password    |
+| POST   | `/users/{id}/identity-proof` | Admin | Upload an ID document (image/PDF)       |
+| GET    | `/users/meta/employee-options` | Admin | Dropdown data for the employee form   |
 
 Send the access token as `Authorization: Bearer <token>`.
+
+## Employees
+
+A user *is* the employee record — the HR fields (`employee_id`, `first_name`,
+`last_name`, `designation`, `employment_type`, `date_of_joining`,
+`employee_status`, `identify_proofs`) ride on the same object and are accepted by
+both `POST /users` and `PATCH /users/{id}`.
+
+- `employee_id` is a per-firm series. Omit it and the next free `EMP-0001`,
+  `EMP-0002`, … is assigned; supplying one that's already used returns `409`.
+- `employment_type` ∈ `full_time | part_time | contract | intern | temporary` and
+  `employee_status` ∈ `active | probation | on_leave | notice_period | resigned |
+  terminated`. Input is normalized, so `"Full Time"` and `"Full-time"` both work;
+  anything outside the list is a `422`. `employee_status` is the HR lifecycle —
+  `is_active` (via `PATCH /users/{id}/status`) is what controls login.
+- `DELETE /users/{id}` is a hard delete: the user's own rows (attendance,
+  notifications, sessions) go with them, while records that merely reference them
+  (customers, leads, quotations, sales orders) survive with the link nulled out.
+  You can't delete yourself, and a delivery partner with an open vehicle loading
+  returns `409` until the end-of-day is recorded. Deactivate instead when the
+  history should stay attributed.
 
 ## Password reset (SMTP)
 
