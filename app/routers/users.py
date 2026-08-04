@@ -39,6 +39,18 @@ _PROFILE_FIELDS = (
 )
 
 
+def _resolve_role(db: Session, admin: User, role_id: str | None, role_name: str | None) -> Role:
+    """Turn the payload's role_id / role name into one of the firm's roles."""
+    role = role_service.resolve_role(db, admin.organization_id, role_id=role_id, role_name=role_name)
+    if role is None:
+        available = ", ".join(role_service.role_names(db, admin.organization_id))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{role_id or role_name}' is not a role in your firm. Available roles: {available}",
+        )
+    return role
+
+
 def _owned_user(db: Session, user_id: str, admin: User) -> User:
     target = db.get(User, user_id)
     if target is None or target.organization_id != admin.organization_id:
@@ -104,17 +116,9 @@ def create_staff(
     db: Session = Depends(get_db),
 ) -> User:
     """Admin creates a staff user in their firm. Accepts `role_id` (preferred) or a
-    legacy `role` enum (mapped to the org's matching default role). The employee
+    `role` name — any role from the firm's Roles page, not a fixed list. The employee
     profile fields are all optional; `employee_id` is auto-assigned if omitted."""
-    # Resolve the role (must belong to the admin's org).
-    if payload.role_id is not None:
-        role = role_service.get_role_in_org(db, admin.organization_id, payload.role_id)
-        if role is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="role_id is not a role in your firm")
-    else:
-        role = role_service.default_role_for_legacy(db, admin.organization_id, payload.role)
-        if role is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown role")
+    role = _resolve_role(db, admin, payload.role_id, payload.role)
 
     if _email_taken(db, payload.email):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
@@ -233,13 +237,11 @@ def change_role(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> User:
-    """Assign a staff member to a different role within the same firm."""
+    """Assign a staff member to a different role within the same firm (by id or name)."""
     target = _owned_user(db, user_id, admin)
     if target.id == admin.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot change your own role")
-    role = role_service.get_role_in_org(db, admin.organization_id, payload.role_id)
-    if role is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="role_id is not a role in your firm")
+    role = _resolve_role(db, admin, payload.role_id, payload.role)
     target.role_id = role.id
     target.role = LEGACY_ROLE_BY_NAME.get(role.name)
     db.commit()

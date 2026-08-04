@@ -475,6 +475,52 @@ client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": cr["
 check("delete custom role with assigned user -> 400",
       client.delete(f"/roles/{cr['id']}", headers=p2_hdr).status_code == 400)
 
+print("\n== staff creation accepts custom roles from the Roles page ==")
+hr_role = client.post("/roles", headers=p2_hdr, json={
+    "name": "HR", "permissions": {"customers": {"view": True}}}).json()
+check("create custom role HR -> id", "id" in hr_role, hr_role)
+
+# By role_id — what the frontend should send after loading GET /roles.
+r = client.post("/users", headers=p2_hdr, json={
+    "name": "Rahul Sharma", "email": f"hr1_{uuid.uuid4().hex[:6]}@f.com",
+    "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Rahul@12345", "role_id": hr_role["id"]})
+check("create staff with custom role_id -> 201", r.status_code == 201, r.text)
+check("custom-role staff has no legacy enum role", r.json()["role"] is None, r.text)
+check("custom-role staff carries the role name", r.json()["role_detail"]["name"] == "HR", r.text)
+
+# By name — "hr" used to 422 against the fixed enum.
+r = client.post("/users", headers=p2_hdr, json={
+    "name": "Priya", "email": f"hr2_{uuid.uuid4().hex[:6]}@f.com",
+    "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Priya@12345", "role": "hr"})
+check("create staff with custom role name -> 201", r.status_code == 201, r.text)
+check("role name resolved to the HR role", r.json()["role_id"] == hr_role["id"], r.text)
+
+# Legacy enum values still resolve, via the default role of the same name.
+r = client.post("/users", headers=p2_hdr, json={
+    "name": "Legacy", "email": f"hr3_{uuid.uuid4().hex[:6]}@f.com",
+    "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Legacy@12345", "role": "sales_officer"})
+check("legacy role=sales_officer still -> 201", r.status_code == 201, r.text)
+check("legacy role maps to the Sales Officer role", r.json()["role_detail"]["name"] == "Sales Officer", r.text)
+
+r = client.post("/users", headers=p2_hdr, json={
+    "name": "Ghost", "email": f"hr4_{uuid.uuid4().hex[:6]}@f.com",
+    "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Ghost@12345", "role": "no_such_role"})
+check("unknown role name -> 400 (not 422)", r.status_code == 400, r.text)
+check("400 lists the firm's roles", "HR" in r.json()["detail"], r.text)
+
+# Cross-org role name must not leak in either.
+check("cross-org role name -> 400",
+      client.post("/users", headers=p2_hdr, json={
+          "name": "X", "email": f"hr5_{uuid.uuid4().hex[:6]}@f.com",
+          "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Staff@123",
+          "role": "Senior Sales Officer"}).status_code == 400)
+
+# PATCH /role accepts a name too.
+r = client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role": "HR"})
+check("PATCH /users/{id}/role by name -> 200", r.status_code == 200 and r.json()["role_id"] == hr_role["id"], r.text)
+check("PATCH /role with neither id nor name -> 422",
+      client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={}).status_code == 422)
+
 print("\n== Categories + Products module (CRUD, variants, bulk-delete, permissions) ==")
 cp_email = f"cp_{uuid.uuid4().hex[:8]}@firm.com"
 cpr = client.post("/auth/register", json={

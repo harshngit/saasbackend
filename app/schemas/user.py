@@ -94,8 +94,9 @@ class UserOut(BaseModel):
 
 
 class StaffCreate(EmployeeProfileIn):
-    """Admin creates a staff user. Prefer `role_id`; `role` (legacy enum) still
-    accepted for backward-compat and mapped to the org's matching default role.
+    """Admin creates a staff user. Prefer `role_id` (from GET /roles); `role` also
+    accepts the role's *name* — any role the firm created on the Roles page, matched
+    case/separator-insensitively, so legacy values like "sales_officer" still work.
     Every employee-profile field is optional — `employee_id` is auto-assigned
     (EMP-0001, EMP-0002, …) when omitted."""
 
@@ -105,7 +106,7 @@ class StaffCreate(EmployeeProfileIn):
     phone: str | None = Field(default=None, max_length=20)
     password: str = Field(min_length=8, max_length=128)
     role_id: str | None = None
-    role: UserRole | None = None
+    role: str | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def _require_a_role(self) -> "StaffCreate":
@@ -125,7 +126,16 @@ class UserUpdate(EmployeeProfileIn):
 
 
 class RoleAssign(BaseModel):
-    role_id: str
+    """Reassign a staff member — by `role_id` (preferred) or by role name."""
+
+    role_id: str | None = None
+    role: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def _require_a_role(self) -> "RoleAssign":
+        if self.role_id is None and self.role is None:
+            raise ValueError("Provide role_id (preferred) or role")
+        return self
 
 
 class UserStatusUpdate(BaseModel):
