@@ -79,7 +79,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "employee-profile-user-delete"
+BUILD_TAG = "fix-not-null-column-backfill"
 
 
 @app.on_event("startup")

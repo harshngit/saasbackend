@@ -1445,6 +1445,14 @@ with _eng.begin() as _c:
     _c.execute(_text("CREATE TABLE organizations (id VARCHAR(36) PRIMARY KEY, name VARCHAR(200))"))
     _c.execute(_text("INSERT INTO organizations (id, name) VALUES ('o1', 'Legacy Co')"))
 
+    # Old-style products table: missing the NOT NULL `inventory_tracking` column.
+    # This is what broke GET /products on prod — the migration used to skip NOT
+    # NULL columns, so every later SELECT hit "column does not exist".
+    _c.execute(_text(
+        "CREATE TABLE products (id VARCHAR(36) PRIMARY KEY, organization_id VARCHAR(36), "
+        "name VARCHAR(200), price FLOAT)"))
+    _c.execute(_text("INSERT INTO products (id, organization_id, name, price) VALUES ('p1','o1','Legacy Bottle',99)"))
+
 import app.core.database as _dbmod  # noqa: E402
 
 _orig_engine = _dbmod.engine
@@ -1457,6 +1465,15 @@ try:
     with _eng.connect() as _c:
         _row = _c.execute(_text("SELECT name FROM organizations WHERE id='o1'")).fetchone()
     check("existing row preserved after migration", _row is not None and _row[0] == "Legacy Co", _row)
+
+    _pcols = {c["name"] for c in _inspect(_eng).get_columns("products")}
+    check("migration added NOT NULL column products.inventory_tracking", "inventory_tracking" in _pcols, _pcols)
+    check("migration added NOT NULL column products.total_inventory", "total_inventory" in _pcols, _pcols)
+    with _eng.connect() as _c:
+        _prow = _c.execute(_text("SELECT name, inventory_tracking, total_inventory FROM products WHERE id='p1'")).fetchone()
+    check("existing product row preserved", _prow is not None and _prow[0] == "Legacy Bottle", _prow)
+    check("NOT NULL backfill uses the model default (inventory_tracking=True)", bool(_prow[1]) is True, _prow)
+    check("NOT NULL backfill uses the model default (total_inventory=0)", _prow[2] == 0, _prow)
 finally:
     _dbmod.engine = _orig_engine
     _eng.dispose()

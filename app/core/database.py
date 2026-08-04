@@ -1,7 +1,23 @@
+import json
 import logging
 from collections.abc import Generator
+from datetime import date, datetime
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    create_engine,
+    event,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -40,13 +56,69 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
+def _sql_literal(value: object) -> str | None:
+    """Render a Python default as a SQL literal for a backfill DEFAULT clause."""
+    if isinstance(value, bool):
+        # SQLite only learned the TRUE/FALSE keywords in 3.23 — 1/0 always works.
+        return ("TRUE" if value else "FALSE") if engine.dialect.name == "postgresql" else ("1" if value else "0")
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    if isinstance(value, (list, dict)):  # JSON columns
+        return "'" + json.dumps(value).replace("'", "''") + "'"
+    if isinstance(value, (datetime, date)):
+        return "CURRENT_TIMESTAMP"
+    return None
+
+
+def _backfill_default(column) -> str | None:  # noqa: ANN001
+    """The DEFAULT to give a NOT NULL column being added to a populated table.
+
+    Uses the model's own default where there is one (so existing rows get the
+    same value a new row would), otherwise falls back to the type's zero value.
+    Returns None when nothing sensible can be derived — those still need a real
+    migration.
+    """
+    default = column.default
+    value = None
+    if default is not None:
+        if getattr(default, "is_scalar", False):
+            value = default.arg
+        elif getattr(default, "is_callable", False):
+            try:
+                value = default.arg(None)  # SQLAlchemy wraps callables to take a context
+            except Exception:  # noqa: BLE001
+                value = None
+    literal = _sql_literal(value) if value is not None else None
+    if literal is not None:
+        return literal
+
+    if isinstance(column.type, Boolean):
+        return _sql_literal(False)
+    if isinstance(column.type, (Integer, Float, Numeric)):
+        return "0"
+    if isinstance(column.type, (DateTime, Date)):
+        return "CURRENT_TIMESTAMP"
+    if isinstance(column.type, JSON):
+        return "'{}'"
+    if isinstance(column.type, (String, Text)):
+        return "''"
+    return None
+
+
 def auto_add_missing_columns() -> None:
-    """Lightweight forward-only migration: add any missing *nullable* columns to
-    existing tables so a model that gained fields doesn't break a live DB.
+    """Lightweight forward-only migration: add any column the model has but the
+    live table lacks, so a model that gained fields doesn't break a live DB.
+
+    NOT NULL columns are added WITH a backfill DEFAULT derived from the model —
+    without that they were silently skipped, and every later SELECT of that table
+    failed with "column does not exist" (which is exactly how /products broke).
 
     This is a stopgap for early development (works on SQLite + Postgres). Once the
     schema stabilises, switch to Alembic migrations for anything non-trivial
-    (NOT NULL columns, type changes, renames, data backfills).
+    (type changes, renames, data backfills).
     """
     inspector = inspect(engine)
     for table in Base.metadata.sorted_tables:
@@ -56,18 +128,26 @@ def auto_add_missing_columns() -> None:
         for column in table.columns:
             if column.name in existing:
                 continue
-            if not column.nullable:
-                # Can't safely add a NOT NULL column to a populated table here.
-                logger.warning(
-                    "Skipping auto-add of NOT NULL column %s.%s — needs a real migration",
-                    table.name,
-                    column.name,
-                )
-                continue
             col_type = column.type.compile(dialect=engine.dialect)
             ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}'
-            with engine.begin() as conn:
-                conn.execute(text(ddl))
+            if not column.nullable:
+                backfill = _backfill_default(column)
+                if backfill is None:
+                    logger.warning(
+                        "Skipping auto-add of NOT NULL column %s.%s — no derivable "
+                        "default, needs a real migration",
+                        table.name,
+                        column.name,
+                    )
+                    continue
+                ddl += f" NOT NULL DEFAULT {backfill}"
+            # Per-column isolation: one failure must not skip every later column.
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(ddl))
+            except Exception:  # noqa: BLE001
+                logger.exception("Could not add column %s.%s", table.name, column.name)
+                continue
             logger.info("Auto-migrated: added column %s.%s", table.name, column.name)
 
 
