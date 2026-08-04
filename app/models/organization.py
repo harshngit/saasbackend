@@ -95,7 +95,12 @@ class Organization(Base):
     doc_trade_license_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     doc_msme_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     doc_fssai_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # First "other" document, kept so clients written against the single-file field
+    # keep working; the full set lives in doc_other_files below.
     doc_other_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # "Other Business Documents" is the one multi-upload slot on the Company Master:
+    # a list of {id, name, url, content_type, size, uploaded_at}.
+    doc_other_files: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
 
     # Authorized Person (Ext)
     auth_person_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -110,6 +115,10 @@ class Organization(Base):
     business_hours: Mapped[str | None] = mapped_column(String(100), nullable=True)
     mission_vision: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Company Master "Status" (active / inactive) — whether the firm is operating.
+    # Admin-editable, and deliberately NOT the `status` column further down, which is
+    # the SaaS subscription lifecycle that only a Super Admin moves.
+    company_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Specified Columns (Backward-Compat / Sheet Specific)
     pin_zip_code: Mapped[str | None] = mapped_column(String(10), nullable=True)
@@ -154,6 +163,12 @@ class Organization(Base):
     requested_plan: Mapped["Plan | None"] = relationship(  # noqa: F821
         foreign_keys=[requested_plan_id], lazy="joined"
     )
+
+    @property
+    def subscription_status(self) -> str:
+        """`status` as a plain string, exposed read-only on the company profile so the
+        Company Master's own `company_status` toggle can't be confused with it."""
+        return self.status.value if isinstance(self.status, OrganizationStatus) else self.status
 
     @property
     def trial_days_left(self) -> int | None:

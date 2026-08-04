@@ -1,4 +1,45 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from datetime import datetime
+from enum import Enum
+from typing import Annotated
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+)
+
+
+class CompanyStatus(str, Enum):
+    """Company Master "Status" — is this company operating? (Not the subscription state.)"""
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
+def _normalize_status(value: object) -> object:
+    """Accept "Active" / "INACTIVE" from a toggle or dropdown."""
+    if isinstance(value, str):
+        return value.strip().lower()
+    return value
+
+
+CompanyStatusIn = Annotated[CompanyStatus, BeforeValidator(_normalize_status)]
+
+
+class OtherDocument(BaseModel):
+    """One file in the "Other Business Documents" multi-upload slot."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    url: str
+    content_type: str | None = None
+    size: int | None = None
+    uploaded_at: datetime | None = None
 
 
 class CompanySettingsOut(BaseModel):
@@ -78,6 +119,8 @@ class CompanySettingsOut(BaseModel):
     doc_msme_url: str | None = None
     doc_fssai_url: str | None = None
     doc_other_url: str | None = None
+    # Every "Other Business Document" uploaded — managed via /settings/documents/other.
+    doc_other_files: list[OtherDocument] = Field(default_factory=list)
 
     # Authorized Person (Ext)
     auth_person_name: str | None = None
@@ -92,10 +135,27 @@ class CompanySettingsOut(BaseModel):
     business_hours: str | None = None
     mission_vision: str | None = None
     notes: str | None = None
+    # Is the company active? Defaults to active for rows written before this field.
+    company_status: CompanyStatus = CompanyStatus.ACTIVE
+    # Read-only mirror of the subscription lifecycle (trial / active / locked / …),
+    # which only a Super Admin changes — never editable from this page.
+    subscription_status: str | None = None
+
+    @field_validator("doc_other_files", mode="before")
+    @classmethod
+    def _default_documents(cls, v: object) -> object:
+        return v or []
+
+    @field_validator("company_status", mode="before")
+    @classmethod
+    def _default_company_status(cls, v: object) -> object:
+        return _normalize_status(v) or CompanyStatus.ACTIVE
 
 
 class CompanySettingsUpdate(BaseModel):
     """Partial update — send only the fields being changed."""
+
+    model_config = ConfigDict(populate_by_name=True)
 
     name: str | None = Field(default=None, min_length=1, max_length=200)
     business_type: str | None = Field(default=None, max_length=100)
@@ -179,8 +239,13 @@ class CompanySettingsUpdate(BaseModel):
     # Additional Info (Ext)
     employee_count: int | None = None
     business_hours: str | None = Field(default=None, max_length=100)
-    mission_vision: str | None = None
+    mission_vision: str | None = Field(default=None, max_length=1000)
     notes: str | None = None
+    # Sent as either "company_status" or plain "status" — the Company Master toggle.
+    # It can never reach the subscription `status` column, which is Super-Admin-only.
+    company_status: CompanyStatusIn | None = Field(
+        default=None, validation_alias=AliasChoices("company_status", "status")
+    )
 
     @field_validator("website")
     @classmethod

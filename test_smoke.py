@@ -1232,6 +1232,81 @@ import io
 r = client.post("/organizations/settings/upload-file", headers=fin_hdr, files={"file": ("certificate.pdf", io.BytesIO(b"%PDF-1.4 ..."), "application/pdf")})
 check("generic upload PDF file -> 200", r.status_code == 200 and r.json()["url"].startswith("data:application/pdf;base64,"), r.text)
 
+print("\n== Company Master: Status field ==")
+r = client.get("/organizations/settings", headers=fin_hdr)
+check("company_status defaults to active", r.json()["company_status"] == "active", r.text)
+check("subscription_status exposed read-only", r.json()["subscription_status"] == "trial", r.text)
+
+r = client.put("/organizations/settings", headers=fin_hdr, json={"company_status": "inactive"})
+check("set company_status=inactive -> 200", r.status_code == 200 and r.json()["company_status"] == "inactive", r.text)
+check("subscription status untouched by the toggle", r.json()["subscription_status"] == "trial", r.text)
+
+# The sheet calls the field plain "Status", and it's a toggle/dropdown — accept both
+# the alias and the capitalised label the UI shows.
+r = client.put("/organizations/settings", headers=fin_hdr, json={"status": "Active"})
+check("alias 'status' -> company_status", r.status_code == 200 and r.json()["company_status"] == "active", r.text)
+check("'status' cannot move the subscription state", r.json()["subscription_status"] == "trial", r.text)
+check("GET /organizations/me still reports trial",
+      client.get("/organizations/me", headers=fin_hdr).json()["status"] == "trial")
+
+r = client.put("/organizations/settings", headers=fin_hdr, json={"status": "suspended"})
+check("subscription value rejected as a company status -> 422", r.status_code == 422, r.text)
+
+print("\n== Company Master: Other Business Documents (multi-file) ==")
+check("other documents start empty",
+      client.get("/organizations/settings/documents/other", headers=fin_hdr).json() == [])
+
+r = client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
+    ("files", ("license.pdf", io.BytesIO(b"%PDF-1.4 license"), "application/pdf")),
+    ("files", ("noc.png", io.BytesIO(png), "image/png")),
+])
+check("upload 2 documents at once -> 201", r.status_code == 201 and len(r.json()) == 2, r.text)
+docs = r.json()
+check("document keeps its filename", docs[0]["name"] == "license.pdf", docs)
+check("document stored as a data URL", docs[0]["url"].startswith("data:application/pdf;base64,"), docs)
+check("document records its size", docs[0]["size"] > 0, docs)
+
+# A second upload appends — it must not wipe the first batch.
+r = client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
+    ("files", ("affidavit.pdf", io.BytesIO(b"%PDF-1.4 affidavit"), "application/pdf")),
+])
+check("second upload appends -> 3 documents", r.status_code == 201 and len(r.json()) == 3, r.text)
+check("documents have unique ids", len({d["id"] for d in r.json()}) == 3, r.text)
+
+settings = client.get("/organizations/settings", headers=fin_hdr).json()
+check("documents visible on the company profile", len(settings["doc_other_files"]) == 3, settings["doc_other_files"])
+check("doc_other_url mirrors the first document", settings["doc_other_url"] == docs[0]["url"])
+
+# A bad file in the batch must not half-write the profile.
+r = client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
+    ("files", ("ok.pdf", io.BytesIO(b"%PDF-1.4 ok"), "application/pdf")),
+    ("files", ("virus.exe", io.BytesIO(b"MZ"), "application/x-msdownload")),
+])
+check("unsupported format in batch -> 400", r.status_code == 400, r.text)
+check("rejected batch left the list untouched",
+      len(client.get("/organizations/settings/documents/other", headers=fin_hdr).json()) == 3)
+
+r = client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
+    ("files", ("huge.pdf", io.BytesIO(b"x" * (6 * 1024 * 1024)), "application/pdf")),
+])
+check("oversized document -> 413", r.status_code == 413, r.text)
+
+doc_id = client.get("/organizations/settings/documents/other", headers=fin_hdr).json()[1]["id"]
+r = client.delete(f"/organizations/settings/documents/other/{doc_id}", headers=fin_hdr)
+check("delete one document -> 200 with 2 left", r.status_code == 200 and len(r.json()) == 2, r.text)
+check("the deleted document is gone", all(d["id"] != doc_id for d in r.json()), r.text)
+check("delete unknown document -> 404",
+      client.delete("/organizations/settings/documents/other/nope", headers=fin_hdr).status_code == 404)
+
+check("staff blocked from other documents -> 403",
+      client.get("/organizations/settings/documents/other", headers=st_hdr).status_code == 403)
+
+check("clear all documents -> 204",
+      client.delete("/organizations/settings/documents/other", headers=fin_hdr).status_code == 204)
+cleared = client.get("/organizations/settings", headers=fin_hdr).json()
+check("list empty after clear", cleared["doc_other_files"] == [], cleared["doc_other_files"])
+check("doc_other_url cleared with the list", cleared["doc_other_url"] is None, cleared["doc_other_url"])
+
 print("\n== Leads CRUD ==")
 lead_payload = {
     "lead_id": "L-12345",
