@@ -87,6 +87,8 @@ class Organization(Base):
     language: Mapped[str | None] = mapped_column(String(50), nullable=True)
     tax_configuration: Mapped[str | None] = mapped_column(Text, nullable=True)
     invoice_settings: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Prefix for the auto-generated employee codes (EMP-0001, ACME-0001, …).
+    employee_id_prefix: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Documents (Ext)
     doc_gst_url: Mapped[str | None] = mapped_column(Text, nullable=True)

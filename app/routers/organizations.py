@@ -284,7 +284,8 @@ AVAILABLE_FIELDS = {
             "doc_gst_url", "doc_pan_url", "doc_coi_url", "doc_trade_license_url", "doc_msme_url", "doc_fssai_url",
             "doc_other_url", "doc_other_files",
             "auth_person_photo_url", "auth_person_signature_url",
-            "employee_count", "business_hours", "mission_vision", "notes"
+            "employee_count", "business_hours", "mission_vision", "notes",
+            "employee_id_prefix"
         ]
     },
     "customer": {

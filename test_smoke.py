@@ -22,6 +22,38 @@ from app.seed import main as seed_main  # noqa: E402
 seed_main()
 client = TestClient(app)
 
+# The employee form makes these mandatory on POST /users. Nearly every staff
+# creation below is really testing roles / permissions / lifecycle rather than
+# the HR form, so fill the mandatory fields in centrally instead of repeating
+# them at ~30 call sites. A body that sets one of them keeps its own value, and
+# `_raw_post` bypasses this for the checks that exercise the contract itself.
+_STAFF_REQUIRED = {
+    "first_name": "Test",
+    "last_name": "Staff",
+    "phone": "9800000000",
+    "designation": "Staff",
+    "employment_type": "full_time",
+    "date_of_joining": "2026-01-01T00:00:00Z",
+    "employee_status": "active",
+    "identity_proof_type": "Aadhaar",
+    "identity_proof_file": "data:image/png;base64,AAAA",
+    "status": "active",
+}
+
+_raw_post = client.post
+
+
+def _post_with_staff_defaults(url, *args, **kwargs):
+    body = kwargs.get("json")
+    if url == "/users" and isinstance(body, dict):
+        body = {**_STAFF_REQUIRED, **body}
+        body.setdefault("confirm_password", body.get("password"))
+        kwargs["json"] = body
+    return _raw_post(url, *args, **kwargs)
+
+
+client.post = _post_with_staff_defaults
+
 passed = 0
 failed = 0
 
@@ -1506,6 +1538,130 @@ check("identity proof rejects non-document -> 400",
                   files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
 check("employee profile visible on /auth/me",
       "employee_id" in client.get("/auth/me", headers=fin_hdr).json()["user"])
+
+print("\n== Employee profile: mandatory fields ==")
+# These go through _raw_post so the central defaults above do not mask the check.
+_min_staff = {"name": "Needs Fields", "password": "Staff@123", "confirm_password": "Staff@123",
+              "role": "accountant"}
+for field in ("first_name", "last_name", "phone", "designation", "employment_type",
+              "date_of_joining", "employee_status", "identity_proof_type",
+              "identity_proof_file", "status"):
+    body = {**_STAFF_REQUIRED, **_min_staff,
+            "email": f"req_{uuid.uuid4().hex[:8]}@firm.com", "username": f"req_{uuid.uuid4().hex[:8]}"}
+    body.pop(field)
+    check(f"POST /users without {field} -> 422",
+          _raw_post("/users", headers=fin_hdr, json=body).status_code == 422)
+check("mismatched confirm_password -> 422",
+      _raw_post("/users", headers=fin_hdr, json={
+          **_STAFF_REQUIRED, **_min_staff, "confirm_password": "Different@123",
+          "email": f"cp_{uuid.uuid4().hex[:8]}@firm.com",
+          "username": f"cp_{uuid.uuid4().hex[:8]}"}).status_code == 422)
+
+print("\n== Employee profile: extended fields ==")
+ext_email = f"ext_{uuid.uuid4().hex[:8]}@firm.com"
+r = client.post("/users", headers=fin_hdr, json={
+    "first_name": "Asha", "last_name": "Verma", "email": ext_email,
+    "username": f"ext_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant",
+    "gender": "Female", "blood_group": "B+", "date_of_birth": "1996-03-04T00:00:00Z",
+    "personal_email": "asha@example.com", "emergency_contact_name": "R Verma",
+    "emergency_contact_number": "9800000000", "emergency_contact_relationship": "Father",
+    "current_address": "12 MG Road", "city": "Pune", "state": "Maharashtra",
+    "country": "India", "pin_zip_code": "411001",
+    "work_location": "Pune Office", "shift": "Morning",
+    "basic_salary": 42000, "bank_name": "SBI", "account_number": "9988776655",
+    "ifsc_swift_code": "SBIN0001", "upi_id": "asha@upi",
+    "skills": ["Tally", "GST"], "language": "en", "time_zone": "Asia/Kolkata",
+})
+check("create with the extended profile -> 201", r.status_code == 201, r.text)
+ext = r.json()
+check("name composed from first/last when omitted", ext["name"] == "Asha Verma", ext["name"])
+check("address fields stored", ext["city"] == "Pune" and ext["pin_zip_code"] == "411001"
+      and (ext["current_address"] or "").startswith("12 MG"), ext)
+check("emergency contact stored", ext["emergency_contact_relationship"] == "Father", ext)
+check("payroll fields stored", ext["basic_salary"] == 42000 and ext["upi_id"] == "asha@upi", ext)
+check("skills stored as a list", ext["skills"] == ["Tally", "GST"], ext["skills"])
+check("identify_proofs mirrors identity_proof_file",
+      ext["identify_proofs"] == ext["identity_proof_file"], ext["identify_proofs"])
+
+# Reporting manager
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={"reporting_manager_id": emp["id"]})
+check("set reporting manager -> 200", r.status_code == 200
+      and r.json()["reporting_manager_id"] == emp["id"], r.text)
+check("self as reporting manager -> 400",
+      client.patch(f"/users/{ext['id']}", headers=fin_hdr,
+                   json={"reporting_manager_id": ext["id"]}).status_code == 400)
+check("reporting loop -> 400",
+      client.patch(f"/users/{emp['id']}", headers=fin_hdr,
+                   json={"reporting_manager_id": ext["id"]}).status_code == 400)
+check("filter by reporting_manager_id",
+      [u["id"] for u in client.get("/users", headers=fin_hdr,
+                                   params={"reporting_manager_id": emp["id"]}).json()] == [ext["id"]])
+
+# Account status drives is_active
+r = client.patch(f"/users/{ext['id']}/account-status", headers=fin_hdr, json={"status": "Suspended"})
+check("account-status suspends and blocks login",
+      r.status_code == 200 and r.json()["status"] == "suspended" and r.json()["is_active"] is False, r.text)
+check("suspended user cannot log in",
+      client.post("/auth/login", json={"email": ext_email, "password": "Staff@123"}).status_code == 403)
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={"status": "active"})
+check("PATCH status back to active restores is_active", r.json()["is_active"] is True, r.text)
+check("filter by status=active",
+      any(u["id"] == ext["id"] for u in client.get("/users", headers=fin_hdr,
+                                                   params={"status": "active"}).json()))
+
+# Employee file slots and document collections
+r = client.post(f"/users/{ext['id']}/files/profile_photo", headers=fin_hdr,
+                files={"file": ("p.png", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 20), "image/png")})
+check("upload profile_photo -> data URL",
+      r.status_code == 200 and (r.json()["profile_photo"] or "").startswith("data:image/png"), r.text)
+check("profile_photo rejects a PDF -> 400",
+      client.post(f"/users/{ext['id']}/files/profile_photo", headers=fin_hdr,
+                  files={"file": ("p.pdf", io.BytesIO(b"%PDF"), "application/pdf")}).status_code == 400)
+r = client.post(f"/users/{ext['id']}/documents/experience_certificates", headers=fin_hdr,
+                files=[("files", ("e1.pdf", io.BytesIO(b"%PDF-1.4 a"), "application/pdf")),
+                       ("files", ("e2.pdf", io.BytesIO(b"%PDF-1.4 b"), "application/pdf"))])
+check("upload 2 experience certificates -> 201", r.status_code == 201 and len(r.json()) == 2, r.text)
+doc_id = r.json()[0]["id"]
+check("documents append rather than replace",
+      len(client.post(f"/users/{ext['id']}/documents/experience_certificates", headers=fin_hdr,
+                      files=[("files", ("e3.pdf", io.BytesIO(b"%PDF"), "application/pdf"))]).json()) == 3)
+check("delete one document -> 200",
+      len(client.delete(f"/users/{ext['id']}/documents/experience_certificates/{doc_id}",
+                        headers=fin_hdr).json()) == 2)
+check("other collections untouched",
+      client.get(f"/users/{ext['id']}", headers=fin_hdr).json()["educational_certificates"] == [])
+check("clear a collection -> 204",
+      client.delete(f"/users/{ext['id']}/documents/experience_certificates",
+                    headers=fin_hdr).status_code == 204)
+
+# Extended options
+opts = client.get("/users/meta/employee-options", headers=fin_hdr).json()
+check("options list account statuses",
+      opts["account_statuses"] == ["active", "inactive", "suspended", "locked"], opts["account_statuses"])
+check("options suggest genders / blood groups",
+      "Female" in opts["genders"] and "B+" in opts["blood_groups"], opts)
+check("options include work locations in use", "Pune Office" in opts["work_locations"], opts["work_locations"])
+check("options list preset designations",
+      opts["designations"][:6] == ["Admin", "Manager", "HR", "Sales", "Finance", "Employee"], opts["designations"])
+check("options keep designations in use after the presets",
+      "Senior Sales Executive" in opts["designations"], opts["designations"])
+check("options serve countries / states / relationships",
+      "India" in opts["countries"] and "India" in opts["nationalities"]
+      and "Maharashtra" in opts["states"] and "Father" in opts["emergency_contact_relationships"], opts)
+
+print("\n== Employee ID prefix (Company Settings) ==")
+check("default employee_id_prefix is EMP-", opts["employee_id_prefix"] == "EMP-", opts["employee_id_prefix"])
+r = client.put("/organizations/settings", headers=fin_hdr, json={"employee_id_prefix": "ACME-"})
+check("admin can set the prefix -> 200",
+      r.status_code == 200 and r.json().get("employee_id_prefix") == "ACME-", r.text[:300])
+check("employee-options reports the new prefix",
+      client.get("/users/meta/employee-options", headers=fin_hdr).json()["employee_id_prefix"] == "ACME-")
+r = client.post("/users", headers=fin_hdr, json={
+    "first_name": "Pre", "last_name": "Fixed", "email": f"pre_{uuid.uuid4().hex[:8]}@firm.com",
+    "username": f"pre_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant"})
+check("new employee uses the firm's prefix",
+      r.status_code == 201 and (r.json()["employee_id"] or "").startswith("ACME-"), r.text[:300])
+client.put("/organizations/settings", headers=fin_hdr, json={"employee_id_prefix": "EMP-"})
 
 print("\n== DELETE user ==")
 check("delete own account -> 400",

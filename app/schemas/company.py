@@ -110,6 +110,7 @@ class CompanySettingsOut(BaseModel):
     language: str | None = None
     tax_configuration: str | None = None
     invoice_settings: str | None = None
+    employee_id_prefix: str | None = None
 
     # Documents (Ext)
     doc_gst_url: str | None = None
@@ -218,6 +219,9 @@ class CompanySettingsUpdate(BaseModel):
     language: str | None = Field(default=None, max_length=50)
     tax_configuration: str | None = None
     invoice_settings: str | None = None
+    employee_id_prefix: str | None = Field(
+        default=None, max_length=20, description='Prefix for auto-generated employee codes (default "EMP-")'
+    )
 
     # Documents (Ext)
     doc_gst_url: str | None = None
