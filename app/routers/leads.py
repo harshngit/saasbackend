@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, Lead, User
-from app.services import numbering_service
+from app.services import numbering_service, lookup_service
 from app.schemas.lead import LeadCreate, LeadOut, LeadUpdate
 
 router = APIRouter(prefix="/leads", tags=["leads"])
@@ -24,10 +24,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, id: str, org_id: str) -> Lead:
-    lead = db.get(Lead, id)
-    if lead is None or lead.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (lead_id)."""
+    record = lookup_service.by_id_or_code(
+        db, Lead, id, org_id, Lead.lead_id
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
-    return lead
+    return record
 
 
 @router.post("", response_model=LeadOut, status_code=status.HTTP_201_CREATED)

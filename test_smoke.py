@@ -1457,6 +1457,49 @@ check("quotation detail carries items and the sheet's extra fields",
                                   "notes", "terms_conditions", "status", "total")), sorted(_qdetail))
 check("quotation detail total matches the list", _qdetail["total"] == _qrow["total"])
 
+print("\n== Fetch by the human-facing code, not just the UUID ==")
+_lcust = client.post("/customers", headers=fin_hdr,
+                     json={"name": "Code Lookup Co", "phone": "9800005555"}).json()
+_lprod = client.post("/products", headers=fin_hdr, json={
+    "name": "Code Lookup Widget", "price": 80, "total_inventory": 20, "sku": "CL-SKU-1"}).json()
+_lquote = client.post("/quotations", headers=fin_hdr, json={
+    "customer_id": _lcust["id"],
+    "items": [{"product_id": _lprod["id"], "quantity": 1, "unit_price": 80}]}).json()
+_linv = client.post("/invoices", headers=fin_hdr, json={
+    "customer_id": _lcust["id"],
+    "items": [{"product_id": _lprod["id"], "quantity": 1, "unit_price": 80}]}).json()
+
+for _label, _path, _rec, _code in [
+    ("customer", "/customers", _lcust, _lcust["customer_id"]),
+    ("product", "/products", _lprod, _lprod["product_id"]),
+    ("quotation", "/quotations", _lquote, _lquote["quotation_number"]),
+    ("invoice", "/invoices", _linv, _linv["invoice_number"]),
+]:
+    check(f"{_label} still fetches by UUID",
+          client.get(f"{_path}/{_rec['id']}", headers=fin_hdr).status_code == 200)
+    _r = client.get(f"{_path}/{_code}", headers=fin_hdr)
+    check(f"{_label} fetches by its code ({_code})",
+          _r.status_code == 200 and _r.json()["id"] == _rec["id"], f"{_r.status_code} {_r.text[:150]}")
+
+check("code lookup is case-insensitive",
+      client.get(f"/customers/{_lcust['customer_id'].lower()}", headers=fin_hdr).status_code == 200)
+check("product also resolves by sku",
+      client.get("/products/CL-SKU-1", headers=fin_hdr).json()["id"] == _lprod["id"])
+check("unknown code still 404s",
+      client.get("/customers/CUST-1999-9999", headers=fin_hdr).status_code == 404)
+check("garbage id 404s rather than 500",
+      client.get("/products/!!!", headers=fin_hdr).status_code == 404)
+check("customer search matches the code",
+      [c["id"] for c in client.get(f"/customers?search={_lcust['customer_id']}",
+                                   headers=fin_hdr).json()] == [_lcust["id"]])
+check("product search matches the code",
+      [p["id"] for p in client.get(f"/products?search={_lprod['product_id']}",
+                                   headers=fin_hdr).json()] == [_lprod["id"]])
+check("another firm never reaches our record by code",
+      client.get(f"/customers/{_lcust['customer_id']}", headers=min_hdr).status_code == 404
+      or client.get(f"/customers/{_lcust['customer_id']}",
+                    headers=min_hdr).json()["id"] != _lcust["id"])
+
 print("\n== Company Master: options, validation, branches, config ==")
 r = client.get("/organizations/settings/options", headers=fin_hdr)
 check("GET /settings/options -> 200", r.status_code == 200, r.text[:200])

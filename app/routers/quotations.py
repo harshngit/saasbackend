@@ -13,7 +13,7 @@ from app.models import (
     QuotationItem,
     User,
 )
-from app.services import numbering_service
+from app.services import numbering_service, lookup_service
 from app.schemas.quotation import QuotationCreate, QuotationListItem, QuotationOut
 
 router = APIRouter(prefix="/quotations", tags=["quotations"])
@@ -31,10 +31,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, id: str, org_id: str) -> Quotation:
-    q = db.get(Quotation, id)
-    if q is None or q.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (quotation_number)."""
+    record = lookup_service.by_id_or_code(
+        db, Quotation, id, org_id, Quotation.quotation_number
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quotation not found")
-    return q
+    return record
 
 
 @router.post("", response_model=QuotationOut, status_code=status.HTTP_201_CREATED)

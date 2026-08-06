@@ -8,7 +8,7 @@ from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import store_upload
 from app.models import EXPENSE_CATEGORIES, Expense, User
 from app.schemas.expense import ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
-from app.services import notification_service, numbering_service
+from app.services import notification_service, numbering_service, lookup_service
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
@@ -26,10 +26,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, expense_id: str, org_id: str) -> Expense:
-    e = db.get(Expense, expense_id)
-    if e is None or e.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (expense_number, expense_id)."""
+    record = lookup_service.by_id_or_code(
+        db, Expense, expense_id, org_id, Expense.expense_number, Expense.expense_id
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
-    return e
+    return record
 
 
 @router.get("/categories")

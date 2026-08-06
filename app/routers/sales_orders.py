@@ -22,7 +22,7 @@ from app.schemas.sales_order import (
     OrderOut,
     RejectBody,
 )
-from app.services import notification_service, numbering_service
+from app.services import notification_service, numbering_service, lookup_service
 
 router = APIRouter(prefix="/orders", tags=["sales_orders"])
 
@@ -39,10 +39,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, order_id: str, org_id: str) -> SalesOrder:
-    order = db.get(SalesOrder, order_id)
-    if order is None or order.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    return order
+    """Accepts the UUID or the human-facing code (order_number, sales_order_number)."""
+    record = lookup_service.by_id_or_code(
+        db, SalesOrder, order_id, org_id, SalesOrder.order_number, SalesOrder.sales_order_number
+    )
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
+    return record
 
 
 def _next_order_number(db: Session, org_id: str) -> str:

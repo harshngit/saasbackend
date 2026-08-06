@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
 from app.models import Customer, CustomerPayment, Invoice, User
-from app.services import numbering_service
+from app.services import numbering_service, lookup_service
 from app.schemas.customer import (
     CustomerCreate,
     CustomerOut,
@@ -36,10 +36,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned_customer(db: Session, customer_id: str, org_id: str) -> Customer:
-    customer = db.get(Customer, customer_id)
-    if customer is None or customer.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (customer_id)."""
+    record = lookup_service.by_id_or_code(
+        db, Customer, customer_id, org_id, Customer.customer_id
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
-    return customer
+    return record
 
 
 def _owned_invoice(
@@ -107,7 +110,7 @@ def create_customer(
 @router.get("", response_model=list[CustomerOut])
 def list_customers(
     user: User = Depends(_view),
-    search: str | None = Query(default=None, description="matches name / business / phone / email"),
+    search: str | None = Query(default=None, description="matches customer code / name / business / phone / email"),
     category: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     assigned_sales_officer_id: str | None = Query(default=None),
@@ -123,6 +126,7 @@ def list_customers(
                 Customer.business_name.ilike(like),
                 Customer.phone.ilike(like),
                 Customer.email.ilike(like),
+                Customer.customer_id.ilike(like),
             )
         )
     if category is not None:

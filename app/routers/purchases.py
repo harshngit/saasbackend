@@ -16,7 +16,7 @@ from app.models import (
     Supplier,
     User,
 )
-from app.services import numbering_service
+from app.services import numbering_service, lookup_service
 from app.schemas.purchase import (
     CancelBody,
     PaymentStatusUpdate,
@@ -42,10 +42,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, id: str, org_id: str) -> PurchaseInvoice:
-    inv = db.get(PurchaseInvoice, id)
-    if inv is None or inv.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (purchase_number, purchase_id, invoice_number)."""
+    record = lookup_service.by_id_or_code(
+        db, PurchaseInvoice, id, org_id, PurchaseInvoice.purchase_number, PurchaseInvoice.purchase_id, PurchaseInvoice.invoice_number
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Purchase invoice not found")
-    return inv
+    return record
 
 
 def _build_items(db: Session, org_id: str, items: list[PurchaseItemIn]) -> tuple[list[PurchaseInvoiceItem], float]:

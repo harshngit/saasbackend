@@ -17,7 +17,7 @@ from app.models import (
     StockMovement,
     User,
 )
-from app.services import numbering_service
+from app.services import numbering_service, lookup_service
 from app.schemas.invoice import CreditNoteBody, InvoiceCreate, InvoiceOut
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
@@ -38,10 +38,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, id: str, org_id: str) -> Invoice:
-    inv = db.get(Invoice, id)
-    if inv is None or inv.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (invoice_number, sales_id)."""
+    record = lookup_service.by_id_or_code(
+        db, Invoice, id, org_id, Invoice.invoice_number, Invoice.sales_id
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
-    return inv
+    return record
 
 
 def _hsn_for(db: Session, product_id: str | None) -> str | None:

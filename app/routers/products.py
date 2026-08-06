@@ -9,7 +9,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import read_upload
 from app.models import Category, Product, ProductVariant, Supplier, User
-from app.services import numbering_service
+from app.services import numbering_service, lookup_service
 from app.schemas.category import BulkDelete, BulkDeleteResult
 from app.schemas.product import (
     ProductAttachment,
@@ -36,10 +36,13 @@ def _org_id(user: User) -> str:
 
 
 def _owned(db: Session, product_id: str, org_id: str) -> Product:
-    product = db.get(Product, product_id)
-    if product is None or product.organization_id != org_id:
+    """Accepts the UUID or the human-facing code (product_id, sku, barcode)."""
+    record = lookup_service.by_id_or_code(
+        db, Product, product_id, org_id, Product.product_id, Product.sku, Product.barcode
+    )
+    if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    return product
+    return record
 
 
 def _validate_category(db: Session, org_id: str, category_id: str | None) -> None:
@@ -113,7 +116,7 @@ def bulk_delete_products(
 @router.get("", response_model=list[ProductListItem])
 def list_products(
     user: User = Depends(_view),
-    search: str | None = Query(default=None, description="matches name / sku / barcode / brand / vendor"),
+    search: str | None = Query(default=None, description="matches product code / name / sku / barcode / brand / vendor"),
     category_id: str | None = Query(default=None),
     preferred_supplier_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
@@ -130,6 +133,7 @@ def list_products(
                 Product.barcode.ilike(like),
                 Product.brand.ilike(like),
                 Product.vendor.ilike(like),
+                Product.product_id.ilike(like),
             )
         )
     if category_id is not None:
