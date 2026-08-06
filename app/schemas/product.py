@@ -32,6 +32,15 @@ class VariantOut(BaseModel):
     inventory: int
 
 
+class NamedRef(BaseModel):
+    """A related record resolved from its id, so callers never look up a name."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+
+
 class ProductAttachment(BaseModel):
     """One file in the product's "other attachments" multi-upload slot."""
 
@@ -197,6 +206,9 @@ class ProductOut(ProductProfileIn):
     total_stock: int
     is_active: bool
     variations: list[VariantOut]
+    # Resolved from category_id / preferred_supplier_id.
+    category: NamedRef | None = None
+    supplier: NamedRef | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -230,6 +242,8 @@ class ProductListItem(BaseModel):
     total_stock: int
     is_active: bool
     variations: list[VariantOut]
+    category: NamedRef | None = None
+    supplier: NamedRef | None = None
     created_at: datetime
 
     # Profile fields that are cheap enough to carry in a list

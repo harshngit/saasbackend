@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
 from app.models import Customer, CustomerPayment, Invoice, User
+from app.services import numbering_service
 from app.schemas.customer import (
     CustomerCreate,
     CustomerOut,
@@ -90,7 +91,12 @@ def create_customer(
 ) -> Customer:
     org_id = _org_id(user)
     _validate_assignee(db, org_id, payload.assigned_sales_officer_id)
-    customer = Customer(organization_id=org_id, **payload.model_dump())
+    data = payload.model_dump()
+    # Sheet: Customer ID is an Auto Number, so it is issued here, not sent in.
+    data["customer_id"] = numbering_service.next_number(
+        db, org_id, Customer.customer_id, "CUST"
+    )
+    customer = Customer(organization_id=org_id, **data)
     customer.recompute_outstanding()  # opening_balance -> outstanding
     db.add(customer)
     db.commit()

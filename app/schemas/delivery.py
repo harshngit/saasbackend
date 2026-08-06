@@ -38,7 +38,7 @@ class DeliveryItemOut(DeliveryItemBase):
 
 
 class DeliveryNoteBase(BaseModel):
-    delivery_note_number: str
+    delivery_note_number: str | None = Field(default=None, description="Auto-generated when omitted")
     delivery_date: datetime | None = None
     sales_order_id: str | None = None
     customer_id: str | None = None

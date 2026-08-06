@@ -17,6 +17,7 @@ from app.models import (
     StockMovement,
     User,
 )
+from app.services import numbering_service
 from app.schemas.invoice import CreditNoteBody, InvoiceCreate, InvoiceOut
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
@@ -52,9 +53,8 @@ def _hsn_for(db: Session, product_id: str | None) -> str | None:
 
 
 def _next_invoice_number(db: Session, org_id: str) -> str:
-    year = datetime.now(timezone.utc).year
-    count = db.query(Invoice).filter(Invoice.organization_id == org_id).count()
-    return f"INV-{year}-{1001 + count}"
+    # max+1, not count+1: counting reissues a number after any deletion.
+    return numbering_service.next_number(db, org_id, Invoice.invoice_number, "INV")
 
 
 # Also exposed as POST /orders/{order_id}/invoice — the route decorator returns the

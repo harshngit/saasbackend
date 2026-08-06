@@ -17,6 +17,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Category,
     Customer,
     Notification,
+    NumberSequence,
     Organization,
     Plan,
     Product,
@@ -30,6 +31,7 @@ from app.models import (  # noqa: F401  (register mappers)
     SupplierPayment,
     User,
 )
+from app.services.numbering_service import backfill_missing_numbers
 from app.routers import (
     attendance,
     auth,
@@ -79,7 +81,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "company-master-options-and-validation"
+BUILD_TAG = "auto-numbers-and-id-resolution"
 
 
 @app.on_event("startup")
@@ -99,6 +101,7 @@ def on_startup() -> None:
         ("widen_columns_to_text", widen_columns_to_text),
         ("add_columns_with_default", add_columns_with_default),
         ("auto_add_missing_columns", auto_add_missing_columns),
+        ("backfill_missing_numbers", backfill_missing_numbers),
     ):
         try:
             step()

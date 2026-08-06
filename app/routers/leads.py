@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, Lead, User
+from app.services import numbering_service
 from app.schemas.lead import LeadCreate, LeadOut, LeadUpdate
 
 router = APIRouter(prefix="/leads", tags=["leads"])
@@ -52,7 +53,9 @@ def create_lead(
 
     lead = Lead(
         organization_id=org_id,
-        lead_id=payload.lead_id,
+        lead_id=payload.lead_id or numbering_service.next_number(
+            db, org_id, Lead.lead_id, "LEAD"
+        ),
         lead_source=payload.lead_source,
         customer_id=payload.customer_id,
         mobile_number=payload.mobile_number,

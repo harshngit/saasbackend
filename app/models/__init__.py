@@ -16,6 +16,7 @@ from app.models.category import Category
 from app.models.customer import Customer, CustomerPayment
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense
 from app.models.notification import Notification
+from app.models.number_sequence import NumberSequence
 from app.models.organization import Organization
 from app.models.purchase_invoice import (
     PAYMENT_STATUSES,
@@ -41,6 +42,7 @@ from app.models.payment_receipt import PaymentReceipt
 from app.models.sales_return import SalesReturn, ReturnItem
 
 __all__ = [
+    "NumberSequence",
     "Organization",
     "Plan",
     "Role",

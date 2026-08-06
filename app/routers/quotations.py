@@ -13,7 +13,8 @@ from app.models import (
     QuotationItem,
     User,
 )
-from app.schemas.quotation import QuotationCreate, QuotationOut
+from app.services import numbering_service
+from app.schemas.quotation import QuotationCreate, QuotationListItem, QuotationOut
 
 router = APIRouter(prefix="/quotations", tags=["quotations"])
 
@@ -58,13 +59,23 @@ def create_quotation(
 
     quotation = Quotation(
         organization_id=org_id,
-        quotation_number=payload.quotation_number,
+        quotation_number=payload.quotation_number or numbering_service.next_number(
+            db, org_id, Quotation.quotation_number, "QT"
+        ),
         quotation_date=payload.quotation_date or datetime.now(timezone.utc),
         valid_until=payload.valid_until,
         customer_id=payload.customer_id,
+        # Sheet marks both addresses "Auto-filled" — default them from the
+        # customer the quotation is for, rather than making the user retype them.
         billing_address=payload.billing_address or customer.billing_address,
+        shipping_address=payload.shipping_address or customer.delivery_address,
         salesperson_id=payload.salesperson_id,
         currency=payload.currency,
+        status=payload.status or "draft",
+        payment_terms=payload.payment_terms,
+        delivery_terms=payload.delivery_terms,
+        notes=payload.notes,
+        terms_conditions=payload.terms_conditions,
     )
 
     for item in payload.items:
@@ -96,7 +107,7 @@ def create_quotation(
     return quotation
 
 
-@router.get("", response_model=list[QuotationOut])
+@router.get("", response_model=list[QuotationListItem])
 def list_quotations(
     user: User = Depends(_view),
     db: Session = Depends(get_db),

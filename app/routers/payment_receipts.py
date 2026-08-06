@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, Invoice, PaymentReceipt, User
+from app.services import numbering_service
 from app.schemas.payment_receipt import PaymentReceiptCreate, PaymentReceiptOut
 
 router = APIRouter(prefix="/payment-receipts", tags=["payment_receipts"])
@@ -42,7 +43,9 @@ def create_receipt(
 
     receipt = PaymentReceipt(
         organization_id=org_id,
-        receipt_number=payload.receipt_number,
+        receipt_number=payload.receipt_number or numbering_service.next_number(
+            db, org_id, PaymentReceipt.receipt_number, "RCPT"
+        ),
         receipt_date=payload.receipt_date or datetime.now(timezone.utc),
         customer_id=payload.customer_id,
         invoice_reference_id=payload.invoice_reference_id,

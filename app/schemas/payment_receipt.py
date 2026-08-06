@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ReceiptCustomerBrief(BaseModel):
@@ -17,7 +17,7 @@ class ReceiptInvoiceBrief(BaseModel):
 
 
 class PaymentReceiptBase(BaseModel):
-    receipt_number: str
+    receipt_number: str | None = Field(default=None, description="Auto-generated when omitted")
     receipt_date: datetime | None = None
     customer_id: str | None = None
     invoice_reference_id: str | None = None

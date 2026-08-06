@@ -1379,6 +1379,84 @@ check("clearing one slot leaves the others",
       (client.get("/organizations/settings", headers=fin_hdr).json()["doc_pan_url"] or "").startswith("data:"))
 client.delete("/organizations/settings/documents/other", headers=fin_hdr)
 
+print("\n== Auto-numbers, embedded refs, list/detail split ==")
+import re as _re  # noqa: E402
+
+_ycust = client.post("/customers", headers=fin_hdr,
+                     json={"name": "Auto Number Co", "phone": "9800001111"}).json()
+check("customer gets an auto CUST-YYYY-#### id",
+      bool(_re.fullmatch(r"CUST-\d{4}-\d+", _ycust.get("customer_id") or "")), _ycust.get("customer_id"))
+_yprod = client.post("/products", headers=fin_hdr,
+                     json={"name": "Auto Number Widget", "price": 100, "total_inventory": 50}).json()
+check("product gets an auto PROD id",
+      bool(_re.fullmatch(r"PROD-\d{4}-\d+", _yprod.get("product_id") or "")), _yprod.get("product_id"))
+
+_ncust = client.post("/customers", headers=fin_hdr,
+                     json={"name": "Doomed Co", "phone": "9800002222"}).json()
+_doomed = _ncust["customer_id"]
+client.delete(f"/customers/{_ncust['id']}", headers=fin_hdr)
+_after = client.post("/customers", headers=fin_hdr,
+                     json={"name": "After Delete", "phone": "9800003333"}).json()
+check("deleting a record never frees its number for reuse",
+      _after["customer_id"] != _doomed
+      and int(_after["customer_id"].split("-")[-1]) > int(_doomed.split("-")[-1]),
+      f"deleted {_doomed}, next {_after['customer_id']}")
+
+_yquote = client.post("/quotations", headers=fin_hdr, json={
+    "customer_id": _ycust["id"],
+    "items": [{"product_id": _yprod["id"], "quantity": 2, "unit_price": 100}]})
+check("quotation number auto-generated in QT-YYYY-#### form",
+      _yquote.status_code == 201
+      and bool(_re.fullmatch(r"QT-\d{4}-\d+", _yquote.json().get("quotation_number") or "")),
+      _yquote.text[:250])
+check("a client-supplied quotation number is still honoured",
+      client.post("/quotations", headers=fin_hdr, json={
+          "quotation_number": "QT-MANUAL-9", "customer_id": _ycust["id"],
+          "items": [{"product_id": _yprod["id"], "quantity": 1, "unit_price": 10}]}
+      ).json()["quotation_number"] == "QT-MANUAL-9")
+_ylead = client.post("/leads", headers=fin_hdr,
+                     json={"customer_id": _ycust["id"], "mobile_number": "9800004444"})
+check("lead gets an auto LEAD id",
+      _ylead.status_code == 201 and bool(_re.fullmatch(r"LEAD-\d{4}-\d+", _ylead.json().get("lead_id") or "")),
+      _ylead.text[:200])
+
+_ycat = client.post("/categories", headers=fin_hdr, json={"name": "Auto Ref Category"}).json()
+_ysup = client.post("/suppliers", headers=fin_hdr, json={"name": "Auto Ref Supplier"}).json()
+_yp2 = client.post("/products", headers=fin_hdr, json={
+    "name": "Linked Widget", "price": 20, "total_inventory": 10,
+    "category_id": _ycat["id"], "preferred_supplier_id": _ysup["id"]}).json()
+check("product resolves category + supplier from their ids",
+      _yp2["category"]["name"] == "Auto Ref Category"
+      and _yp2["supplier"]["name"] == "Auto Ref Supplier", (_yp2.get("category"), _yp2.get("supplier")))
+check("product list carries the resolved refs",
+      next(x for x in client.get("/products", headers=fin_hdr).json()
+           if x["id"] == _yp2["id"])["supplier"]["name"] == "Auto Ref Supplier")
+check("a product with no category/supplier reports null, not an error",
+      client.get(f"/products/{_yprod['id']}", headers=fin_hdr).json()["category"] is None)
+
+_yinv = client.post("/invoices", headers=fin_hdr, json={
+    "customer_id": _ycust["id"],
+    "items": [{"product_id": _yprod["id"], "quantity": 1, "unit_price": 100}]}).json()
+client.post(f"/customers/{_ycust['id']}/payments", headers=fin_hdr,
+            json={"amount": 40, "invoice_id": _yinv["id"]})
+_yhist = client.get(f"/customers/{_ycust['id']}/payments", headers=fin_hdr).json()
+check("payment history resolves the invoice it settled",
+      _yhist[0]["invoice"]["invoice_number"] == _yinv["invoice_number"], _yhist[0].get("invoice"))
+
+_qlist = client.get("/quotations", headers=fin_hdr).json()
+_qrow = next(x for x in _qlist if x["id"] == _yquote.json()["id"])
+check("quotation list shows what the table needs",
+      _qrow["customer"]["name"] == "Auto Number Co" and _qrow["status"] == "draft"
+      and _qrow["total"] == 200 and _qrow["item_count"] == 1, _qrow)
+check("quotation list omits the heavy detail",
+      "items" not in _qrow and "terms_conditions" not in _qrow, list(_qrow))
+_qdetail = client.get(f"/quotations/{_yquote.json()['id']}", headers=fin_hdr).json()
+check("quotation detail carries items and the sheet's extra fields",
+      len(_qdetail["items"]) == 1 and all(
+          k in _qdetail for k in ("shipping_address", "payment_terms", "delivery_terms",
+                                  "notes", "terms_conditions", "status", "total")), sorted(_qdetail))
+check("quotation detail total matches the list", _qdetail["total"] == _qrow["total"])
+
 print("\n== Company Master: options, validation, branches, config ==")
 r = client.get("/organizations/settings/options", headers=fin_hdr)
 check("GET /settings/options -> 200", r.status_code == 200, r.text[:200])

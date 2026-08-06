@@ -22,7 +22,7 @@ from app.schemas.sales_order import (
     OrderOut,
     RejectBody,
 )
-from app.services import notification_service
+from app.services import notification_service, numbering_service
 
 router = APIRouter(prefix="/orders", tags=["sales_orders"])
 
@@ -46,9 +46,8 @@ def _owned(db: Session, order_id: str, org_id: str) -> SalesOrder:
 
 
 def _next_order_number(db: Session, org_id: str) -> str:
-    year = datetime.now(timezone.utc).year
-    count = db.query(SalesOrder).filter(SalesOrder.organization_id == org_id).count()
-    return f"SO-{year}-{1001 + count}"
+    # max+1, not count+1: counting reissues a number after any deletion.
+    return numbering_service.next_number(db, org_id, SalesOrder.order_number, "SO")
 
 
 def _stock_target(db: Session, item: SalesOrderItem) -> tuple[object, int]:

@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import read_upload
 from app.models import Category, Product, ProductVariant, Supplier, User
+from app.services import numbering_service
 from app.schemas.category import BulkDelete, BulkDeleteResult
 from app.schemas.product import (
     ProductAttachment,
@@ -77,6 +78,9 @@ def create_product(
     data = payload.model_dump()
     variations = data.pop("variations")
     has_variants = data.pop("has_variants")
+    data.setdefault("product_id", None)
+    if not data.get("product_id"):
+        data["product_id"] = numbering_service.next_number(db, org_id, Product.product_id, "PROD")
     product = Product(organization_id=org_id, **data)
     product.variations = _build_variants([VariantIn(**v) for v in variations])
     # Left unset, the toggle just follows whether variants were actually sent.

@@ -153,6 +153,12 @@ class Product(Base):
     variations: Mapped[list["ProductVariant"]] = relationship(
         back_populates="product", cascade="all, delete-orphan", lazy="joined"
     )
+    # Loaded with the product so responses can resolve the ids into names without
+    # the caller making a second call.
+    category: Mapped["Category | None"] = relationship(lazy="joined")  # noqa: F821
+    supplier: Mapped["Supplier | None"] = relationship(
+        foreign_keys=[preferred_supplier_id], lazy="joined"
+    )
 
     @property
     def total_stock(self) -> int:

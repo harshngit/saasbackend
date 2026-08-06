@@ -33,6 +33,15 @@ class Quotation(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     currency: Mapped[str | None] = mapped_column(String(10), default="INR", nullable=True)
+    # Sheet fields the quotation was missing. `status` is what the UI's
+    # Draft / Sent badge reads.
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False, index=True)
+    shipping_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payment_terms: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    delivery_terms: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terms_conditions: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -44,6 +53,16 @@ class Quotation(Base):
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined", primaryjoin="Quotation.customer_id == Customer.id")  # noqa: F821
     salesperson: Mapped["User | None"] = relationship(lazy="joined", primaryjoin="Quotation.salesperson_id == User.id")  # noqa: F821
+
+
+    @property
+    def total(self) -> float:
+        """Sum of the line totals — what the list's Amount column shows."""
+        return round(sum((i.quantity or 0) * (i.unit_price or 0) for i in self.items), 2)
+
+    @property
+    def item_count(self) -> int:
+        return len(self.items)
 
 
 class QuotationItem(Base):

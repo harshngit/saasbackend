@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ReturnCustomerBrief(BaseModel):
@@ -32,7 +32,7 @@ class ReturnItemOut(ReturnItemBase):
 
 
 class SalesReturnBase(BaseModel):
-    return_number: str
+    return_number: str | None = Field(default=None, description="Auto-generated when omitted")
     return_date: datetime | None = None
     customer_id: str | None = None
     invoice_reference_id: str | None = None

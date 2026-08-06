@@ -15,6 +15,7 @@ from app.models import (
     StockMovement,
     User,
 )
+from app.services import numbering_service
 from app.schemas.sales_return import SalesReturnCreate, SalesReturnOut
 
 router = APIRouter(prefix="/sales-returns", tags=["sales_returns"])
@@ -51,7 +52,9 @@ def create_sales_return(
 
     sales_return = SalesReturn(
         organization_id=org_id,
-        return_number=payload.return_number,
+        return_number=payload.return_number or numbering_service.next_number(
+            db, org_id, SalesReturn.return_number, "RET"
+        ),
         return_date=payload.return_date or datetime.now(timezone.utc),
         customer_id=payload.customer_id,
         invoice_reference_id=payload.invoice_reference_id,

@@ -17,6 +17,7 @@ from app.models import (
     Delivery,
     DeliveryItem,
 )
+from app.services import numbering_service
 from app.schemas.delivery import DeliveryStatusUpdate
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
@@ -89,7 +90,9 @@ def create_delivery_note(
 
     delivery = Delivery(
         organization_id=org_id,
-        delivery_note_number=payload.delivery_note_number,
+        delivery_note_number=payload.delivery_note_number or numbering_service.next_number(
+            db, org_id, Delivery.delivery_note_number, "DN"
+        ),
         delivery_date=payload.delivery_date or datetime.now(timezone.utc),
         sales_order_id=payload.sales_order_id,
         customer_id=payload.customer_id,

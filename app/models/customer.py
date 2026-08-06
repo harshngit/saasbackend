@@ -100,3 +100,6 @@ class CustomerPayment(Base):
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    # Loaded with the payment so history rows carry the invoice number, not just its id.
+    invoice: Mapped["Invoice | None"] = relationship(lazy="joined")  # noqa: F821

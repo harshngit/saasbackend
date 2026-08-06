@@ -32,6 +32,16 @@ class CustomerOut(BaseModel):
     category: str | None
     notes: str | None
     is_active: bool
+
+    # Customer profile. These columns existed but were never exposed, so
+    # `customer_id` looked absent to every caller.
+    customer_id: str | None = None
+    customer_since: datetime | None = None
+    status: str | None = None
+    primary_contact_person: str | None = None
+    maps_latitude: float | None = None
+    maps_longitude: float | None = None
+
     created_at: datetime
     updated_at: datetime
 
@@ -69,6 +79,18 @@ class CustomerPaymentCreate(BaseModel):
     received_on: datetime | None = None
 
 
+class PaymentInvoiceBrief(BaseModel):
+    """The invoice a payment settled, resolved from invoice_id."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    invoice_number: str
+    total: float
+    amount_paid: float
+    status: str
+
+
 class CustomerPaymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -76,6 +98,7 @@ class CustomerPaymentOut(BaseModel):
     customer_id: str
     order_id: str | None
     invoice_id: str | None = None
+    invoice: PaymentInvoiceBrief | None = None
     amount: float
     payment_mode: str
     reference: str | None
