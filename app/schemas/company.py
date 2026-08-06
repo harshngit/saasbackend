@@ -29,6 +29,31 @@ def _normalize_status(value: object) -> object:
 CompanyStatusIn = Annotated[CompanyStatus, BeforeValidator(_normalize_status)]
 
 
+class BusinessDocumentSlot(str, Enum):
+    """The Company Master's single-file document slots, uploadable via
+    POST /organizations/settings/documents/{slot}. "Other Business Documents"
+    is deliberately not here — it holds many files and has its own endpoints."""
+
+    gst_certificate = "gst_certificate"
+    pan_card = "pan_card"
+    certificate_of_incorporation = "certificate_of_incorporation"
+    trade_license = "trade_license"
+    msme_certificate = "msme_certificate"
+    fssai_license = "fssai_license"
+
+    @property
+    def column(self) -> str:
+        """The organization column this slot writes to."""
+        return {
+            BusinessDocumentSlot.gst_certificate: "doc_gst_url",
+            BusinessDocumentSlot.pan_card: "doc_pan_url",
+            BusinessDocumentSlot.certificate_of_incorporation: "doc_coi_url",
+            BusinessDocumentSlot.trade_license: "doc_trade_license_url",
+            BusinessDocumentSlot.msme_certificate: "doc_msme_url",
+            BusinessDocumentSlot.fssai_license: "doc_fssai_url",
+        }[self]
+
+
 class OtherDocument(BaseModel):
     """One file in the "Other Business Documents" multi-upload slot."""
 

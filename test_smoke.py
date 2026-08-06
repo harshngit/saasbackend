@@ -1339,6 +1339,45 @@ cleared = client.get("/organizations/settings", headers=fin_hdr).json()
 check("list empty after clear", cleared["doc_other_files"] == [], cleared["doc_other_files"])
 check("doc_other_url cleared with the list", cleared["doc_other_url"] is None, cleared["doc_other_url"])
 
+print("\n== Single business document slots ==")
+_SLOT_COLUMN = {
+    "gst_certificate": "doc_gst_url",
+    "pan_card": "doc_pan_url",
+    "certificate_of_incorporation": "doc_coi_url",
+    "trade_license": "doc_trade_license_url",
+    "msme_certificate": "doc_msme_url",
+    "fssai_license": "doc_fssai_url",
+}
+for slot, column in _SLOT_COLUMN.items():
+    r = client.post(f"/organizations/settings/documents/{slot}", headers=fin_hdr,
+                    files={"file": (f"{slot}.pdf", io.BytesIO(b"%PDF-1.4 doc"), "application/pdf")})
+    check(f"upload {slot} -> {column}",
+          r.status_code == 200 and (r.json()[column] or "").startswith("data:application/pdf"), r.text[:200])
+settings_now = client.get("/organizations/settings", headers=fin_hdr).json()
+check("every single-document slot is filled and independent",
+      all((settings_now[c] or "").startswith("data:") for c in _SLOT_COLUMN.values()), settings_now.get("doc_gst_url"))
+check("'other' still routes to the multi-file slot, not the enum",
+      client.get("/organizations/settings/documents/other", headers=fin_hdr).status_code == 200)
+check("multi-file upload still appends to 'other'",
+      len(client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
+          ("files", ("a.pdf", io.BytesIO(b"%PDF a"), "application/pdf")),
+          ("files", ("b.pdf", io.BytesIO(b"%PDF b"), "application/pdf"))]).json()) == 2)
+check("unknown document slot -> 422",
+      client.post("/organizations/settings/documents/not_a_slot", headers=fin_hdr,
+                  files={"file": ("x.pdf", io.BytesIO(b"%PDF"), "application/pdf")}).status_code == 422)
+check("single-document slot rejects an unsupported format -> 400",
+      client.post("/organizations/settings/documents/pan_card", headers=fin_hdr,
+                  files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
+check("staff cannot upload business documents -> 403",
+      client.post("/organizations/settings/documents/gst_certificate", headers=st_hdr,
+                  files={"file": ("x.pdf", io.BytesIO(b"%PDF"), "application/pdf")}).status_code == 403)
+r = client.delete("/organizations/settings/documents/gst_certificate", headers=fin_hdr)
+check("clear a single-document slot",
+      r.status_code == 200 and r.json()["doc_gst_url"] is None, r.text[:200])
+check("clearing one slot leaves the others",
+      (client.get("/organizations/settings", headers=fin_hdr).json()["doc_pan_url"] or "").startswith("data:"))
+client.delete("/organizations/settings/documents/other", headers=fin_hdr)
+
 print("\n== Leads CRUD ==")
 lead_payload = {
     "lead_id": "L-12345",

@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.core.deps import require_system_role
 from app.models import Organization, Plan, SystemRole, User
 from app.schemas.company import (
+    BusinessDocumentSlot,
     CompanySettingsOut,
     CompanySettingsUpdate,
     CompanyStatus,
@@ -176,6 +177,8 @@ def upload_settings_file(
     return UploadResponse(url=url)
 
 
+
+
 # --------------------------- Other Business Documents ---------------------------
 # The one Company Master slot that holds many files (the rest are single-document
 # fields like doc_gst_url). Stored as a JSON list on the org.
@@ -260,6 +263,47 @@ def delete_other_document(
 def clear_other_documents(admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> None:
     """Remove every "Other Business Document" for this company."""
     _save_documents(db, _admin_org(admin, db), [])
+
+
+# ------------------------- Single business documents -------------------------
+# GST certificate, PAN, incorporation certificate, trade licence, MSME, FSSAI —
+# one file each. These are plain URL columns, so they can still be set through
+# PUT /settings; the endpoints below just make "pick a file, it's saved" one call
+# instead of upload-file followed by a settings update.
+#
+# Registered *after* the /documents/other routes on purpose: "other" is not a
+# BusinessDocumentSlot, and a path parameter declared first would shadow it.
+
+
+@router.post("/settings/documents/{slot}", response_model=CompanySettingsOut)
+def upload_business_document(
+    slot: BusinessDocumentSlot,
+    file: UploadFile = File(..., description="PDF / PNG / JPG / DOCX, max 5 MB"),
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> Organization:
+    """Upload one of the single-file business documents. Replaces whatever was in
+    that slot. The many-file slot is /settings/documents/other."""
+    org = _admin_org(admin, db)
+    url, _ = _store_document(file)
+    setattr(org, slot.column, url)
+    db.commit()
+    db.refresh(org)
+    return org
+
+
+@router.delete("/settings/documents/{slot}", response_model=CompanySettingsOut)
+def clear_business_document(
+    slot: BusinessDocumentSlot,
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> Organization:
+    """Remove one of the single-file business documents."""
+    org = _admin_org(admin, db)
+    setattr(org, slot.column, None)
+    db.commit()
+    db.refresh(org)
+    return org
 
 
 # ------------------------------- Field Settings -------------------------------
