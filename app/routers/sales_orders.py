@@ -128,10 +128,17 @@ def create_order(
     if customer is None or customer.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id is not a customer in your firm")
 
+    _order_no = _next_order_number(db, org_id)
     order = SalesOrder(
         organization_id=org_id,
-        order_number=_next_order_number(db, org_id),
+        order_number=_order_no,
+        # The sheet calls it Sales Order Number; same value, kept in its own
+        # column so either name works.
+        sales_order_number=_order_no,
         customer_id=customer.id,
+        order_date=payload.order_date or datetime.now(timezone.utc),
+        salesperson_id=payload.salesperson_id,
+        order_status=payload.order_status or "Draft",
         status="pending",
         source=payload.source,
         created_by=user.id,

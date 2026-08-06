@@ -37,6 +37,9 @@ class Invoice(Base):
         String(36), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True
     )
     invoice_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    # Copied from the customer when the invoice is raised — a bill must keep the
+    # address it was issued to, even if the customer later moves.
+    billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     status: Mapped[str] = mapped_column(String(20), default="unpaid", nullable=False, index=True)
 

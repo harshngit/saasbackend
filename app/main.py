@@ -81,7 +81,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "auto-numbers-and-id-resolution"
+BUILD_TAG = "sheet-fields-exposed"
 
 
 @app.on_event("startup")

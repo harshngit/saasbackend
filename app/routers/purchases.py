@@ -16,6 +16,7 @@ from app.models import (
     Supplier,
     User,
 )
+from app.services import numbering_service
 from app.schemas.purchase import (
     CancelBody,
     PaymentStatusUpdate,
@@ -90,6 +91,19 @@ def create_purchase(
         invoice_date=payload.invoice_date or datetime.now(timezone.utc),
         status="pending", discount=payload.discount, tax=payload.tax,
         notes=payload.notes, attachment_url=payload.attachment_url, created_by=user.id,
+        # Sheet fields — both ids are Auto Numbers, and the billing address is
+        # copied from the supplier at creation time.
+        purchase_id=numbering_service.next_number(db, org_id, PurchaseInvoice.purchase_id, "PURID"),
+        purchase_number=numbering_service.next_number(db, org_id, PurchaseInvoice.purchase_number, "PUR"),
+        purchase_type=payload.purchase_type or "Direct Purchase",
+        purchase_date=payload.purchase_date or payload.invoice_date or datetime.now(timezone.utc),
+        financial_year=payload.financial_year,
+        purchase_status=payload.purchase_status or "Draft",
+        billing_address=payload.billing_address or supplier.address,
+        warehouse_id=payload.warehouse_id,
+        receiving_status=payload.receiving_status or "Pending",
+        purchase_account_id=payload.purchase_account_id,
+        approval_status=payload.approval_status or "Pending",
     )
     inv.items, _ = _build_items(db, org_id, payload.items)
     _recompute_totals(inv)

@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from app.schemas.choices import ApprovalStatus, PurchaseStatus, PurchaseType, ReceivingStatus
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -60,6 +61,19 @@ class PurchaseOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # Sheet fields
+    purchase_id: str | None = None
+    purchase_number: str | None = None
+    purchase_type: str | None = None
+    purchase_date: datetime | None = None
+    financial_year: str | None = None
+    purchase_status: str | None = None
+    billing_address: str | None = None
+    warehouse_id: str | None = None
+    receiving_status: str | None = None
+    purchase_account_id: str | None = None
+    approval_status: str | None = None
+
 
 class PurchaseCreate(BaseModel):
     invoice_number: str = Field(min_length=1, max_length=60)
@@ -70,6 +84,17 @@ class PurchaseCreate(BaseModel):
     notes: str | None = None
     attachment_url: str | None = None
     items: list[PurchaseItemIn] = Field(min_length=1)
+
+    # Sheet fields (purchase_id / purchase_number are auto-generated)
+    purchase_type: PurchaseType | None = Field(default=None, description="Purchase Order | Direct Purchase | Service Purchase | Asset Purchase")
+    purchase_date: datetime | None = None
+    financial_year: str | None = Field(default=None, max_length=20)
+    purchase_status: PurchaseStatus | None = Field(default=None, description="Draft | Ordered | Received | Invoiced | Paid | Cancelled")
+    billing_address: str | None = Field(default=None, description="Defaults to the supplier's address")
+    warehouse_id: str | None = Field(default=None, description="Receiving warehouse")
+    receiving_status: ReceivingStatus | None = Field(default=None, description="Pending | Partial | Completed")
+    purchase_account_id: str | None = Field(default=None, description="Ledger account to post against")
+    approval_status: ApprovalStatus | None = Field(default=None, description="Pending | Approved | Rejected")
 
 
 class PurchaseUpdate(BaseModel):

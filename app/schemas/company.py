@@ -165,6 +165,7 @@ class CompanySettingsOut(BaseModel):
     tax_configuration: dict | str | None = None
     invoice_settings: dict | str | None = None
     employee_id_prefix: str | None = None
+    number_prefixes: dict[str, str] = Field(default_factory=dict)
 
     # Documents (Ext)
     doc_gst_url: str | None = None
@@ -200,6 +201,11 @@ class CompanySettingsOut(BaseModel):
     @classmethod
     def _default_documents(cls, v: object) -> object:
         return v or []
+
+    @field_validator("number_prefixes", mode="before")
+    @classmethod
+    def _default_prefixes(cls, v: object) -> object:
+        return v or {}
 
     @field_validator("tax_configuration", "invoice_settings", mode="before")
     @classmethod
@@ -314,6 +320,11 @@ class CompanySettingsUpdate(BaseModel):
     )
     employee_id_prefix: str | None = Field(
         default=None, max_length=20, description='Prefix for auto-generated employee codes (default "EMP-")'
+    )
+    number_prefixes: dict[str, str] | None = Field(
+        default=None,
+        description='Per-series prefix overrides, e.g. {"QT": "EST", "INV": "BILL"}. '
+                    "Series: CUST, PROD, LEAD, QT, SO, INV, SALE, RCPT, RET, DN, EXP, EXPID, PUR, PURID.",
     )
 
     # Documents (Ext)
@@ -432,6 +443,26 @@ class CompanyOptions(BaseModel):
     states: list[str]
     bank_names: list[str]
     company_statuses: list[str]
+    number_series: dict[str, str]        # series -> the prefix in use for this firm
+    customer_statuses: list[str]
+    customer_types: list[str]
+    sales_types: list[str]
+    sales_statuses: list[str]
+    order_statuses: list[str]
+    invoice_statuses: list[str]
+    invoice_payment_statuses: list[str]
+    purchase_types: list[str]
+    purchase_statuses: list[str]
+    receiving_statuses: list[str]
+    purchase_payment_statuses: list[str]
+    expense_types: list[str]
+    expense_statuses: list[str]
+    expense_payment_statuses: list[str]
+    approval_statuses: list[str]
+    return_types: list[str]
+    return_statuses: list[str]
+    payment_methods: list[str]
+    units_of_measure: list[str]
 
 
 class CompanyCompleteness(BaseModel):

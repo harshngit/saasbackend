@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from app.schemas.choices import CustomerStatus
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
@@ -65,6 +66,13 @@ class CustomerCreate(BaseModel):
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
 
+    # Customer profile (customer_id is auto-generated, so not settable)
+    customer_since: datetime | None = None
+    status: CustomerStatus | None = Field(default=None, description="Active | Inactive | Blacklisted | Prospect")
+    primary_contact_person: str | None = Field(default=None, max_length=150)
+    maps_latitude: float | None = Field(default=None, ge=-90, le=90)
+    maps_longitude: float | None = Field(default=None, ge=-180, le=180)
+
 
 class CustomerPaymentCreate(BaseModel):
     amount: float = Field(gt=0)
@@ -127,3 +135,12 @@ class CustomerUpdate(BaseModel):
     @classmethod
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
+
+    # Customer profile (customer_id is auto-generated, so not settable)
+    customer_since: datetime | None = None
+    status: CustomerStatus | None = Field(default=None, description="Active | Inactive | Blacklisted | Prospect")
+    primary_contact_person: str | None = Field(default=None, max_length=150)
+    maps_latitude: float | None = Field(default=None, ge=-90, le=90)
+    maps_longitude: float | None = Field(default=None, ge=-180, le=180)
+
+

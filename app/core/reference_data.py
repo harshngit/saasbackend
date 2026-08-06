@@ -88,3 +88,36 @@ INDIAN_STATES = [
     "Mizoram", "Nagaland", "Odisha", "Puducherry", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
     "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
 ]
+
+
+# --- Allowed values from the field sheet ------------------------------------
+# Closed lists (the sheet names every value) are validated; lists the sheet ends
+# with "etc." stay free text and these act as suggestions for the dropdown.
+
+CUSTOMER_STATUSES = ["Active", "Inactive", "Blacklisted", "Prospect"]
+CUSTOMER_TYPES = ["Individual", "Business", "Government", "Dealer", "Distributor", "Vendor"]
+
+SALES_TYPES = ["Quotation", "Sales Order", "Invoice", "POS Sale", "Return", "Credit Note"]
+SALES_STATUSES = ["Draft", "Confirmed", "Completed", "Cancelled", "Returned"]
+INVOICE_PAYMENT_STATUSES = ["Unpaid", "Partial", "Paid", "Refunded"]
+
+ORDER_STATUSES_SHEET = ["Draft", "Confirmed", "Processing", "Completed", "Cancelled"]
+
+PURCHASE_TYPES = ["Purchase Order", "Direct Purchase", "Service Purchase", "Asset Purchase"]
+PURCHASE_STATUSES = ["Draft", "Ordered", "Received", "Invoiced", "Paid", "Cancelled"]
+RECEIVING_STATUSES = ["Pending", "Partial", "Completed"]
+PURCHASE_PAYMENT_STATUSES = ["Unpaid", "Partial", "Paid"]
+
+EXPENSE_STATUSES_SHEET = ["Draft", "Submitted", "Approved", "Rejected", "Paid"]
+EXPENSE_PAYMENT_STATUSES = ["Pending", "Partially Paid", "Paid"]
+
+APPROVAL_STATUSES = ["Pending", "Approved", "Rejected"]
+
+RETURN_TYPES = ["Refund", "Replacement", "Credit Note"]
+RETURN_STATUSES = ["Requested", "Approved", "Refunded", "Closed"]
+
+# Open lists — the sheet ends these with "etc.", so they are suggestions only.
+PAYMENT_METHODS = ["Cash", "Card", "UPI", "Bank Transfer", "Cheque", "Wallet", "Credit"]
+EXPENSE_TYPES = ["Operational", "Capital", "Reimbursable", "Petty Cash", "Travel", "Utilities"]
+INVOICE_STATUSES = ["Draft", "Issued", "Paid", "Cancelled"]
+UNITS_OF_MEASURE = ["Piece", "Box", "Kg", "Gram", "Litre", "Millilitre", "Metre", "Dozen", "Pack", "Set"]

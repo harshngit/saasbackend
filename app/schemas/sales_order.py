@@ -60,6 +60,12 @@ class OrderOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # Sheet fields
+    sales_order_number: str | None = None
+    order_date: datetime | None = None
+    salesperson_id: str | None = None
+    order_status: str | None = None
+
 
 class OrderCreate(BaseModel):
     customer_id: str
@@ -75,6 +81,11 @@ class OrderCreate(BaseModel):
         if v not in ("office", "delivery_vehicle"):
             raise ValueError("source must be 'office' or 'delivery_vehicle'")
         return v
+
+    # Sheet fields (sales_order_number is auto-generated)
+    order_date: datetime | None = None
+    salesperson_id: str | None = Field(default=None, description="Assigned salesperson")
+    order_status: str | None = Field(default=None, max_length=30, description="Draft, Confirmed, Processing, Completed, Cancelled")
 
 
 class RejectBody(BaseModel):

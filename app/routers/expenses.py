@@ -8,7 +8,7 @@ from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import store_upload
 from app.models import EXPENSE_CATEGORIES, Expense, User
 from app.schemas.expense import ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
-from app.services import notification_service
+from app.services import notification_service, numbering_service
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
@@ -45,11 +45,21 @@ def create_expense(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Expense:
+    org_id = _org_id(user)
+    data = payload.model_dump(exclude={"expense_date"})
     expense = Expense(
-        organization_id=_org_id(user),
+        organization_id=org_id,
         submitted_by=user.id,
         expense_date=payload.expense_date or datetime.now(timezone.utc),
-        **payload.model_dump(exclude={"expense_date"}),
+        # Sheet: both are Auto Numbers.
+        expense_id=numbering_service.next_number(db, org_id, Expense.expense_id, "EXPID"),
+        expense_number=numbering_service.next_number(db, org_id, Expense.expense_number, "EXP"),
+        **{
+            **data,
+            "expense_status": data.get("expense_status") or "Submitted",
+            "payment_status": data.get("payment_status") or "Pending",
+            "approval_status": data.get("approval_status") or "Pending",
+        },
     )
     db.add(expense)
     db.flush()

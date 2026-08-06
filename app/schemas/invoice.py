@@ -1,4 +1,5 @@
 from datetime import datetime
+from app.schemas.choices import InvoicePaymentStatus, SalesStatus, SalesType
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -62,6 +63,15 @@ class InvoiceOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # Full Invoice sheet fields
+    sales_id: str | None = None
+    sales_type: str | None = None
+    sales_date: datetime | None = None
+    sales_status: str | None = None
+    invoice_status: str | None = None
+    payment_status: str | None = None
+    billing_address: str | None = None
+
 
 class InvoiceCreate(BaseModel):
     customer_id: str
@@ -70,6 +80,14 @@ class InvoiceCreate(BaseModel):
     tax: float = Field(default=0, ge=0)
     notes: str | None = None
     items: list[InvoiceItemIn] = Field(min_length=1)
+
+    # Full Invoice sheet fields (sales_id / invoice_number are auto-generated)
+    sales_type: SalesType | None = Field(default=None, description="Quotation | Sales Order | Invoice | POS Sale | Return | Credit Note")
+    sales_date: datetime | None = None
+    sales_status: SalesStatus | None = Field(default=None, description="Draft | Confirmed | Completed | Cancelled | Returned")
+    invoice_status: str | None = Field(default=None, max_length=30, description="Draft, Issued, Paid, …")
+    payment_status: InvoicePaymentStatus | None = Field(default=None, description="Unpaid | Partial | Paid | Refunded")
+    billing_address: str | None = Field(default=None, description="Defaults to the customer's billing address")
 
 
 class CreditNoteItem(BaseModel):

@@ -42,19 +42,33 @@ def _highest_issued(db: Session, org_id: str, column, stem: str) -> int:
     return highest
 
 
-def next_number(db: Session, org_id: str, column, prefix: str, year: int | None = None) -> str:
+def prefix_for(db: Session, org_id: str, series: str) -> str:
+    """The firm's prefix for a series — its Company Settings override, else the
+    series' own name (QT, INV, CUST …)."""
+    from app.models.organization import Organization
+
+    org = db.get(Organization, org_id)
+    overrides = (org.number_prefixes or {}) if org is not None else {}
+    return (overrides.get(series) or series).strip() or series
+
+
+def next_number(db: Session, org_id: str, column, series: str, year: int | None = None) -> str:
     """Next `<prefix>-<year>-<n>` for this firm, from a stored counter that only
-    moves forward — deleting a record never frees its number for reuse."""
+    moves forward — deleting a record never frees its number for reuse.
+
+    The counter is keyed on the series, not the rendered prefix, so renaming the
+    prefix continues the same run instead of restarting it."""
     from app.models.number_sequence import NumberSequence
 
     year = year or _year()
+    prefix = prefix_for(db, org_id, series)
     stem = f"{prefix}-{year}-"
 
     sequence = (
         db.query(NumberSequence)
         .filter(
             NumberSequence.organization_id == org_id,
-            NumberSequence.series == prefix,
+            NumberSequence.series == series,
             NumberSequence.year == year,
         )
         .with_for_update(nowait=False)
@@ -63,7 +77,7 @@ def next_number(db: Session, org_id: str, column, prefix: str, year: int | None 
     if sequence is None:
         sequence = NumberSequence(
             organization_id=org_id,
-            series=prefix,
+            series=series,
             year=year,
             last_number=_highest_issued(db, org_id, column, stem),
         )

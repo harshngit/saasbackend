@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_system_role
+from app.core import reference_data as R
 from app.core.reference_data import (
     BANK_NAMES,
     BUSINESS_TYPES,
@@ -32,7 +33,7 @@ from app.schemas.company import (
     UploadResponse,
 )
 from app.schemas.organization import OrganizationOut, UpgradeRequest
-from app.services import org_service
+from app.services import numbering_service, org_service
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -149,9 +150,12 @@ REQUIRED_COMPANY_FIELDS = [
 
 
 @router.get("/settings/options", response_model=CompanyOptions)
-def company_options(admin: User = Depends(_ADMIN)) -> CompanyOptions:
-    """Dropdown data for the Company Master form — business types, industries,
-    currencies, IANA time zones, languages, countries, states and banks."""
+def company_options(
+    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+) -> CompanyOptions:
+    """Every dropdown list the app needs: Company Master fields, plus the allowed
+    values the field sheet spells out for customers, sales, purchases and expenses,
+    plus this firm's auto-number prefixes."""
     return CompanyOptions(
         business_types=BUSINESS_TYPES,
         industries=INDUSTRIES,
@@ -162,6 +166,30 @@ def company_options(admin: User = Depends(_ADMIN)) -> CompanyOptions:
         states=INDIAN_STATES,
         bank_names=BANK_NAMES,
         company_statuses=[s.value for s in CompanyStatus],
+        number_series={
+            series: numbering_service.prefix_for(db, admin.organization_id, series)
+            for series in ("CUST", "PROD", "LEAD", "QT", "SO", "INV", "SALE",
+                           "RCPT", "RET", "DN", "EXP", "EXPID", "PUR", "PURID")
+        },
+        customer_statuses=R.CUSTOMER_STATUSES,
+        customer_types=R.CUSTOMER_TYPES,
+        sales_types=R.SALES_TYPES,
+        sales_statuses=R.SALES_STATUSES,
+        order_statuses=R.ORDER_STATUSES_SHEET,
+        invoice_statuses=R.INVOICE_STATUSES,
+        invoice_payment_statuses=R.INVOICE_PAYMENT_STATUSES,
+        purchase_types=R.PURCHASE_TYPES,
+        purchase_statuses=R.PURCHASE_STATUSES,
+        receiving_statuses=R.RECEIVING_STATUSES,
+        purchase_payment_statuses=R.PURCHASE_PAYMENT_STATUSES,
+        expense_types=R.EXPENSE_TYPES,
+        expense_statuses=R.EXPENSE_STATUSES_SHEET,
+        expense_payment_statuses=R.EXPENSE_PAYMENT_STATUSES,
+        approval_statuses=R.APPROVAL_STATUSES,
+        return_types=R.RETURN_TYPES,
+        return_statuses=R.RETURN_STATUSES,
+        payment_methods=R.PAYMENT_METHODS,
+        units_of_measure=R.UNITS_OF_MEASURE,
     )
 
 

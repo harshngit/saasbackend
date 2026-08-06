@@ -89,6 +89,9 @@ class Organization(Base):
     invoice_settings: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Prefix for the auto-generated employee codes (EMP-0001, ACME-0001, …).
     employee_id_prefix: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Per-series overrides for the auto-number prefixes, e.g. {"QT": "EST", "INV": "BILL"}.
+    # Anything absent falls back to the series' built-in prefix.
+    number_prefixes: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True)
     # Repeatable Branch / Office Addresses. `branch_address` above keeps the first
     # one as plain text so clients reading the old single field still work.
     branch_addresses: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
