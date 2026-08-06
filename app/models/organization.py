@@ -89,6 +89,9 @@ class Organization(Base):
     invoice_settings: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Prefix for the auto-generated employee codes (EMP-0001, ACME-0001, …).
     employee_id_prefix: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Repeatable Branch / Office Addresses. `branch_address` above keeps the first
+    # one as plain text so clients reading the old single field still work.
+    branch_addresses: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
 
     # Documents (Ext)
     doc_gst_url: Mapped[str | None] = mapped_column(Text, nullable=True)

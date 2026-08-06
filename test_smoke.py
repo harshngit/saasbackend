@@ -1319,9 +1319,10 @@ check("rejected batch left the list untouched",
       len(client.get("/organizations/settings/documents/other", headers=fin_hdr).json()) == 3)
 
 r = client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
-    ("files", ("huge.pdf", io.BytesIO(b"x" * (6 * 1024 * 1024)), "application/pdf")),
+    # Document cap is 10 MB (Company Master sheet), so 11 MB must be refused.
+    ("files", ("huge.pdf", io.BytesIO(b"x" * (11 * 1024 * 1024)), "application/pdf")),
 ])
-check("oversized document -> 413", r.status_code == 413, r.text)
+check("oversized document -> 413", r.status_code == 413, r.text[:200])
 
 doc_id = client.get("/organizations/settings/documents/other", headers=fin_hdr).json()[1]["id"]
 r = client.delete(f"/organizations/settings/documents/other/{doc_id}", headers=fin_hdr)
@@ -1377,6 +1378,89 @@ check("clear a single-document slot",
 check("clearing one slot leaves the others",
       (client.get("/organizations/settings", headers=fin_hdr).json()["doc_pan_url"] or "").startswith("data:"))
 client.delete("/organizations/settings/documents/other", headers=fin_hdr)
+
+print("\n== Company Master: options, validation, branches, config ==")
+r = client.get("/organizations/settings/options", headers=fin_hdr)
+check("GET /settings/options -> 200", r.status_code == 200, r.text[:200])
+copts = r.json()
+check("options: business types from the sheet",
+      copts["business_types"][:6] == ["Private Limited", "Public Limited", "LLP", "Partnership",
+                                      "Proprietorship", "NGO"], copts["business_types"][:6])
+check("options: IANA time zones", "Asia/Kolkata" in copts["time_zones"] and len(copts["time_zones"]) > 100)
+check("options: currencies / languages / banks",
+      "INR" in copts["currencies"] and "Hindi" in copts["languages"]
+      and "HDFC Bank" in copts["bank_names"])
+check("options: countries and states", "India" in copts["countries"] and "Maharashtra" in copts["states"])
+check("staff cannot read company options",
+      client.get("/organizations/settings/options", headers=st_hdr).status_code == 403)
+
+for _field, _bad, _label in [
+    ("gstin_pan", "BADGST", "GSTIN/PAN"), ("bank_ifsc", "HD1", "IFSC"),
+    ("pin_code", "12", "PIN"), ("primary_mobile", "not-a-phone", "phone"),
+    ("name", "N" * 101, "name > 100"), ("legal_name", "L" * 151, "legal name > 150"),
+    ("description", "D" * 501, "description > 500"), ("cin_number", "C" * 31, "CIN > 30"),
+]:
+    check(f"settings rejects invalid {_label}",
+          client.put("/organizations/settings", headers=fin_hdr,
+                     json={_field: _bad}).status_code == 422)
+r = client.put("/organizations/settings", headers=fin_hdr, json={
+    "gstin_pan": "27aapfu0939f1zv", "bank_ifsc": "hdfc0001234", "pin_code": "411001",
+    "primary_mobile": "+91 98765 43210"})
+check("valid values accepted and upper-cased",
+      r.status_code == 200 and r.json()["gstin_pan"] == "27AAPFU0939F1ZV"
+      and r.json()["bank_ifsc"] == "HDFC0001234", r.text[:250])
+check("bare domain upgraded to https://",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"website": "acme.com"}).json()["website"] == "https://acme.com")
+check("http:// website rejected",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"website": "http://acme.com"}).status_code == 422)
+
+for _sheet, _api, _val in [
+    ("pin_zip_code", "pin_code", "400001"), ("company_logo", "logo_url", "data:image/png;base64,AA"),
+    ("authorized_signature", "signature_url", "data:image/png;base64,BB"),
+    ("google_pay_phonepe_paytm_qr_code", "payment_qr_url", "data:image/png;base64,CC"),
+    ("time_zone", "timezone", "Asia/Kolkata"),
+    ("owner_director_name", "auth_person_name", "Sushil Shinde"),
+    ("designation", "auth_person_designation", "Director"),
+    ("mobile_number", "auth_person_mobile", "+919812345678"),
+]:
+    check(f"sheet name '{_sheet}' accepted for {_api}",
+          client.put("/organizations/settings", headers=fin_hdr,
+                     json={_sheet: _val}).json()[_api] == _val)
+
+r = client.put("/organizations/settings", headers=fin_hdr, json={"branch_addresses": [
+    {"label": "Pune Warehouse", "address": "Plot 12, MIDC", "city": "Pune", "pin_code": "411018"},
+    {"label": "Delhi Office", "address": "22 Nehru Place", "city": "New Delhi"}]})
+check("repeatable branch addresses -> 200", r.status_code == 200 and len(r.json()["branch_addresses"]) == 2,
+      r.text[:250])
+check("each branch gets an id", all(b["id"] for b in r.json()["branch_addresses"]))
+check("legacy branch_address mirrors the first", r.json()["branch_address"] == "Plot 12, MIDC")
+check("branch without an address -> 422",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"branch_addresses": [{"label": "No address"}]}).status_code == 422)
+
+_cfg = {"numbering_series": "INV", "prefix": "INV-", "next_number": 1001, "footer": "Thank you",
+        "terms": "Payable in 30 days", "logo_placement": "left", "signature_placement": "right"}
+check("invoice_settings accepts and returns an object",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"invoice_settings": _cfg}).json()["invoice_settings"] == _cfg)
+check("tax_configuration accepts an object",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"tax_configuration": {"regime": "gst", "default_gst_rate": 18}}
+                 ).json()["tax_configuration"]["regime"] == "gst")
+check("legacy plain-string config still works",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"invoice_settings": "legacy string"}).json()["invoice_settings"] == "legacy string")
+
+r = client.get("/organizations/settings/completeness", headers=fin_hdr)
+check("GET /settings/completeness -> 200", r.status_code == 200, r.text[:200])
+comp = r.json()
+check("completeness covers the sheet's 24 mandatory fields", comp["total"] == 24, comp["total"])
+check("filled + missing add up", comp["filled"] + len(comp["missing"]) == comp["total"], comp)
+check("partial update of one field still allowed",
+      client.put("/organizations/settings", headers=fin_hdr,
+                 json={"city": "Mumbai"}).json()["city"] == "Mumbai")
 
 print("\n== HSN codes and payment allocation ==")
 hsn_prod = client.post("/products", headers=fin_hdr, json={

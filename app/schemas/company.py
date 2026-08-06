@@ -1,3 +1,5 @@
+import json
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Annotated
@@ -54,6 +56,30 @@ class BusinessDocumentSlot(str, Enum):
         }[self]
 
 
+class BranchAddress(BaseModel):
+    """One entry in the repeatable Branch / Office Addresses section."""
+
+    id: str | None = Field(default=None, description="Server-assigned; omit when adding")
+    label: str | None = Field(default=None, max_length=100, description='e.g. "Pune Warehouse"')
+    address: str = Field(min_length=1, max_length=500)
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    country: str | None = Field(default=None, max_length=100)
+    pin_code: str | None = Field(default=None, max_length=10)
+
+
+# --- Validation rules from the Company Master sheet -------------------------
+# Applied on input only, so rows written before these existed still read back.
+
+_GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$")
+_PAN_RE = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
+_IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
+_PIN_RE = re.compile(r"^[0-9]{5,10}$")
+# Deliberately permissive: E.164 is preferred but existing rows hold plain
+# 10-digit numbers, and rejecting those would break every edit of an old record.
+_PHONE_RE = re.compile(r"^\+?[0-9][0-9\s\-()]{5,19}$")
+
+
 class OtherDocument(BaseModel):
     """One file in the "Other Business Documents" multi-upload slot."""
 
@@ -103,6 +129,7 @@ class CompanySettingsOut(BaseModel):
     # Address Info (Ext)
     registered_address: str | None = None
     branch_address: str | None = None
+    branch_addresses: list[BranchAddress] = Field(default_factory=list)
     city: str | None = None
     state: str | None = None
     country: str | None = None
@@ -133,8 +160,10 @@ class CompanySettingsOut(BaseModel):
     currency: str | None = None
     timezone: str | None = None
     language: str | None = None
-    tax_configuration: str | None = None
-    invoice_settings: str | None = None
+    # Returned as an object when a config object was saved, otherwise as the
+    # plain string that was there before configuration panels existed.
+    tax_configuration: dict | str | None = None
+    invoice_settings: dict | str | None = None
     employee_id_prefix: str | None = None
 
     # Documents (Ext)
@@ -167,10 +196,22 @@ class CompanySettingsOut(BaseModel):
     # which only a Super Admin changes — never editable from this page.
     subscription_status: str | None = None
 
-    @field_validator("doc_other_files", mode="before")
+    @field_validator("doc_other_files", "branch_addresses", mode="before")
     @classmethod
     def _default_documents(cls, v: object) -> object:
         return v or []
+
+    @field_validator("tax_configuration", "invoice_settings", mode="before")
+    @classmethod
+    def _parse_config(cls, v: object) -> object:
+        """Config panels are stored as a JSON string in a TEXT column; hand back the
+        object when it parses, and the raw string when it is legacy free text."""
+        if isinstance(v, str) and v.strip().startswith("{"):
+            try:
+                return json.loads(v)
+            except ValueError:
+                return v
+        return v
 
     @field_validator("company_status", mode="before")
     @classmethod
@@ -179,11 +220,16 @@ class CompanySettingsOut(BaseModel):
 
 
 class CompanySettingsUpdate(BaseModel):
-    """Partial update — send only the fields being changed."""
+    """Partial update — send only the fields being changed.
+
+    Field lengths and formats follow the Company Master sheet's validation rules.
+    Where the sheet's name differs from the stored one, both are accepted (e.g.
+    `pin_zip_code` for `pin_code`, `company_logo` for `logo_url`).
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    name: str | None = Field(default=None, min_length=1, max_length=200)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     business_type: str | None = Field(default=None, max_length=100)
     gst_number: str | None = Field(default=None, max_length=20)
     pan_number: str | None = Field(default=None, max_length=20)
@@ -191,16 +237,18 @@ class CompanySettingsUpdate(BaseModel):
     phone: str | None = Field(default=None, max_length=20)
     email: str | None = None
     financial_year: str | None = Field(default=None, max_length=20)
-    logo_url: str | None = None
-    signature_url: str | None = None
+    logo_url: str | None = Field(default=None, validation_alias=AliasChoices("logo_url", "company_logo"))
+    signature_url: str | None = Field(
+        default=None, validation_alias=AliasChoices("signature_url", "authorized_signature")
+    )
 
     # Basic Info (Ext)
-    legal_name: str | None = Field(default=None, max_length=200)
+    legal_name: str | None = Field(default=None, max_length=150)
     industry: str | None = Field(default=None, max_length=100)
     date_of_incorporation: str | None = Field(default=None, max_length=50)
-    cin_number: str | None = Field(default=None, max_length=50)
-    gstin_pan: str | None = Field(default=None, max_length=50)
-    description: str | None = None
+    cin_number: str | None = Field(default=None, max_length=30)
+    gstin_pan: str | None = Field(default=None, max_length=15, description="GSTIN (15) or PAN (10)")
+    description: str | None = Field(default=None, max_length=500)
 
     # Contact Info (Ext)
     primary_mobile: str | None = Field(default=None, max_length=20)
@@ -211,11 +259,18 @@ class CompanySettingsUpdate(BaseModel):
 
     # Address Info (Ext)
     registered_address: str | None = None
-    branch_address: str | None = None
+    branch_address: str | None = Field(
+        default=None, deprecated=True, description="Single legacy branch address; use branch_addresses"
+    )
+    branch_addresses: list[BranchAddress] | None = Field(
+        default=None, description="Repeatable branch / office addresses. Replaces the whole list."
+    )
     city: str | None = Field(default=None, max_length=100)
     state: str | None = Field(default=None, max_length=100)
     country: str | None = Field(default=None, max_length=100)
-    pin_code: str | None = Field(default=None, max_length=20)
+    pin_code: str | None = Field(
+        default=None, max_length=10, validation_alias=AliasChoices("pin_code", "pin_zip_code")
+    )
 
     # Branding (Ext)
     stamp_url: str | None = None
@@ -223,7 +278,10 @@ class CompanySettingsUpdate(BaseModel):
     banner_url: str | None = None
 
     # Digital Payments (Ext)
-    payment_qr_url: str | None = None
+    payment_qr_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("payment_qr_url", "google_pay_phonepe_paytm_qr_code"),
+    )
     upi_id: str | None = Field(default=None, max_length=100)
     bank_account_details: str | None = None
     bank_account_holder: str | None = Field(default=None, max_length=200)
@@ -240,10 +298,20 @@ class CompanySettingsUpdate(BaseModel):
 
     # Business Settings (Ext)
     currency: str | None = Field(default=None, max_length=10)
-    timezone: str | None = Field(default=None, max_length=50)
+    timezone: str | None = Field(
+        default=None, max_length=50, validation_alias=AliasChoices("timezone", "time_zone")
+    )
     language: str | None = Field(default=None, max_length=50)
-    tax_configuration: str | None = None
-    invoice_settings: str | None = None
+    tax_configuration: dict | str | None = Field(
+        default=None,
+        description="Configuration object (e.g. {regime, default_gst_rate, prices_include_tax}) "
+                    "or a plain string. Stored as JSON when an object is sent.",
+    )
+    invoice_settings: dict | str | None = Field(
+        default=None,
+        description="Configuration object (e.g. {numbering_series, prefix, next_number, footer, "
+                    "terms, logo_placement, signature_placement}) or a plain string.",
+    )
     employee_id_prefix: str | None = Field(
         default=None, max_length=20, description='Prefix for auto-generated employee codes (default "EMP-")'
     )
@@ -258,9 +326,18 @@ class CompanySettingsUpdate(BaseModel):
     doc_other_url: str | None = None
 
     # Authorized Person (Ext)
-    auth_person_name: str | None = Field(default=None, max_length=200)
-    auth_person_designation: str | None = Field(default=None, max_length=100)
-    auth_person_mobile: str | None = Field(default=None, max_length=20)
+    auth_person_name: str | None = Field(
+        default=None, max_length=200,
+        validation_alias=AliasChoices("auth_person_name", "owner_director_name"),
+    )
+    auth_person_designation: str | None = Field(
+        default=None, max_length=100,
+        validation_alias=AliasChoices("auth_person_designation", "designation"),
+    )
+    auth_person_mobile: str | None = Field(
+        default=None, max_length=20,
+        validation_alias=AliasChoices("auth_person_mobile", "mobile_number"),
+    )
     auth_person_email: str | None = Field(default=None, max_length=255)
     auth_person_photo_url: str | None = None
     auth_person_signature_url: str | None = None
@@ -279,8 +356,14 @@ class CompanySettingsUpdate(BaseModel):
     @field_validator("website")
     @classmethod
     def validate_website(cls, v: str | None) -> str | None:
-        if v is not None and v != "" and not v.startswith("https://"):
+        """Sheet: must begin with https://. A bare domain is upgraded rather than
+        rejected, so "acme.com" typed into the form still saves."""
+        if v is None or v == "":
+            return v
+        if v.startswith("http://"):
             raise ValueError("Website must begin with https://")
+        if not v.startswith("https://"):
+            return f"https://{v}"
         return v
 
     @field_validator("email", "auth_person_email")
@@ -291,9 +374,78 @@ class CompanySettingsUpdate(BaseModel):
                 raise ValueError("Must be a valid email address")
         return v
 
+    @field_validator("gstin_pan", "gst_number", "pan_number", "bank_ifsc", mode="before")
+    @classmethod
+    def _upper(cls, v: object) -> object:
+        """These are always uppercase — normalise instead of rejecting lowercase input."""
+        return v.strip().upper() if isinstance(v, str) else v
+
+    @field_validator("gstin_pan")
+    @classmethod
+    def validate_gstin_pan(cls, v: str | None) -> str | None:
+        if not v:
+            return v
+        if len(v) == 15 and _GSTIN_RE.match(v):
+            return v
+        if len(v) == 10 and _PAN_RE.match(v):
+            return v
+        raise ValueError("Must be a valid 15-character GSTIN or 10-character PAN")
+
+    @field_validator("bank_ifsc")
+    @classmethod
+    def validate_ifsc(cls, v: str | None) -> str | None:
+        if v and not _IFSC_RE.match(v):
+            raise ValueError("IFSC must be 11 characters, e.g. HDFC0001234")
+        return v
+
+    @field_validator("pin_code")
+    @classmethod
+    def validate_pin(cls, v: str | None) -> str | None:
+        if v and not _PIN_RE.match(v):
+            raise ValueError("PIN / ZIP code must be 5 to 10 digits")
+        return v
+
+    @field_validator(
+        "phone", "primary_mobile", "alternate_mobile", "landline",
+        "customer_support_number", "whatsapp_number", "auth_person_mobile",
+    )
+    @classmethod
+    def validate_phone(cls, v: str | None) -> str | None:
+        if v and not _PHONE_RE.match(v.strip()):
+            raise ValueError("Enter a valid phone number, with country code where applicable")
+        return v
+
 
 class UploadResponse(BaseModel):
     url: str
+
+
+class CompanyOptions(BaseModel):
+    """Dropdown data for the Company Master form."""
+
+    business_types: list[str]
+    industries: list[str]
+    currencies: list[str]
+    time_zones: list[str]
+    languages: list[str]
+    countries: list[str]
+    states: list[str]
+    bank_names: list[str]
+    company_statuses: list[str]
+
+
+class CompanyCompleteness(BaseModel):
+    """Which of the sheet's mandatory Company Master fields are still blank.
+
+    Reported rather than enforced on write: PUT /settings is a partial update, so
+    demanding all of them on every call would make editing one field impossible.
+    """
+
+    complete: bool
+    filled: int
+    total: int
+    missing: list[str]
+    required: list[str]
 
 
 class FieldSettingsOut(BaseModel):

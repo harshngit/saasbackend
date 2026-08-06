@@ -1,4 +1,5 @@
 import base64
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -7,9 +8,21 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_system_role
+from app.core.reference_data import (
+    BANK_NAMES,
+    BUSINESS_TYPES,
+    COUNTRIES,
+    CURRENCIES,
+    INDIAN_STATES,
+    INDUSTRIES,
+    LANGUAGES,
+    TIME_ZONES,
+)
 from app.models import Organization, Plan, SystemRole, User
 from app.schemas.company import (
     BusinessDocumentSlot,
+    CompanyCompleteness,
+    CompanyOptions,
     CompanySettingsOut,
     CompanySettingsUpdate,
     CompanyStatus,
@@ -24,8 +37,9 @@ from app.services import org_service
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
 _ADMIN = require_system_role(SystemRole.ADMIN)
-_MAX_UPLOAD_BYTES = 1024 * 1024  # 1 MB cap for logo/signature images
-_MAX_DOCUMENT_BYTES = 5 * 1024 * 1024  # 5 MB cap per uploaded document
+# Limits from the sheet's validation rules: images up to 5 MB, documents up to 10 MB.
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+_MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 _MAX_OTHER_DOCUMENTS = 20  # "Other Business Documents" is multi-file, but not unbounded
 
 
@@ -46,7 +60,7 @@ def _store_image(file: UploadFile) -> str:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
     content = file.file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image too large (max 1 MB)")
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Image too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{file.content_type};base64,{encoded}"
 
@@ -108,10 +122,69 @@ def update_company_settings(
     for field, value in payload.model_dump(exclude_unset=True).items():
         if isinstance(value, CompanyStatus):
             value = value.value
+        elif field in ("tax_configuration", "invoice_settings") and isinstance(value, dict):
+            value = json.dumps(value)  # TEXT column, so config panels ride as JSON
+        elif field == "branch_addresses" and value is not None:
+            value = _numbered_branches(value)
+            # Keep the single legacy field pointing at the first branch.
+            org.branch_address = value[0]["address"] if value else None
         setattr(org, field, value)
     db.commit()
     db.refresh(org)
     return org
+
+
+# The Company Master sheet's mandatory fields, in sheet order. Used by
+# /settings/completeness — see CompanyCompleteness for why these are reported
+# rather than enforced on every partial update.
+REQUIRED_COMPANY_FIELDS = [
+    "name", "legal_name", "business_type", "industry",
+    "primary_mobile", "email",
+    "registered_address", "city", "state", "country", "pin_code",
+    "logo_url", "signature_url", "payment_qr_url",
+    "currency", "timezone", "language", "tax_configuration", "invoice_settings",
+    "auth_person_name", "auth_person_designation", "auth_person_mobile", "auth_person_email",
+    "company_status",
+]
+
+
+@router.get("/settings/options", response_model=CompanyOptions)
+def company_options(admin: User = Depends(_ADMIN)) -> CompanyOptions:
+    """Dropdown data for the Company Master form — business types, industries,
+    currencies, IANA time zones, languages, countries, states and banks."""
+    return CompanyOptions(
+        business_types=BUSINESS_TYPES,
+        industries=INDUSTRIES,
+        currencies=CURRENCIES,
+        time_zones=TIME_ZONES,
+        languages=LANGUAGES,
+        countries=COUNTRIES,
+        states=INDIAN_STATES,
+        bank_names=BANK_NAMES,
+        company_statuses=[s.value for s in CompanyStatus],
+    )
+
+
+@router.get("/settings/completeness", response_model=CompanyCompleteness)
+def company_completeness(
+    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+) -> CompanyCompleteness:
+    """Which mandatory Company Master fields are still blank, so the UI can show
+    a "profile 18/24 complete" indicator and flag what is left."""
+    org = _admin_org(admin, db)
+    missing = [f for f in REQUIRED_COMPANY_FIELDS if not getattr(org, f, None)]
+    return CompanyCompleteness(
+        complete=not missing,
+        filled=len(REQUIRED_COMPANY_FIELDS) - len(missing),
+        total=len(REQUIRED_COMPANY_FIELDS),
+        missing=missing,
+        required=REQUIRED_COMPANY_FIELDS,
+    )
+
+
+def _numbered_branches(branches: list[dict]) -> list[dict]:
+    """Give every branch a stable id so the front-end can edit or delete one."""
+    return [{**b, "id": b.get("id") or str(uuid.uuid4())} for b in branches]
 
 
 @router.post("/settings/logo", response_model=UploadResponse)
@@ -161,7 +234,8 @@ def _store_document(file: UploadFile) -> tuple[str, bytes]:
     if len(content) > _MAX_DOCUMENT_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"'{file.filename}' is too large (max 5 MB per file)",
+            detail=f"'{file.filename}' is too large "
+                   f"(max {_MAX_DOCUMENT_BYTES // (1024 * 1024)} MB per file)",
         )
     encoded = base64.b64encode(content).decode("ascii")
     return f"data:{content_type};base64,{encoded}", content
@@ -329,7 +403,7 @@ AVAILABLE_FIELDS = {
             "doc_other_url", "doc_other_files",
             "auth_person_photo_url", "auth_person_signature_url",
             "employee_count", "business_hours", "mission_vision", "notes",
-            "employee_id_prefix"
+            "employee_id_prefix", "branch_addresses"
         ]
     },
     "customer": {

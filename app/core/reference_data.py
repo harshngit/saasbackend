@@ -4,6 +4,49 @@ Kept here rather than in a schema module because they are shared data, not
 request/response shapes — customers and suppliers can use the same country list.
 """
 
+from zoneinfo import available_timezones
+
+# Company Master dropdowns.
+BUSINESS_TYPES = [
+    "Private Limited", "Public Limited", "LLP", "Partnership", "Proprietorship", "NGO",
+    "One Person Company", "Trust", "Society", "HUF",
+]
+
+INDUSTRIES = [
+    "Agriculture", "Automotive", "Banking & Finance", "Chemicals", "Construction",
+    "Consulting", "Consumer Goods", "E-commerce", "Education", "Electronics",
+    "Energy & Utilities", "Engineering", "Entertainment & Media", "Fashion & Apparel",
+    "Food & Beverage", "Government", "Healthcare", "Hospitality", "Insurance",
+    "Information Technology", "Legal", "Logistics & Transport", "Manufacturing",
+    "Mining", "Non-Profit", "Pharmaceuticals", "Real Estate", "Retail", "Telecom",
+    "Textiles", "Tourism & Travel", "Wholesale & Distribution", "Other",
+]
+
+# ISO 4217 codes for the currencies a firm here is realistically billing in.
+CURRENCIES = [
+    "INR", "USD", "EUR", "GBP", "AED", "SGD", "AUD", "CAD", "JPY", "CNY", "CHF",
+    "HKD", "MYR", "NZD", "SAR", "QAR", "KWD", "OMR", "BHD", "LKR", "NPR", "BDT",
+    "THB", "ZAR", "RUB", "BRL",
+]
+
+LANGUAGES = [
+    "English", "Hindi", "Marathi", "Gujarati", "Bengali", "Tamil", "Telugu",
+    "Kannada", "Malayalam", "Punjabi", "Odia", "Assamese", "Urdu",
+]
+
+# IANA zone names, straight from the stdlib database rather than hard-coded, so
+# the list stays correct as tzdata is updated.
+TIME_ZONES = sorted(available_timezones())
+
+BANK_NAMES = [
+    "State Bank of India", "HDFC Bank", "ICICI Bank", "Axis Bank", "Kotak Mahindra Bank",
+    "Punjab National Bank", "Bank of Baroda", "Canara Bank", "Union Bank of India",
+    "Bank of India", "Indian Bank", "Central Bank of India", "Indian Overseas Bank",
+    "UCO Bank", "Bank of Maharashtra", "Punjab & Sind Bank", "IDBI Bank", "Yes Bank",
+    "IndusInd Bank", "IDFC First Bank", "Federal Bank", "South Indian Bank",
+    "Karnataka Bank", "RBL Bank", "Bandhan Bank", "AU Small Finance Bank", "Other",
+]
+
 # ISO 3166-1 country names.
 COUNTRIES = [
     "Afghanistan", "Albania", "Algeria", "Andorra", "Angola", "Antigua and Barbuda", "Argentina",
