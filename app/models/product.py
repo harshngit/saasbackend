@@ -84,6 +84,8 @@ class Product(Base):
     expiry_tracking: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # 5. Tax
+    # HSN (goods) / SAC (services) code — printed per line item on the GST invoice.
+    hsn_code: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     tax_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     tax_inclusive: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 

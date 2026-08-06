@@ -62,6 +62,10 @@ class CustomerPaymentCreate(BaseModel):
     reference: str | None = Field(default=None, max_length=150)
     note: str | None = None
     order_id: str | None = None
+    invoice_id: str | None = Field(
+        default=None,
+        description="Settle this invoice. Omit for an advance / on-account payment.",
+    )
     received_on: datetime | None = None
 
 
@@ -71,6 +75,7 @@ class CustomerPaymentOut(BaseModel):
     id: str
     customer_id: str
     order_id: str | None
+    invoice_id: str | None = None
     amount: float
     payment_mode: str
     reference: str | None

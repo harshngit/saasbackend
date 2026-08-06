@@ -89,6 +89,11 @@ class CustomerPayment(Base):
     order_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("sales_orders.id", ondelete="SET NULL"), nullable=True
     )
+    # Which invoice this payment settles. Null means it is an advance / on-account
+    # payment that only moves the customer's running balance.
+    invoice_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("invoices.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     payment_mode: Mapped[str] = mapped_column(String(30), default="cash", nullable=False)
     reference: Mapped[str | None] = mapped_column(String(150), nullable=True)

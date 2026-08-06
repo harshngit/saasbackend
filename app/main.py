@@ -79,7 +79,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "business-document-slots"
+BUILD_TAG = "hsn-codes-and-payment-allocation"
 
 
 @app.on_event("startup")
@@ -133,6 +133,7 @@ app.include_router(sales_orders.router)
 app.include_router(purchases.router, prefix="/purchase-invoices")
 app.include_router(purchases.router, prefix="/purchases")
 app.include_router(invoices.router)
+app.include_router(invoices.orders_router)  # POST /orders/{id}/invoice
 app.include_router(vehicle_stock.router)
 app.include_router(deliveries.router)
 app.include_router(expenses.router)

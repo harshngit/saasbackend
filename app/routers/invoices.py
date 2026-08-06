@@ -20,6 +20,9 @@ from app.models import (
 from app.schemas.invoice import CreditNoteBody, InvoiceCreate, InvoiceOut
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
+# "Invoice this order" reads better hanging off the order it belongs to, so the
+# same handler is served at POST /orders/{order_id}/invoice as well.
+orders_router = APIRouter(prefix="/orders", tags=["invoices"])
 
 _view = require_permission("invoices", "view")
 _create = require_permission("invoices", "create")
@@ -40,12 +43,23 @@ def _owned(db: Session, id: str, org_id: str) -> Invoice:
     return inv
 
 
+def _hsn_for(db: Session, product_id: str | None) -> str | None:
+    """The product's HSN/SAC, copied onto the line at invoicing time."""
+    if not product_id:
+        return None
+    product = db.get(Product, product_id)
+    return product.hsn_code if product else None
+
+
 def _next_invoice_number(db: Session, org_id: str) -> str:
     year = datetime.now(timezone.utc).year
     count = db.query(Invoice).filter(Invoice.organization_id == org_id).count()
     return f"INV-{year}-{1001 + count}"
 
 
+# Also exposed as POST /orders/{order_id}/invoice — the route decorator returns the
+# function untouched, so stacking registers the one handler on both routers.
+@orders_router.post("/{order_id}/invoice", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
 @router.post("/orders/{order_id}/invoice", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
 def generate_from_order(
     order_id: str,
@@ -96,6 +110,7 @@ def generate_from_order(
                 product_id=item.product_id,
                 variant_id=item.variant_id,
                 product_name=item.product_name,
+                hsn_code=_hsn_for(db, item.product_id),
                 quantity=item.quantity,
                 unit_price=item.unit_price,
                 discount=item.discount,
@@ -181,6 +196,7 @@ def create_direct_invoice(
                 product_id=product.id,
                 variant_id=it.variant_id,
                 product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                hsn_code=product.hsn_code,
                 quantity=it.quantity,
                 unit_price=unit_price,
                 discount=it.discount,

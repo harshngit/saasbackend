@@ -110,31 +110,33 @@ def invoice_pdf(org, customer, invoice) -> bytes:
     
     pdf.ln(5)
 
-    # Line Items Table
+    # Line Items Table. HSN/SAC is a statutory column on a GST invoice, so it sits
+    # right after the description — the product column gives up the width for it.
     pdf.set_font("Helvetica", "B", 9)
-    # Header widths: Product (80), Price (25), Qty (15), Discount (20), GST Rate (15), Total (35)
-    widths = [80, 25, 15, 20, 15, 35]
-    headers = ["Product / Service", "Unit Price", "Qty", "Discount", "GST %", "Total"]
-    
+    widths = [58, 22, 25, 15, 20, 15, 35]
+    headers = ["Product / Service", "HSN/SAC", "Unit Price", "Qty", "Discount", "GST %", "Total"]
+
     for w, h in zip(widths, headers):
-        pdf.cell(w, 7, h, border=1, align="C" if w != 80 else "L")
+        pdf.cell(w, 7, h, border=1, align="C" if w != 58 else "L")
     pdf.ln(7)
     
     pdf.set_font("Helvetica", size=9)
     for item in invoice.items:
         # Product Name
-        pdf.cell(widths[0], 7, _s(item.product_name[:40]), border=1)
+        pdf.cell(widths[0], 7, _s(item.product_name[:30]), border=1)
+        # HSN / SAC — copied from the product when the invoice was raised
+        pdf.cell(widths[1], 7, _s(item.hsn_code or "-"), border=1, align="C")
         # Unit Price
-        pdf.cell(widths[1], 7, _s(f"Rs {item.unit_price:,.2f}"), border=1, align="R")
+        pdf.cell(widths[2], 7, _s(f"Rs {item.unit_price:,.2f}"), border=1, align="R")
         # Qty
-        pdf.cell(widths[2], 7, _s(str(item.quantity)), border=1, align="C")
+        pdf.cell(widths[3], 7, _s(str(item.quantity)), border=1, align="C")
         # Discount
-        pdf.cell(widths[3], 7, _s(f"Rs {item.discount:,.2f}"), border=1, align="R")
-        # GST Rate (Mock HSN/GST: default 18% or calculate)
+        pdf.cell(widths[4], 7, _s(f"Rs {item.discount:,.2f}"), border=1, align="R")
+        # GST Rate (derived from the line's tax; falls back to 18%)
         gst_pct = f"{int(item.tax / (item.line_total - item.tax) * 100)}%" if (item.line_total - item.tax) > 0 and item.tax > 0 else "18%"
-        pdf.cell(widths[4], 7, _s(gst_pct), border=1, align="C")
+        pdf.cell(widths[5], 7, _s(gst_pct), border=1, align="C")
         # Total
-        pdf.cell(widths[5], 7, _s(f"Rs {item.line_total:,.2f}"), border=1, align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(widths[6], 7, _s(f"Rs {item.line_total:,.2f}"), border=1, align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         
     pdf.ln(3)
 

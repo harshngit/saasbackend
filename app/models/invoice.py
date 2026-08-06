@@ -77,6 +77,9 @@ class InvoiceItem(Base):
         String(36), ForeignKey("product_variants.id", ondelete="SET NULL"), nullable=True
     )
     product_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Copied from the product at invoicing time — a GST invoice must show the HSN
+    # that applied then, even if the product's code is corrected later.
+    hsn_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)

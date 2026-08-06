@@ -23,6 +23,7 @@ class InvoiceItemOut(BaseModel):
     product_id: str | None
     variant_id: str | None
     product_name: str
+    hsn_code: str | None = None
     quantity: int
     unit_price: float
     discount: float

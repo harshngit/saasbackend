@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
-from app.models import Customer, CustomerPayment, User
+from app.models import Customer, CustomerPayment, Invoice, User
 from app.schemas.customer import (
     CustomerCreate,
     CustomerOut,
@@ -39,6 +39,35 @@ def _owned_customer(db: Session, customer_id: str, org_id: str) -> Customer:
     if customer is None or customer.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
     return customer
+
+
+def _owned_invoice(
+    db: Session, invoice_id: str | None, customer: Customer, org_id: str
+) -> Invoice | None:
+    """The invoice a payment settles — it must belong to this firm and this customer."""
+    if not invoice_id:
+        return None
+    invoice = db.get(Invoice, invoice_id)
+    if invoice is None or invoice.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+    if invoice.customer_id != customer.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That invoice belongs to a different customer",
+        )
+    return invoice
+
+
+def _apply_to_invoice(invoice: Invoice, amount: float) -> None:
+    """Move an invoice's paid figure by `amount` (negative to void) and restate its
+    status. Clamped at zero so voiding can never push it negative."""
+    invoice.amount_paid = round(max((invoice.amount_paid or 0) + amount, 0), 2)
+    if invoice.amount_paid <= 0:
+        invoice.status = "unpaid"
+    elif invoice.amount_paid + 0.01 >= (invoice.total or 0):
+        invoice.status = "paid"
+    else:
+        invoice.status = "partial"
 
 
 def _validate_assignee(db: Session, org_id: str, sales_officer_id: str | None) -> None:
@@ -132,14 +161,22 @@ def record_customer_payment(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Customer:
-    """Record a payment received from a customer. Returns the customer with updated balances."""
+    """Record a payment received from a customer. Returns the customer with updated balances.
+
+    Pass `invoice_id` to settle a specific invoice — that invoice's `amount_paid`
+    and `status` move with it. Omit it and the payment is an advance that only
+    reduces the customer's outstanding balance."""
     org_id = _org_id(user)
     customer = _owned_customer(db, customer_id, org_id)
+    invoice = _owned_invoice(db, payload.invoice_id, customer, org_id)
     db.add(CustomerPayment(
         customer_id=customer.id, organization_id=org_id, order_id=payload.order_id,
+        invoice_id=invoice.id if invoice else None,
         amount=payload.amount, payment_mode=payload.payment_mode, reference=payload.reference,
         note=payload.note, received_on=payload.received_on or datetime.now(timezone.utc),
     ))
+    if invoice is not None:
+        _apply_to_invoice(invoice, payload.amount)
     customer.total_received = round((customer.total_received or 0) + payload.amount, 2)
     customer.recompute_outstanding()
     db.commit()
@@ -193,6 +230,11 @@ def void_customer_payment(
     payment = db.get(CustomerPayment, payment_id)
     if payment is None or payment.customer_id != customer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+    # Undo whatever this payment did: the invoice it settled, or the advance balance.
+    if payment.invoice_id:
+        invoice = db.get(Invoice, payment.invoice_id)
+        if invoice is not None:
+            _apply_to_invoice(invoice, -payment.amount)
     customer.total_received = round((customer.total_received or 0) - payment.amount, 2)
     customer.recompute_outstanding()
     db.delete(payment)

@@ -100,6 +100,9 @@ class ProductProfileIn(BaseModel):
     expiry_tracking: bool = False
 
     # 5. Tax
+    hsn_code: str | None = Field(
+        default=None, max_length=20, description="HSN (goods) / SAC (services) code for GST invoices"
+    )
     tax_category: str | None = Field(default=None, max_length=100)
     tax_inclusive: bool = False
 
@@ -245,6 +248,7 @@ class ProductListItem(BaseModel):
     minimum_stock_level: int | None = None
     reorder_level: int | None = None
     bin_shelf_location: str | None = None
+    hsn_code: str | None = None
     tax_category: str | None = None
     tax_inclusive: bool = False
     preferred_supplier_id: str | None = None

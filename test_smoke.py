@@ -1378,6 +1378,56 @@ check("clearing one slot leaves the others",
       (client.get("/organizations/settings", headers=fin_hdr).json()["doc_pan_url"] or "").startswith("data:"))
 client.delete("/organizations/settings/documents/other", headers=fin_hdr)
 
+print("\n== HSN codes and payment allocation ==")
+hsn_prod = client.post("/products", headers=fin_hdr, json={
+    "name": "HSN Test Pipe", "price": 500, "hsn_code": "7306", "total_inventory": 50}).json()
+check("product stores hsn_code", hsn_prod.get("hsn_code") == "7306", hsn_prod.get("hsn_code"))
+hsn_cust = client.post("/customers", headers=fin_hdr, json={
+    "name": "HSN Traders", "phone": "9800000123"}).json()
+r = client.post("/invoices", headers=fin_hdr, json={
+    "customer_id": hsn_cust["id"],
+    "items": [{"product_id": hsn_prod["id"], "quantity": 2, "unit_price": 500, "tax": 180}]})
+check("direct invoice -> 201", r.status_code == 201, r.text[:300])
+hsn_inv = r.json()
+check("invoice line carries the HSN code", hsn_inv["items"][0]["hsn_code"] == "7306", hsn_inv["items"][0])
+check("invoice PDF still renders with the HSN column",
+      client.get(f"/invoices/{hsn_inv['id']}/pdf", headers=fin_hdr).content[:4] == b"%PDF")
+
+hsn_order = client.post("/orders", headers=fin_hdr, json={
+    "customer_id": hsn_cust["id"],
+    "items": [{"product_id": hsn_prod["id"], "quantity": 1, "unit_price": 500}]}).json()
+client.patch(f"/orders/{hsn_order['id']}/approve", headers=fin_hdr)
+r = client.post(f"/orders/{hsn_order['id']}/invoice", headers=fin_hdr)
+check("POST /orders/{id}/invoice -> 201", r.status_code == 201, f"{r.status_code} {r.text[:250]}")
+check("order-generated invoice carries the HSN code",
+      r.json()["items"][0]["hsn_code"] == "7306", r.json()["items"][0])
+
+r = client.post(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr,
+                json={"amount": 500, "invoice_id": hsn_inv["id"], "payment_mode": "upi"})
+check("payment against an invoice -> 201", r.status_code == 201, r.text[:250])
+paid = client.get(f"/invoices/{hsn_inv['id']}", headers=fin_hdr).json()
+check("part payment marks the invoice partial",
+      paid["status"] == "partial" and paid["amount_paid"] == 500, f"{paid['status']} {paid['amount_paid']}")
+client.post(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr,
+            json={"amount": 680, "invoice_id": hsn_inv["id"]})
+check("settling in full marks it paid",
+      client.get(f"/invoices/{hsn_inv['id']}", headers=fin_hdr).json()["status"] == "paid")
+hsn_pays = client.get(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr).json()
+check("payment history records invoice_id",
+      all(p["invoice_id"] == hsn_inv["id"] for p in hsn_pays), hsn_pays)
+client.delete(f"/customers/{hsn_cust['id']}/payments/{hsn_pays[0]['id']}", headers=fin_hdr)
+check("voiding a payment reverses the invoice",
+      client.get(f"/invoices/{hsn_inv['id']}", headers=fin_hdr).json()["status"] != "paid")
+check("invoice belonging to another customer -> 400",
+      client.post(f"/customers/{fcust['id']}/payments", headers=fin_hdr,
+                  json={"amount": 100, "invoice_id": hsn_inv["id"]}).status_code == 400)
+check("unknown invoice_id -> 404",
+      client.post(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr,
+                  json={"amount": 100, "invoice_id": "nope"}).status_code == 404)
+check("advance payment without invoice_id still works",
+      client.post(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr,
+                  json={"amount": 250}).status_code == 201)
+
 print("\n== Leads CRUD ==")
 lead_payload = {
     "lead_id": "L-12345",
