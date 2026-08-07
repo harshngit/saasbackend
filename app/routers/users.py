@@ -1,13 +1,13 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_system_role, require_unlocked_org
-from app.core.files import read_upload, store_upload
+from app.core.files import save_upload
 from app.core.reference_data import COUNTRIES, INDIAN_STATES
 from app.core.security import hash_password
 from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, User, VehicleLoading
@@ -405,6 +405,7 @@ def update_account_status(
 
 @router.post("/{user_id}/identity-proof", response_model=UploadResponse)
 def upload_identity_proof(
+    request: Request,
     user_id: str,
     admin: User = Depends(_ADMIN),
     _unlocked: User = Depends(require_unlocked_org),
@@ -416,7 +417,7 @@ def upload_identity_proof(
     Kept for older clients — the same slot is reachable as
     POST /users/{id}/files/identity_proof_file."""
     target = _owned_user(db, user_id, admin)
-    target.identity_proof_file = store_upload(file)
+    target.identity_proof_file, _ = save_upload(db, admin.organization_id, file, request)
     target.identify_proofs = target.identity_proof_file
     db.commit()
     return UploadResponse(url=target.identity_proof_file)
@@ -440,6 +441,7 @@ _MAX_DOCUMENTS = 20
 
 @router.post("/{user_id}/files/{field}", response_model=UserOut)
 def upload_employee_file(
+    request: Request,
     user_id: str,
     field: EmployeeFileField,
     file: UploadFile = File(...),
@@ -450,7 +452,7 @@ def upload_employee_file(
     """Upload one of the employee's single-file slots — profile photo, identity
     proof, resume/CV, offer letter or appointment letter. Replaces whatever was there."""
     target = _owned_user(db, user_id, admin)
-    url, _size = read_upload(file, **_FILE_RULES[field])
+    url, _size = save_upload(db, admin.organization_id, file, request, **_FILE_RULES[field])
     setattr(target, field.value, url)
     if field is EmployeeFileField.identity_proof_file:
         target.identify_proofs = url  # keep the legacy alias in step
@@ -509,6 +511,7 @@ def list_employee_documents(
     status_code=status.HTTP_201_CREATED,
 )
 def upload_employee_documents(
+    request: Request,
     user_id: str,
     collection: EmployeeDocumentCollection,
     files: list[UploadFile] = File(..., description="One or more image / PDF files"),
@@ -528,7 +531,7 @@ def upload_employee_documents(
                    f"({len(documents)} already uploaded). Delete some first.",
         )
     for file in files:
-        url, size = read_upload(file)
+        url, size = save_upload(db, admin.organization_id, file, request)
         documents.append(
             {
                 "id": str(uuid.uuid4()),

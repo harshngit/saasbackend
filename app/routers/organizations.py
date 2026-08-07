@@ -3,10 +3,11 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.files import save_upload
 from app.core.deps import require_system_role
 from app.core import reference_data as R
 from app.core.reference_data import (
@@ -51,19 +52,12 @@ def _admin_org(admin: User, db: Session) -> Organization:
     return org
 
 
-def _store_image(file: UploadFile) -> str:
-    """Read an uploaded image and return it as a base64 data: URL.
-
-    Works on Render's ephemeral disk (persisted in the DB). Swap for S3/Cloudinary
-    later without changing the API contract (this still returns a URL string).
-    """
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File must be an image")
-    content = file.file.read()
-    if len(content) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Image too large (max {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB)")
-    encoded = base64.b64encode(content).decode("ascii")
-    return f"data:{file.content_type};base64,{encoded}"
+def _store_image(db: Session, org_id: str | None, file: UploadFile, request: Request) -> str:
+    """Store an uploaded image and return the URL it is served from."""
+    url, _size = save_upload(
+        db, org_id, file, request, allow_pdf=False, max_bytes=_MAX_UPLOAD_BYTES
+    )
+    return url
 
 
 @router.get("/me", response_model=OrganizationOut)
@@ -217,24 +211,26 @@ def _numbered_branches(branches: list[dict]) -> list[dict]:
 
 @router.post("/settings/logo", response_model=UploadResponse)
 def upload_logo(
+    request: Request,
     file: UploadFile = File(...),
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> UploadResponse:
     org = _admin_org(admin, db)
-    org.logo_url = _store_image(file)
+    org.logo_url = _store_image(db, org.id, file, request)
     db.commit()
     return UploadResponse(url=org.logo_url)
 
 
 @router.post("/settings/signature", response_model=UploadResponse)
 def upload_signature(
+    request: Request,
     file: UploadFile = File(...),
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> UploadResponse:
     org = _admin_org(admin, db)
-    org.signature_url = _store_image(file)
+    org.signature_url = _store_image(db, org.id, file, request)
     db.commit()
     return UploadResponse(url=org.signature_url)
 
@@ -250,32 +246,32 @@ def _is_document(content_type: str) -> bool:
     )
 
 
-def _store_document(file: UploadFile) -> tuple[str, bytes]:
-    """Validate + read one document upload, returning its data: URL and raw bytes."""
+def _store_document(
+    db: Session, org_id: str | None, file: UploadFile, request: Request
+) -> tuple[str, int]:
+    """Validate + store one document upload, returning its URL and byte size."""
     content_type = file.content_type or ""
     if not _is_document(content_type):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported file format for '{file.filename}' (allowed: PDF, PNG, JPG, DOCX)",
         )
-    content = file.file.read()
-    if len(content) > _MAX_DOCUMENT_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"'{file.filename}' is too large "
-                   f"(max {_MAX_DOCUMENT_BYTES // (1024 * 1024)} MB per file)",
-        )
-    encoded = base64.b64encode(content).decode("ascii")
-    return f"data:{content_type};base64,{encoded}", content
+    return save_upload(
+        db, org_id, file, request, allow_any=True, max_bytes=_MAX_DOCUMENT_BYTES
+    )
 
 
 @router.post("/settings/upload-file", response_model=UploadResponse)
 def upload_settings_file(
+    request: Request,
     file: UploadFile = File(...),
     admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
 ) -> UploadResponse:
     """Generic file uploader for company settings assets (images, PDFs, documents up to 5 MB)."""
-    url, _ = _store_document(file)
+    org = _admin_org(admin, db)
+    url, _ = _store_document(db, org.id, file, request)
+    db.commit()
     return UploadResponse(url=url)
 
 
@@ -313,6 +309,7 @@ def list_other_documents(admin: User = Depends(_ADMIN), db: Session = Depends(ge
     status_code=status.HTTP_201_CREATED,
 )
 def upload_other_documents(
+    request: Request,
     files: list[UploadFile] = File(..., description="One or more PDF / PNG / JPG / DOCX files"),
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
@@ -332,14 +329,14 @@ def upload_other_documents(
     # Validate and read every file before writing, so a bad one in the batch
     # doesn't leave the company profile half-updated.
     for file in files:
-        url, content = _store_document(file)
+        url, size = _store_document(db, org.id, file, request)
         documents.append(
             {
                 "id": str(uuid.uuid4()),
                 "name": file.filename or "document",
                 "url": url,
                 "content_type": file.content_type,
-                "size": len(content),
+                "size": size,
                 "uploaded_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -379,6 +376,7 @@ def clear_other_documents(admin: User = Depends(_ADMIN), db: Session = Depends(g
 
 @router.post("/settings/documents/{slot}", response_model=CompanySettingsOut)
 def upload_business_document(
+    request: Request,
     slot: BusinessDocumentSlot,
     file: UploadFile = File(..., description="PDF / PNG / JPG / DOCX, max 5 MB"),
     admin: User = Depends(_ADMIN),
@@ -387,7 +385,7 @@ def upload_business_document(
     """Upload one of the single-file business documents. Replaces whatever was in
     that slot. The many-file slot is /settings/documents/other."""
     org = _admin_org(admin, db)
-    url, _ = _store_document(file)
+    url, _ = _store_document(db, org.id, file, request)
     setattr(org, slot.column, url)
     db.commit()
     db.refresh(org)

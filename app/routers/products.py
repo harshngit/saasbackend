@@ -1,13 +1,13 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.core.files import read_upload
+from app.core.files import save_upload
 from app.models import Category, Product, ProductVariant, Supplier, User
 from app.services import numbering_service, lookup_service
 from app.schemas.category import BulkDelete, BulkDeleteResult
@@ -212,6 +212,7 @@ _MAX_ATTACHMENTS = 10
 
 @router.post("/{product_id}/files/{field}", response_model=ProductOut)
 def upload_product_file(
+    request: Request,
     product_id: str,
     field: ProductFileField,
     file: UploadFile = File(...),
@@ -222,8 +223,9 @@ def upload_product_file(
     """Upload one of the product's single-file slots — cover image, video,
     brochure, manual, datasheet, compliance certificate, warranty document, or a
     digital product's download file. Replaces whatever was in that slot."""
-    product = _owned(db, product_id, _org_id(user))
-    url, _size = read_upload(file, **_FILE_RULES[field])
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
+    url, _size = save_upload(db, org_id, file, request, **_FILE_RULES[field])
     setattr(product, field.value, url)
     db.commit()
     db.refresh(product)
@@ -273,6 +275,7 @@ def list_attachments(
     status_code=status.HTTP_201_CREATED,
 )
 def upload_attachments(
+    request: Request,
     product_id: str,
     files: list[UploadFile] = File(..., description="One or more image / PDF files"),
     user: User = Depends(_edit),
@@ -290,7 +293,7 @@ def upload_attachments(
                    f"({len(attachments)} already uploaded). Delete some first.",
         )
     for file in files:
-        url, size = read_upload(file)
+        url, size = save_upload(db, _org_id(user), file, request)
         attachments.append(
             {
                 "id": str(uuid.uuid4()),

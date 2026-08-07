@@ -54,6 +54,11 @@ def _post_with_staff_defaults(url, *args, **kwargs):
 
 client.post = _post_with_staff_defaults
 
+def is_file_url(value):
+    """Uploads now return a link to GET /files/{id}, never an inline data: URL."""
+    return isinstance(value, str) and "/files/" in value and "base64," not in value
+
+
 passed = 0
 failed = 0
 
@@ -666,7 +671,7 @@ check("payment receipt PDF", rc.status_code == 200 and rc.content[:4] == b"%PDF"
 # expense receipt upload (PDF allowed) + request-clarification
 ex = client.post("/expenses", headers=nt_hdr, json={"category": "Fuel", "amount": 500}).json()
 r = client.post(f"/expenses/{ex['id']}/receipt", headers=nt_hdr, files={"file": ("bill.pdf", io.BytesIO(b"%PDF-1.4 fake"), "application/pdf")})
-check("expense receipt upload (PDF) -> 200", r.status_code == 200 and r.json()["receipt_url"].startswith("data:application/pdf"), r.text)
+check("expense receipt upload (PDF) -> 200", r.status_code == 200 and is_file_url(r.json()["receipt_url"]), r.text[:200])
 check("upload non-allowed type -> 400",
       client.post(f"/expenses/{ex['id']}/receipt", headers=nt_hdr, files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
 r = client.patch(f"/expenses/{ex['id']}/request-clarification", headers=nt_hdr, json={"reason": "attach GST bill"})
@@ -676,7 +681,7 @@ check("request-clarification -> status", r.status_code == 200 and r.json()["stat
 nsup = client.post("/suppliers", headers=nt_hdr, json={"name": "Sup"}).json()
 pinv = client.post("/purchases", headers=nt_hdr, json={"invoice_number": "PX", "supplier_id": nsup["id"], "items": [{"product_id": nprod["id"], "quantity": 20, "purchase_price": 10}]}).json()
 r = client.post(f"/purchases/{pinv['id']}/documents", headers=nt_hdr, files={"file": ("scan.jpg", io.BytesIO(b"\xff\xd8\xff"), "image/jpeg")})
-check("purchase document upload -> 200", r.status_code == 200 and r.json()["attachment_url"].startswith("data:image/jpeg"), r.text)
+check("purchase document upload -> 200", r.status_code == 200 and is_file_url(r.json()["attachment_url"]), r.text[:200])
 client.patch(f"/purchases/{pinv['id']}/approve", headers=nt_hdr)  # stock 50 -> 70, supplier purchases +200
 check("stock after purchase approve = 70", client.get(f"/inventory/{nprod['id']}", headers=nt_hdr).json()["total_stock"] == 70)
 r = client.post(f"/purchases/{pinv['id']}/returns", headers=nt_hdr, json={"items": [{"product_id": nprod["id"], "quantity": 5}], "reason": "damaged"})
@@ -1042,11 +1047,11 @@ check("staff blocked from settings -> 403", client.get("/organizations/settings"
 # Logo upload -> data URL
 png = b"\x89PNG\r\n\x1a\n" + b"0" * 40
 r = client.post("/organizations/settings/logo", headers=min_hdr, files={"file": ("logo.png", io.BytesIO(png), "image/png")})
-check("upload logo -> data URL", r.status_code == 200 and r.json()["url"].startswith("data:image/png;base64,"), r.text)
+check("upload logo -> file URL", r.status_code == 200 and is_file_url(r.json()["url"]), r.text[:200])
 check("upload non-image -> 400",
       client.post("/organizations/settings/logo", headers=min_hdr, files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
 check("settings reflects uploaded logo",
-      client.get("/organizations/settings", headers=min_hdr).json()["logo_url"].startswith("data:image/png"))
+      is_file_url(client.get("/organizations/settings", headers=min_hdr).json()["logo_url"]))
 
 # Staff username: required + unique
 uname = f"staffuser_{uuid.uuid4().hex[:6]}"
@@ -1262,7 +1267,7 @@ check("email validation error -> 422", r.status_code == 422, r.text)
 # Generic file upload uploader test
 import io
 r = client.post("/organizations/settings/upload-file", headers=fin_hdr, files={"file": ("certificate.pdf", io.BytesIO(b"%PDF-1.4 ..."), "application/pdf")})
-check("generic upload PDF file -> 200", r.status_code == 200 and r.json()["url"].startswith("data:application/pdf;base64,"), r.text)
+check("generic upload PDF file -> 200", r.status_code == 200 and is_file_url(r.json()["url"]), r.text[:200])
 
 print("\n== Company Master: Status field ==")
 r = client.get("/organizations/settings", headers=fin_hdr)
@@ -1295,7 +1300,7 @@ r = client.post("/organizations/settings/documents/other", headers=fin_hdr, file
 check("upload 2 documents at once -> 201", r.status_code == 201 and len(r.json()) == 2, r.text)
 docs = r.json()
 check("document keeps its filename", docs[0]["name"] == "license.pdf", docs)
-check("document stored as a data URL", docs[0]["url"].startswith("data:application/pdf;base64,"), docs)
+check("document stored as a file URL", is_file_url(docs[0]["url"]), str(docs)[:200])
 check("document records its size", docs[0]["size"] > 0, docs)
 
 # A second upload appends — it must not wipe the first batch.
@@ -1353,10 +1358,10 @@ for slot, column in _SLOT_COLUMN.items():
     r = client.post(f"/organizations/settings/documents/{slot}", headers=fin_hdr,
                     files={"file": (f"{slot}.pdf", io.BytesIO(b"%PDF-1.4 doc"), "application/pdf")})
     check(f"upload {slot} -> {column}",
-          r.status_code == 200 and (r.json()[column] or "").startswith("data:application/pdf"), r.text[:200])
+          r.status_code == 200 and is_file_url(r.json()[column]), r.text[:200])
 settings_now = client.get("/organizations/settings", headers=fin_hdr).json()
 check("every single-document slot is filled and independent",
-      all((settings_now[c] or "").startswith("data:") for c in _SLOT_COLUMN.values()), settings_now.get("doc_gst_url"))
+      all(is_file_url(settings_now[c]) for c in _SLOT_COLUMN.values()), settings_now.get("doc_gst_url"))
 check("'other' still routes to the multi-file slot, not the enum",
       client.get("/organizations/settings/documents/other", headers=fin_hdr).status_code == 200)
 check("multi-file upload still appends to 'other'",
@@ -1376,7 +1381,7 @@ r = client.delete("/organizations/settings/documents/gst_certificate", headers=f
 check("clear a single-document slot",
       r.status_code == 200 and r.json()["doc_gst_url"] is None, r.text[:200])
 check("clearing one slot leaves the others",
-      (client.get("/organizations/settings", headers=fin_hdr).json()["doc_pan_url"] or "").startswith("data:"))
+      is_file_url(client.get("/organizations/settings", headers=fin_hdr).json()["doc_pan_url"]))
 client.delete("/organizations/settings/documents/other", headers=fin_hdr)
 
 print("\n== Auto-numbers, embedded refs, list/detail split ==")
@@ -1823,10 +1828,10 @@ check("options include designations in use", "Senior Sales Executive" in opts["d
 # Identity proof upload
 r = client.post(f"/users/{emp['id']}/identity-proof", headers=fin_hdr,
                 files={"file": ("aadhaar.pdf", io.BytesIO(b"%PDF-1.4 id"), "application/pdf")})
-check("upload identity proof -> data URL",
-      r.status_code == 200 and r.json()["url"].startswith("data:application/pdf;base64,"), r.text)
+check("upload identity proof -> file URL",
+      r.status_code == 200 and is_file_url(r.json()["url"]), r.text[:200])
 check("user detail reflects identity proof",
-      (client.get(f"/users/{emp['id']}", headers=fin_hdr).json()["identify_proofs"] or "").startswith("data:application/pdf"))
+      is_file_url(client.get(f"/users/{emp['id']}", headers=fin_hdr).json()["identify_proofs"]))
 check("identity proof rejects non-document -> 400",
       client.post(f"/users/{emp['id']}/identity-proof", headers=fin_hdr,
                   files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
@@ -1907,7 +1912,7 @@ check("filter by status=active",
 r = client.post(f"/users/{ext['id']}/files/profile_photo", headers=fin_hdr,
                 files={"file": ("p.png", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 20), "image/png")})
 check("upload profile_photo -> data URL",
-      r.status_code == 200 and (r.json()["profile_photo"] or "").startswith("data:image/png"), r.text)
+      r.status_code == 200 and is_file_url(r.json()["profile_photo"]), r.text[:200])
 check("profile_photo rejects a PDF -> 400",
       client.post(f"/users/{ext['id']}/files/profile_photo", headers=fin_hdr,
                   files={"file": ("p.pdf", io.BytesIO(b"%PDF"), "application/pdf")}).status_code == 400)

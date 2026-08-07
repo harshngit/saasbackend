@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.core.files import store_upload
+from app.core.files import save_upload
 from app.models import (
     PAYMENT_STATUSES,
     Product,
@@ -279,6 +279,7 @@ def cancel_purchase(
 
 @router.post("/{id}/documents", response_model=PurchaseOut)
 def upload_document(
+    request: Request,
     id: str,
     file: UploadFile = File(...),
     user: User = Depends(_edit),
@@ -287,7 +288,7 @@ def upload_document(
 ) -> PurchaseInvoice:
     """Attach a supporting document (invoice scan/photo — image or PDF, max 10 MB)."""
     inv = _owned(db, id, _org_id(user))
-    inv.attachment_url = store_upload(file)
+    inv.attachment_url, _ = save_upload(db, inv.organization_id, file, request)
     db.commit()
     db.refresh(inv)
     return inv

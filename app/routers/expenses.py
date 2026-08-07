@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.core.files import store_upload
+from app.core.files import save_upload
 from app.models import EXPENSE_CATEGORIES, Expense, User
 from app.schemas.expense import ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
 from app.services import notification_service, numbering_service, lookup_service
@@ -76,6 +76,7 @@ def create_expense(
 
 @router.post("/{expense_id}/receipt", response_model=ExpenseOut)
 def upload_receipt(
+    request: Request,
     expense_id: str,
     file: UploadFile = File(...),
     user: User = Depends(_edit),
@@ -84,7 +85,7 @@ def upload_receipt(
 ) -> Expense:
     """Attach a bill/receipt (image or PDF, max 10 MB) to an expense."""
     expense = _owned(db, expense_id, _org_id(user))
-    expense.receipt_url = store_upload(file)
+    expense.receipt_url, _ = save_upload(db, expense.organization_id, file, request)
     db.commit()
     db.refresh(expense)
     return expense

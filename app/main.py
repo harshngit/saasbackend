@@ -19,6 +19,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Notification,
     NumberSequence,
     Organization,
+    StoredFile,
     Plan,
     Product,
     ProductVariant,
@@ -31,6 +32,7 @@ from app.models import (  # noqa: F401  (register mappers)
     SupplierPayment,
     User,
 )
+from app.services.file_migration_service import convert_inline_uploads
 from app.services.numbering_service import backfill_missing_numbers
 from app.routers import (
     attendance,
@@ -39,6 +41,7 @@ from app.routers import (
     customers,
     deliveries,
     expenses,
+    files,
     inventory,
     invoices,
     notifications,
@@ -81,7 +84,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "lookup-by-record-code"
+BUILD_TAG = "file-urls-not-base64"
 
 
 @app.on_event("startup")
@@ -102,6 +105,7 @@ def on_startup() -> None:
         ("add_columns_with_default", add_columns_with_default),
         ("auto_add_missing_columns", auto_add_missing_columns),
         ("backfill_missing_numbers", backfill_missing_numbers),
+        ("convert_inline_uploads", convert_inline_uploads),
     ):
         try:
             step()
@@ -124,6 +128,7 @@ def health() -> dict[str, str]:
     return {"status": "ok", "build": BUILD_TAG}
 
 
+app.include_router(files.router)
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(roles.router)

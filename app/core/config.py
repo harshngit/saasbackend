@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # Free-trial length (days) applied at registration.
     trial_days: int = 7
 
+    # Absolute base for uploaded-file links (https://api.example.com). Left blank,
+    # the URL is derived from the request that uploaded the file.
+    public_base_url: str = ""
+
     cors_origins: str = "http://localhost,http://localhost:3000,http://localhost:8080"
 
     # --- Password reset ---

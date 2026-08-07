@@ -5,6 +5,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     JSON,
+    LargeBinary,
     Boolean,
     Date,
     DateTime,
@@ -95,6 +96,8 @@ def _backfill_default(column) -> str | None:  # noqa: ANN001
     if literal is not None:
         return literal
 
+    if isinstance(column.type, LargeBinary):
+        return None
     if isinstance(column.type, Boolean):
         return _sql_literal(False)
     if isinstance(column.type, (Integer, Float, Numeric)):
@@ -105,6 +108,8 @@ def _backfill_default(column) -> str | None:  # noqa: ANN001
         return "'{}'"
     if isinstance(column.type, (String, Text)):
         return "''"
+    # LargeBinary and anything else exotic: SQLite refuses a non-constant default
+    # for these, so leave them to a real migration rather than guessing.
     return None
 
 

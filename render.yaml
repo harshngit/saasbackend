@@ -25,6 +25,10 @@ services:
       # A strong secret is generated once and kept stable across deploys.
       - key: JWT_SECRET
         generateValue: true
+      # Absolute base for uploaded-file links, so /files/{id} URLs are usable
+      # from the mobile app. Left unset, the host is taken from the request.
+      - key: PUBLIC_BASE_URL
+        value: "https://crm-saas-backend-9nom.onrender.com"
       - key: PYTHON_VERSION
         value: "3.12.4"
       # Create the Super Admin + demo firm on first boot (idempotent).
