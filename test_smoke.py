@@ -1462,6 +1462,30 @@ check("quotation detail carries items and the sheet's extra fields",
                                   "notes", "terms_conditions", "status", "total")), sorted(_qdetail))
 check("quotation detail total matches the list", _qdetail["total"] == _qrow["total"])
 
+print("\n== Generic upload endpoint (no record id needed) ==")
+_g = client.post("/files/upload", headers=fin_hdr,
+                 files={"file": ("profile.jpg", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 64), "image/jpeg")})
+check("POST /files/upload -> 201", _g.status_code == 201, _g.text[:200])
+_gj = _g.json()
+check("returns a usable file URL", is_file_url(_gj["url"]), _gj.get("url"))
+check("returns filename / type / size",
+      _gj["filename"] == "profile.jpg" and _gj["content_type"] == "image/jpeg" and _gj["size"] == 72, _gj)
+check("that URL serves the file", client.get("/files/" + _gj["file_id"]).status_code == 200)
+check("the URL can be sent straight into a record",
+      client.post("/products", headers=fin_hdr,
+                  json={"name": "Generic Upload Product", "price": 5,
+                        "cover_image": _gj["url"]}).json()["cover_image"] == _gj["url"])
+check("generic upload accepts any type",
+      client.post("/files/upload", headers=fin_hdr,
+                  files={"file": ("a.csv", io.BytesIO(b"a,b"), "text/csv")}).status_code == 201)
+check("generic upload rejects over 10 MB",
+      client.post("/files/upload", headers=fin_hdr,
+                  files={"file": ("big.bin", io.BytesIO(b"x" * (11 * 1024 * 1024)),
+                                  "application/octet-stream")}).status_code == 413)
+check("generic upload needs a token",
+      client.post("/files/upload",
+                  files={"file": ("x.png", io.BytesIO(b"x"), "image/png")}).status_code in (401, 403))
+
 print("\n== Fetch by the human-facing code, not just the UUID ==")
 _lcust = client.post("/customers", headers=fin_hdr,
                      json={"name": "Code Lookup Co", "phone": "9800005555"}).json()

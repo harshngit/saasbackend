@@ -84,7 +84,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "file-urls-not-base64"
+BUILD_TAG = "generic-upload-endpoint"
 
 
 @app.on_event("startup")
