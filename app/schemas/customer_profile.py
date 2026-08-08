@@ -177,8 +177,15 @@ class Preferences(BaseModel):
 
 
 class DocumentsSection(BaseModel):
-    """Read-only. Filled from the customer's uploaded documents, so the ids here
-    are always real files — uploading is done through /customers/{id}/documents."""
+    """Attach already-uploaded files to the customer.
+
+    Upload first with POST /files/upload (which needs no record id, so it works
+    before the customer exists), then send the `file_id` it returns here. The
+    same ids come back on read, so what you send is what you get.
+
+    A named slot holds one file — sending a new id replaces it.
+    `other_document_ids` is the many-file slot.
+    """
 
     gst_certificate_id: str | None = None
     pan_card_id: str | None = None
@@ -219,9 +226,10 @@ class CustomerProfileIn(BaseModel):
     social_media_online_presence: SocialMediaOnlinePresence | None = None
     additional_information: AdditionalInformation | None = None
     preferences: Preferences | None = None
-    # Accepted so a round-tripped profile does not 422, but ignored: documents
-    # are created by uploading them.
-    documents: DocumentsSection | None = Field(default=None, deprecated=True)
+    documents: DocumentsSection | None = Field(
+        default=None,
+        description="File ids from POST /files/upload. Attaches them to the customer.",
+    )
 
     _SECTION_MODELS = {
         "basic_information": BasicInformation,

@@ -1532,6 +1532,40 @@ check("customer_name is required",
                   json={"basic_information": {"industry": "X"}}).status_code == 422)
 
 _pdf = b"%PDF-1.4 cert"
+
+
+def _upload(name):
+    """Upload with no record id at all — this is what makes create-time
+    documents possible."""
+    return client.post("/files/upload", headers=fin_hdr,
+                       files={"file": (name, io.BytesIO(_pdf), "application/pdf")}).json()
+
+
+_fg, _fp, _fo1, _fo2 = _upload("gst.pdf"), _upload("pan.pdf"), _upload("a.pdf"), _upload("b.pdf")
+_dc = client.post("/customers", headers=fin_hdr, json={
+    "basic_information": {"customer_name": "Docs At Create"},
+    "documents": {"gst_certificate_id": _fg["file_id"], "pan_card_id": _fp["file_id"],
+                  "other_document_ids": [_fo1["file_id"], _fo2["file_id"]]}})
+check("create a customer with already-uploaded document ids -> 201", _dc.status_code == 201,
+      _dc.text[:300])
+check("the ids you sent are the ids you get back",
+      _dc.json()["documents"]["gst_certificate_id"] == _fg["file_id"]
+      and sorted(_dc.json()["documents"]["other_document_ids"]) == sorted([_fo1["file_id"], _fo2["file_id"]]),
+      _dc.json()["documents"])
+check("create-time documents appear in the documents list",
+      {d["name"] for d in client.get(f"/customers/{_dc.json()['id']}/documents",
+                                     headers=fin_hdr).json()} == {"gst.pdf", "pan.pdf", "a.pdf", "b.pdf"})
+check("a create-time document downloads",
+      client.get(f"/customers/{_dc.json()['id']}/documents/{_fg['file_id']}/download",
+                 headers=fin_hdr).content == _pdf)
+check("patching a named slot with a new file id replaces it",
+      client.patch(f"/customers/{_dc.json()['id']}", headers=fin_hdr,
+                   json={"documents": {"gst_certificate_id": _upload("gst2.pdf")["file_id"]}}
+                   ).json()["documents"]["gst_certificate_id"] != _fg["file_id"])
+check("an unknown file id -> 400",
+      client.post("/customers", headers=fin_hdr,
+                  json={"basic_information": {"customer_name": "Bad Doc"},
+                        "documents": {"gst_certificate_id": "nope"}}).status_code == 400)
 _d = client.post(f"/customers/{_cpj['id']}/documents", headers=fin_hdr,
                  data={"document_type": "gst_certificate"},
                  files={"file": ("gst-certificate.pdf", io.BytesIO(_pdf), "application/pdf")})

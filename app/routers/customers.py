@@ -80,6 +80,16 @@ def _apply_to_invoice(invoice: Invoice, amount: float) -> None:
         invoice.status = "partial"
 
 
+def _attach_documents(db: Session, customer: Customer, section) -> None:
+    """Attach uploaded files named in the payload's `documents` block."""
+    if section is None:
+        return
+    try:
+        customer_profile_service.attach_documents(db, customer, section)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 def _validate_assignee(db: Session, org_id: str, sales_officer_id: str | None) -> None:
     if sales_officer_id is None:
         return
@@ -119,6 +129,8 @@ def create_customer(
     customer = Customer(organization_id=org_id, **data)
     customer.recompute_outstanding()  # opening_balance -> outstanding
     db.add(customer)
+    db.flush()
+    _attach_documents(db, customer, payload.documents)
     db.commit()
     db.refresh(customer)
     return customer_profile_service.build_profile(db, customer)
@@ -184,6 +196,7 @@ def update_customer(
         setattr(customer, field, value)
     if "opening_balance" in data:
         customer.recompute_outstanding()
+    _attach_documents(db, customer, payload.documents)
     db.commit()
     db.refresh(customer)
     return customer_profile_service.build_profile(db, customer)
@@ -331,6 +344,8 @@ def upload_customer_document(
             db.delete(existing)
 
     document = CustomerDocument(
+        # One id everywhere: the stored file's id is the document's id.
+        id=url.rsplit("/", 1)[-1],
         customer_id=customer.id,
         organization_id=org_id,
         document_type=kind,
@@ -366,6 +381,7 @@ def upload_other_customer_documents(
     for upload in files:
         url, size = save_upload(db, org_id, upload, request, allow_any=True)
         db.add(CustomerDocument(
+            id=url.rsplit("/", 1)[-1],
             customer_id=customer.id,
             organization_id=org_id,
             document_type=OTHER_DOCUMENT_TYPE,

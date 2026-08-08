@@ -1,6 +1,8 @@
 """Assemble the sectioned customer profile from the flat row plus its history."""
 
 from sqlalchemy import func
+
+from app.core.files import public_url
 from sqlalchemy.orm import Session
 
 from app.schemas.customer_profile import (
@@ -78,6 +80,50 @@ def documents_section(customer) -> DocumentsSection:
         elif document.document_type == OTHER_DOCUMENT_TYPE:
             section.other_document_ids.append(document.id)
     return section
+
+
+def _file_id(value: str) -> str:
+    """Accept the bare id or the whole URL that POST /files/upload returned."""
+    return (value or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def attach_documents(db: Session, customer, section) -> None:
+    """Turn the file ids in a `documents` block into the customer's documents.
+
+    The document row reuses the stored file's id, so the id the caller uploaded,
+    the id in the profile, and the id used to download or delete are all one id.
+    """
+    from app.models import CustomerDocument, StoredFile
+
+    def attach(file_ref: str, document_type: str) -> None:
+        file_id = _file_id(file_ref)
+        stored = db.get(StoredFile, file_id)
+        if stored is None:
+            raise ValueError(f"No uploaded file with id '{file_id}' — upload it first")
+        if any(d.id == file_id for d in customer.documents or []):
+            return  # already attached
+        if document_type != OTHER_DOCUMENT_TYPE:
+            for existing in [d for d in customer.documents if d.document_type == document_type]:
+                db.delete(existing)
+        db.add(CustomerDocument(
+            id=file_id,
+            customer_id=customer.id,
+            organization_id=customer.organization_id,
+            document_type=document_type,
+            name=stored.filename,
+            content_type=stored.content_type,
+            size=stored.size,
+            url=public_url(None, stored.id),
+            file_id=stored.id,
+        ))
+
+    for document_type, key in NAMED_DOCUMENT_TYPES.items():
+        value = getattr(section, key, None)
+        if value:
+            attach(value, document_type)
+    for value in section.other_document_ids or []:
+        if value:
+            attach(value, OTHER_DOCUMENT_TYPE)
 
 
 def financial_summary(customer) -> FinancialSummary:
