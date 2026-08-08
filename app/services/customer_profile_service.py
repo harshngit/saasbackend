@@ -52,10 +52,8 @@ def _section(customer, name: str):
     values = {}
     for field in SECTION_FIELDS[name]:
         values[field] = getattr(customer, COLUMN_FOR.get(field, field), None)
-    # List columns are nullable in the database; the API always shows a list.
-    for key, value in list(values.items()):
-        if model.model_fields[key].annotation is list[str] and value is None:
-            values[key] = []
+    # Nullable JSON columns are coerced to [] by the schema's StringList type,
+    # so nothing to do here.
     block = model(**values)
     if name == "sales_crm_information":
         officer = customer.assigned_sales_officer

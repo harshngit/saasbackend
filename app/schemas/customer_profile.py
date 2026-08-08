@@ -10,7 +10,9 @@ shape keep working — see `CustomerProfileIn.fold_flat_keys`.
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Annotated
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from app.core.reference_data import CUSTOMER_STATUSES, CUSTOMER_TYPES
 from app.schemas.choices import CustomerStatus, CustomerType
@@ -62,6 +64,15 @@ SECTION_FIELDS: dict[str, list[str]] = {
         "default_tax_profile_id", "default_warehouse_id", "preferred_invoice_delivery",
     ],
 }
+
+
+def _as_list(value: object) -> object:
+    """These are JSON columns, nullable in the table — rows written before the
+    column existed hold NULL. The API always shows a list."""
+    return value or []
+
+
+StringList = Annotated[list[str], BeforeValidator(_as_list)]
 
 
 class GeoLocation(BaseModel):
@@ -136,8 +147,8 @@ class SalesCrmInformation(BaseModel):
     lead_source: str | None = Field(default=None, max_length=50)
     territory: str | None = Field(default=None, max_length=100)
     customer_priority: str | None = Field(default=None, max_length=20, description="high | medium | low")
-    preferred_communication: list[str] = Field(default_factory=list)
-    customer_tags: list[str] = Field(default_factory=list)
+    preferred_communication: StringList = Field(default_factory=list)
+    customer_tags: StringList = Field(default_factory=list)
 
 
 class SocialMediaOnlinePresence(BaseModel):
@@ -158,11 +169,11 @@ class AdditionalInformation(BaseModel):
 
 class Preferences(BaseModel):
     portal_access_enabled: bool = False
-    favorite_product_ids: list[str] = Field(default_factory=list)
+    favorite_product_ids: StringList = Field(default_factory=list)
     default_price_list_id: str | None = None
     default_tax_profile_id: str | None = None
     default_warehouse_id: str | None = None
-    preferred_invoice_delivery: list[str] = Field(default_factory=list)
+    preferred_invoice_delivery: StringList = Field(default_factory=list)
 
 
 class DocumentsSection(BaseModel):
@@ -174,7 +185,7 @@ class DocumentsSection(BaseModel):
     business_registration_certificate_id: str | None = None
     address_proof_id: str | None = None
     purchase_agreement_id: str | None = None
-    other_document_ids: list[str] = Field(default_factory=list)
+    other_document_ids: StringList = Field(default_factory=list)
 
 
 class FinancialSummary(BaseModel):

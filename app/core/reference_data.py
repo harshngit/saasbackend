@@ -94,8 +94,9 @@ INDIAN_STATES = [
 # Closed lists (the sheet names every value) are validated; lists the sheet ends
 # with "etc." stay free text and these act as suggestions for the dropdown.
 
-CUSTOMER_STATUSES = ["Active", "Inactive", "Blacklisted", "Prospect"]
-CUSTOMER_TYPES = ["Individual", "Business", "Government", "Dealer", "Distributor", "Vendor"]
+# Lower-case, matching the Customer Profile spec's own example values.
+CUSTOMER_STATUSES = ["active", "inactive", "blacklisted", "prospect"]
+CUSTOMER_TYPES = ["individual", "business", "government", "dealer", "distributor", "vendor"]
 
 SALES_TYPES = ["Quotation", "Sales Order", "Invoice", "POS Sale", "Return", "Credit Note"]
 SALES_STATUSES = ["Draft", "Confirmed", "Completed", "Cancelled", "Returned"]
