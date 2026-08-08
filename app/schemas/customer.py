@@ -144,3 +144,17 @@ class CustomerUpdate(BaseModel):
     maps_longitude: float | None = Field(default=None, ge=-180, le=180)
 
 
+
+
+class CustomerDocumentOut(BaseModel):
+    """One uploaded customer document."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    document_type: str
+    name: str
+    content_type: str
+    size: int
+    url: str
+    uploaded_at: datetime

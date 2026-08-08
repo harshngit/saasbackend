@@ -13,7 +13,7 @@ from app.models.enums import (
 )
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.category import Category
-from app.models.customer import Customer, CustomerPayment
+from app.models.customer import Customer, CustomerDocument, CustomerPayment
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense
 from app.models.notification import Notification
 from app.models.number_sequence import NumberSequence
@@ -49,6 +49,7 @@ __all__ = [
     "Plan",
     "Role",
     "Customer",
+    "CustomerDocument",
     "Category",
     "Product",
     "ProductVariant",

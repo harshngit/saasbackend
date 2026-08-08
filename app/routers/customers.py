@@ -1,16 +1,22 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status,
+)
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
-from app.models import Customer, CustomerPayment, Invoice, User
-from app.services import numbering_service, lookup_service
+from app.core.files import save_upload
+from app.models import Customer, CustomerDocument, CustomerPayment, Invoice, StoredFile, User
+from app.services import customer_profile_service, lookup_service, numbering_service
+from app.services.customer_profile_service import DOCUMENT_TYPES, OTHER_DOCUMENT_TYPE
+from app.schemas.customer_profile import CustomerProfileIn, CustomerProfileOut
 from app.schemas.customer import (
     CustomerCreate,
+    CustomerDocumentOut,
     CustomerOut,
     CustomerPaymentCreate,
     CustomerPaymentOut,
@@ -85,17 +91,28 @@ def _validate_assignee(db: Session, org_id: str, sales_officer_id: str | None) -
         )
 
 
-@router.post("", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=CustomerProfileOut, status_code=status.HTTP_201_CREATED)
 def create_customer(
-    payload: CustomerCreate,
+    payload: CustomerProfileIn,
     user: User = Depends(_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> Customer:
+) -> CustomerProfileOut:
+    """Create a customer from the sectioned profile body.
+
+    A flat body is still accepted — any top-level field that belongs to a
+    section is folded into it, so callers written against the older shape keep
+    working. `customer_id` is an Auto Number and is issued here, not sent in;
+    the `documents` section is filled by uploading, not by writing ids.
+    """
     org_id = _org_id(user)
-    _validate_assignee(db, org_id, payload.assigned_sales_officer_id)
-    data = payload.model_dump()
-    # Sheet: Customer ID is an Auto Number, so it is issued here, not sent in.
+    data = payload.to_columns()
+    _validate_assignee(db, org_id, data.get("assigned_sales_officer_id"))
+    if not data.get("name"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="basic_information.customer_name is required",
+        )
     data["customer_id"] = numbering_service.next_number(
         db, org_id, Customer.customer_id, "CUST"
     )
@@ -104,7 +121,7 @@ def create_customer(
     db.add(customer)
     db.commit()
     db.refresh(customer)
-    return customer
+    return customer_profile_service.build_profile(db, customer)
 
 
 @router.get("", response_model=list[CustomerOut])
@@ -138,29 +155,38 @@ def list_customers(
     return query.order_by(Customer.created_at.desc()).all()
 
 
-@router.get("/{customer_id}", response_model=CustomerOut)
-def get_customer(customer_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> Customer:
-    return _owned_customer(db, customer_id, _org_id(user))
+@router.get("/{customer_id}", response_model=CustomerProfileOut)
+def get_customer(
+    customer_id: str, user: User = Depends(_view), db: Session = Depends(get_db)
+) -> CustomerProfileOut:
+    """The full 360° customer profile: every section, the uploaded documents, and
+    the financial and sales summaries. Accepts the UUID or the customer code."""
+    customer = _owned_customer(db, customer_id, _org_id(user))
+    return customer_profile_service.build_profile(db, customer)
 
 
-@router.patch("/{customer_id}", response_model=CustomerOut)
+@router.patch("/{customer_id}", response_model=CustomerProfileOut)
 def update_customer(
     customer_id: str,
-    payload: CustomerUpdate,
+    payload: CustomerProfileIn,
     user: User = Depends(_edit),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> Customer:
+) -> CustomerProfileOut:
+    """Partial update. Only the sections you send are touched, and within a
+    section only the fields you send. A flat body works too."""
     org_id = _org_id(user)
     customer = _owned_customer(db, customer_id, org_id)
-    data = payload.model_dump(exclude_unset=True)
+    data = payload.to_columns()
     if "assigned_sales_officer_id" in data:
         _validate_assignee(db, org_id, data["assigned_sales_officer_id"])
     for field, value in data.items():
         setattr(customer, field, value)
+    if "opening_balance" in data:
+        customer.recompute_outstanding()
     db.commit()
     db.refresh(customer)
-    return customer
+    return customer_profile_service.build_profile(db, customer)
 
 
 @router.post("/{customer_id}/payments", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
@@ -262,4 +288,148 @@ def delete_customer(
 ) -> None:
     customer = _owned_customer(db, customer_id, _org_id(user))
     db.delete(customer)
+    db.commit()
+
+
+# ------------------------------ Customer documents ------------------------------
+# A row per file, so the named slots (GST certificate, PAN card, …) and the
+# many-file "other" slot behave identically. No base64 anywhere: the bytes go to
+# stored_files and the record keeps a URL.
+
+@router.post(
+    "/{customer_id}/documents",
+    response_model=CustomerDocumentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_customer_document(
+    customer_id: str,
+    request: Request,
+    document_type: str = Form(..., description=" | ".join(DOCUMENT_TYPES)),
+    file: UploadFile = File(...),
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> CustomerDocument:
+    """Upload one document against a customer.
+
+    A named type replaces whatever was in that slot; `other` appends, so the
+    customer can carry many miscellaneous files."""
+    org_id = _org_id(user)
+    customer = _owned_customer(db, customer_id, org_id)
+    kind = document_type.strip().lower().replace(" ", "_").replace("-", "_")
+    if kind not in DOCUMENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"document_type must be one of: {', '.join(DOCUMENT_TYPES)}",
+        )
+
+    url, size = save_upload(db, org_id, file, request, allow_any=True)
+    if kind != OTHER_DOCUMENT_TYPE:
+        # Named slots hold one file — drop the previous one rather than leaving
+        # two rows claiming to be "the" GST certificate.
+        for existing in [d for d in customer.documents if d.document_type == kind]:
+            db.delete(existing)
+
+    document = CustomerDocument(
+        customer_id=customer.id,
+        organization_id=org_id,
+        document_type=kind,
+        name=file.filename or "document",
+        content_type=file.content_type or "application/octet-stream",
+        size=size,
+        url=url,
+        file_id=url.rsplit("/", 1)[-1],
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+@router.post(
+    "/{customer_id}/documents/other",
+    response_model=list[CustomerDocumentOut],
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_other_customer_documents(
+    customer_id: str,
+    request: Request,
+    files: list[UploadFile] = File(..., description="One or more files"),
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> list[CustomerDocument]:
+    """Upload several "other" documents in one call. Appends to what is already
+    on file and returns every other-document the customer now has."""
+    org_id = _org_id(user)
+    customer = _owned_customer(db, customer_id, org_id)
+    for upload in files:
+        url, size = save_upload(db, org_id, upload, request, allow_any=True)
+        db.add(CustomerDocument(
+            customer_id=customer.id,
+            organization_id=org_id,
+            document_type=OTHER_DOCUMENT_TYPE,
+            name=upload.filename or "document",
+            content_type=upload.content_type or "application/octet-stream",
+            size=size,
+            url=url,
+            file_id=url.rsplit("/", 1)[-1],
+        ))
+    db.commit()
+    db.refresh(customer)
+    return [d for d in customer.documents if d.document_type == OTHER_DOCUMENT_TYPE]
+
+
+@router.get("/{customer_id}/documents", response_model=list[CustomerDocumentOut])
+def list_customer_documents(
+    customer_id: str,
+    document_type: str | None = Query(default=None, description="Filter to one type"),
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[CustomerDocument]:
+    """Every document on file for this customer."""
+    customer = _owned_customer(db, customer_id, _org_id(user))
+    documents = sorted(customer.documents or [], key=lambda d: d.uploaded_at)
+    if document_type:
+        documents = [d for d in documents if d.document_type == document_type]
+    return documents
+
+
+def _owned_document(db: Session, customer, document_id: str) -> CustomerDocument:
+    for document in customer.documents or []:
+        if document.id == document_id:
+            return document
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+
+@router.get("/{customer_id}/documents/{document_id}/download")
+def download_customer_document(
+    customer_id: str,
+    document_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Download the file itself, with its original filename."""
+    customer = _owned_customer(db, customer_id, _org_id(user))
+    document = _owned_document(db, customer, document_id)
+    stored = db.get(StoredFile, document.file_id) if document.file_id else None
+    if stored is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File no longer stored")
+    return Response(
+        content=stored.data,
+        media_type=document.content_type,
+        headers={"Content-Disposition": f'attachment; filename="{document.name}"'},
+    )
+
+
+@router.delete("/{customer_id}/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_customer_document(
+    customer_id: str,
+    document_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    customer = _owned_customer(db, customer_id, _org_id(user))
+    db.delete(_owned_document(db, customer, document_id))
     db.commit()

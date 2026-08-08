@@ -784,12 +784,15 @@ check("filter expenses by status=approved", all(e["status"] == "approved" for e 
 
 # --- Customer Payments + receivables from orders ---
 fcust = client.post("/customers", headers=fin_hdr, json={"name": "Regular Buyer", "opening_balance": 500}).json()
-check("customer opening_balance -> outstanding 500", fcust["outstanding_balance"] == 500, fcust)
+check("customer opening_balance -> outstanding 500",
+      fcust["financial_summary"]["outstanding_balance"] == 500, fcust["financial_summary"])
 # order for this customer, approve -> billed
 o = client.post("/orders", headers=fin_hdr, json={"customer_id": fcust["id"], "items": [{"product_id": fprod["id"], "quantity": 2, "unit_price": 100}]}).json()
 client.patch(f"/orders/{o['id']}/approve", headers=fin_hdr)
 after_order = client.get(f"/customers/{fcust['id']}", headers=fin_hdr).json()
-check("order approve bills customer (outstanding 500+200=700)", after_order["outstanding_balance"] == 700, after_order)
+check("order approve bills customer (outstanding 500+200=700)",
+      after_order["financial_summary"]["outstanding_balance"] == 700,
+      after_order["financial_summary"])
 # record payment
 r = client.post(f"/customers/{fcust['id']}/payments", headers=fin_hdr, json={"amount": 300, "payment_mode": "upi"})
 check("customer payment -> received 300, outstanding 400", r.status_code == 201 and r.json()["total_received"] == 300 and r.json()["outstanding_balance"] == 400, r.text)
@@ -990,7 +993,8 @@ check("search by name finds it", any(c["id"] == cust_id for c in client.get("/cu
 check("search miss -> empty", len(client.get("/customers", headers=cust_hdr, params={"search": "zzznope"}).json()) == 0)
 check("get customer -> 200", client.get(f"/customers/{cust_id}", headers=cust_hdr).status_code == 200)
 r = client.patch(f"/customers/{cust_id}", headers=cust_hdr, json={"credit_limit": 75000, "category": "Retail"})
-check("update customer -> 200", r.status_code == 200 and r.json()["credit_limit"] == 75000 and r.json()["category"] == "Retail", r.text)
+check("update customer -> 200", r.status_code == 200 and r.json()["payment_information"]["credit_limit"] == 75000
+      and r.json()["basic_information"]["customer_category"] == "Retail", r.text[:300])
 
 # Assign a sales officer (must be a same-org user)
 c_roles = client.get("/roles", headers=cust_hdr).json()
@@ -1000,7 +1004,8 @@ so_email = f"cso_{uuid.uuid4().hex[:6]}@f.com"
 so_user = client.post("/users", headers=cust_hdr, json={
     "name": "SO", "email": so_email, "username": f"cso_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": so_role["id"]}).json()
 r = client.patch(f"/customers/{cust_id}", headers=cust_hdr, json={"assigned_sales_officer_id": so_user["id"]})
-check("assign sales officer -> nested name", r.status_code == 200 and r.json()["assigned_sales_officer"]["name"] == "SO", r.text)
+check("assign sales officer -> nested name", r.status_code == 200
+      and r.json()["sales_crm_information"]["sales_representative"]["name"] == "SO", r.text[:300])
 check("assign cross-firm user -> 400",
       client.patch(f"/customers/{cust_id}", headers=cust_hdr, json={"assigned_sales_officer_id": "nonexistent"}).status_code == 400)
 
@@ -1461,6 +1466,113 @@ check("quotation detail carries items and the sheet's extra fields",
           k in _qdetail for k in ("shipping_address", "payment_terms", "delivery_terms",
                                   "notes", "terms_conditions", "status", "total")), sorted(_qdetail))
 check("quotation detail total matches the list", _qdetail["total"] == _qrow["total"])
+
+print("\n== Sectioned customer profile + documents ==")
+_rep = client.get("/users", headers=fin_hdr).json()[0]["id"]
+_cp = client.post("/customers", headers=fin_hdr, json={
+    "basic_information": {"customer_type": "business", "customer_name": "Sharma Enterprises",
+                          "legal_business_name": "Sharma Enterprises Private Limited",
+                          "industry": "FMCG", "customer_category": "wholesale", "status": "active"},
+    "contact_information": {"primary_contact_person": "Rahul Sharma", "designation": "Purchase Manager",
+                            "mobile_number": "+919876543210", "email_address": "rahul@sharma.com",
+                            "website": "https://sharmaenterprises.com"},
+    "address_information": {"billing_address": "Unit 12, Andheri", "shipping_address": "Warehouse 4",
+                            "city": "Mumbai", "state": "Maharashtra", "country": "India",
+                            "pin_zip_code": "400093",
+                            "google_maps_location": {"latitude": 19.1136, "longitude": 72.8697}},
+    "business_tax_information": {"gstin_tax_id": "27ABCDE1234F1Z5", "tax_exempt": False,
+                                 "tax_category": "registered", "currency": "INR"},
+    "payment_information": {"payment_terms": "net_30", "credit_limit": 500000,
+                            "bank_name": "HDFC Bank", "ifsc_swift_code": "HDFC0001234"},
+    "sales_crm_information": {"sales_representative_id": _rep, "lead_source": "referral",
+                              "territory": "Mumbai West", "customer_priority": "high",
+                              "preferred_communication": ["whatsapp", "email"],
+                              "customer_tags": ["wholesale", "priority_customer"]},
+    "social_media_online_presence": {"facebook_url": "https://facebook.com/sharma"},
+    "additional_information": {"loyalty_number": "LOY-00125", "notes": "Deliver before 4 PM."},
+    "preferences": {"portal_access_enabled": False, "preferred_invoice_delivery": ["email"]}})
+check("sectioned customer create -> 201", _cp.status_code == 201, _cp.text[:400])
+_cpj = _cp.json()
+check("response carries all ten sections plus summaries",
+      all(k in _cpj for k in ("basic_information", "contact_information", "address_information",
+                              "business_tax_information", "payment_information", "sales_crm_information",
+                              "social_media_online_presence", "documents", "additional_information",
+                              "preferences", "financial_summary", "sales_summary")), sorted(_cpj))
+check("fields land in their own section",
+      _cpj["basic_information"]["legal_business_name"] == "Sharma Enterprises Private Limited"
+      and _cpj["contact_information"]["designation"] == "Purchase Manager"
+      and _cpj["payment_information"]["payment_terms"] == "net_30"
+      and _cpj["sales_crm_information"]["customer_tags"] == ["wholesale", "priority_customer"], _cpj)
+check("geo location round-trips",
+      _cpj["address_information"]["google_maps_location"]["latitude"] == 19.1136,
+      _cpj["address_information"].get("google_maps_location"))
+check("sales representative resolved from the id",
+      _cpj["sales_crm_information"]["sales_representative"]["id"] == _rep,
+      _cpj["sales_crm_information"].get("sales_representative"))
+check("financial summary computed",
+      _cpj["financial_summary"]["credit_limit"] == 500000
+      and _cpj["financial_summary"]["available_credit"] == 500000, _cpj["financial_summary"])
+check("sales summary starts empty",
+      _cpj["sales_summary"]["total_orders"] == 0
+      and _cpj["sales_summary"]["last_purchase_date"] is None, _cpj["sales_summary"])
+check("customer code still auto-generated", (_cpj["customer_id"] or "").startswith("CUST-"))
+
+_cpu = client.patch(f"/customers/{_cpj['id']}", headers=fin_hdr,
+                    json={"address_information": {"city": "Pune"}})
+check("section-level partial update",
+      _cpu.json()["address_information"]["city"] == "Pune"
+      and _cpu.json()["address_information"]["state"] == "Maharashtra"
+      and _cpu.json()["basic_information"]["customer_name"] == "Sharma Enterprises", _cpu.text[:250])
+check("a flat body is still accepted",
+      client.post("/customers", headers=fin_hdr,
+                  json={"name": "Flat Body Co", "phone": "9800009999", "credit_limit": 100}
+                  ).json()["basic_information"]["customer_name"] == "Flat Body Co")
+check("customer_name is required",
+      client.post("/customers", headers=fin_hdr,
+                  json={"basic_information": {"industry": "X"}}).status_code == 422)
+
+_pdf = b"%PDF-1.4 cert"
+_d = client.post(f"/customers/{_cpj['id']}/documents", headers=fin_hdr,
+                 data={"document_type": "gst_certificate"},
+                 files={"file": ("gst-certificate.pdf", io.BytesIO(_pdf), "application/pdf")})
+check("upload a named customer document -> 201", _d.status_code == 201, _d.text[:250])
+check("document response shape",
+      _d.json()["document_type"] == "gst_certificate" and _d.json()["name"] == "gst-certificate.pdf"
+      and _d.json()["content_type"] == "application/pdf" and _d.json()["size"] == len(_pdf), _d.json())
+check("document url is a link, not base64", is_file_url(_d.json()["url"]), _d.json().get("url"))
+check("profile documents section fills from the upload",
+      client.get(f"/customers/{_cpj['id']}", headers=fin_hdr
+                 ).json()["documents"]["gst_certificate_id"] == _d.json()["id"])
+client.post(f"/customers/{_cpj['id']}/documents", headers=fin_hdr,
+            data={"document_type": "gst_certificate"},
+            files={"file": ("gst-v2.pdf", io.BytesIO(_pdf), "application/pdf")})
+check("a named slot holds one file",
+      len([x for x in client.get(f"/customers/{_cpj['id']}/documents", headers=fin_hdr).json()
+           if x["document_type"] == "gst_certificate"]) == 1)
+_others = client.post(f"/customers/{_cpj['id']}/documents/other", headers=fin_hdr,
+                      files=[("files", ("a.pdf", io.BytesIO(_pdf), "application/pdf")),
+                             ("files", ("b.pdf", io.BytesIO(_pdf), "application/pdf"))])
+check("other documents upload as an array", _others.status_code == 201 and len(_others.json()) == 2,
+      _others.text[:250])
+check("other documents append",
+      len(client.post(f"/customers/{_cpj['id']}/documents/other", headers=fin_hdr,
+                      files=[("files", ("c.pdf", io.BytesIO(_pdf), "application/pdf"))]).json()) == 3)
+check("profile lists other_document_ids",
+      len(client.get(f"/customers/{_cpj['id']}", headers=fin_hdr
+                     ).json()["documents"]["other_document_ids"]) == 3)
+_alldocs = client.get(f"/customers/{_cpj['id']}/documents", headers=fin_hdr).json()
+check("documents list returns everything", len(_alldocs) == 4, [x["document_type"] for x in _alldocs])
+_dl = client.get(f"/customers/{_cpj['id']}/documents/{_alldocs[0]['id']}/download", headers=fin_hdr)
+check("download returns the bytes", _dl.status_code == 200 and _dl.content == _pdf, _dl.status_code)
+check("delete a document -> 204",
+      client.delete(f"/customers/{_cpj['id']}/documents/{_alldocs[0]['id']}",
+                    headers=fin_hdr).status_code == 204)
+check("unknown document -> 404",
+      client.delete(f"/customers/{_cpj['id']}/documents/nope", headers=fin_hdr).status_code == 404)
+check("invalid document_type -> 400",
+      client.post(f"/customers/{_cpj['id']}/documents", headers=fin_hdr,
+                  data={"document_type": "nonsense"},
+                  files={"file": ("x.pdf", io.BytesIO(_pdf), "application/pdf")}).status_code == 400)
 
 print("\n== Generic upload endpoint (no record id needed) ==")
 _g = client.post("/files/upload", headers=fin_hdr,
