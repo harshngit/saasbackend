@@ -66,6 +66,8 @@ class BranchAddress(BaseModel):
     state: str | None = Field(default=None, max_length=100)
     country: str | None = Field(default=None, max_length=100)
     pin_code: str | None = Field(default=None, max_length=10)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
 
 
 # --- Validation rules from the Company Master sheet -------------------------
@@ -100,6 +102,7 @@ class CompanySettingsOut(BaseModel):
 
     id: str
     name: str
+    company_code: str | None = None
     business_type: str | None
     gst_number: str | None
     pan_number: str | None
@@ -134,6 +137,8 @@ class CompanySettingsOut(BaseModel):
     state: str | None = None
     country: str | None = None
     pin_code: str | None = None
+    maps_latitude: float | None = None
+    maps_longitude: float | None = None
 
     # Branding (Ext)
     stamp_url: str | None = None
@@ -277,6 +282,10 @@ class CompanySettingsUpdate(BaseModel):
     pin_code: str | None = Field(
         default=None, max_length=10, validation_alias=AliasChoices("pin_code", "pin_zip_code")
     )
+    maps_latitude: float | None = Field(
+        default=None, ge=-90, le=90, description="Map pin for the registered office"
+    )
+    maps_longitude: float | None = Field(default=None, ge=-180, le=180)
 
     # Branding (Ext)
     stamp_url: str | None = None

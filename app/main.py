@@ -13,6 +13,7 @@ from app.core.database import (
     widen_columns_to_text,
 )
 from app.models import (  # noqa: F401  (register mappers)
+    ActivityLog,
     Attendance,
     Category,
     Customer,
@@ -84,7 +85,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "documents-by-file-id"
+BUILD_TAG = "sectioned-employee-and-company-overview"
 
 
 @app.on_event("startup")

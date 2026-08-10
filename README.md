@@ -81,39 +81,110 @@ Once the server is running, open:
 | POST   | `/auth/forgot-password` | Public  | Email a reset link (always 200, no leak)   |
 | POST   | `/auth/reset-password`  | Public  | Set a new password using the emailed token |
 | POST   | `/auth/change-password` | Authenticated | Change own password (needs current)  |
-| POST   | `/users`         | Admin          | Create a staff user + employee profile     |
-| GET    | `/users`         | Admin          | List/search employees (role, status, designation, employment type) |
-| GET    | `/users/{id}`    | Admin          | One employee                               |
-| PATCH  | `/users/{id}`    | Admin          | Edit account details + employee profile    |
-| DELETE | `/users/{id}`    | Admin          | Permanently remove an employee             |
-| PATCH  | `/users/{id}/role` | Admin        | Reassign the staff member's role           |
-| PATCH  | `/users/{id}/status` | Admin      | Activate / deactivate a firm user          |
-| POST   | `/users/{id}/reset-password` | Admin | Admin sets a staff member's password    |
-| POST   | `/users/{id}/identity-proof` | Admin | Upload an ID document (image/PDF)       |
-| GET    | `/users/meta/employee-options` | Admin | Dropdown data for the employee form   |
 
 Send the access token as `Authorization: Bearer <token>`.
 
-## Employees
+## Employee endpoints
 
-A user *is* the employee record — the HR fields (`employee_id`, `first_name`,
-`last_name`, `designation`, `employment_type`, `date_of_joining`,
-`employee_status`, `identify_proofs`) ride on the same object and are accepted by
-both `POST /users` and `PATCH /users/{id}`.
+The whole employee module, deliberately kept to this. Anything that used to have
+an endpoint of its own — status changes, role reassignment, per-field uploads,
+dropdown data — is part of `PATCH /users/{id}` or gone.
 
+| Method | Path             | Who            | Purpose                                   |
+|--------|------------------|----------------|-------------------------------------------|
+| POST   | `/users`         | Admin          | Create an employee (sectioned body)        |
+| GET    | `/users`         | Admin          | List/search employees (role, status, designation, employment type) |
+| GET    | `/users/{id}`    | Admin          | One employee's full sectioned profile      |
+| PATCH  | `/users/{id}`    | Admin          | Edit anything about an employee            |
+| DELETE | `/users/{id}`    | Admin          | Permanently remove an employee             |
+| DELETE | `/users/{id}/documents/{collection}?document_id=` | Admin | Drop one file out of a document list |
+| POST   | `/users/{id}/reset-password` | Admin | Admin sets a staff member's password    |
+| POST   | `/files/upload`  | Authenticated  | Upload any file → `{file_id, url, name, …}` |
+| GET    | `/files/{id}`    | Public         | Serve an uploaded file (capability URL)     |
+| DELETE | `/files/{id}`    | Authenticated  | Discard an uploaded file                   |
+
+Removed, and what replaces each:
+
+| Gone                                    | Use instead                                        |
+|-----------------------------------------|----------------------------------------------------|
+| `PATCH /users/{id}/status`               | `system_preferences.account_status` on `PATCH /users/{id}` |
+| `PATCH /users/{id}/account-status`       | same                                                |
+| `PATCH /users/{id}/role`                 | `employment_information.role_id` (or `role` by name) |
+| `POST /users/{id}/identity-proof`        | `POST /files/upload` → `documents.identity_proof_file` |
+| `POST /users/{id}/files/{field}`         | `POST /files/upload` → the matching field           |
+| `DELETE /users/{id}/files/{field}`       | send that field as `null`                           |
+| `GET/POST /users/{id}/documents/{collection}` | the `documents` section on `PATCH /users/{id}` |
+| `GET /users/meta/employee-options`       | nothing — the frontend owns its dropdowns           |
+
+### How the employee body works
+
+A user *is* the employee record. `POST /users` and `PATCH /users/{id}` take the
+same **sectioned** body — `basic_information`, `contact_information`,
+`address_information`, `employment_information`, `login_security`,
+`payroll_information`, `documents`, `professional_information`,
+`system_preferences` — and `GET /users/{id}` returns it in that shape. The table
+underneath stays flat; `app/schemas/employee_profile.py` holds the mapping. Older
+flat bodies (`{"first_name": …, "email": …}`) are still folded into their sections,
+and `GET /users` (the list) stays flat, one row per employee.
+
+- **Nothing is required** but the two a login account cannot exist without:
+  `contact_information.official_email` and `login_security.password`. Which fields
+  a form insists on is the frontend's business, and no dropdown data is served
+  from here.
+- **One endpoint for every change.** There is no separate status API: an employee
+  resigning is `employment_information` (`employee_status`, `date_of_exit`) plus
+  `system_preferences.account_status` in a single `PATCH`. `account_status` drives
+  `is_active`, so only an `active` account can log in; `employee_status` is the HR
+  lifecycle. `login_security.password` and `employment_information.role_id` are
+  accepted on `PATCH` too.
+- **Files are uploaded before the employee exists.** `POST /files/upload` takes no
+  record id and returns `{file_id, url, name, content_type, size}`; put the `url`
+  into `basic_information.profile_photo` or the `documents` section on create. The
+  document lists (`experience_certificates`, `educational_certificates`,
+  `other_documents`) are URL lists in and out. Drop one file with
+  `DELETE /users/{id}/documents/{collection}/{document_id}`, where `document_id`
+  is the `file_id` (the last segment of the URL); empty a named slot with
+  `DELETE /users/{id}/files/{field}`, and discard an upload that was never
+  attached with `DELETE /files/{id}`.
 - `employee_id` is a per-firm series. Omit it and the next free `EMP-0001`,
   `EMP-0002`, … is assigned; supplying one that's already used returns `409`.
 - `employment_type` ∈ `full_time | part_time | contract | intern | temporary` and
   `employee_status` ∈ `active | probation | on_leave | notice_period | resigned |
-  terminated`. Input is normalized, so `"Full Time"` and `"Full-time"` both work;
-  anything outside the list is a `422`. `employee_status` is the HR lifecycle —
-  `is_active` (via `PATCH /users/{id}/status`) is what controls login.
+  terminated`. Input is normalized, so `"Full Time"` and `"Full-time"` both work.
 - `DELETE /users/{id}` is a hard delete: the user's own rows (attendance,
   notifications, sessions) go with them, while records that merely reference them
   (customers, leads, quotations, sales orders) survive with the link nulled out.
   You can't delete yourself, and a delivery partner with an open vehicle loading
-  returns `409` until the end-of-day is recorded. Deactivate instead when the
-  history should stay attributed.
+  returns `409` until the end-of-day is recorded. Set `account_status` to
+  `inactive` instead when the history should stay attributed.
+
+## Company Settings dashboard
+
+`GET /organizations/overview` (Admin) is the one call behind the Company Settings
+page. Read-only and entirely derived — one block per card:
+
+| Block                 | What it holds                                                       |
+|-----------------------|---------------------------------------------------------------------|
+| `company`             | Name, `company_code` (`CMP-10001`, issued on first read), legal name, industry, `company_type` (from `business_type`), `registration_date` (from `date_of_incorporation`), `company_status`, logo, GST/PAN, plus a nested `plan` with the subscription state, trial countdown and quotas |
+| `counts`              | `employees`, `active_users`, `branches`, `documents`                 |
+| `storage`             | `files`, `used_bytes` / `used_mb` / `used_gb`, `limit_gb` from the plan's `max_storage_gb` (null = unlimited) and `percent_used` |
+| `profile_completion`  | `percent`, `filled`/`total`, and the gaps both as display labels (`missing_information`) and as column names (`missing_fields`) |
+| `authorized_person`   | Name, designation, email, mobile, photo, signature, `is_complete`    |
+| `documents`           | `uploaded`/`pending` counts plus one row per document — the six named slots and every "other" file, each with `key`, `name`, `status`, `url` |
+| `addresses`           | The registered office first (`is_primary`), then each branch, all with `latitude`/`longitude` |
+| `recent_activity`     | Newest first: `type`, `title`, `description`, `at`, `by`. `?activity_limit=` (1–100, default 10) sizes it — that is what the page's "View All" reads |
+
+Recent Activity comes from the `activity_logs` table, written by
+`activity_service.record()` inside the transaction that made the change. Company
+profile updates are split by the section of the page they touched, so one `PUT
+/settings` can produce "Billing information changed" and "Authorized person
+updated" as separate entries. Employee create / update / delete are recorded too.
+Dropping `activity_service.record(...)` into another router adds it to the feed.
+
+Two things the page shows that the backend does not store yet: document **expiry**
+(`expires_at` is always null, so nothing reports `expired`) and any notion of the
+authorized person being externally *verified* — `is_complete` only says every field
+is filled in.
 
 ## Password reset (SMTP)
 

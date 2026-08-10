@@ -22,12 +22,15 @@ from app.seed import main as seed_main  # noqa: E402
 seed_main()
 client = TestClient(app)
 
-# The employee form makes these mandatory on POST /users. Nearly every staff
-# creation below is really testing roles / permissions / lifecycle rather than
-# the HR form, so fill the mandatory fields in centrally instead of repeating
-# them at ~30 call sites. A body that sets one of them keeps its own value, and
-# `_raw_post` bypasses this for the checks that exercise the contract itself.
-_STAFF_REQUIRED = {
+# POST /users takes the sectioned employee body, and nothing in it is mandatory
+# beyond the login email and password — which fields a form insists on is the
+# frontend's business. Nearly every staff creation below is really testing roles /
+# permissions / lifecycle rather than the HR form, so those calls stay in the older
+# *flat* shape (which the API still folds into sections) with the profile fields
+# filled in centrally instead of at ~30 call sites. A body that sets one of them
+# keeps its own value, and `_raw_post` bypasses this for the checks that exercise
+# the body itself.
+_STAFF_FLAT_DEFAULTS = {
     "first_name": "Test",
     "last_name": "Staff",
     "phone": "9800000000",
@@ -45,8 +48,8 @@ _raw_post = client.post
 
 def _post_with_staff_defaults(url, *args, **kwargs):
     body = kwargs.get("json")
-    if url == "/users" and isinstance(body, dict):
-        body = {**_STAFF_REQUIRED, **body}
+    if url == "/users" and isinstance(body, dict) and "login_security" not in body:
+        body = {**_STAFF_FLAT_DEFAULTS, **body}
         body.setdefault("confirm_password", body.get("password"))
         kwargs["json"] = body
     return _raw_post(url, *args, **kwargs)
@@ -169,8 +172,9 @@ check("list users -> 200", r.status_code == 200, r.text)
 check("firm has 2 users (admin + staff)", len(r.json()) == 2, r.text)
 
 print("\n== deactivate staff, then blocked from login ==")
-r = client.patch(f"/users/{staff_id}/status",
-    headers={"Authorization": f"Bearer {admin_access}"}, json={"is_active": False})
+r = client.patch(f"/users/{staff_id}",
+    headers={"Authorization": f"Bearer {admin_access}"},
+    json={"system_preferences": {"account_status": "inactive"}})
 check("deactivate -> 200", r.status_code == 200 and r.json()["is_active"] is False, r.text)
 r = client.post("/auth/login", json={"email": staff_email, "password": "Staff@123"})
 check("deactivated staff login -> 403", r.status_code == 403, r.text)
@@ -236,8 +240,9 @@ other_email = f"other_{uuid.uuid4().hex[:8]}@firm.com"
 r2 = client.post("/auth/register", json={
     "organization_name": "Other Co", "admin_name": "Other", "email": other_email, "password": "Secret@123"})
 other_user_id = r2.json()["user"]["id"]
-r = client.patch(f"/users/{other_user_id}/status",
-    headers={"Authorization": f"Bearer {admin_access}"}, json={"is_active": False})
+r = client.patch(f"/users/{other_user_id}",
+    headers={"Authorization": f"Bearer {admin_access}"},
+    json={"system_preferences": {"account_status": "inactive"}})
 check("cross-firm status change -> 404", r.status_code == 404, r.text)
 
 print("\n== trial expiry -> lock -> upgrade -> super-admin approve ==")
@@ -433,7 +438,8 @@ check("delete custom role -> 204",
 staff_reg = client.post("/users", headers=roles_hdr, json={
     "name": "St", "email": f"st_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role": "sales_officer"})
 st_tok = client.post("/auth/login", json={
-    "email": staff_reg.json()["email"], "password": "Staff@123"}).json()["tokens"]["access_token"]
+    "email": staff_reg.json()["contact_information"]["official_email"],
+    "password": "Staff@123"}).json()["tokens"]["access_token"]
 check("staff blocked from /roles -> 403",
       client.get("/roles", headers={"Authorization": f"Bearer {st_tok}"}).status_code == 403)
 # Cross-org: another firm's admin cannot see this firm's roles by id
@@ -464,10 +470,14 @@ r = client.post("/users", headers=p2_hdr, json={
     "name": "Staffy", "email": st_email, "password": "Staff@123", "username": f"u_{uuid.uuid4().hex[:8]}", "role_id": sales_role["id"]})
 check("create staff via role_id -> 201", r.status_code == 201, r.text)
 staff = r.json()
+_employment = staff["employment_information"]
 check("staff system_role=staff", staff["system_role"] == "staff", staff)
-check("staff role_id set", staff["role_id"] == sales_role["id"], staff)
-check("staff role_detail has permissions", staff["role_detail"]["permissions"].get("customers", {}).get("create") is True, staff)
-check("staff legacy role mapped (sales_officer)", staff["role"] == "sales_officer", staff)
+check("staff role_id set", _employment["role_id"] == sales_role["id"], _employment)
+check("staff role_detail has permissions",
+      _employment["role_detail"]["permissions"].get("customers", {}).get("create") is True, _employment)
+check("staff legacy role mapped (sales_officer) on the flat shape",
+      next(u for u in client.get("/users", headers=p2_hdr).json()
+           if u["id"] == staff["id"])["role"] == "sales_officer", staff)
 p2_staff_id = staff["id"]
 
 # role_id from another org → rejected
@@ -494,11 +504,28 @@ check("filter ?is_active=false empty (none deactivated yet)",
 
 # GET one / PATCH profile / PATCH role
 check("GET /users/{id} -> 200", client.get(f"/users/{p2_staff_id}", headers=p2_hdr).status_code == 200)
-r = client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={"phone": "9000000000", "name": "Staffy Renamed"})
-check("PATCH /users/{id} profile -> 200", r.status_code == 200 and r.json()["phone"] == "9000000000" and r.json()["name"] == "Staffy Renamed", r.text)
+r = client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={
+    "contact_information": {"mobile_number": "9000000000"}, "name": "Staffy Renamed"})
+check("PATCH /users/{id} profile -> 200", r.status_code == 200
+      and r.json()["contact_information"]["mobile_number"] == "9000000000"
+      and r.json()["name"] == "Staffy Renamed", r.text)
 deliv_role = next(rr for rr in roles if rr["name"] == "Delivery Partner")
-r = client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": deliv_role["id"]})
-check("PATCH /users/{id}/role -> 200 new role", r.status_code == 200 and r.json()["role_id"] == deliv_role["id"] and r.json()["role"] == "delivery_partner", r.text)
+# Reassignment is part of the one update endpoint — there is no /role route.
+r = client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={
+    "employment_information": {"role_id": deliv_role["id"]}})
+check("PATCH /users/{id} reassigns the role", r.status_code == 200
+      and r.json()["employment_information"]["role_id"] == deliv_role["id"]
+      and r.json()["employment_information"]["role_detail"]["name"] == "Delivery Partner", r.text)
+check("the removed /role route is gone",
+      client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr,
+                   json={"role_id": deliv_role["id"]}).status_code == 404)
+check("a role name works on PATCH too", client.patch(f"/users/{p2_staff_id}", headers=p2_hdr,
+      json={"role": "Sales Officer"}).json()["employment_information"]["role_id"] == sales_role["id"])
+check("an explicit null clears the role assignment",
+      client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={
+          "employment_information": {"role_id": None}}).json()["employment_information"]["role_id"] is None)
+client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={
+    "employment_information": {"role_id": deliv_role["id"]}})
 
 # Cross-org: another admin can't fetch this firm's user
 check("cross-org GET /users/{id} -> 404", client.get(f"/users/{p2_staff_id}", headers={"Authorization": f"Bearer {other['tokens']['access_token']}"}).status_code == 404)
@@ -508,7 +535,7 @@ check("cross-org GET /users/{id} -> 404", client.get(f"/users/{p2_staff_id}", he
 check("delete default role -> 400", client.delete(f"/roles/{sales_role['id']}", headers=p2_hdr).status_code == 400)
 # Custom role with an assigned user → 400
 cr = client.post("/roles", headers=p2_hdr, json={"name": "Temp Role", "permissions": {"customers": {"view": True}}}).json()
-client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role_id": cr["id"]})
+client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={"employment_information": {"role_id": cr["id"]}})
 check("delete custom role with assigned user -> 400",
       client.delete(f"/roles/{cr['id']}", headers=p2_hdr).status_code == 400)
 
@@ -522,22 +549,27 @@ r = client.post("/users", headers=p2_hdr, json={
     "name": "Rahul Sharma", "email": f"hr1_{uuid.uuid4().hex[:6]}@f.com",
     "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Rahul@12345", "role_id": hr_role["id"]})
 check("create staff with custom role_id -> 201", r.status_code == 201, r.text)
-check("custom-role staff has no legacy enum role", r.json()["role"] is None, r.text)
-check("custom-role staff carries the role name", r.json()["role_detail"]["name"] == "HR", r.text)
+check("custom-role staff carries the role name",
+      r.json()["employment_information"]["role_detail"]["name"] == "HR", r.text)
+check("custom-role staff has no legacy enum role on the flat shape",
+      next(u for u in client.get("/users", headers=p2_hdr).json()
+           if u["id"] == r.json()["id"])["role"] is None, r.text)
 
 # By name — "hr" used to 422 against the fixed enum.
 r = client.post("/users", headers=p2_hdr, json={
     "name": "Priya", "email": f"hr2_{uuid.uuid4().hex[:6]}@f.com",
     "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Priya@12345", "role": "hr"})
 check("create staff with custom role name -> 201", r.status_code == 201, r.text)
-check("role name resolved to the HR role", r.json()["role_id"] == hr_role["id"], r.text)
+check("role name resolved to the HR role",
+      r.json()["employment_information"]["role_id"] == hr_role["id"], r.text)
 
 # Legacy enum values still resolve, via the default role of the same name.
 r = client.post("/users", headers=p2_hdr, json={
     "name": "Legacy", "email": f"hr3_{uuid.uuid4().hex[:6]}@f.com",
     "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Legacy@12345", "role": "sales_officer"})
 check("legacy role=sales_officer still -> 201", r.status_code == 201, r.text)
-check("legacy role maps to the Sales Officer role", r.json()["role_detail"]["name"] == "Sales Officer", r.text)
+check("legacy role maps to the Sales Officer role",
+      r.json()["employment_information"]["role_detail"]["name"] == "Sales Officer", r.text)
 
 r = client.post("/users", headers=p2_hdr, json={
     "name": "Ghost", "email": f"hr4_{uuid.uuid4().hex[:6]}@f.com",
@@ -552,11 +584,12 @@ check("cross-org role name -> 400",
           "username": f"u_{uuid.uuid4().hex[:8]}", "password": "Staff@123",
           "role": "Senior Sales Officer"}).status_code == 400)
 
-# PATCH /role accepts a name too.
-r = client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={"role": "HR"})
-check("PATCH /users/{id}/role by name -> 200", r.status_code == 200 and r.json()["role_id"] == hr_role["id"], r.text)
-check("PATCH /role with neither id nor name -> 422",
-      client.patch(f"/users/{p2_staff_id}/role", headers=p2_hdr, json={}).status_code == 422)
+# A role name works on PATCH as well as a role_id.
+r = client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={"role": "HR"})
+check("PATCH /users/{id} by role name -> 200", r.status_code == 200
+      and r.json()["employment_information"]["role_id"] == hr_role["id"], r.text)
+check("an empty PATCH body is a no-op, not an error",
+      client.patch(f"/users/{p2_staff_id}", headers=p2_hdr, json={}).status_code == 200)
 
 print("\n== Categories + Products module (CRUD, variants, bulk-delete, permissions) ==")
 cp_email = f"cp_{uuid.uuid4().hex[:8]}@firm.com"
@@ -1062,11 +1095,12 @@ check("settings reflects uploaded logo",
 uname = f"staffuser_{uuid.uuid4().hex[:6]}"
 r = client.post("/users", headers=min_hdr, json={
     "name": "U", "email": f"u1_{uuid.uuid4().hex[:6]}@f.com", "username": uname, "password": "Staff@123", "role": "accountant"})
-check("create staff with username -> 201", r.status_code == 201 and r.json()["username"] == uname, r.text)
+check("create staff with username -> 201",
+      r.status_code == 201 and r.json()["login_security"]["username"] == uname, r.text)
 check("duplicate username -> 409",
       client.post("/users", headers=min_hdr, json={"name": "U2", "email": f"u2_{uuid.uuid4().hex[:6]}@f.com", "username": uname, "password": "Staff@123", "role": "accountant"}).status_code == 409)
-check("missing username -> 422",
-      client.post("/users", headers=min_hdr, json={"name": "U3", "email": f"u3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"}).status_code == 422)
+check("username is optional — the form decides -> 201",
+      client.post("/users", headers=min_hdr, json={"name": "U3", "email": f"u3_{uuid.uuid4().hex[:6]}@f.com", "password": "Staff@123", "role": "accountant"}).status_code == 201)
 
 print("\n== DEMO direct password reset (check-email + reset-password-direct) ==")
 demo_reset_email = f"dr_{uuid.uuid4().hex[:8]}@firm.com"
@@ -1758,6 +1792,162 @@ check("partial update of one field still allowed",
       client.put("/organizations/settings", headers=fin_hdr,
                  json={"city": "Mumbai"}).json()["city"] == "Mumbai")
 
+print("\n== Company Settings dashboard (GET /organizations/overview) ==")
+# One call behind the whole page: header, stat tiles, storage, completion,
+# authorized person, documents, addresses and the activity feed.
+client.put("/organizations/settings", headers=fin_hdr, json={
+    "industry": "Beverages", "business_type": "Private Limited",
+    "date_of_incorporation": "2025-01-15", "company_status": "active",
+    "auth_person_name": "John Smith", "auth_person_designation": "Chief Executive Officer",
+    "auth_person_email": "john.smith@abcbeverages.com", "auth_person_mobile": "+919123456789",
+    "registered_address": "123, Business Park, Hitech City", "city": "Hyderabad",
+    "state": "Telangana", "country": "India", "pin_code": "500081",
+    "maps_latitude": 17.4435, "maps_longitude": 78.3772})
+
+r = client.get("/organizations/overview", headers=fin_hdr)
+check("GET /organizations/overview -> 200", r.status_code == 200, r.text[:400])
+ov = r.json()
+check("overview has one block per card on the page",
+      set(ov) == {"company", "counts", "storage", "profile_completion", "authorized_person",
+                  "documents", "addresses", "recent_activity"}, sorted(ov))
+
+# --- header ---
+co = ov["company"]
+check("company code issued as CMP-#####",
+      (co["company_code"] or "").startswith("CMP-") and co["company_code"][4:].isdigit(), co)
+check("the company code is stable across calls",
+      client.get("/organizations/overview", headers=fin_hdr).json()["company"]["company_code"]
+      == co["company_code"])
+check("company code also on GET /settings",
+      client.get("/organizations/settings", headers=fin_hdr).json()["company_code"] == co["company_code"])
+check("header carries industry / company type / registration date",
+      co["industry"] == "Beverages" and co["company_type"] == "Private Limited"
+      and co["registration_date"] == "2025-01-15", co)
+check("header carries the company status and the plan",
+      co["company_status"] == "active" and co["plan"]["name"] is not None, co)
+check("plan block reports the subscription lifecycle separately",
+      co["plan"]["subscription_status"] in ("trial", "active", "locked", "inactive", "suspended"),
+      co["plan"])
+
+# --- stat tiles ---
+counts = ov["counts"]
+_users = client.get("/users", headers=fin_hdr).json()
+check("employees count matches the employee list", counts["employees"] == len(_users), counts)
+check("active users counts only accounts that can log in",
+      counts["active_users"] == sum(1 for u in _users if u["is_active"]), counts)
+check("branches count matches branch_addresses",
+      counts["branches"] == len(client.get("/organizations/settings",
+                                           headers=fin_hdr).json()["branch_addresses"]), counts)
+check("documents count matches the uploaded documents",
+      counts["documents"] == ov["documents"]["uploaded"], counts)
+
+# --- storage ---
+st = ov["storage"]
+check("storage reports files, bytes and the derived units",
+      st["files"] > 0 and st["used_bytes"] > 0 and st["used_mb"] >= 0 and st["used_gb"] >= 0, st)
+check("an unlimited plan reports no percentage",
+      st["limit_gb"] is not None or st["percent_used"] is None, st)
+_plan_id = co["plan"]["id"]
+client.put(f"/superadmin/plans/{_plan_id}", headers=sa_hdr, json={"max_storage_gb": 20})
+st2 = client.get("/organizations/overview", headers=fin_hdr).json()["storage"]
+check("a plan quota drives limit_gb and percent_used",
+      st2["limit_gb"] == 20 and st2["percent_used"] is not None and st2["percent_used"] < 100, st2)
+
+# --- profile completion ---
+pc = ov["profile_completion"]
+check("completion reports a percentage out of the mandatory fields",
+      0 <= pc["percent"] <= 100 and pc["filled"] + len(pc["missing_fields"]) == pc["total"], pc)
+check("missing information is labelled for display and named for code",
+      len(pc["missing_information"]) == len(pc["missing_fields"]), pc)
+check("completion agrees with /settings/completeness",
+      pc["total"] == client.get("/organizations/settings/completeness",
+                                headers=fin_hdr).json()["total"], pc)
+
+# --- authorized person ---
+ap = ov["authorized_person"]
+check("authorized person block filled from the company profile",
+      ap["name"] == "John Smith" and ap["designation"] == "Chief Executive Officer"
+      and ap["email"] == "john.smith@abcbeverages.com" and ap["is_complete"] is True, ap)
+
+# --- documents ---
+docs = ov["documents"]
+check("documents list every named slot plus the 'other' files",
+      docs["total"] == len(docs["items"]) and docs["uploaded"] + docs["pending"] == docs["total"], docs)
+check("each document row carries key / name / status / url",
+      all({"key", "name", "status", "url"} <= set(d) for d in docs["items"]), docs["items"][:2])
+check("a filled slot reads uploaded, an empty one pending",
+      {d["status"] for d in docs["items"]} <= {"uploaded", "pending"},
+      [d["status"] for d in docs["items"]])
+check("the GST slot was cleared earlier, so it reads pending",
+      next(d for d in docs["items"] if d["key"] == "gst_certificate")["status"] == "pending", docs)
+client.post("/organizations/settings/documents/other", headers=fin_hdr, files=[
+    ("files", ("insurance-certificate.pdf", io.BytesIO(b"%PDF-1.4 ins"), "application/pdf"))])
+_docs2 = client.get("/organizations/overview", headers=fin_hdr).json()["documents"]
+check("'other' documents appear as their own rows, named after the file",
+      any(d["key"] == "other" and d["name"] == "insurance-certificate.pdf"
+          for d in _docs2["items"]), _docs2["items"][-2:])
+check("an 'other' row carries the size and upload time the slot knows",
+      all(d["size"] and d["uploaded_at"] for d in _docs2["items"] if d["key"] == "other"),
+      [d for d in _docs2["items"] if d["key"] == "other"])
+
+# --- addresses ---
+addrs = ov["addresses"]
+check("the registered office is first and primary",
+      addrs[0]["type"] == "registered_office" and addrs[0]["is_primary"] is True, addrs[0])
+check("the registered office carries its map pin",
+      addrs[0]["latitude"] == 17.4435 and addrs[0]["longitude"] == 78.3772, addrs[0])
+check("branches follow, with their labels and ids",
+      all(a["type"] == "branch" and a["id"] for a in addrs[1:])
+      and any(a["label"] == "Pune Warehouse" for a in addrs[1:]), addrs[1:])
+check("a branch can carry its own map pin",
+      client.put("/organizations/settings", headers=fin_hdr, json={"branch_addresses": [
+          {"label": "Pune Warehouse", "address": "Plot 12, MIDC", "city": "Pune",
+           "pin_code": "411018", "latitude": 18.5204, "longitude": 73.8567}]})
+      .json()["branch_addresses"][0]["latitude"] == 18.5204)
+
+# --- recent activity ---
+acts = ov["recent_activity"]
+check("recent activity is newest first, with who did it",
+      len(acts) > 0 and all({"id", "type", "title", "at", "by"} <= set(a) for a in acts), acts[:2])
+check("the profile update just made is in the feed",
+      any(a["type"] == "authorized_person" for a in acts), [a["title"] for a in acts])
+check("one update is split into the sections of the page it touched",
+      {"address", "company_profile"} <= {a["type"] for a in acts}, [a["type"] for a in acts])
+_all_acts = client.get("/organizations/overview", headers=fin_hdr,
+                       params={"activity_limit": 100}).json()["recent_activity"]
+check("document uploads are recorded",
+      any(a["type"] == "document" for a in _all_acts), [a["title"] for a in _all_acts])
+check("the feed is newest first",
+      [a["at"] for a in _all_acts] == sorted((a["at"] for a in _all_acts), reverse=True))
+check("activity_limit caps the feed",
+      len(client.get("/organizations/overview", headers=fin_hdr,
+                     params={"activity_limit": 2}).json()["recent_activity"]) == 2)
+check("activity_limit out of range -> 422",
+      client.get("/organizations/overview", headers=fin_hdr,
+                 params={"activity_limit": 0}).status_code == 422)
+_before = len(client.get("/organizations/overview", headers=fin_hdr,
+                         params={"activity_limit": 100}).json()["recent_activity"])
+_emp = client.post("/users", headers=fin_hdr, json={
+    "name": "Feed Tester", "email": f"feed_{uuid.uuid4().hex[:8]}@firm.com",
+    "username": f"feed_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant"}).json()
+_after = client.get("/organizations/overview", headers=fin_hdr,
+                    params={"activity_limit": 100}).json()["recent_activity"]
+check("adding an employee shows up in the feed",
+      len(_after) == _before + 1 and _after[0]["type"] == "employee"
+      and _after[0]["by"] is not None, _after[:1])
+check("removing an employee is recorded too",
+      client.delete(f"/users/{_emp['id']}", headers=fin_hdr).status_code == 204
+      and client.get("/organizations/overview", headers=fin_hdr)
+      .json()["recent_activity"][0]["title"] == "Employee removed")
+check("the feed is scoped to the firm",
+      all(a["id"] for a in client.get("/organizations/overview", headers=min_hdr)
+          .json()["recent_activity"]))
+check("another firm cannot see this firm's activity",
+      client.get("/organizations/overview", headers=min_hdr).json()["recent_activity"]
+      != ov["recent_activity"])
+check("staff cannot read the overview -> 403",
+      client.get("/organizations/overview", headers=st_hdr).status_code == 403)
+
 print("\n== HSN codes and payment allocation ==")
 hsn_prod = client.post("/products", headers=fin_hdr, json={
     "name": "HSN Test Pipe", "price": 500, "hsn_code": "7306", "total_inventory": 50}).json()
@@ -1929,23 +2119,56 @@ check("GET /sales-returns list -> 200", r.status_code == 200 and len(r.json()) >
 r = client.get(f"/sales-returns/{ret_obj['id']}", headers=fin_hdr)
 check("GET /sales-returns/{id} detail -> 200", r.status_code == 200, r.text)
 
-print("\n== Employee profile on users ==")
+print("\n== Employee profile on users (sectioned body) ==")
+# POST /users and PATCH /users/{id} take the same sectioned body, and GET hands it
+# back in the same shape. No dropdown data and no required-field policy come from
+# the backend — the form owns both.
 emp_email = f"emp_{uuid.uuid4().hex[:8]}@firm.com"
-r = client.post("/users", headers=fin_hdr, json={
-    "name": "Ravi Kumar", "email": emp_email, "username": f"emp_{uuid.uuid4().hex[:8]}",
-    "password": "Staff@123", "role": "sales_officer",
-    "employee_id": "EMP-9001", "first_name": "Ravi", "last_name": "Kumar",
-    "designation": "Field Sales Executive", "employment_type": "Full Time",
-    "date_of_joining": "2026-01-15T00:00:00Z", "employee_status": "On-Leave",
+emp_username = f"emp_{uuid.uuid4().hex[:8]}"
+r = _raw_post("/users", headers=fin_hdr, json={
+    "employee_id": "EMP-9001",
+    "role": "sales_officer",
+    "basic_information": {
+        "first_name": "Ravi", "last_name": "Kumar", "display_name": "Ravi Kumar",
+        "gender": "Male", "date_of_birth": "1998-05-12", "marital_status": "Single",
+        "blood_group": "O+", "nationality": "Indian"},
+    "contact_information": {"official_email": emp_email, "mobile_number": "+919876543210"},
+    "employment_information": {
+        "designation": "Field Sales Executive", "employment_type": "Full Time",
+        "date_of_joining": "2026-01-15", "employee_status": "On-Leave"},
+    "login_security": {"username": emp_username, "password": "Staff@123",
+                       "confirm_password": "Staff@123"},
 })
-check("create employee with profile -> 201", r.status_code == 201, r.text)
+check("create employee from the sectioned body -> 201", r.status_code == 201, r.text)
 emp = r.json()
 check("employee_id stored", emp["employee_id"] == "EMP-9001", emp)
-check("first/last name stored", emp["first_name"] == "Ravi" and emp["last_name"] == "Kumar", emp)
-check("designation stored", emp["designation"] == "Field Sales Executive", emp)
-check("employment_type normalized 'Full Time' -> full_time", emp["employment_type"] == "full_time", emp)
-check("employee_status normalized 'On-Leave' -> on_leave", emp["employee_status"] == "on_leave", emp)
-check("date_of_joining stored", (emp["date_of_joining"] or "").startswith("2026-01-15"), emp)
+check("name composed from first + last", emp["name"] == "Ravi Kumar", emp)
+check("basic_information stored",
+      emp["basic_information"]["first_name"] == "Ravi"
+      and emp["basic_information"]["last_name"] == "Kumar"
+      and emp["basic_information"]["blood_group"] == "O+"
+      and (emp["basic_information"]["date_of_birth"] or "").startswith("1998-05-12"),
+      emp["basic_information"])
+check("contact_information stored",
+      emp["contact_information"]["official_email"] == emp_email
+      and emp["contact_information"]["mobile_number"] == "+919876543210",
+      emp["contact_information"])
+check("designation stored",
+      emp["employment_information"]["designation"] == "Field Sales Executive",
+      emp["employment_information"])
+check("employment_type normalized 'Full Time' -> full_time",
+      emp["employment_information"]["employment_type"] == "full_time", emp["employment_information"])
+check("employee_status normalized 'On-Leave' -> on_leave",
+      emp["employment_information"]["employee_status"] == "on_leave", emp["employment_information"])
+check("date_of_joining stored",
+      (emp["employment_information"]["date_of_joining"] or "").startswith("2026-01-15"),
+      emp["employment_information"])
+check("login_security shows the username and never the password",
+      emp["login_security"] == {"username": emp_username}, emp["login_security"])
+check("GET /users/{id} returns exactly the same profile",
+      client.get(f"/users/{emp['id']}", headers=fin_hdr).json() == emp)
+check("the new employee can log in",
+      client.post("/auth/login", json={"email": emp_email, "password": "Staff@123"}).status_code == 200)
 
 # employee_id is auto-assigned when omitted, and unique per firm
 r = client.post("/users", headers=fin_hdr, json={
@@ -1954,7 +2177,10 @@ r = client.post("/users", headers=fin_hdr, json={
 auto_emp = r.json()
 check("employee_id auto-assigned EMP-####",
       r.status_code == 201 and (auto_emp["employee_id"] or "").startswith("EMP-"), r.text)
-check("employee_status defaults to active", auto_emp["employee_status"] == "active", auto_emp)
+check("employee_status defaults to active",
+      auto_emp["employment_information"]["employee_status"] == "active", auto_emp)
+check("account_status defaults to active",
+      auto_emp["system_preferences"]["account_status"] == "active", auto_emp)
 check("duplicate employee_id -> 409", client.post("/users", headers=fin_hdr, json={
     "name": "Dupe", "email": f"dup_{uuid.uuid4().hex[:8]}@firm.com",
     "username": f"dup_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant",
@@ -1964,7 +2190,7 @@ check("invalid employment_type -> 422", client.post("/users", headers=fin_hdr, j
     "username": f"bad_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant",
     "employment_type": "freelance-ish"}).status_code == 422)
 
-# Filters
+# Filters (the list endpoint stays flat — one row per employee)
 check("filter by employee_status=on_leave",
       any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"employee_status": "on_leave"}).json()))
 check("filter by employment_type=full_time",
@@ -1975,156 +2201,244 @@ check("search by employee_id",
       any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"search": "EMP-9001"}).json()))
 check("search by name",
       any(u["id"] == emp["id"] for u in client.get("/users", headers=fin_hdr, params={"search": "Ravi"}).json()))
+check("the list stays flat", all("basic_information" not in u for u in client.get("/users", headers=fin_hdr).json()))
 
-# Edit the profile
-r = client.patch(f"/users/{emp['id']}", headers=fin_hdr,
-                 json={"designation": "Senior Sales Executive", "employee_status": "active", "phone": "9812345678"})
-check("PATCH employee profile -> 200",
-      r.status_code == 200 and r.json()["designation"] == "Senior Sales Executive"
-      and r.json()["employee_status"] == "active" and r.json()["phone"] == "9812345678", r.text)
+# Edit the profile — any mix of sections in one call
+r = client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={
+    "employment_information": {"designation": "Senior Sales Executive", "employee_status": "active"},
+    "contact_information": {"mobile_number": "9812345678"}})
+check("PATCH employee profile -> 200", r.status_code == 200
+      and r.json()["employment_information"]["designation"] == "Senior Sales Executive"
+      and r.json()["employment_information"]["employee_status"] == "active"
+      and r.json()["contact_information"]["mobile_number"] == "9812345678", r.text)
+check("sections the PATCH did not mention are untouched",
+      r.json()["basic_information"]["blood_group"] == "O+", r.json()["basic_information"])
 check("PATCH to a taken employee_id -> 409",
       client.patch(f"/users/{auto_emp['id']}", headers=fin_hdr, json={"employee_id": "EMP-9001"}).status_code == 409)
 check("PATCH keeping own employee_id -> 200",
       client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={"employee_id": "EMP-9001"}).status_code == 200)
-
-# Options endpoint for the employee form
-r = client.get("/users/meta/employee-options", headers=fin_hdr)
-opts = r.json()
-check("GET employee-options -> 200", r.status_code == 200, r.text)
-check("options list employment types", "full_time" in opts["employment_types"] and "contract" in opts["employment_types"], opts)
-check("options list employee statuses", "on_leave" in opts["employee_statuses"], opts)
-check("options include designations in use", "Senior Sales Executive" in opts["designations"], opts)
+check("a flat PATCH body still folds into its sections",
+      client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={"work_location": "Pune Office"})
+      .json()["employment_information"]["work_location"] == "Pune Office")
+check("no dropdown data is served from the backend",
+      client.get("/users/meta/employee-options", headers=fin_hdr).status_code == 404)
 
 # Identity proof upload
-r = client.post(f"/users/{emp['id']}/identity-proof", headers=fin_hdr,
-                files={"file": ("aadhaar.pdf", io.BytesIO(b"%PDF-1.4 id"), "application/pdf")})
-check("upload identity proof -> file URL",
-      r.status_code == 200 and is_file_url(r.json()["url"]), r.text[:200])
-check("user detail reflects identity proof",
-      is_file_url(client.get(f"/users/{emp['id']}", headers=fin_hdr).json()["identify_proofs"]))
-check("identity proof rejects non-document -> 400",
+# Identity proof: upload, then PATCH the URL in — the only path there is.
+aadhaar = client.post("/files/upload", headers=fin_hdr,
+                      files={"file": ("aadhaar.pdf", io.BytesIO(b"%PDF-1.4 id"), "application/pdf")}).json()
+r = client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={
+    "documents": {"identity_proof_type": "Aadhaar", "identity_proof_file": aadhaar["url"]}})
+check("attach the identity proof by URL -> 200",
+      r.status_code == 200 and r.json()["documents"]["identity_proof_file"] == aadhaar["url"], r.text[:200])
+check("the removed /identity-proof route is gone",
       client.post(f"/users/{emp['id']}/identity-proof", headers=fin_hdr,
-                  files={"file": ("x.txt", io.BytesIO(b"hi"), "text/plain")}).status_code == 400)
+                  files={"file": ("a.pdf", io.BytesIO(b"%PDF"), "application/pdf")}).status_code == 404)
+check("clearing a named slot with null -> 200",
+      client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={
+          "documents": {"identity_proof_file": None}}).json()["documents"]["identity_proof_file"] is None)
+client.patch(f"/users/{emp['id']}", headers=fin_hdr,
+             json={"documents": {"identity_proof_file": aadhaar["url"]}})
 check("employee profile visible on /auth/me",
       "employee_id" in client.get("/auth/me", headers=fin_hdr).json()["user"])
 
-print("\n== Employee profile: mandatory fields ==")
-# These go through _raw_post so the central defaults above do not mask the check.
-_min_staff = {"name": "Needs Fields", "password": "Staff@123", "confirm_password": "Staff@123",
-              "role": "accountant"}
-for field in ("first_name", "last_name", "phone", "designation", "employment_type",
-              "date_of_joining", "employee_status", "identity_proof_type",
-              "identity_proof_file", "status"):
-    body = {**_STAFF_REQUIRED, **_min_staff,
-            "email": f"req_{uuid.uuid4().hex[:8]}@firm.com", "username": f"req_{uuid.uuid4().hex[:8]}"}
-    body.pop(field)
-    check(f"POST /users without {field} -> 422",
-          _raw_post("/users", headers=fin_hdr, json=body).status_code == 422)
+print("\n== Employee profile: only the login pair is mandatory ==")
+# Every other field is optional; which of them a form insists on is the frontend's
+# call. These go through `_raw_post` so the flat defaults do not mask the check.
+check("POST /users without contact_information.official_email -> 422",
+      _raw_post("/users", headers=fin_hdr, json={
+          "login_security": {"password": "Staff@123", "confirm_password": "Staff@123"}}).status_code == 422)
+check("POST /users without login_security.password -> 422",
+      _raw_post("/users", headers=fin_hdr, json={
+          "contact_information": {"official_email": f"np_{uuid.uuid4().hex[:8]}@firm.com"}}).status_code == 422)
+r = _raw_post("/users", headers=fin_hdr, json={
+    "contact_information": {"official_email": f"bare_{uuid.uuid4().hex[:8]}@firm.com"},
+    "login_security": {"password": "Staff@123", "confirm_password": "Staff@123"}})
+check("POST /users with just those two -> 201", r.status_code == 201, r.text[:300])
+check("no role is required either",
+      r.json()["employment_information"]["role_id"] is None, r.json()["employment_information"])
 check("mismatched confirm_password -> 422",
       _raw_post("/users", headers=fin_hdr, json={
-          **_STAFF_REQUIRED, **_min_staff, "confirm_password": "Different@123",
-          "email": f"cp_{uuid.uuid4().hex[:8]}@firm.com",
-          "username": f"cp_{uuid.uuid4().hex[:8]}"}).status_code == 422)
+          "contact_information": {"official_email": f"cp_{uuid.uuid4().hex[:8]}@firm.com"},
+          "login_security": {"password": "Staff@123",
+                             "confirm_password": "Different@123"}}).status_code == 422)
 
-print("\n== Employee profile: extended fields ==")
+print("\n== Employee profile: every section, with uploaded files ==")
+# The form's real order: upload each file first (no employee id needed), then send
+# the URLs it got back in one create call.
+photo = client.post("/files/upload", headers=fin_hdr, files={
+    "file": ("profile-photo.png", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 20), "image/png")}).json()
+cert1 = client.post("/files/upload", headers=fin_hdr, files={
+    "file": ("experience-1.pdf", io.BytesIO(b"%PDF-1.4 a"), "application/pdf")}).json()
+cert2 = client.post("/files/upload", headers=fin_hdr, files={
+    "file": ("experience-2.pdf", io.BytesIO(b"%PDF-1.4 b"), "application/pdf")}).json()
+check("POST /files/upload returns file_id / url / name / content_type / size",
+      {"file_id", "url", "name", "content_type", "size"} <= set(photo)
+      and is_file_url(photo["url"]) and photo["name"] == "profile-photo.png", photo)
+
 ext_email = f"ext_{uuid.uuid4().hex[:8]}@firm.com"
-r = client.post("/users", headers=fin_hdr, json={
-    "first_name": "Asha", "last_name": "Verma", "email": ext_email,
-    "username": f"ext_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant",
-    "gender": "Female", "blood_group": "B+", "date_of_birth": "1996-03-04T00:00:00Z",
-    "personal_email": "asha@example.com", "emergency_contact_name": "R Verma",
-    "emergency_contact_number": "9800000000", "emergency_contact_relationship": "Father",
-    "current_address": "12 MG Road", "city": "Pune", "state": "Maharashtra",
-    "country": "India", "pin_zip_code": "411001",
-    "work_location": "Pune Office", "shift": "Morning",
-    "basic_salary": 42000, "bank_name": "SBI", "account_number": "9988776655",
-    "ifsc_swift_code": "SBIN0001", "upi_id": "asha@upi",
-    "skills": ["Tally", "GST"], "language": "en", "time_zone": "Asia/Kolkata",
+r = _raw_post("/users", headers=fin_hdr, json={
+    "role": "accountant",
+    "basic_information": {
+        "first_name": "Asha", "last_name": "Verma", "gender": "Female", "blood_group": "B+",
+        "date_of_birth": "1996-03-04", "nationality": "Indian", "profile_photo": photo["url"]},
+    "contact_information": {
+        "official_email": ext_email, "personal_email": "asha@example.com",
+        "mobile_number": "9800000001", "alternate_mobile_number": "9800000002",
+        "emergency_contact_name": "R Verma", "emergency_contact_number": "9800000000",
+        "emergency_contact_relationship": "Father"},
+    "address_information": {
+        "current_address": "12 MG Road", "permanent_address": "Old Pune Road", "city": "Pune",
+        "state": "Maharashtra", "country": "India", "pin_zip_code": "411001"},
+    "employment_information": {
+        "designation": "Accountant", "employment_type": "full_time",
+        "date_of_joining": "2026-02-01", "work_location": "Pune Office", "shift": "Morning",
+        "employee_status": "probation"},
+    "login_security": {"username": f"ext_{uuid.uuid4().hex[:8]}", "password": "Staff@123",
+                       "confirm_password": "Staff@123"},
+    "payroll_information": {
+        "basic_salary": 42000, "bank_name": "SBI", "account_number": "9988776655",
+        "ifsc_swift_code": "SBIN0001", "account_holder_name": "Asha Verma", "upi_id": "asha@upi"},
+    "documents": {
+        "identity_proof_type": "Aadhaar", "identity_proof_file": cert1["url"],
+        "experience_certificates": [cert1["url"], cert2["url"]]},
+    "professional_information": {"skills": ["Tally", "GST"]},
+    "system_preferences": {"language": "en", "time_zone": "Asia/Kolkata",
+                           "account_status": "active"},
 })
-check("create with the extended profile -> 201", r.status_code == 201, r.text)
+check("create with every section -> 201", r.status_code == 201, r.text)
 ext = r.json()
-check("name composed from first/last when omitted", ext["name"] == "Asha Verma", ext["name"])
-check("address fields stored", ext["city"] == "Pune" and ext["pin_zip_code"] == "411001"
-      and (ext["current_address"] or "").startswith("12 MG"), ext)
-check("emergency contact stored", ext["emergency_contact_relationship"] == "Father", ext)
-check("payroll fields stored", ext["basic_salary"] == 42000 and ext["upi_id"] == "asha@upi", ext)
-check("skills stored as a list", ext["skills"] == ["Tally", "GST"], ext["skills"])
-check("identify_proofs mirrors identity_proof_file",
-      ext["identify_proofs"] == ext["identity_proof_file"], ext["identify_proofs"])
+check("name composed when omitted", ext["name"] == "Asha Verma", ext["name"])
+check("the uploaded photo is the profile photo",
+      ext["basic_information"]["profile_photo"] == photo["url"], ext["basic_information"])
+check("address section stored", ext["address_information"]["city"] == "Pune"
+      and ext["address_information"]["pin_zip_code"] == "411001"
+      and (ext["address_information"]["current_address"] or "").startswith("12 MG"),
+      ext["address_information"])
+check("emergency contact stored",
+      ext["contact_information"]["emergency_contact_relationship"] == "Father",
+      ext["contact_information"])
+check("payroll section stored", ext["payroll_information"]["basic_salary"] == 42000
+      and ext["payroll_information"]["upi_id"] == "asha@upi", ext["payroll_information"])
+check("skills stored as a list",
+      ext["professional_information"]["skills"] == ["Tally", "GST"], ext["professional_information"])
+check("system preferences stored",
+      ext["system_preferences"]["time_zone"] == "Asia/Kolkata", ext["system_preferences"])
+check("document URLs round-trip exactly as sent",
+      ext["documents"]["identity_proof_file"] == cert1["url"]
+      and ext["documents"]["experience_certificates"] == [cert1["url"], cert2["url"]],
+      ext["documents"])
+check("legacy identify_proofs still mirrors it on the flat shape",
+      next(u for u in client.get("/users", headers=fin_hdr).json()
+           if u["id"] == ext["id"])["identify_proofs"] == cert1["url"])
 
 # Reporting manager
-r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={"reporting_manager_id": emp["id"]})
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+    "employment_information": {"reporting_manager_id": emp["id"]}})
 check("set reporting manager -> 200", r.status_code == 200
-      and r.json()["reporting_manager_id"] == emp["id"], r.text)
+      and r.json()["employment_information"]["reporting_manager_id"] == emp["id"], r.text)
+check("the manager is resolved to a name",
+      r.json()["employment_information"]["reporting_manager"]["name"] == emp["name"],
+      r.json()["employment_information"])
 check("self as reporting manager -> 400",
-      client.patch(f"/users/{ext['id']}", headers=fin_hdr,
-                   json={"reporting_manager_id": ext["id"]}).status_code == 400)
+      client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+          "employment_information": {"reporting_manager_id": ext["id"]}}).status_code == 400)
 check("reporting loop -> 400",
-      client.patch(f"/users/{emp['id']}", headers=fin_hdr,
-                   json={"reporting_manager_id": ext["id"]}).status_code == 400)
+      client.patch(f"/users/{emp['id']}", headers=fin_hdr, json={
+          "employment_information": {"reporting_manager_id": ext["id"]}}).status_code == 400)
 check("filter by reporting_manager_id",
       [u["id"] for u in client.get("/users", headers=fin_hdr,
                                    params={"reporting_manager_id": emp["id"]}).json()] == [ext["id"]])
 
-# Account status drives is_active
-r = client.patch(f"/users/{ext['id']}/account-status", headers=fin_hdr, json={"status": "Suspended"})
-check("account-status suspends and blocks login",
-      r.status_code == 200 and r.json()["status"] == "suspended" and r.json()["is_active"] is False, r.text)
+print("\n== One endpoint for every status change ==")
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+    "system_preferences": {"account_status": "Suspended"}})
+check("account_status suspends and blocks login", r.status_code == 200
+      and r.json()["system_preferences"]["account_status"] == "suspended"
+      and r.json()["is_active"] is False, r.text)
 check("suspended user cannot log in",
       client.post("/auth/login", json={"email": ext_email, "password": "Staff@123"}).status_code == 403)
-r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={"status": "active"})
-check("PATCH status back to active restores is_active", r.json()["is_active"] is True, r.text)
+# A resignation: employment status, exit date and account status in a single PATCH.
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+    "employment_information": {"employee_status": "resigned", "date_of_exit": "2026-08-31"},
+    "system_preferences": {"account_status": "inactive"}})
+check("resign in one call", r.status_code == 200
+      and r.json()["employment_information"]["employee_status"] == "resigned"
+      and (r.json()["employment_information"]["date_of_exit"] or "").startswith("2026-08-31")
+      and r.json()["system_preferences"]["account_status"] == "inactive"
+      and r.json()["is_active"] is False, r.text)
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+    "system_preferences": {"account_status": "active"}})
+check("back to active restores is_active", r.json()["is_active"] is True, r.text)
 check("filter by status=active",
       any(u["id"] == ext["id"] for u in client.get("/users", headers=fin_hdr,
                                                    params={"status": "active"}).json()))
+check("the separate status endpoints are gone",
+      client.patch(f"/users/{ext['id']}/status", headers=fin_hdr,
+                   json={"is_active": False}).status_code == 404
+      and client.patch(f"/users/{ext['id']}/account-status", headers=fin_hdr,
+                       json={"status": "locked"}).status_code == 404)
+check("an admin cannot deactivate their own account -> 400",
+      client.patch(f"/users/{client.get('/auth/me', headers=fin_hdr).json()['user']['id']}",
+                   headers=fin_hdr,
+                   json={"system_preferences": {"account_status": "inactive"}}).status_code == 400)
+# A password change rides on the same endpoint.
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+    "login_security": {"password": "Fresh@12345", "confirm_password": "Fresh@12345"}})
+check("PATCH changes the password too", r.status_code == 200, r.text[:200])
+check("the new password works",
+      client.post("/auth/login", json={"email": ext_email, "password": "Fresh@12345"}).status_code == 200)
 
-# Employee file slots and document collections
-r = client.post(f"/users/{ext['id']}/files/profile_photo", headers=fin_hdr,
-                files={"file": ("p.png", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 20), "image/png")})
-check("upload profile_photo -> data URL",
-      r.status_code == 200 and is_file_url(r.json()["profile_photo"]), r.text[:200])
-check("profile_photo rejects a PDF -> 400",
+print("\n== Employee files: upload, attach, detach ==")
+# One upload endpoint, then PATCH the URLs in. The per-field upload routes are gone.
+photo2 = client.post("/files/upload", headers=fin_hdr, files={
+    "file": ("p.png", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 20), "image/png")}).json()
+edu = [client.post("/files/upload", headers=fin_hdr, files={
+    "file": (f"e{i}.pdf", io.BytesIO(b"%PDF-1.4 " + str(i).encode()), "application/pdf")}).json()
+    for i in range(1, 4)]
+r = client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+    "basic_information": {"profile_photo": photo2["url"]},
+    "documents": {"educational_certificates": [d["url"] for d in edu]}})
+check("attach a photo and a document list in one PATCH", r.status_code == 200
+      and r.json()["basic_information"]["profile_photo"] == photo2["url"]
+      and r.json()["documents"]["educational_certificates"] == [d["url"] for d in edu], r.text[:300])
+check("the removed per-field upload route is gone",
       client.post(f"/users/{ext['id']}/files/profile_photo", headers=fin_hdr,
-                  files={"file": ("p.pdf", io.BytesIO(b"%PDF"), "application/pdf")}).status_code == 400)
-r = client.post(f"/users/{ext['id']}/documents/experience_certificates", headers=fin_hdr,
-                files=[("files", ("e1.pdf", io.BytesIO(b"%PDF-1.4 a"), "application/pdf")),
-                       ("files", ("e2.pdf", io.BytesIO(b"%PDF-1.4 b"), "application/pdf"))])
-check("upload 2 experience certificates -> 201", r.status_code == 201 and len(r.json()) == 2, r.text)
-doc_id = r.json()[0]["id"]
-check("documents append rather than replace",
-      len(client.post(f"/users/{ext['id']}/documents/experience_certificates", headers=fin_hdr,
-                      files=[("files", ("e3.pdf", io.BytesIO(b"%PDF"), "application/pdf"))]).json()) == 3)
-check("delete one document -> 200",
-      len(client.delete(f"/users/{ext['id']}/documents/experience_certificates/{doc_id}",
-                        headers=fin_hdr).json()) == 2)
+                  files={"file": ("p.png", io.BytesIO(b"\x89PNG"), "image/png")}).status_code == 404)
+check("delete one document out of a list -> 200",
+      client.delete(f"/users/{ext['id']}/documents/educational_certificates",
+                    headers=fin_hdr, params={"document_id": edu[0]["file_id"]})
+      .json()["documents"]["educational_certificates"] == [edu[1]["url"], edu[2]["url"]])
+check("delete an unknown document -> 404",
+      client.delete(f"/users/{ext['id']}/documents/educational_certificates",
+                    headers=fin_hdr, params={"document_id": "nope"}).status_code == 404)
+check("other_documents names the same slot as uploaded_documents",
+      client.delete(f"/users/{ext['id']}/documents/other_documents",
+                    headers=fin_hdr, params={"document_id": "nope"}).status_code == 404)
 check("other collections untouched",
-      client.get(f"/users/{ext['id']}", headers=fin_hdr).json()["educational_certificates"] == [])
-check("clear a collection -> 204",
-      client.delete(f"/users/{ext['id']}/documents/experience_certificates",
-                    headers=fin_hdr).status_code == 204)
-
-# Extended options
-opts = client.get("/users/meta/employee-options", headers=fin_hdr).json()
-check("options list account statuses",
-      opts["account_statuses"] == ["active", "inactive", "suspended", "locked"], opts["account_statuses"])
-check("options suggest genders / blood groups",
-      "Female" in opts["genders"] and "B+" in opts["blood_groups"], opts)
-check("options include work locations in use", "Pune Office" in opts["work_locations"], opts["work_locations"])
-check("options list preset designations",
-      opts["designations"][:6] == ["Admin", "Manager", "HR", "Sales", "Finance", "Employee"], opts["designations"])
-check("options keep designations in use after the presets",
-      "Senior Sales Executive" in opts["designations"], opts["designations"])
-check("options serve countries / states / relationships",
-      "India" in opts["countries"] and "India" in opts["nationalities"]
-      and "Maharashtra" in opts["states"] and "Father" in opts["emergency_contact_relationships"], opts)
+      client.get(f"/users/{ext['id']}", headers=fin_hdr).json()["documents"]["experience_certificates"]
+      == [cert1["url"], cert2["url"]])
+check("PATCH documents with an empty list clears that slot",
+      client.patch(f"/users/{ext['id']}", headers=fin_hdr,
+                   json={"documents": {"experience_certificates": []}})
+      .json()["documents"]["experience_certificates"] == [])
+check("and leaves the neighbouring slots alone",
+      client.get(f"/users/{ext['id']}", headers=fin_hdr).json()["documents"]["identity_proof_type"] == "Aadhaar")
+check("a document list beyond the sanity cap -> 422",
+      client.patch(f"/users/{ext['id']}", headers=fin_hdr, json={
+          "documents": {"other_documents": [f"https://x/files/{n}" for n in range(51)]}}).status_code == 422)
+spare = client.post("/files/upload", headers=fin_hdr, files={
+    "file": ("spare.pdf", io.BytesIO(b"%PDF-1.4 s"), "application/pdf")}).json()
+check("DELETE /files/{id} discards an upload -> 204",
+      client.delete(f"/files/{spare['file_id']}", headers=fin_hdr).status_code == 204)
+check("the discarded file is gone", client.get(f"/files/{spare['file_id']}").status_code == 404)
+check("DELETE /files/{id} for an unknown file -> 404",
+      client.delete("/files/no-such-file", headers=fin_hdr).status_code == 404)
 
 print("\n== Employee ID prefix (Company Settings) ==")
-check("default employee_id_prefix is EMP-", opts["employee_id_prefix"] == "EMP-", opts["employee_id_prefix"])
 r = client.put("/organizations/settings", headers=fin_hdr, json={"employee_id_prefix": "ACME-"})
 check("admin can set the prefix -> 200",
       r.status_code == 200 and r.json().get("employee_id_prefix") == "ACME-", r.text[:300])
-check("employee-options reports the new prefix",
-      client.get("/users/meta/employee-options", headers=fin_hdr).json()["employee_id_prefix"] == "ACME-")
 r = client.post("/users", headers=fin_hdr, json={
     "first_name": "Pre", "last_name": "Fixed", "email": f"pre_{uuid.uuid4().hex[:8]}@firm.com",
     "username": f"pre_{uuid.uuid4().hex[:8]}", "password": "Staff@123", "role": "accountant"})

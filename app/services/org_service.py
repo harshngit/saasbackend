@@ -6,9 +6,34 @@ from app.core.config import settings
 from app.models import BillingCycle, Organization, OrganizationStatus, Plan, UpgradeStatus
 
 
+COMPANY_CODE_PREFIX = "CMP-"
+_FIRST_COMPANY_NUMBER = 10001
+
+
 def get_default_plan(db: Session) -> Plan | None:
     """The plan new trial orgs are placed on (the free/default plan), if seeded."""
     return db.query(Plan).filter(Plan.is_default.is_(True)).first()
+
+
+def ensure_company_code(db: Session, org: Organization) -> str:
+    """The firm's human-facing code (`CMP-10001`), issued on first use.
+
+    Assigned lazily rather than at registration so firms created before the column
+    existed also get one, and never reused: the next number is one past the highest
+    code in use, so deleting a firm does not hand its code to the next one.
+    """
+    if org.company_code:
+        return org.company_code
+    codes = [
+        row[0] for row in db.query(Organization.company_code)
+        .filter(Organization.company_code.isnot(None)).all()
+    ]
+    numbers = [int(c[len(COMPANY_CODE_PREFIX):]) for c in codes
+               if c.startswith(COMPANY_CODE_PREFIX) and c[len(COMPANY_CODE_PREFIX):].isdigit()]
+    org.company_code = f"{COMPANY_CODE_PREFIX}{max(numbers, default=_FIRST_COMPANY_NUMBER - 1) + 1}"
+    db.commit()
+    db.refresh(org)
+    return org.company_code
 
 
 def start_trial(db: Session, org: Organization) -> None:

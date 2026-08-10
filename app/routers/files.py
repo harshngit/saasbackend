@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -10,13 +10,22 @@ from app.models import StoredFile, User
 router = APIRouter(prefix="/files", tags=["files"])
 
 
+def _stored_file(db: Session, file_id: str) -> StoredFile:
+    stored = db.get(StoredFile, file_id)
+    if stored is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    return stored
+
+
 class FileUploadOut(BaseModel):
     """What every upload hands back. `url` is the only field most callers need —
-    put it straight into whichever record field the file belongs to."""
+    put it straight into whichever record field the file belongs to. `file_id` is
+    what DELETE /files/{file_id} and the per-document delete routes take."""
 
     url: str
     file_id: str
-    filename: str
+    name: str
+    filename: str = Field(deprecated=True, description="Same as `name`")
     content_type: str
     size: int
 
@@ -48,10 +57,12 @@ def upload_file(
     )
     stored_id = url.rsplit("/", 1)[-1]
     db.commit()
+    name = file.filename or "upload"
     return FileUploadOut(
         url=url,
         file_id=stored_id,
-        filename=file.filename or "upload",
+        name=name,
+        filename=name,
         content_type=file.content_type or "application/octet-stream",
         size=size,
     )
@@ -67,9 +78,7 @@ def get_file(file_id: str, db: Session = Depends(get_db)) -> Response:
     stronger protection than that (identity proofs, bank documents), it should
     move to short-lived signed URLs rather than a token on this route.
     """
-    stored = db.get(StoredFile, file_id)
-    if stored is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    stored = _stored_file(db, file_id)
     return Response(
         content=stored.data,
         media_type=stored.content_type,
@@ -79,3 +88,25 @@ def get_file(file_id: str, db: Session = Depends(get_db)) -> Response:
             "Cache-Control": "public, max-age=31536000, immutable",
         },
     )
+
+
+@router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_file(
+    file_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Delete an uploaded file — for the one the form uploaded and then discarded,
+    before it was ever attached to a record.
+
+    This removes the file itself, not any reference to it: a record still holding
+    the URL will be left pointing at nothing. To detach a file from an employee,
+    use DELETE /users/{id}/files/{field} or
+    DELETE /users/{id}/documents/{collection}/{document_id} instead.
+    """
+    stored = _stored_file(db, file_id)
+    # Files are uploaded within a firm; only that firm can delete them.
+    if stored.organization_id is not None and stored.organization_id != user.organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    db.delete(stored)
+    db.commit()

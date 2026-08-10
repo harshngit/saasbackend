@@ -1,42 +1,28 @@
-import uuid
-from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_system_role, require_unlocked_org
-from app.core.files import save_upload
-from app.core.reference_data import COUNTRIES, INDIAN_STATES
 from app.core.security import hash_password
 from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, User, VehicleLoading
 from app.schemas.auth import MessageResponse
-from app.schemas.company import UploadResponse
+from app.schemas.employee_profile import EmployeeProfileIn, EmployeeProfileOut
 from app.schemas.user import (
-    BLOOD_GROUPS,
-    DESIGNATIONS,
-    EMERGENCY_CONTACT_RELATIONSHIPS,
-    GENDERS,
-    IDENTITY_PROOF_TYPES,
-    MARITAL_STATUSES,
+    COLLECTION_COLUMN,
     AccountStatus,
-    AccountStatusUpdate,
     AdminResetPassword,
-    EmployeeDocument,
     EmployeeDocumentCollection,
-    EmployeeFileField,
-    EmployeeOptions,
-    EmployeeProfileIn,
     EmployeeStatus,
     EmploymentType,
-    RoleAssign,
-    StaffCreate,
     UserOut,
-    UserStatusUpdate,
-    UserUpdate,
 )
-from app.services import password_service, role_service
+from app.services import (
+    activity_service,
+    employee_profile_service,
+    password_service,
+    role_service,
+)
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -44,13 +30,6 @@ _ADMIN = require_system_role(SystemRole.ADMIN)
 
 # Used when a firm has not set its own employee_id_prefix in Company Settings.
 DEFAULT_EMPLOYEE_ID_PREFIX = "EMP-"
-
-# Employee-profile columns the create/update endpoints may write — exactly the
-# fields the shared profile schema declares, so the two never drift apart.
-_PROFILE_FIELDS = tuple(EmployeeProfileIn.model_fields)
-
-# Choice fields stored as their plain string value, not the Enum member.
-_ENUM_FIELDS = ("employment_type", "employee_status", "status")
 
 
 def _resolve_role(db: Session, admin: User, role_id: str | None, role_name: str | None) -> Role:
@@ -128,7 +107,7 @@ def _validate_reporting_manager(
     if manager is None or manager.organization_id != admin.organization_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="reporting_manager_id is not an employee in your firm",
+            detail="employment_information.reporting_manager_id is not an employee in your firm",
         )
     if target is None:
         return
@@ -143,10 +122,9 @@ def _validate_reporting_manager(
         )
 
 
-def _profile_values(data: dict, db: Session, admin: User, target: User | None = None) -> dict:
-    """Pull the employee-profile keys out of a validated payload, enforcing the
-    per-firm uniqueness of employee_id. Enum values are stored as their strings."""
-    values = {field: data[field] for field in _PROFILE_FIELDS if field in data}
+def _check_columns(db: Session, admin: User, values: dict, target: User | None = None) -> None:
+    """Cross-record checks on the columns a body wants to write: the employee code
+    is unique within the firm, and the reporting line is sane."""
     if values.get("employee_id") is not None:
         taken = _employee_ids_in_org(db, admin.organization_id, exclude_id=target.id if target else None)
         if values["employee_id"] in taken:
@@ -156,57 +134,96 @@ def _profile_values(data: dict, db: Session, admin: User, target: User | None = 
             )
     if "reporting_manager_id" in values:
         _validate_reporting_manager(db, admin, values["reporting_manager_id"], target=target)
-    for field in _ENUM_FIELDS:
-        if isinstance(values.get(field), (EmploymentType, EmployeeStatus, AccountStatus)):
-            values[field] = values[field].value
-    return values
 
 
-@router.post("", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def _composed_name(values: dict, email: str) -> str:
+    """`name` is the record's label and cannot be empty, so fall back through the
+    other names the body carries before settling for the email's local part."""
+    first_last = " ".join(p for p in (values.get("first_name"), values.get("last_name")) if p).strip()
+    return values.get("name") or values.get("display_name") or first_last or email.split("@")[0]
+
+
+def _sync_identity_alias(target: User) -> None:
+    """`identify_proofs` is the legacy name of identity_proof_file — kept in step so
+    older clients reading the flat shape still see the document."""
+    target.identify_proofs = target.identity_proof_file
+
+
+@router.post("", response_model=EmployeeProfileOut, status_code=status.HTTP_201_CREATED)
 def create_staff(
-    payload: StaffCreate,
+    payload: EmployeeProfileIn,
     admin: User = Depends(_ADMIN),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> User:
-    """Admin creates a staff user in their firm. Accepts `role_id` (preferred) or a
-    `role` name — any role from the firm's Roles page, not a fixed list.
+) -> EmployeeProfileOut:
+    """Create an employee from the sectioned profile body.
 
-    `designation`, `employment_type`, `date_of_joining`, `employee_status`,
-    `identity_proof_type`, `identity_proof_file` and `status` are required by the
-    employee form; the rest of the profile is optional. `name` may be omitted when
-    first/last name are given, and `employee_id` is auto-assigned if omitted."""
-    role = _resolve_role(db, admin, payload.role_id, payload.role)
+    Every field is optional except the two a login account cannot exist without:
+    `contact_information.official_email` and `login_security.password`. Which
+    others a form insists on is the form's business.
 
-    if _email_taken(db, payload.email):
+    Files are not uploaded here — POST /files/upload first (it needs no employee
+    id, so it works before the employee exists) and send the URLs it returns in
+    `basic_information.profile_photo` and the `documents` section.
+
+    A flat body is still accepted: any top-level field belonging to a section is
+    folded into it. `employee_id` is auto-assigned (EMP-0001, …) when omitted,
+    using the firm's `employee_id_prefix`, and `name` is composed from first +
+    last name.
+    """
+    data = payload.to_columns()
+    email = data.get("email")
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="contact_information.official_email is required — it is the login identifier",
+        )
+    if not payload.password:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="login_security.password is required",
+        )
+
+    role_id = data.pop("role_id", None)
+    role = _resolve_role(db, admin, role_id, payload.role) if (role_id or payload.role) else None
+
+    if _email_taken(db, email):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    if _username_taken(db, payload.username):
+    if data.get("username") and _username_taken(db, data["username"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
 
-    profile = _profile_values(payload.model_dump(exclude_unset=True), db, admin)
-    if profile.get("employee_id") is None:
-        profile["employee_id"] = _next_employee_id(
+    _check_columns(db, admin, data)
+    if data.get("employee_id") is None:
+        data["employee_id"] = _next_employee_id(
             _employee_ids_in_org(db, admin.organization_id), _employee_id_prefix(admin)
         )
+    data["name"] = _composed_name(data, email)
+    # A new employee is on the payroll and able to log in unless told otherwise.
+    data.setdefault("employee_status", EmployeeStatus.ACTIVE.value)
+    data.setdefault("status", AccountStatus.ACTIVE.value)
 
     staff = User(
         organization_id=admin.organization_id,
-        name=payload.name,
-        email=payload.email,
-        username=payload.username,
-        phone=payload.phone,
         password_hash=hash_password(payload.password),
         system_role=SystemRole.STAFF.value,
-        role_id=role.id,
-        role=LEGACY_ROLE_BY_NAME.get(role.name),  # legacy enum for default roles, else None
+        role_id=role.id if role is not None else None,
+        # Legacy enum for the default roles, else None.
+        role=LEGACY_ROLE_BY_NAME.get(role.name) if role is not None else None,
         # Only an ACTIVE account may log in — see AccountStatus.
-        is_active=payload.status is AccountStatus.ACTIVE,
-        **profile,
+        is_active=data["status"] == AccountStatus.ACTIVE.value,
+        **data,
     )
     db.add(staff)
+    db.flush()
+    employee_profile_service.apply_documents(db, staff, payload.documents)
+    _sync_identity_alias(staff)
+    activity_service.record(
+        db, admin.organization_id, admin, "employee", "Employee added",
+        f"{staff.name} ({staff.employee_id}) joined the firm",
+    )
     db.commit()
     db.refresh(staff)
-    return staff
+    return employee_profile_service.build_profile(db, staff)
 
 
 @router.get("", response_model=list[UserOut])
@@ -223,7 +240,10 @@ def list_staff(
     reporting_manager_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> list[User]:
-    """List the firm's employees, filtered by role / login state / employee profile."""
+    """List the firm's employees, filtered by role / login state / employee profile.
+
+    Rows come back flat — one row per employee, everything at the top level. The
+    sectioned profile is what GET /users/{id} serves."""
     query = db.query(User).filter(User.organization_id == admin.organization_id)
     if role_id is not None:
         query = query.filter(User.role_id == role_id)
@@ -255,60 +275,65 @@ def list_staff(
     return query.order_by(User.created_at.desc()).all()
 
 
-@router.get("/meta/employee-options", response_model=EmployeeOptions)
-def employee_options(admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> EmployeeOptions:
-    """Dropdown data for the employee form — the fixed choice lists, suggested
-    values for the free-text choice fields, and the values already used in this firm."""
-
-    def in_use(column) -> list[str]:  # noqa: ANN001
-        rows = (
-            db.query(column)
-            .filter(User.organization_id == admin.organization_id, column.isnot(None))
-            .distinct()
-        )
-        return sorted(row[0] for row in rows if row[0])
-
-    return EmployeeOptions(
-        employment_types=[e.value for e in EmploymentType],
-        employee_statuses=[e.value for e in EmployeeStatus],
-        account_statuses=[e.value for e in AccountStatus],
-        genders=GENDERS,
-        marital_statuses=MARITAL_STATUSES,
-        blood_groups=BLOOD_GROUPS,
-        identity_proof_types=IDENTITY_PROOF_TYPES,
-        emergency_contact_relationships=EMERGENCY_CONTACT_RELATIONSHIPS,
-        countries=COUNTRIES,
-        nationalities=COUNTRIES,  # nationality is recorded as the country name
-        states=INDIAN_STATES,
-        # Presets first, then anything else this firm already uses.
-        designations=DESIGNATIONS + [d for d in in_use(User.designation) if d not in DESIGNATIONS],
-        work_locations=in_use(User.work_location),
-        shifts=in_use(User.shift),
-        employee_id_prefix=_employee_id_prefix(admin),
-    )
+@router.get("/{user_id}", response_model=EmployeeProfileOut)
+def get_user(
+    user_id: str, admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+) -> EmployeeProfileOut:
+    """The employee's full profile, in the same sections the create body uses."""
+    return employee_profile_service.build_profile(db, _owned_user(db, user_id, admin))
 
 
-@router.get("/{user_id}", response_model=UserOut)
-def get_user(user_id: str, admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> User:
-    return _owned_user(db, user_id, admin)
-
-
-@router.patch("/{user_id}", response_model=UserOut)
+@router.patch("/{user_id}", response_model=EmployeeProfileOut)
 def update_user(
     user_id: str,
-    payload: UserUpdate,
+    payload: EmployeeProfileIn,
     admin: User = Depends(_ADMIN),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> User:
-    """Edit a staff member's account details and employee profile (not their role)."""
+) -> EmployeeProfileOut:
+    """Partial update — the one endpoint for every change to an employee.
+
+    Only the sections you send are touched, and within a section only the fields
+    you send. That covers what used to need endpoints of its own: an employee
+    resigning is `employment_information` (`employee_status`, `date_of_exit`) plus
+    `system_preferences.account_status` in a single call, and `account_status`
+    still drives whether they can log in.
+    """
     target = _owned_user(db, user_id, admin)
-    data = payload.model_dump(exclude_unset=True)
-    if "email" in data and data["email"] != target.email and _email_taken(db, data["email"], exclude_id=target.id):
+    data = payload.to_columns()
+    # The label and the login identifier are the two columns that cannot be empty,
+    # so an explicit null for them means "leave it alone", not "erase it".
+    for required in ("name", "email"):
+        if required in data and data[required] is None:
+            del data[required]
+
+    # Resolve everything that can fail before writing anything.
+    role_sent = "role_id" in data or payload.role is not None
+    role: Role | None = None
+    if role_sent:
+        role_id = data.pop("role_id", None)
+        if target.id == admin.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot change your own role"
+            )
+        # An explicit null clears the assignment rather than failing to resolve it.
+        if role_id or payload.role:
+            role = _resolve_role(db, admin, role_id, payload.role)
+
+    if data.get("email") and data["email"] != target.email and _email_taken(db, data["email"], exclude_id=target.id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    if "username" in data and data["username"] != target.username and _username_taken(db, data["username"], exclude_id=target.id):
+    if data.get("username") and data["username"] != target.username and _username_taken(db, data["username"], exclude_id=target.id):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
-    data.update(_profile_values(data, db, admin, target=target))
+    if "status" in data and target.id == admin.id and data["status"] != AccountStatus.ACTIVE.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot deactivate your own account",
+        )
+    _check_columns(db, admin, data, target=target)
+
+    if role_sent:
+        target.role_id = role.id if role is not None else None
+        target.role = LEGACY_ROLE_BY_NAME.get(role.name) if role is not None else None
     for field, value in data.items():
         setattr(target, field, value)
     # Renaming either half of the name refreshes the combined `name`, unless the
@@ -319,47 +344,21 @@ def update_user(
             target.name = composed
     if "status" in data:
         target.is_active = data["status"] == AccountStatus.ACTIVE.value
+    if payload.password is not None:
+        target.password_hash = hash_password(payload.password)
+    employee_profile_service.apply_documents(db, target, payload.documents)
+    if payload.documents is not None:
+        _sync_identity_alias(target)
+    activity_service.record(
+        db, admin.organization_id, admin, "employee", "Employee updated",
+        f"{target.name}'s profile was updated",
+    )
     db.commit()
+    if payload.password is not None:
+        # A new password ends the sessions opened with the old one.
+        password_service.revoke_all_refresh_tokens(db, target.id)
     db.refresh(target)
-    return target
-
-
-@router.patch("/{user_id}/role", response_model=UserOut)
-def change_role(
-    user_id: str,
-    payload: RoleAssign,
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> User:
-    """Assign a staff member to a different role within the same firm (by id or name)."""
-    target = _owned_user(db, user_id, admin)
-    if target.id == admin.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot change your own role")
-    role = _resolve_role(db, admin, payload.role_id, payload.role)
-    target.role_id = role.id
-    target.role = LEGACY_ROLE_BY_NAME.get(role.name)
-    db.commit()
-    db.refresh(target)
-    return target
-
-
-@router.patch("/{user_id}/status", response_model=UserOut)
-def update_staff_status(
-    user_id: str,
-    payload: UserStatusUpdate,
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> User:
-    """Activate / deactivate a user within the admin's firm (cannot target self)."""
-    target = _owned_user(db, user_id, admin)
-    if target.id == admin.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot change your own status")
-    target.is_active = payload.is_active
-    db.commit()
-    db.refresh(target)
-    return target
+    return employee_profile_service.build_profile(db, target)
 
 
 @router.post("/{user_id}/reset-password", response_model=MessageResponse)
@@ -383,198 +382,40 @@ def admin_reset_password(
     return MessageResponse(detail="Password reset for user")
 
 
-@router.patch("/{user_id}/account-status", response_model=UserOut)
-def update_account_status(
-    user_id: str,
-    payload: AccountStatusUpdate,
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> User:
-    """Set the richer account status (active / inactive / suspended / locked).
-    `is_active` follows it, so anything other than ACTIVE also blocks login."""
-    target = _owned_user(db, user_id, admin)
-    if target.id == admin.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot change your own status")
-    target.status = payload.status.value
-    target.is_active = payload.status is AccountStatus.ACTIVE
-    db.commit()
-    db.refresh(target)
-    return target
+# ---------------------------- Employee documents -----------------------------
+# Every file slot on an employee is a plain URL column, written by PATCH /users/{id}:
+# upload with POST /files/upload, then send the URL in `documents` (or
+# `basic_information.profile_photo`). Sending null empties a named slot and sending
+# [] empties one of the lists. The one thing PATCH cannot do is drop a single file
+# out of a list without resending the rest — that is what this endpoint is for.
 
 
-@router.post("/{user_id}/identity-proof", response_model=UploadResponse)
-def upload_identity_proof(
-    request: Request,
-    user_id: str,
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-) -> UploadResponse:
-    """Attach a scanned ID document (image or PDF) to an employee's profile.
-
-    Kept for older clients — the same slot is reachable as
-    POST /users/{id}/files/identity_proof_file."""
-    target = _owned_user(db, user_id, admin)
-    target.identity_proof_file, _ = save_upload(db, admin.organization_id, file, request)
-    target.identify_proofs = target.identity_proof_file
-    db.commit()
-    return UploadResponse(url=target.identity_proof_file)
-
-
-# ------------------------------ Employee uploads ------------------------------
-# Every file slot is a plain column holding a URL, so it can also be set through
-# PATCH /users/{id} with an external URL — preferable for anything large, since
-# uploads here are inlined as base64 data: URLs (max 10 MB, no S3 yet).
-
-_FILE_RULES: dict[EmployeeFileField, dict[str, bool]] = {
-    EmployeeFileField.profile_photo: {"allow_pdf": False},
-    EmployeeFileField.identity_proof_file: {},
-    EmployeeFileField.resume_cv: {},
-    EmployeeFileField.offer_letter: {},
-    EmployeeFileField.appointment_letter: {},
-}
-
-_MAX_DOCUMENTS = 20
-
-
-@router.post("/{user_id}/files/{field}", response_model=UserOut)
-def upload_employee_file(
-    request: Request,
-    user_id: str,
-    field: EmployeeFileField,
-    file: UploadFile = File(...),
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> User:
-    """Upload one of the employee's single-file slots — profile photo, identity
-    proof, resume/CV, offer letter or appointment letter. Replaces whatever was there."""
-    target = _owned_user(db, user_id, admin)
-    url, _size = save_upload(db, admin.organization_id, file, request, **_FILE_RULES[field])
-    setattr(target, field.value, url)
-    if field is EmployeeFileField.identity_proof_file:
-        target.identify_proofs = url  # keep the legacy alias in step
-    db.commit()
-    db.refresh(target)
-    return target
-
-
-@router.delete("/{user_id}/files/{field}", response_model=UserOut)
-def clear_employee_file(
-    user_id: str,
-    field: EmployeeFileField,
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> User:
-    """Empty one of the employee's single-file slots."""
-    target = _owned_user(db, user_id, admin)
-    setattr(target, field.value, None)
-    if field is EmployeeFileField.identity_proof_file:
-        target.identify_proofs = None
-    db.commit()
-    db.refresh(target)
-    return target
-
-
-def _documents(target: User, collection: EmployeeDocumentCollection) -> list[dict]:
-    return list(getattr(target, collection.value) or [])
-
-
-def _save_documents(
-    db: Session, target: User, collection: EmployeeDocumentCollection, documents: list[dict]
-) -> list[dict]:
-    """Persist one document collection. Reassigned wholesale — SQLAlchemy does not
-    track in-place mutation of a JSON column."""
-    setattr(target, collection.value, documents)
-    db.commit()
-    db.refresh(target)
-    return _documents(target, collection)
-
-
-@router.get("/{user_id}/documents/{collection}", response_model=list[EmployeeDocument])
-def list_employee_documents(
-    user_id: str,
-    collection: EmployeeDocumentCollection,
-    admin: User = Depends(_ADMIN),
-    db: Session = Depends(get_db),
-) -> list[dict]:
-    """Every file in one of the employee's multi-file slots."""
-    return _documents(_owned_user(db, user_id, admin), collection)
-
-
-@router.post(
-    "/{user_id}/documents/{collection}",
-    response_model=list[EmployeeDocument],
-    status_code=status.HTTP_201_CREATED,
-)
-def upload_employee_documents(
-    request: Request,
-    user_id: str,
-    collection: EmployeeDocumentCollection,
-    files: list[UploadFile] = File(..., description="One or more image / PDF files"),
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> list[dict]:
-    """Upload one or more files into a multi-file slot — general documents,
-    experience certificates or educational certificates. Appended to what is
-    already on file, so uploading again does not replace the earlier ones."""
-    target = _owned_user(db, user_id, admin)
-    documents = _documents(target, collection)
-    if len(documents) + len(files) > _MAX_DOCUMENTS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"At most {_MAX_DOCUMENTS} files in {collection.value} "
-                   f"({len(documents)} already uploaded). Delete some first.",
-        )
-    for file in files:
-        url, size = save_upload(db, admin.organization_id, file, request)
-        documents.append(
-            {
-                "id": str(uuid.uuid4()),
-                "name": file.filename or "document",
-                "url": url,
-                "content_type": file.content_type,
-                "size": size,
-                "uploaded_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-    return _save_documents(db, target, collection, documents)
-
-
-@router.delete(
-    "/{user_id}/documents/{collection}/{document_id}", response_model=list[EmployeeDocument]
-)
+@router.delete("/{user_id}/documents/{collection}", response_model=EmployeeProfileOut)
 def delete_employee_document(
     user_id: str,
     collection: EmployeeDocumentCollection,
-    document_id: str,
+    document_id: str = Query(
+        ...,
+        description="The `file_id` from POST /files/upload — the last segment of the "
+                    "document's URL",
+    ),
     admin: User = Depends(_ADMIN),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> list[dict]:
-    """Remove one file from a multi-file slot. Returns the remaining list."""
+) -> EmployeeProfileOut:
+    """Remove one file from `experience_certificates`, `educational_certificates` or
+    `other_documents`, leaving the rest of that list alone."""
     target = _owned_user(db, user_id, admin)
-    documents = _documents(target, collection)
+    column = COLLECTION_COLUMN[collection]
+    documents = list(getattr(target, column) or [])
     remaining = [d for d in documents if d.get("id") != document_id]
     if len(remaining) == len(documents):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    return _save_documents(db, target, collection, remaining)
-
-
-@router.delete("/{user_id}/documents/{collection}", status_code=status.HTTP_204_NO_CONTENT)
-def clear_employee_documents(
-    user_id: str,
-    collection: EmployeeDocumentCollection,
-    admin: User = Depends(_ADMIN),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> None:
-    """Empty one of the employee's multi-file slots."""
-    _save_documents(db, _owned_user(db, user_id, admin), collection, [])
+    # Reassigned wholesale — SQLAlchemy does not track in-place JSON mutation.
+    setattr(target, column, remaining)
+    db.commit()
+    db.refresh(target)
+    return employee_profile_service.build_profile(db, target)
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -588,8 +429,9 @@ def delete_user(
 
     Records that merely *reference* the user (customers, leads, quotations, sales
     orders) keep their history with the link nulled out; the user's own rows
-    (attendance, notifications, sessions) go with them. Use PATCH /status to
-    deactivate instead when the history should stay attributed.
+    (attendance, notifications, sessions) go with them. Set
+    `system_preferences.account_status` to `inactive` instead when the history
+    should stay attributed.
     """
     # Blocking self-delete is also what keeps a firm from losing its last admin:
     # the caller is an admin of this org, so a surviving admin is guaranteed.
@@ -611,5 +453,9 @@ def delete_user(
         )
 
     password_service.revoke_all_refresh_tokens(db, target.id)
+    activity_service.record(
+        db, admin.organization_id, admin, "employee", "Employee removed",
+        f"{target.name} ({target.employee_id}) was removed from the firm",
+    )
     db.delete(target)
     db.commit()

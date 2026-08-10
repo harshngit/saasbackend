@@ -2,7 +2,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, JSON, String, Text
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -24,6 +24,10 @@ class Organization(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Human-facing firm code (CMP-10001, CMP-10002, …), issued once and never reused.
+    # Assigned lazily by org_service.ensure_company_code — nullable so the live DB
+    # auto-migrates and pre-existing firms get theirs on first read.
+    company_code: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
 
     # Business profile.
     business_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -59,6 +63,9 @@ class Organization(Base):
     state: Mapped[str | None] = mapped_column(String(100), nullable=True)
     country: Mapped[str | None] = mapped_column(String(100), nullable=True)
     pin_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Map pin for the registered office (branches carry their own in branch_addresses).
+    maps_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maps_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Branding (Ext)
     stamp_url: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -3,7 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -34,7 +34,8 @@ from app.schemas.company import (
     UploadResponse,
 )
 from app.schemas.organization import OrganizationOut, UpgradeRequest
-from app.services import numbering_service, org_service
+from app.schemas.overview import CompanyOverviewOut
+from app.services import activity_service, numbering_service, org_service, overview_service
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -49,6 +50,9 @@ def _admin_org(admin: User, db: Session) -> Organization:
     org = admin.organization
     if org is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No organization")
+    # Every Company Settings request comes through here, which is where a firm
+    # created before company codes existed picks one up.
+    org_service.ensure_company_code(db, org)
     return org
 
 
@@ -96,6 +100,27 @@ def request_upgrade(
 # ------------------------------- Company Settings -------------------------------
 
 
+@router.get("/overview", response_model=CompanyOverviewOut)
+def company_overview(
+    activity_limit: int = Query(
+        default=10, ge=1, le=100, description="How many Recent Activity entries to return"
+    ),
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> CompanyOverviewOut:
+    """Everything the Company Settings dashboard shows, in one call.
+
+    One block per card on the page: `company` (header + plan), `counts` (the stat
+    tiles), `storage`, `profile_completion`, `authorized_person`, `documents`,
+    `addresses` and `recent_activity`. All read-only and derived — edit the
+    underlying values through PUT /settings and the document endpoints.
+    """
+    org = _admin_org(admin, db)
+    return overview_service.build_overview(
+        db, org, REQUIRED_COMPANY_FIELDS, activity_limit=activity_limit
+    )
+
+
 @router.get("/settings", response_model=CompanySettingsOut)
 def get_company_settings(admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> Organization:
     """Full company profile for the Company Settings page (Admin only)."""
@@ -114,7 +139,8 @@ def update_company_settings(
     the subscription lifecycle (trial / locked / …) is not editable from this page.
     """
     org = _admin_org(admin, db)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         if isinstance(value, CompanyStatus):
             value = value.value
         elif field in ("tax_configuration", "invoice_settings") and isinstance(value, dict):
@@ -124,6 +150,7 @@ def update_company_settings(
             # Keep the single legacy field pointing at the first branch.
             org.branch_address = value[0]["address"] if value else None
         setattr(org, field, value)
+    activity_service.record_field_changes(db, org.id, admin, list(changes))
     db.commit()
     db.refresh(org)
     return org
@@ -218,6 +245,7 @@ def upload_logo(
 ) -> UploadResponse:
     org = _admin_org(admin, db)
     org.logo_url = _store_image(db, org.id, file, request)
+    activity_service.record(db, org.id, admin, "branding", "Company logo updated")
     db.commit()
     return UploadResponse(url=org.logo_url)
 
@@ -231,6 +259,7 @@ def upload_signature(
 ) -> UploadResponse:
     org = _admin_org(admin, db)
     org.signature_url = _store_image(db, org.id, file, request)
+    activity_service.record(db, org.id, admin, "branding", "Authorized signature updated")
     db.commit()
     return UploadResponse(url=org.signature_url)
 
@@ -340,6 +369,10 @@ def upload_other_documents(
                 "uploaded_at": datetime.now(timezone.utc).isoformat(),
             }
         )
+    activity_service.record(
+        db, org.id, admin, "document", "Document uploaded",
+        f"{len(files)} other business document(s) uploaded",
+    )
     return _save_documents(db, org, documents)
 
 
@@ -355,6 +388,7 @@ def delete_other_document(
     remaining = [d for d in documents if d.get("id") != document_id]
     if len(remaining) == len(documents):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    activity_service.record(db, org.id, admin, "document", "Document removed")
     return _save_documents(db, org, remaining)
 
 
@@ -387,6 +421,10 @@ def upload_business_document(
     org = _admin_org(admin, db)
     url, _ = _store_document(db, org.id, file, request)
     setattr(org, slot.column, url)
+    activity_service.record(
+        db, org.id, admin, "document", "Document uploaded",
+        f"{slot.value.replace('_', ' ').title()} uploaded",
+    )
     db.commit()
     db.refresh(org)
     return org
@@ -401,6 +439,10 @@ def clear_business_document(
     """Remove one of the single-file business documents."""
     org = _admin_org(admin, db)
     setattr(org, slot.column, None)
+    activity_service.record(
+        db, org.id, admin, "document", "Document removed",
+        f"{slot.value.replace('_', ' ').title()} removed",
+    )
     db.commit()
     db.refresh(org)
     return org

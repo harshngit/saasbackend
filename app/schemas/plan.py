@@ -14,6 +14,7 @@ class PlanOut(BaseModel):
     original_price_yearly: float | None
     max_users: int | None
     max_orders: int | None
+    max_storage_gb: float | None
     features: list[str]
     is_active: bool
     is_default: bool
@@ -29,6 +30,7 @@ class PlanCreate(BaseModel):
     original_price_yearly: float | None = Field(default=None, ge=0)
     max_users: int | None = Field(default=None, ge=0)
     max_orders: int | None = Field(default=None, ge=0)
+    max_storage_gb: float | None = Field(default=None, ge=0, description="Upload quota; null = unlimited")
     features: list[str] = Field(default_factory=list)
     is_default: bool = False
 
@@ -47,6 +49,7 @@ class PlanUpdate(BaseModel):
     original_price_yearly: float | None = Field(default=None, ge=0)
     max_users: int | None = Field(default=None, ge=0)
     max_orders: int | None = Field(default=None, ge=0)
+    max_storage_gb: float | None = Field(default=None, ge=0)
     features: list[str] | None = None
     is_active: bool | None = None
     is_default: bool | None = None

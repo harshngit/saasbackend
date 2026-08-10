@@ -11,6 +11,7 @@ from app.models.enums import (
     UserRole,
     system_role_for,
 )
+from app.models.activity_log import ActivityLog
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.category import Category
 from app.models.customer import Customer, CustomerDocument, CustomerPayment
@@ -43,6 +44,7 @@ from app.models.payment_receipt import PaymentReceipt
 from app.models.sales_return import SalesReturn, ReturnItem
 
 __all__ = [
+    "ActivityLog",
     "NumberSequence",
     "StoredFile",
     "Organization",
