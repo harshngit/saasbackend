@@ -158,6 +158,111 @@ and `GET /users` (the list) stays flat, one row per employee.
   returns `409` until the end-of-day is recorded. Set `account_status` to
   `inactive` instead when the history should stay attributed.
 
+## Roles, permissions & staff login
+
+An Admin defines roles on the Roles page; staff hold a `role_id` and nothing else.
+Permissions are never copied onto a user, so editing a role changes what every
+holder can do on their next request.
+
+| Method | Path                | Who   | Purpose                                        |
+|--------|---------------------|-------|------------------------------------------------|
+| GET    | `/roles/catalog`    | Admin | Every module + action, for the matrix UI        |
+| POST   | `/roles`            | Admin | Create a role with its permission matrix       |
+| GET    | `/roles`            | Admin | This organization's roles (never another firm's) |
+| GET    | `/roles/{id}`       | Admin | Full details + matrix — the Edit Role screen    |
+| PATCH  | `/roles/{id}`       | Admin | Update name / workspace / description / scope / permissions |
+| DELETE | `/roles/{id}`       | Admin | Custom roles only, and only when unassigned     |
+
+A role carries:
+
+- **`permissions`** — `{ "<module>": { "view": …, "create": …, "edit": …, "delete": …,
+  "approve": …, "export": …, "download": … } }`. Deny-by-default: a module with
+  nothing granted is dropped rather than stored as all-false. Friendly module names
+  are accepted (`orders` → `sales_orders`); `GET /roles/catalog` lists the canonical
+  keys. `PATCH` replaces the whole matrix, which is what the Edit screen holds.
+- **`workspace`** — free text (`sales` / `delivery` / `accounts` / …). The frontend
+  routes on it after login; the backend never interprets it.
+- **`data_scope`** — `all` (default, back-office roles see the whole firm) or `own`
+  (field roles see only their own records; see below).
+
+The seeded defaults are Sales Officer (`sales`, `own`), Delivery Partner
+(`delivery`, `own`) and Accountant (`accounts`, `all`). They can be edited but not
+deleted.
+
+### Login
+
+`POST /auth/login` only checks the credentials and returns tokens. The frontend then
+calls `GET /auth/me`, which is the single source of truth for the session:
+
+```json
+{
+  "id": "user_101", "organization_id": "org_abc", "name": "Sunil Sharma",
+  "role": { "id": "role_001", "name": "Sales Officer", "workspace": "sales",
+            "data_scope": "own", "is_default": true },
+  "permissions": { "customers": { "view": true, "create": true, "edit": true,
+                                  "delete": false, "approve": false,
+                                  "export": false, "download": false } },
+  "full_access": false,
+  "data_scope": "own",
+  "user": { … }, "organization": { … }
+}
+```
+
+An Admin gets `role: null`, `full_access: true` and a **fully granted** matrix, so
+the frontend can read `permissions` the same way for every kind of user.
+
+### Two layers of filtering, both server-side
+
+1. **Organization** — every endpoint scopes to the authenticated user's
+   `organization_id`. A client never sends one and cannot widen it. Reaching another
+   firm's record is a `404`.
+2. **Ownership** — when the role's `data_scope` is `own`, list endpoints return only
+   the user's own records, and a record outside their scope reads as `404` (not
+   `403`, so they cannot probe which ids exist):
+
+   | Endpoint       | "Mine" means                                              |
+   |----------------|-----------------------------------------------------------|
+   | `/customers`   | I am the assigned sales representative                     |
+   | `/orders`      | I raised it, I am its salesperson, or it is out for my delivery |
+   | `/leads`       | assigned to me                                             |
+   | `/quotations`  | I am the salesperson                                       |
+   | `/deliveries`  | assigned to me                                             |
+   | `/attendance`  | my own records                                             |
+
+   A record a scoped user creates is assigned to them automatically — otherwise they
+   could not see what they just added. `/products` and `/inventory` are firm-wide
+   for anyone with `view`. There is no visits or follow-ups module yet, so nothing
+   is scoped for those. `app/core/scoping.py` is the whole mechanism.
+
+Permissions are enforced on the API, not just hidden in the UI: `customers.delete
+= false` makes `DELETE /customers/{id}` return `403` regardless of what the
+frontend renders.
+
+## Admin dashboard
+
+`GET /dashboard/admin` (needs `dashboard.view`) returns every widget on the Admin
+Dashboard in one call, for the logged-in user's firm — no `organization_id` is
+accepted.
+
+Query params: `date_from`, `date_to` (YYYY-MM-DD; default the 1st of this month →
+today), plus optional `branch_id`, `warehouse_id`, `customer_id`, `supplier_id`.
+A filter naming something outside the firm is a `400` rather than a silently empty
+dashboard.
+
+Blocks: `filters`, `summary`, `orders`, `cashflow`, `receivables_payables`,
+`top_customers`, `top_products`, `expense_breakdown`, `sales_trend`, `stock_watch`,
+`recent_orders`. Summaries only — `GET /reports/{type}` and the module list
+endpoints still serve the drill-in screens.
+
+Definitions match the reports, so a dashboard figure equals the report behind it:
+a sale is an order past approval, purchases and expenses count only approved ones,
+gross profit is sales − purchases and net is gross − expenses (there is no cost
+price on a product yet, so no COGS-based margin). `receivables_payables` and
+`stock_watch` are a position as of now, so the date range does not apply to them;
+"overdue" uses the customer's `payment_terms` (`net_30` → 30 days) where set, else
+30 days. `branch_id` is validated against the firm's branches but no transaction
+carries a branch yet, so it does not narrow the figures.
+
 ## Company Settings dashboard
 
 `GET /organizations/overview` (Admin) is the one call behind the Company Settings

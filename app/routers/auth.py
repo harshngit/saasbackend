@@ -119,14 +119,26 @@ def logout(payload: LogoutRequest, db: Session = Depends(get_db)) -> MessageResp
 
 @router.get("/me", response_model=MeResponse)
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> MeResponse:
-    # Include org state (status/plan/trial) so the UI can render banners/lock screens
-    # on refresh without a re-login. Also lazily locks an expired trial.
-    org = org_service.apply_trial_expiry(db, user.organization)
+    """Who is logged in, their firm, their role + workspace, and their permissions.
 
-    # Effective permissions for the frontend to show/hide UI.
-    full_access = user.effective_system_role in ("admin", "super_admin")
-    permissions = {} if full_access or user.role_detail is None else user.role_detail.permissions
-    return MeResponse(user=user, organization=org, full_access=full_access, permissions=permissions)
+    The frontend calls this right after login: `role.workspace` selects the
+    dashboard and `permissions` drives which pages and buttons appear. The org
+    state (status / plan / trial) rides along so a refresh can render banners and
+    lock screens without a re-login — which is also when an expired trial locks.
+    """
+    org = org_service.apply_trial_expiry(db, user.organization)
+    role = role_service.role_for(db, user)
+    return MeResponse(
+        id=user.id,
+        organization_id=user.organization_id,
+        name=user.name,
+        role=role,
+        permissions=role_service.effective_permissions(db, user),
+        full_access=role_service.is_full_access(user),
+        data_scope=role_service.data_scope(db, user),
+        user=user,
+        organization=org,
+    )
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

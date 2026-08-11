@@ -401,8 +401,14 @@ check("Sales Officer has no payments access", "payments" not in so["permissions"
 
 # Catalog
 r = client.get("/roles/catalog", headers=roles_hdr)
+cat = r.json()
 check("catalog returns modules + actions",
-      r.status_code == 200 and len(r.json()["modules"]) == 17 and len(r.json()["actions"]) == 7, r.text)
+      r.status_code == 200 and len(cat["modules"]) > 15 and len(cat["actions"]) == 7, r.text)
+check("the catalog covers every module a router gates on",
+      {"customers", "leads", "quotations", "sales_orders", "sales_returns", "payment_receipts",
+       "deliveries", "invoices", "payments", "expenses", "purchases", "inventory", "products",
+       "suppliers", "attendance", "reports", "vehicle_stock", "dashboard"}
+      <= {m["key"] for m in cat["modules"]}, [m["key"] for m in cat["modules"]])
 
 # Create custom role
 r = client.post("/roles", headers=roles_hdr, json={
@@ -421,11 +427,13 @@ check("duplicate role name -> 409",
       client.post("/roles", headers=roles_hdr, json={"name": "Senior Sales Officer", "permissions": {}}).status_code == 409)
 
 # Update (edit a default role's permissions + rename custom)
-r = client.put(f"/roles/{custom_id}", headers=roles_hdr, json={"permissions": {"customers": {"view": True}}})
+r = client.patch(f"/roles/{custom_id}", headers=roles_hdr, json={"permissions": {"customers": {"view": True}}})
 check("update role permissions (full replace) -> 200",
       r.status_code == 200 and r.json()["permissions"] == {"customers": {"view": True, "create": False, "edit": False, "delete": False, "approve": False, "export": False, "download": False}}, r.text)
+check("PUT is gone — PATCH is the update verb",
+      client.put(f"/roles/{custom_id}", headers=roles_hdr, json={"name": "X"}).status_code == 405)
 so_id = so["id"]
-r = client.put(f"/roles/{so_id}", headers=roles_hdr, json={"permissions": {"customers": {"view": True}}})
+r = client.patch(f"/roles/{so_id}", headers=roles_hdr, json={"permissions": {"customers": {"view": True}}})
 check("editing a default role is allowed -> 200", r.status_code == 200, r.text)
 
 # Delete rules
@@ -458,7 +466,12 @@ check("admin has system_role=admin", p2["user"]["system_role"] == "admin", p2["u
 
 # admin /auth/me → full_access true, empty permissions
 me = client.get("/auth/me", headers=p2_hdr).json()
-check("admin me full_access=true", me["full_access"] is True and me["permissions"] == {}, me)
+check("admin me full_access=true", me["full_access"] is True, me)
+check("an admin's permissions come back fully granted, not empty",
+      all(all(actions.values()) for actions in me["permissions"].values())
+      and len(me["permissions"]) > 15, sorted(me["permissions"]))
+check("an admin holds no org-scoped role and is never narrowed",
+      me["role"] is None and me["data_scope"] == "all", me["role"])
 
 # Get role ids
 roles = client.get("/roles", headers=p2_hdr).json()
@@ -944,8 +957,9 @@ check("second payment -> outstanding 2000", r.json()["outstanding_payable"] == 2
 pays = client.get(f"/suppliers/{sup_id}/payments", headers=sup_hdr).json()
 check("payment history -> 2", len(pays) == 2, pays)
 
-# Void a payment -> balance restored
-void_pid = pays[0]["id"]
+# Void a payment -> balance restored. Named by amount, not by position: both
+# payments were recorded in the same instant, so their order is a tie.
+void_pid = next(p for p in pays if p["amount"] == 1000)["id"]
 r = client.delete(f"/suppliers/{sup_id}/payments/{void_pid}", headers=sup_hdr)
 check("void payment -> balance restored", r.status_code == 200 and r.json()["total_paid"] == 2000, r.text)  # 3000 - 1000
 check("payment history -> 1 after void", len(client.get(f"/suppliers/{sup_id}/payments", headers=sup_hdr).json()) == 1)
@@ -2488,6 +2502,373 @@ check("order's assigned_delivery_partner_id nulled",
       o_after.json().get("assigned_delivery_partner_id") is None, o_after.text)
 check("deleted user can no longer log in -> 401",
       client.post("/auth/login", json={"email": dp_email, "password": "Partner@123"}).status_code == 401)
+
+# --------- Roles, permissions, org + own-data scoping, admin dashboard ---------
+# Wrapped in a function so this block's locals cannot shadow anything above it.
+# Two fresh firms, so it proves isolation without leaning on earlier state.
+
+
+def _roles_scoping_and_dashboard_checks():
+    import json
+
+    def hdr(token):
+        return {"Authorization": f"Bearer {token}"}
+
+
+
+    # ---------------------------------------------------------------- two firms ---
+    def firm(name):
+        em = f"{name}_{uuid.uuid4().hex[:8]}@firm.com"
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": f"{name} Admin",
+            "email": em, "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+
+    abc, abc_hdr = firm("ABC")
+    xyz, xyz_hdr = firm("XYZ")
+
+    print("\n== 1. Role APIs ==")
+    r = client.post("/roles", headers=abc_hdr, json={
+        "name": "Field Sales", "workspace": "sales", "description": "Sales team role",
+        "data_scope": "own",
+        "permissions": {
+            "customers": {"view": True, "create": True, "edit": True, "delete": False},
+            "orders":    {"view": True, "create": True, "edit": True, "delete": False},
+            "products":  {"view": True, "create": False, "edit": False, "delete": False},
+        }})
+    check("POST /roles -> 201", r.status_code == 201, r.text)
+    role = r.json()
+    print(json.dumps(role, indent=2)[:900])
+    check("role echoes name / workspace / description / data_scope",
+          role["name"] == "Field Sales" and role["workspace"] == "sales"
+          and role["description"] == "Sales team role" and role["data_scope"] == "own", role)
+    check("'orders' is accepted as an alias of sales_orders",
+          role["permissions"]["sales_orders"]["view"] is True
+          and role["permissions"]["sales_orders"]["delete"] is False, role["permissions"])
+    check("granted modules keep all 7 actions",
+          set(role["permissions"]["customers"]) == {"view", "create", "edit", "delete", "approve",
+                                                    "export", "download"}, role["permissions"])
+    check("a module with nothing granted is dropped (deny by default)",
+          "products" not in role["permissions"] or role["permissions"]["products"]["view"] is True,
+          role["permissions"])
+    check("new role starts with nobody assigned", role["assigned_users"] == 0, role)
+
+    check("duplicate role name -> 409",
+          client.post("/roles", headers=abc_hdr, json={"name": "Field Sales"}).status_code == 409)
+    check("bad data_scope -> 422",
+          client.post("/roles", headers=abc_hdr, json={"name": "Nope", "data_scope": "some"}).status_code == 422)
+
+    roles = client.get("/roles", headers=abc_hdr).json()
+    check("GET /roles lists this firm's roles only",
+          {"Sales Officer", "Delivery Partner", "Accountant", "Field Sales"} <= {x["name"] for x in roles},
+          [x["name"] for x in roles])
+    check("seeded defaults carry a workspace and a data scope",
+          {(x["name"], x["workspace"], x["data_scope"]) for x in roles if x["is_default"]}
+          == {("Sales Officer", "sales", "own"), ("Delivery Partner", "delivery", "own"),
+              ("Accountant", "accounts", "all")},
+          [(x["name"], x["workspace"], x["data_scope"]) for x in roles])
+    check("another firm cannot see these roles",
+          all(x["name"] != "Field Sales" for x in client.get("/roles", headers=xyz_hdr).json()))
+    check("cross-firm role fetch -> 404",
+          client.get(f"/roles/{role['id']}", headers=xyz_hdr).status_code == 404)
+
+    detail = client.get(f"/roles/{role['id']}", headers=abc_hdr).json()
+    check("GET /roles/{id} returns the full matrix for the Edit screen",
+          detail["permissions"] == role["permissions"], detail)
+
+    r = client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
+        "permissions": {"customers": {"view": True, "create": True, "edit": True, "delete": True}}})
+    check("PATCH replaces the matrix -> 200",
+          r.status_code == 200 and r.json()["permissions"]["customers"]["delete"] is True
+          and "sales_orders" not in r.json()["permissions"], r.text[:300])
+    r = client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={"workspace": "field", "name": "Field Sales 2"})
+    check("PATCH renames and re-points the workspace without touching permissions",
+          r.json()["workspace"] == "field" and r.json()["name"] == "Field Sales 2"
+          and r.json()["permissions"]["customers"]["delete"] is True, r.text[:300])
+    client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
+        "name": "Field Sales", "workspace": "sales",
+        "permissions": {
+            "dashboard": {"view": True},
+            "customers": {"view": True, "create": True, "edit": True, "delete": False},
+            "leads": {"view": True, "create": True, "edit": True},
+            "orders": {"view": True, "create": True, "edit": True, "delete": False},
+            "products": {"view": True},
+        }})
+
+    print("\n== 2. Staff creation just names the role ==")
+    sunil_email = f"sunil_{uuid.uuid4().hex[:6]}@abc.com"
+    r = client.post("/users", headers=abc_hdr, json={
+        "basic_information": {"first_name": "Sunil", "last_name": "Sharma"},
+        "contact_information": {"official_email": sunil_email},
+        "login_security": {"username": f"sunil.sales.{uuid.uuid4().hex[:4]}",
+                           "password": "Sunil@12345", "confirm_password": "Sunil@12345"},
+        "employment_information": {"role_id": role["id"]}})
+    check("staff created with just a role_id -> 201", r.status_code == 201, r.text[:400])
+    sunil = r.json()
+    check("no permissions are copied onto the employee",
+          "permissions" not in sunil and sunil["employment_information"]["role_id"] == role["id"], sunil)
+    check("the role is reported back with its permission matrix",
+          sunil["employment_information"]["role_detail"]["permissions"]["customers"]["create"] is True)
+    check("the role now counts one assigned user",
+          client.get(f"/roles/{role['id']}", headers=abc_hdr).json()["assigned_users"] == 1)
+    # A second holder of the same role — one role, many staff.
+    r2 = client.post("/users", headers=abc_hdr, json={
+        "basic_information": {"first_name": "Second", "last_name": "Officer"},
+        "contact_information": {"official_email": f"second_{uuid.uuid4().hex[:6]}@abc.com"},
+        "login_security": {"password": "Second@12345", "confirm_password": "Second@12345"},
+        "employment_information": {"role_id": role["id"]}})
+    other_officer = r2.json()
+    check("many staff share one role_id",
+          client.get(f"/roles/{role['id']}", headers=abc_hdr).json()["assigned_users"] == 2)
+    check("a role still held by staff cannot be deleted",
+          client.delete(f"/roles/{role['id']}", headers=abc_hdr).status_code == 400)
+
+    print("\n== 3. Login + /auth/me ==")
+    login = client.post("/auth/login", json={"email": sunil_email, "password": "Sunil@12345"})
+    check("login -> 200 with tokens", login.status_code == 200 and "access_token" in login.json()["tokens"])
+    s_hdr = hdr(login.json()["tokens"]["access_token"])
+    me = client.get("/auth/me", headers=s_hdr)
+    check("GET /auth/me -> 200", me.status_code == 200, me.text[:300])
+    me = me.json()
+    print(json.dumps({k: me[k] for k in ("id", "organization_id", "name", "role", "full_access",
+                                         "data_scope")}, indent=2))
+    check("me returns id / organization_id / name",
+          me["id"] == sunil["id"] and me["organization_id"] == abc["organization"]["id"]
+          and me["name"] == "Sunil Sharma", me)
+    check("me returns the role with its workspace",
+          me["role"]["id"] == role["id"] and me["role"]["name"] == "Field Sales"
+          and me["role"]["workspace"] == "sales", me["role"])
+    check("me returns the resolved permission matrix",
+          me["permissions"]["customers"] == {"view": True, "create": True, "edit": True,
+                                             "delete": False, "approve": False, "export": False,
+                                             "download": False}, me["permissions"])
+    check("staff is not full access, and is narrowed to its own records",
+          me["full_access"] is False and me["data_scope"] == "own", me)
+    check("editing the role changes what /auth/me reports, with no user update",
+          client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
+              "permissions": {"dashboard": {"view": True},
+                              "customers": {"view": True, "create": True, "edit": True, "delete": True},
+                              "leads": {"view": True, "create": True, "edit": True},
+                              "orders": {"view": True, "create": True, "edit": True},
+                              "products": {"view": True}}}).status_code == 200
+          and client.get("/auth/me", headers=s_hdr).json()["permissions"]["customers"]["delete"] is True)
+    # put it back to delete=false for the 403 check below
+    client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
+        "permissions": {"dashboard": {"view": True},
+                        "customers": {"view": True, "create": True, "edit": True, "delete": False},
+                        "leads": {"view": True, "create": True, "edit": True},
+                        "orders": {"view": True, "create": True, "edit": True},
+                        "products": {"view": True}}})
+
+    print("\n== 4. Organization separation ==")
+    abc_cust = client.post("/customers", headers=abc_hdr, json={
+        "basic_information": {"customer_name": "Fitness First Gym"},
+        "contact_information": {"mobile_number": "9800000001"}}).json()
+    xyz_cust = client.post("/customers", headers=xyz_hdr, json={
+        "basic_information": {"customer_name": "XYZ Only Customer"},
+        "contact_information": {"mobile_number": "9800000002"}}).json()
+    check("each firm's list holds only its own customers",
+          [c["name"] for c in client.get("/customers", headers=xyz_hdr).json()] == ["XYZ Only Customer"],
+          client.get("/customers", headers=xyz_hdr).json())
+    check("cross-firm customer fetch -> 404",
+          client.get(f"/customers/{abc_cust['id']}", headers=xyz_hdr).status_code == 404)
+    check("no organization_id is accepted from the client",
+          "organization_id" not in str(client.get("/openapi.json").json()["paths"]["/customers"]["get"]
+                                       .get("parameters", [])))
+
+    print("\n== 5. Own-data scoping for a field role ==")
+    # Sunil creates his own customer; the other officer has one of their own.
+    sunil_cust = client.post("/customers", headers=s_hdr, json={
+        "basic_information": {"customer_name": "Sunil's Gym"},
+        "contact_information": {"mobile_number": "9800000003"}}).json()
+    check("a customer a field role creates is assigned to them",
+          sunil_cust["sales_crm_information"]["sales_representative_id"] == sunil["id"], sunil_cust)
+    o_hdr = hdr(client.post("/auth/login", json={
+        "email": other_officer["contact_information"]["official_email"],
+        "password": "Second@12345"}).json()["tokens"]["access_token"])
+    other_cust = client.post("/customers", headers=o_hdr, json={
+        "basic_information": {"customer_name": "Other Officer's Gym"},
+        "contact_information": {"mobile_number": "9800000004"}}).json()
+
+    mine = [c["name"] for c in client.get("/customers", headers=s_hdr).json()]
+    check("GET /customers returns only the logged-in officer's customers",
+          mine == ["Sunil's Gym"], mine)
+    check("the other officer sees only theirs",
+          [c["name"] for c in client.get("/customers", headers=o_hdr).json()] == ["Other Officer's Gym"])
+    check("the Admin still sees every customer in the firm",
+          {c["name"] for c in client.get("/customers", headers=abc_hdr).json()}
+          == {"Fitness First Gym", "Sunil's Gym", "Other Officer's Gym"})
+    check("a customer outside the officer's scope reads as 404, not 403",
+          client.get(f"/customers/{other_cust['id']}", headers=s_hdr).status_code == 404)
+    check("and they cannot edit it either",
+          client.patch(f"/customers/{other_cust['id']}", headers=s_hdr,
+                       json={"basic_information": {"customer_name": "Hijacked"}}).status_code == 404)
+
+    # Orders
+    my_order = client.post("/orders", headers=s_hdr, json={
+        "customer_id": sunil_cust["id"],
+        "items": [{"product_id": None, "product_name": "Water 20L", "quantity": 2, "unit_price": 60}]})
+    if my_order.status_code != 201:
+        prod = client.post("/products", headers=abc_hdr, json={"name": "Water 20L", "price": 60,
+                                                               "total_inventory": 500}).json()
+        my_order = client.post("/orders", headers=s_hdr, json={
+            "customer_id": sunil_cust["id"],
+            "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 60}]})
+    check("a field role can raise an order -> 201", my_order.status_code == 201, my_order.text[:300])
+    my_order = my_order.json()
+    other_order = client.post("/orders", headers=o_hdr, json={
+        "customer_id": other_cust["id"],
+        "items": [{"product_id": my_order["items"][0]["product_id"], "quantity": 1, "unit_price": 60}]}).json()
+    listed = [o["id"] for o in client.get("/orders", headers=s_hdr).json()]
+    check("GET /orders returns only the officer's own orders",
+          listed == [my_order["id"]], listed)
+    check("an order outside their scope -> 404",
+          client.get(f"/orders/{other_order['id']}", headers=s_hdr).status_code == 404)
+    check("the Admin sees both orders",
+          len(client.get("/orders", headers=abc_hdr).json()) == 2)
+
+    # Leads
+    my_lead = client.post("/leads", headers=s_hdr, json={"mobile_number": "9800001111"}).json()
+    other_lead = client.post("/leads", headers=o_hdr, json={"mobile_number": "9800002222"}).json()
+    check("a lead a field role creates is assigned to them",
+          my_lead["assigned_salesperson_id"] == sunil["id"], my_lead)
+    check("GET /leads returns only their own",
+          [x["id"] for x in client.get("/leads", headers=s_hdr).json()] == [my_lead["id"]])
+    check("a lead outside their scope -> 404",
+          client.get(f"/leads/{other_lead['id']}", headers=s_hdr).status_code == 404)
+
+    print("\n== 6. Permission checks are enforced server-side ==")
+    spare_cust = client.post("/customers", headers=s_hdr, json={
+        "basic_information": {"customer_name": "Spare Gym"},
+        "contact_information": {"mobile_number": "9800000009"}}).json()
+    check("customers.delete = false -> DELETE /customers/{id} 403",
+          client.delete(f"/customers/{spare_cust['id']}", headers=s_hdr).status_code == 403)
+    check("no invoices permission -> 403",
+          client.get("/invoices", headers=s_hdr).status_code == 403)
+    check("no users permission -> 403 on the staff list",
+          client.get("/users", headers=s_hdr).status_code == 403)
+    check("products.view = true -> the firm's products are visible",
+          client.get("/products", headers=s_hdr).status_code == 200)
+    check("products.create = false -> 403",
+          client.post("/products", headers=s_hdr, json={"name": "Nope", "price": 1}).status_code == 403)
+    r = client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
+        "permissions": {"dashboard": {"view": True},
+                        "customers": {"view": True, "create": True, "edit": True, "delete": True},
+                        "leads": {"view": True, "create": True, "edit": True},
+                        "orders": {"view": True, "create": True, "edit": True},
+                        "products": {"view": True}}})
+    check("granting delete makes the same call succeed",
+          client.delete(f"/customers/{spare_cust['id']}", headers=s_hdr).status_code == 204, r.text[:200])
+
+    print("\n== 7. GET /dashboard/admin ==")
+    # Some data to summarise, in the ABC firm.
+    prod_id = my_order["items"][0]["product_id"]
+    client.patch(f"/orders/{my_order['id']}/approve", headers=abc_hdr)
+    client.post("/expenses", headers=abc_hdr, json={"category": "Salaries", "amount": 12540})
+    exp = client.post("/expenses", headers=abc_hdr, json={"category": "Fuel", "amount": 2000}).json()
+    for e in client.get("/expenses", headers=abc_hdr).json():
+        client.patch(f"/expenses/{e['id']}/approve", headers=abc_hdr)
+
+    r = client.get("/dashboard/admin", headers=abc_hdr)
+    check("GET /dashboard/admin -> 200", r.status_code == 200, r.text[:500])
+    d = r.json()
+    print(json.dumps(d, indent=2)[:2600])
+    check("every widget block is present",
+          set(d) == {"filters", "summary", "orders", "cashflow", "receivables_payables",
+                     "top_customers", "top_products", "expense_breakdown", "sales_trend",
+                     "stock_watch", "recent_orders"}, sorted(d))
+    check("filters echo the window used",
+          d["filters"]["date_from"] and d["filters"]["date_to"], d["filters"])
+    check("summary carries every stat card",
+          {"today_sales", "month_sales", "period_sales", "purchases", "expenses", "gross_profit",
+           "net_profit", "new_customers", "sales_growth_percentage"} == set(d["summary"]), d["summary"])
+    check("approved sales are counted", d["summary"]["period_sales"] > 0, d["summary"])
+    check("approved expenses are counted", d["summary"]["expenses"] == 14540, d["summary"])
+    check("net profit = gross minus expenses",
+          round(d["summary"]["gross_profit"] - d["summary"]["expenses"], 2) == d["summary"]["net_profit"],
+          d["summary"])
+    check("new customers counted in the window", d["summary"]["new_customers"] >= 2, d["summary"])
+    check("order counts are broken down",
+          d["orders"]["total"] >= 1 and set(d["orders"]) == {"total", "pending", "to_deliver",
+                                                            "delivered", "cancelled"}, d["orders"])
+    check("cashflow has one point per day, with both directions",
+          all(set(p) == {"date", "inflow", "outflow"} for p in d["cashflow"]) and len(d["cashflow"]) >= 1,
+          d["cashflow"][:2])
+    check("receivables / payables reported with the overdue split",
+          set(d["receivables_payables"]) == {"receivables", "payables", "overdue_receivables",
+                                             "overdue_payables", "overdue_after_days"},
+          d["receivables_payables"])
+    check("top customers ranked with their sales",
+          d["top_customers"] and d["top_customers"][0]["sales"] > 0
+          and "customer_name" in d["top_customers"][0], d["top_customers"])
+    check("top products ranked with amount and quantity",
+          d["top_products"] and d["top_products"][0]["quantity"] > 0, d["top_products"])
+    check("expenses broken down by category, largest first",
+          [x["category"] for x in d["expense_breakdown"]] == ["Salaries", "Fuel"], d["expense_breakdown"])
+    check("sales trend has one point per day",
+          all(set(p) == {"date", "sales", "orders"} for p in d["sales_trend"]), d["sales_trend"][:2])
+    check("recent orders carry status, payment status and total",
+          d["recent_orders"] and {"id", "order_number", "customer_name", "status", "payment_status",
+                                  "total", "date"} == set(d["recent_orders"][0]), d["recent_orders"][:1])
+    check("an unbilled order reads as unpaid",
+          d["recent_orders"][0]["payment_status"] in ("unpaid", "partial", "paid"))
+
+    # Stock watch
+    low = client.post("/products", headers=abc_hdr, json={
+        "name": "Sparkling Water 750ml", "price": 40, "total_inventory": 9,
+        "minimum_stock_level": 25}).json()
+    client.post("/products", headers=abc_hdr, json={
+        "name": "Out Of Stock Item", "price": 10, "total_inventory": 0, "minimum_stock_level": 5})
+    watch = client.get("/dashboard/admin", headers=abc_hdr).json()["stock_watch"]
+    check("stock watch flags low stock with a percentage of the minimum",
+          any(w["product_id"] == low["id"] and w["status"] == "low_stock"
+              and w["stock_percentage"] == 36 for w in watch), watch)
+    check("out of stock is listed first",
+          watch and watch[0]["status"] == "out_of_stock", watch[:2])
+
+    print("\n-- dashboard filters --")
+    _old = client.get("/dashboard/admin", headers=abc_hdr,
+                      params={"date_from": "2000-01-01", "date_to": "2000-01-31"})
+    check("date range narrows the figures",
+          _old.status_code == 200 and _old.json()["summary"]["period_sales"] == 0, _old.text[:200])
+    check("date_from after date_to -> 400",
+          client.get("/dashboard/admin", headers=abc_hdr,
+                     params={"date_from": "2026-05-10", "date_to": "2026-05-01"}).status_code == 400)
+    check("a bad date -> 400",
+          client.get("/dashboard/admin", headers=abc_hdr,
+                     params={"date_from": "10-05-2026"}).status_code == 400)
+    check("customer_id filter narrows to that customer",
+          client.get("/dashboard/admin", headers=abc_hdr,
+                     params={"customer_id": sunil_cust["id"]}).json()["summary"]["period_sales"] > 0)
+    check("a customer from another firm -> 400",
+          client.get("/dashboard/admin", headers=abc_hdr,
+                     params={"customer_id": xyz_cust["id"]}).status_code == 400)
+    check("an unknown branch -> 400",
+          client.get("/dashboard/admin", headers=abc_hdr,
+                     params={"branch_id": "nope"}).status_code == 400)
+    branch = client.put("/organizations/settings", headers=abc_hdr, json={
+        "branch_addresses": [{"label": "Main", "address": "1 Road"}]}).json()["branch_addresses"][0]
+    check("a real branch id is accepted",
+          client.get("/dashboard/admin", headers=abc_hdr,
+                     params={"branch_id": branch["id"]}).status_code == 200)
+
+    print("\n-- dashboard isolation + permissions --")
+    check("the other firm's dashboard is its own",
+          client.get("/dashboard/admin", headers=xyz_hdr).json()["summary"]["period_sales"] == 0)
+    check("no organization_id parameter is exposed",
+          "organization_id" not in [p["name"] for p in client.get("/openapi.json").json()["paths"]
+                                    ["/dashboard/admin"]["get"]["parameters"]])
+    check("dashboard.view = true -> a field role may read it",
+          client.get("/dashboard/admin", headers=s_hdr).status_code == 200)
+    client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
+        "permissions": {"customers": {"view": True}}})
+    check("without dashboard.view -> 403",
+          client.get("/dashboard/admin", headers=s_hdr).status_code == 403)
+    check("no token -> 403", client.get("/dashboard/admin").status_code == 403)
+
+
+_roles_scoping_and_dashboard_checks()
 
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify

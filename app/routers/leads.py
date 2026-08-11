@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, Lead, User
 from app.services import numbering_service, lookup_service
@@ -23,12 +24,15 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned(db: Session, id: str, org_id: str) -> Lead:
+def _owned(db: Session, id: str, org_id: str, user: User | None = None) -> Lead:
     """Accepts the UUID or the human-facing code (lead_id)."""
     record = lookup_service.by_id_or_code(
         db, Lead, id, org_id, Lead.lead_id
     )
-    if record is None:
+    if record is None or (
+        user is not None
+        and not scoping.owns_record(db, user, record, "assigned_salesperson_id")
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
     return record
 
@@ -62,7 +66,9 @@ def create_lead(
         lead_source=payload.lead_source,
         customer_id=payload.customer_id,
         mobile_number=payload.mobile_number,
-        assigned_salesperson_id=payload.assigned_salesperson_id,
+        # Default to the creator for a field role — see customers.create_customer.
+        assigned_salesperson_id=payload.assigned_salesperson_id
+        or (user.id if scoping.scope_to_own(db, user) else None),
         lead_status=payload.lead_status or "new",
     )
 
@@ -82,6 +88,8 @@ def list_leads(
     q = db.query(Lead).filter(Lead.organization_id == org_id)
     if status_filter:
         q = q.filter(Lead.lead_status == status_filter)
+    # A field role sees only the leads assigned to them.
+    q = scoping.owned_by(q, db, user, Lead.assigned_salesperson_id)
     return q.order_by(Lead.created_at.desc()).all()
 
 
@@ -91,7 +99,7 @@ def get_lead_detail(
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> Lead:
-    return _owned(db, id, _org_id(user))
+    return _owned(db, id, _org_id(user), user)
 
 
 @router.put("/{id}", response_model=LeadOut)

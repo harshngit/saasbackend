@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import (
     Customer,
@@ -30,12 +31,14 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned(db: Session, id: str, org_id: str) -> Quotation:
+def _owned(db: Session, id: str, org_id: str, user: User | None = None) -> Quotation:
     """Accepts the UUID or the human-facing code (quotation_number)."""
     record = lookup_service.by_id_or_code(
         db, Quotation, id, org_id, Quotation.quotation_number
     )
-    if record is None:
+    if record is None or (
+        user is not None and not scoping.owns_record(db, user, record, "salesperson_id")
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quotation not found")
     return record
 
@@ -72,7 +75,9 @@ def create_quotation(
         # customer the quotation is for, rather than making the user retype them.
         billing_address=payload.billing_address or customer.billing_address,
         shipping_address=payload.shipping_address or customer.delivery_address,
-        salesperson_id=payload.salesperson_id,
+        # Default to the creator for a field role — see customers.create_customer.
+        salesperson_id=payload.salesperson_id
+        or (user.id if scoping.scope_to_own(db, user) else None),
         currency=payload.currency,
         status=payload.status or "draft",
         payment_terms=payload.payment_terms,
@@ -115,12 +120,10 @@ def list_quotations(
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> list[Quotation]:
-    return (
-        db.query(Quotation)
-        .filter(Quotation.organization_id == _org_id(user))
-        .order_by(Quotation.created_at.desc())
-        .all()
-    )
+    query = db.query(Quotation).filter(Quotation.organization_id == _org_id(user))
+    # A field role sees only their own quotations.
+    query = scoping.owned_by(query, db, user, Quotation.salesperson_id)
+    return query.order_by(Quotation.created_at.desc()).all()
 
 
 @router.get("/{id}", response_model=QuotationOut)
@@ -129,7 +132,7 @@ def get_quotation_detail(
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> Quotation:
-    return _owned(db, id, _org_id(user))
+    return _owned(db, id, _org_id(user), user)
 
 
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)

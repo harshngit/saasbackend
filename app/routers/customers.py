@@ -7,6 +7,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
 from app.core.files import save_upload
@@ -41,12 +42,15 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned_customer(db: Session, customer_id: str, org_id: str) -> Customer:
-    """Accepts the UUID or the human-facing code (customer_id)."""
+def _owned_customer(db: Session, customer_id: str, user: User) -> Customer:
+    """The customer, if this user may see it. Accepts the UUID or the customer code.
+
+    Out of scope reads as "not found" rather than "forbidden": a field role should
+    not be able to probe which customer ids exist in the firm."""
     record = lookup_service.by_id_or_code(
-        db, Customer, customer_id, org_id, Customer.customer_id
+        db, Customer, customer_id, _org_id(user), Customer.customer_id
     )
-    if record is None:
+    if record is None or not scoping.owns_record(db, user, record, "assigned_sales_officer_id"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
     return record
 
@@ -126,6 +130,10 @@ def create_customer(
     data["customer_id"] = numbering_service.next_number(
         db, org_id, Customer.customer_id, "CUST"
     )
+    # A field role only sees its own customers, so default the sales rep to whoever
+    # is creating it — otherwise they could not see the customer they just added.
+    if not data.get("assigned_sales_officer_id") and scoping.scope_to_own(db, user):
+        data["assigned_sales_officer_id"] = user.id
     customer = Customer(organization_id=org_id, **data)
     customer.recompute_outstanding()  # opening_balance -> outstanding
     db.add(customer)
@@ -164,6 +172,7 @@ def list_customers(
         query = query.filter(Customer.is_active == is_active)
     if assigned_sales_officer_id is not None:
         query = query.filter(Customer.assigned_sales_officer_id == assigned_sales_officer_id)
+    query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
     return query.order_by(Customer.created_at.desc()).all()
 
 
@@ -173,7 +182,7 @@ def get_customer(
 ) -> CustomerProfileOut:
     """The full 360° customer profile: every section, the uploaded documents, and
     the financial and sales summaries. Accepts the UUID or the customer code."""
-    customer = _owned_customer(db, customer_id, _org_id(user))
+    customer = _owned_customer(db, customer_id, user)
     return customer_profile_service.build_profile(db, customer)
 
 
@@ -188,7 +197,7 @@ def update_customer(
     """Partial update. Only the sections you send are touched, and within a
     section only the fields you send. A flat body works too."""
     org_id = _org_id(user)
-    customer = _owned_customer(db, customer_id, org_id)
+    customer = _owned_customer(db, customer_id, user)
     data = payload.to_columns()
     if "assigned_sales_officer_id" in data:
         _validate_assignee(db, org_id, data["assigned_sales_officer_id"])
@@ -216,7 +225,7 @@ def record_customer_payment(
     and `status` move with it. Omit it and the payment is an advance that only
     reduces the customer's outstanding balance."""
     org_id = _org_id(user)
-    customer = _owned_customer(db, customer_id, org_id)
+    customer = _owned_customer(db, customer_id, user)
     invoice = _owned_invoice(db, payload.invoice_id, customer, org_id)
     db.add(CustomerPayment(
         customer_id=customer.id, organization_id=org_id, order_id=payload.order_id,
@@ -237,11 +246,11 @@ def record_customer_payment(
 def list_customer_payments(
     customer_id: str, user: User = Depends(_pay_view), db: Session = Depends(get_db)
 ) -> list[CustomerPayment]:
-    _owned_customer(db, customer_id, _org_id(user))
+    _owned_customer(db, customer_id, user)
     return (
         db.query(CustomerPayment)
         .filter(CustomerPayment.customer_id == customer_id)
-        .order_by(CustomerPayment.received_on.desc())
+        .order_by(CustomerPayment.received_on.desc(), CustomerPayment.id.desc())
         .all()
     )
 
@@ -255,7 +264,7 @@ def payment_receipt(
 ) -> Response:
     """Download a PDF receipt for a customer payment."""
     org_id = _org_id(user)
-    customer = _owned_customer(db, customer_id, org_id)
+    customer = _owned_customer(db, customer_id, user)
     payment = db.get(CustomerPayment, payment_id)
     if payment is None or payment.customer_id != customer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
@@ -275,7 +284,7 @@ def void_customer_payment(
     db: Session = Depends(get_db),
 ) -> Customer:
     org_id = _org_id(user)
-    customer = _owned_customer(db, customer_id, org_id)
+    customer = _owned_customer(db, customer_id, user)
     payment = db.get(CustomerPayment, payment_id)
     if payment is None or payment.customer_id != customer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
@@ -299,7 +308,7 @@ def delete_customer(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> None:
-    customer = _owned_customer(db, customer_id, _org_id(user))
+    customer = _owned_customer(db, customer_id, user)
     db.delete(customer)
     db.commit()
 
@@ -328,7 +337,7 @@ def upload_customer_document(
     A named type replaces whatever was in that slot; `other` appends, so the
     customer can carry many miscellaneous files."""
     org_id = _org_id(user)
-    customer = _owned_customer(db, customer_id, org_id)
+    customer = _owned_customer(db, customer_id, user)
     kind = document_type.strip().lower().replace(" ", "_").replace("-", "_")
     if kind not in DOCUMENT_TYPES:
         raise HTTPException(
@@ -377,7 +386,7 @@ def upload_other_customer_documents(
     """Upload several "other" documents in one call. Appends to what is already
     on file and returns every other-document the customer now has."""
     org_id = _org_id(user)
-    customer = _owned_customer(db, customer_id, org_id)
+    customer = _owned_customer(db, customer_id, user)
     for upload in files:
         url, size = save_upload(db, org_id, upload, request, allow_any=True)
         db.add(CustomerDocument(
@@ -404,7 +413,7 @@ def list_customer_documents(
     db: Session = Depends(get_db),
 ) -> list[CustomerDocument]:
     """Every document on file for this customer."""
-    customer = _owned_customer(db, customer_id, _org_id(user))
+    customer = _owned_customer(db, customer_id, user)
     documents = sorted(customer.documents or [], key=lambda d: d.uploaded_at)
     if document_type:
         documents = [d for d in documents if d.document_type == document_type]
@@ -426,7 +435,7 @@ def download_customer_document(
     db: Session = Depends(get_db),
 ) -> Response:
     """Download the file itself, with its original filename."""
-    customer = _owned_customer(db, customer_id, _org_id(user))
+    customer = _owned_customer(db, customer_id, user)
     document = _owned_document(db, customer, document_id)
     stored = db.get(StoredFile, document.file_id) if document.file_id else None
     if stored is None:
@@ -446,6 +455,6 @@ def delete_customer_document(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> None:
-    customer = _owned_customer(db, customer_id, _org_id(user))
+    customer = _owned_customer(db, customer_id, user)
     db.delete(_owned_document(db, customer, document_id))
     db.commit()

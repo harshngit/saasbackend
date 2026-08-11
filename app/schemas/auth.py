@@ -2,6 +2,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.models.enums import UserRole
 from app.schemas.organization import OrganizationOut
+from app.schemas.role import RoleBriefOut
 from app.schemas.user import UserOut
 
 
@@ -56,14 +57,31 @@ class AuthResponse(BaseModel):
 
 
 class MeResponse(BaseModel):
-    """GET /auth/me — current user, their org, and their effective permissions."""
+    """GET /auth/me — who is logged in, which firm they belong to, which workspace
+    to open, and exactly what they may do.
+
+    This is the only call the frontend needs after login: `role.workspace` picks
+    the dashboard, and `permissions` decides which pages and buttons to show. The
+    same matrix is enforced server-side, so hiding a button is a convenience, not
+    the security boundary.
+    """
+
+    id: str
+    organization_id: str | None = None
+    name: str
+    # The staff member's role. Null for an Admin / Super Admin, who hold no
+    # org-scoped role — `full_access` is what marks them.
+    role: RoleBriefOut | None = None
+    # Every module + action the user may use. Filled in for an Admin too (all
+    # true), so the frontend can read this one field for any kind of user.
+    permissions: dict[str, dict[str, bool]] = {}
+    # True for admin/super_admin (full access in their scope); false for staff.
+    full_access: bool = False
+    # `own` means list endpoints return only this user's own/assigned records.
+    data_scope: str = "all"
 
     user: UserOut
     organization: OrganizationOut | None
-    # True for admin/super_admin (full access in their scope); false for staff.
-    full_access: bool = False
-    # Staff's permission matrix (empty when full_access is true).
-    permissions: dict[str, dict[str, bool]] = {}
 
 
 class RefreshRequest(BaseModel):

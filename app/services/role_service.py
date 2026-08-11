@@ -1,29 +1,48 @@
 from sqlalchemy.orm import Session
 
-from app.core.permissions import default_role_matrices, normalize_permissions
+from app.core.permissions import (
+    DEFAULT_ROLE_SETTINGS,
+    default_role_matrices,
+    normalize_permissions,
+)
 from app.models import STAFF_ROLE_NAME, Organization, Role, UserRole
 
 
 def seed_default_roles(db: Session, organization_id: str) -> None:
-    """Create the 3 default roles for an org if they don't already exist (idempotent)."""
+    """Create the 3 default roles for an org if they don't already exist (idempotent).
+
+    Also backfills `workspace` / `data_scope` on defaults seeded before those
+    columns existed, so an upgraded database gets them without a migration.
+    """
     existing = {
-        name
-        for (name,) in db.query(Role.name).filter(Role.organization_id == organization_id).all()
+        role.name: role
+        for role in db.query(Role).filter(Role.organization_id == organization_id).all()
     }
-    created = False
+    changed = False
     for name, matrix in default_role_matrices().items():
-        if name in existing:
-            continue
-        db.add(
-            Role(
-                organization_id=organization_id,
-                name=name,
-                is_default=True,
-                permissions=normalize_permissions(matrix),
+        settings = DEFAULT_ROLE_SETTINGS.get(name, {})
+        role = existing.get(name)
+        if role is None:
+            db.add(
+                Role(
+                    organization_id=organization_id,
+                    name=name,
+                    is_default=True,
+                    workspace=settings.get("workspace"),
+                    data_scope=settings.get("data_scope", "all"),
+                    permissions=normalize_permissions(matrix),
+                )
             )
-        )
-        created = True
-    if created:
+            changed = True
+            continue
+        # Only fill blanks — an Admin who has changed either one keeps their choice.
+        if role.workspace is None and settings.get("workspace"):
+            role.workspace = settings["workspace"]
+            changed = True
+        if role.data_scope is None:
+            role.data_scope = settings.get("data_scope", "all")
+            changed = True
+    if changed:
         db.commit()
 
 
@@ -123,3 +142,40 @@ def default_role_for_legacy(db: Session, organization_id: str, legacy_role: User
         .filter(Role.organization_id == organization_id, Role.name == name)
         .first()
     )
+
+
+# ----------------------- Effective access for a user -----------------------
+# One place that answers "what may this user do, and whose records may they see",
+# so /auth/me, the permission guard and the list-scoping helper never disagree.
+
+
+def is_full_access(user) -> bool:  # noqa: ANN001
+    """Admins and the platform Super Admin are not permission-checked inside their
+    own scope — an Admin owns their firm."""
+    return user.effective_system_role in ("admin", "super_admin")
+
+
+def role_for(db: Session, user) -> Role | None:  # noqa: ANN001
+    """The user's org-scoped role, or None (Admins hold no role)."""
+    if not user.role_id:
+        return None
+    return db.get(Role, user.role_id)
+
+
+def effective_permissions(db: Session, user) -> dict:  # noqa: ANN001
+    """The permission matrix to enforce and to report on /auth/me. An Admin gets
+    every module/action so callers can read one field for any kind of user."""
+    from app.core.permissions import full_access_matrix
+
+    if is_full_access(user):
+        return full_access_matrix()
+    role = role_for(db, user)
+    return (role.permissions if role is not None else {}) or {}
+
+
+def data_scope(db: Session, user) -> str:  # noqa: ANN001
+    """"own" when the user's role only sees its own records, else "all"."""
+    if is_full_access(user):
+        return "all"
+    role = role_for(db, user)
+    return (role.data_scope if role is not None else None) or "all"

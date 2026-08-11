@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import (
     Customer,
@@ -38,12 +39,19 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned(db: Session, order_id: str, org_id: str) -> SalesOrder:
-    """Accepts the UUID or the human-facing code (order_number, sales_order_number)."""
+def _owned(db: Session, order_id: str, org_id: str, user: User | None = None) -> SalesOrder:
+    """The order, if this user may see it. Accepts the UUID or the human-facing code
+    (order_number, sales_order_number).
+
+    Pass `user` on anything a field role can reach: out of their scope reads as
+    "not found", so they cannot probe the firm's order ids."""
     record = lookup_service.by_id_or_code(
         db, SalesOrder, order_id, org_id, SalesOrder.order_number, SalesOrder.sales_order_number
     )
-    if record is None:
+    out_of_scope = user is not None and not scoping.owns_record(
+        db, user, record, "created_by", "salesperson_id", "assigned_delivery_partner_id"
+    ) if record is not None else False
+    if record is None or out_of_scope:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
     return record
 
@@ -111,12 +119,17 @@ def list_orders(
         query = query.filter(SalesOrder.assigned_delivery_partner_id == assigned_delivery_partner_id)
     if search:
         query = query.filter(SalesOrder.order_number.ilike(f"%{search}%"))
+    # A field role sees the orders it raised, was recorded against, or must deliver.
+    query = scoping.owned_by(
+        query, db, user,
+        SalesOrder.created_by, SalesOrder.salesperson_id, SalesOrder.assigned_delivery_partner_id,
+    )
     return query.order_by(SalesOrder.created_at.desc()).all()
 
 
 @router.get("/{order_id}", response_model=OrderOut)
 def get_order(order_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> SalesOrder:
-    return _owned(db, order_id, _org_id(user))
+    return _owned(db, order_id, _org_id(user), user)
 
 
 @router.post("", response_model=OrderOut, status_code=status.HTTP_201_CREATED)

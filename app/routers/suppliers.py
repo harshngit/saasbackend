@@ -170,7 +170,7 @@ def list_payments(
     return (
         db.query(SupplierPayment)
         .filter(SupplierPayment.supplier_id == supplier_id)
-        .order_by(SupplierPayment.paid_on.desc())
+        .order_by(SupplierPayment.paid_on.desc(), SupplierPayment.id.desc())
         .all()
     )
 

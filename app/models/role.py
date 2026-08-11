@@ -31,6 +31,15 @@ class Role(Base):
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Which dashboard the frontend opens for this role after login
+    # (sales / delivery / accounts / admin / …). Free text, not an enum, so a firm
+    # can name its own workspaces.
+    workspace: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # "all"  -> the role sees every record in the firm (back-office roles)
+    # "own"  -> list endpoints return only records assigned to / created by the
+    #           logged-in user (field roles). See app/core/scoping.py.
+    data_scope: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     # { "<module>": { "view": bool, "create": bool, ... }, ... } — deny-by-default.
     permissions: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
