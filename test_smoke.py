@@ -2577,6 +2577,25 @@ def _roles_scoping_and_dashboard_checks():
     check("GET /roles/{id} returns the full matrix for the Edit screen",
           detail["permissions"] == role["permissions"], detail)
 
+    # A row written before data_scope existed holds NULL. This reached production
+    # once: the list endpoint 500'd because the response model demanded a string.
+    from app.core.database import SessionLocal as _RoleSession
+    from app.models import Role as _Role
+    _rdb = _RoleSession()
+    for _r in _rdb.query(_Role).filter(_Role.organization_id == abc["organization"]["id"]).all():
+        _r.data_scope = None
+        _r.workspace = None
+    _rdb.commit()
+    _rdb.close()
+    r = client.get("/roles", headers=abc_hdr)
+    check("a legacy role row with no data_scope still lists -> 200",
+          r.status_code == 200 and all(x["data_scope"] == "all" for x in r.json()), r.text[:300])
+    check("and /auth/me still works for its holder",
+          client.get("/auth/me", headers=abc_hdr).status_code == 200)
+    # Put the scope back — the checks below rely on it.
+    client.patch(f"/roles/{role['id']}", headers=abc_hdr,
+                 json={"data_scope": "own", "workspace": "sales"})
+
     r = client.patch(f"/roles/{role['id']}", headers=abc_hdr, json={
         "permissions": {"customers": {"view": True, "create": True, "edit": True, "delete": True}}})
     check("PATCH replaces the matrix -> 200",

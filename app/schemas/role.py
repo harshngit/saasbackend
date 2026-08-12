@@ -3,7 +3,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
-from app.core.permissions import DATA_SCOPES
+from app.core.permissions import DATA_SCOPES, DEFAULT_DATA_SCOPE
 
 # permissions shape: { "<module>": { "view": bool, "create": bool, ... }, ... }
 PermissionMatrix = dict[str, dict[str, bool]]
@@ -14,9 +14,19 @@ def _normalize_scope(value: object) -> object:
     return value.strip().lower() if isinstance(value, str) else value
 
 
+def _scope_or_default(value: object) -> object:
+    """Roles written before this column existed hold NULL — read those as "all",
+    the same widest-scope default a new role gets. Without this, one legacy row
+    makes the whole roles list fail to serialize."""
+    return DEFAULT_DATA_SCOPE if value is None else _normalize_scope(value)
+
+
+# On the way in: a scope must be one of the two. On the way out: NULL from an old
+# row reads as the default rather than failing.
 DataScope = Annotated[
     str, BeforeValidator(_normalize_scope), Field(pattern=f"^({'|'.join(DATA_SCOPES)})$")
 ]
+DataScopeOut = Annotated[str, BeforeValidator(_scope_or_default)]
 
 _SCOPE_HELP = (
     "all = the role sees every record in the firm; "
@@ -33,7 +43,7 @@ class RoleOut(BaseModel):
     name: str
     workspace: str | None = None
     description: str | None = None
-    data_scope: str = Field(default="all", description=_SCOPE_HELP)
+    data_scope: DataScopeOut = Field(default=DEFAULT_DATA_SCOPE, description=_SCOPE_HELP)
     is_default: bool
     permissions: PermissionMatrix
     # How many staff currently hold this role — the Roles screen shows it, and it
@@ -73,5 +83,5 @@ class RoleBriefOut(BaseModel):
     id: str
     name: str
     workspace: str | None = None
-    data_scope: str = "all"
+    data_scope: DataScopeOut = DEFAULT_DATA_SCOPE
     is_default: bool = False

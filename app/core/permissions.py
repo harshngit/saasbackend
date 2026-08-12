@@ -140,6 +140,9 @@ DEFAULT_ROLE_SETTINGS: dict[str, dict[str, str]] = {
 }
 
 DATA_SCOPES = ("all", "own")
+# What a role with no scope recorded is treated as — the widest, so adding the
+# column never silently hid anyone's data.
+DEFAULT_DATA_SCOPE = "all"
 
 
 def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
