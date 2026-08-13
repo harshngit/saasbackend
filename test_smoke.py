@@ -4556,6 +4556,26 @@ def _phase1kn_checks():
 
 _phase1kn_checks()
 
+print("\n== every model column made nullable is relaxed on Postgres too ==")
+# SQLite ignores a NOT NULL that Postgres enforces, so a column made nullable in the
+# model looks fine locally and 500s in production. Anything nullable in the model that
+# was once mandatory has to be listed for the live database as well.
+from app.core.database import _RELAX_NOT_NULL as _relax  # noqa: E402
+from app.core.database import Base as _RelaxBase  # noqa: E402
+from app.models import CustomerPayment as _RelaxPayment  # noqa: E402
+
+check("an anonymous walk-in payment needs no customer",
+      _RelaxPayment.__table__.c.customer_id.nullable)
+check("and the live database is told to drop that constraint",
+      ("customer_payments", "customer_id") in _relax, _relax)
+for _table, _column in _relax:
+    _model_table = _RelaxBase.metadata.tables.get(_table)
+    check(f"{_table}.{_column} is still nullable in the model",
+          _model_table is not None and _column in _model_table.c
+          and _model_table.c[_column].nullable,
+          f"{_table}.{_column} is listed as relaxed but the model requires it")
+
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

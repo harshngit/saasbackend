@@ -225,6 +225,10 @@ _DROPPED_COLUMNS = [
 # Columns whose NOT NULL constraint must be relaxed (model made them nullable).
 _RELAX_NOT_NULL = [
     ("users", "role"),  # legacy role enum is now optional (staff use role_id)
+    # An anonymous walk-in payment belongs to no customer, so the column that used to
+    # be mandatory no longer is. Making a column nullable in the model is invisible to
+    # an existing Postgres database — the constraint has to be dropped here too.
+    ("customer_payments", "customer_id"),
 ]
 
 
