@@ -124,6 +124,15 @@ class User(Base):
     # kept in sync whenever `status` is written.
     status: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
 
+    # 9. Last known position, written by POST /users/me/location. Deliberately the
+    # latest ping only — `work_location` above is the office they are posted to and
+    # is never used as a live location.
+    last_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_location_accuracy_m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_location_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    last_location_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)

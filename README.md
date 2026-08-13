@@ -99,6 +99,8 @@ dropdown data — is part of `PATCH /users/{id}` or gone.
 | DELETE | `/users/{id}`    | Admin          | Permanently remove an employee             |
 | DELETE | `/users/{id}/documents/{collection}?document_id=` | Admin | Drop one file out of a document list |
 | POST   | `/users/{id}/reset-password` | Admin | Admin sets a staff member's password    |
+| GET    | `/users/{id}/overview` | Admin    | Staff Detail's operational summary, shaped by the role's workspace |
+| POST   | `/users/me/location` | Authenticated | The field app posts its own GPS reading      |
 | POST   | `/files/upload`  | Authenticated  | Upload any file → `{file_id, url, name, …}` |
 | GET    | `/files/{id}`    | Public         | Serve an uploaded file (capability URL)     |
 | DELETE | `/files/{id}`    | Authenticated  | Discard an uploaded file                   |
@@ -157,6 +159,77 @@ and `GET /users` (the list) stays flat, one row per employee.
   You can't delete yourself, and a delivery partner with an open vehicle loading
   returns `409` until the end-of-day is recorded. Set `account_status` to
   `inactive` instead when the history should stay attributed.
+
+## Staff Detail (Admin)
+
+The page is two calls: the static profile, and the live summary beside it.
+
+```
+GET /users/{user_id}            → profile, incl. employment_information.role_detail.workspace
+GET /users/{user_id}/overview   → operational summary for that workspace
+```
+
+Switch the layout on **`role_detail.workspace`**, never on the role's name — a firm
+can call its sales role anything. `role_detail` carries `id`, `name`, `workspace`,
+`data_scope`, `is_default` and the full `permissions` matrix.
+
+`GET /users/{user_id}/overview?date_from=&date_to=` returns a stable shape whatever
+the workspace. Always filled:
+
+| Block | Holds |
+|---|---|
+| `user_id`, `employee_id`, `name`, `workspace`, `role` | who this is, and which layout to render |
+| `period` | the window the series and period figures cover — defaults to the last 7 days |
+| `attendance` | today's row: `status` (`checked_in` / `checked_out` / `absent`), the four checkpoints, `active_duration_minutes` |
+| `current_location` | the last GPS reading, or `{"available": false}` |
+| `summary`, `performance`, `recent_activity` | shaped by the workspace |
+
+Then, by workspace:
+
+- **`sales`** — `summary` has `today_sales`, `orders_today`, `period_sales`,
+  `period_orders`, `assigned_customers`; `performance` is a per-day
+  `{date, sales_amount, orders}` series; plus the `recent_orders` and
+  `assigned_customers` lists.
+- **`delivery`** — `summary` has `deliveries_today` split into `completed_today` /
+  `pending_today` / `partial_today` / `failed_today`, plus `delivery_value`,
+  `amount_collected` and `amount_receivable`; `performance` is
+  `{date, deliveries_completed, delivery_amount}`; plus `assigned_deliveries` (the
+  open ones, each with `payment_type` and `amount_due`), `delivery_summary`, and
+  `vehicle` — the day's open loading.
+- **anything else** — a generic `summary`: `orders_created_period`,
+  `sales_amount_period`, `assigned_customers`, `days_present_period`.
+
+Blocks that do not apply to a workspace come back **`null`** rather than being
+omitted, so the frontend never has to guard for a missing key.
+
+An order counts as this employee's when they raised it, they are its salesperson, or
+it is out for their delivery. `amount_collected` is the payments recorded against
+their orders — a payment has no "collected by" column, so the order's assignment is
+the link.
+
+### Live location
+
+`POST /users/me/location` writes the caller's own position, and nothing else can
+write it:
+
+```json
+{ "latitude": 28.6315, "longitude": 77.2167,
+  "accuracy_meters": 15, "label": "Connaught Place, New Delhi",
+  "captured_at": "2026-08-13T11:18:00Z" }
+```
+
+`label` is optional and comes from the device — the backend does no reverse
+geocoding. Only the latest reading is kept, and until one arrives
+`current_location` reports `{"available": false}`. An employee's `work_location` is
+the office they are posted to and is **never** used as a live position.
+
+### Not available yet
+
+`visits_today`, `pending_followups`, `last_visit` and `next_followup` report `null`
+because there is no visits or follow-ups module. `pod_completed` and `pod_status`
+report `null` because proof of delivery is not captured. `vehicle.vehicle_number` is
+null — a loading records who is out with stock, not which van. There is deliberately
+no route / stops / view-route data: that needs a real route-planning module.
 
 ## Roles, permissions & staff login
 

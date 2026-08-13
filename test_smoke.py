@@ -2889,6 +2889,265 @@ def _roles_scoping_and_dashboard_checks():
 
 _roles_scoping_and_dashboard_checks()
 
+# ------------- Staff Detail: role workspace, location, overviews --------------
+# Wrapped in a function so this block's locals cannot shadow anything above it.
+
+
+def _staff_detail_checks():
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": f"{name} Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+
+    abc, ah = firm("StaffCo")
+    other, oh = firm("OtherCo")
+    roles = {r["name"]: r for r in client.get("/roles", headers=ah).json()}
+
+
+    def staff(first, role_name, pwd="Staff@12345"):
+        email = f"{first.lower()}_{uuid.uuid4().hex[:6]}@abc.com"
+        r = client.post("/users", headers=ah, json={
+            "basic_information": {"first_name": first, "last_name": "Kumar"},
+            "contact_information": {"official_email": email},
+            "login_security": {"password": pwd, "confirm_password": pwd},
+            "employment_information": {"role_id": roles[role_name]["id"]}})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        tok = client.post("/auth/login", json={"email": email, "password": pwd}).json()["tokens"]["access_token"]
+        return body, hdr(tok)
+
+
+    print("== 1. role_detail carries workspace + data_scope ==")
+    sales_emp, sales_hdr = staff("Sunil", "Sales Officer")
+    rd = sales_emp["employment_information"]["role_detail"]
+    print(json.dumps({k: rd[k] for k in ("id", "name", "workspace", "data_scope", "is_default")}, indent=2))
+    check("role_detail has workspace", rd["workspace"] == "sales", rd)
+    check("role_detail has data_scope", rd["data_scope"] == "own", rd)
+    check("role_detail still has id / name / is_default / permissions",
+          rd["id"] == roles["Sales Officer"]["id"] and rd["name"] == "Sales Officer"
+          and rd["is_default"] is True and isinstance(rd["permissions"], dict), rd)
+    check("GET /users/{id} reports the same",
+          client.get(f"/users/{sales_emp['id']}", headers=ah)
+          .json()["employment_information"]["role_detail"]["workspace"] == "sales")
+
+    print("\n== 2. POST /users/me/location ==")
+    r = client.get(f"/users/{sales_emp['id']}/overview", headers=ah)
+    check("no ping yet -> current_location.available false",
+          r.status_code == 200 and r.json()["current_location"] == {
+              "available": False, "latitude": None, "longitude": None,
+              "accuracy_meters": None, "label": None, "updated_at": None},
+          r.json().get("current_location"))
+    r = client.post("/users/me/location", headers=sales_hdr, json={
+        "latitude": 28.6315, "longitude": 77.2167, "accuracy_meters": 15,
+        "label": "Connaught Place, New Delhi", "captured_at": "2026-08-13T11:18:00Z"})
+    check("POST /users/me/location -> 200", r.status_code == 200, r.text[:300])
+    print(json.dumps(r.json(), indent=2))
+    check("ping echoes the reading",
+          r.json()["user_id"] == sales_emp["id"] and r.json()["latitude"] == 28.6315
+          and r.json()["accuracy_meters"] == 15
+          and r.json()["label"] == "Connaught Place, New Delhi", r.json())
+    loc = client.get(f"/users/{sales_emp['id']}/overview", headers=ah).json()["current_location"]
+    check("overview now reports the position",
+          loc["available"] is True and loc["latitude"] == 28.6315 and loc["longitude"] == 77.2167
+          and loc["label"] == "Connaught Place, New Delhi" and loc["updated_at"] is not None, loc)
+    check("work_location is never used as a live position",
+          client.patch(f"/users/{sales_emp['id']}", headers=ah,
+                       json={"employment_information": {"work_location": "Mumbai Office"}}).status_code == 200
+          and client.get(f"/users/{sales_emp['id']}/overview", headers=ah)
+          .json()["current_location"]["label"] == "Connaught Place, New Delhi")
+    check("bad latitude -> 422",
+          client.post("/users/me/location", headers=sales_hdr,
+                      json={"latitude": 200, "longitude": 77}).status_code == 422)
+    check("a ping only ever writes to the caller",
+          "user_id" in client.post("/users/me/location", headers=ah,
+                                   json={"latitude": 1, "longitude": 1}).json())
+    check("no token -> 403", client.post("/users/me/location",
+                                         json={"latitude": 1, "longitude": 1}).status_code == 403)
+
+    print("\n== 3. Sales workspace overview ==")
+    cust = client.post("/customers", headers=sales_hdr, json={
+        "basic_information": {"customer_name": "Sharma Retail Store"},
+        "contact_information": {"mobile_number": "9800000001"},
+        "address_information": {"city": "New Delhi"},
+        "sales_crm_information": {"territory": "Karol Bagh"}}).json()
+    prod = client.post("/products", headers=ah, json={
+        "name": "Water 20L", "price": 60, "total_inventory": 500}).json()
+    order = client.post("/orders", headers=sales_hdr, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 60}]}).json()
+    client.patch(f"/orders/{order['id']}/approve", headers=ah)
+
+    r = client.get(f"/users/{sales_emp['id']}/overview", headers=ah)
+    check("GET /users/{id}/overview -> 200", r.status_code == 200, r.text[:400])
+    d = r.json()
+    print(json.dumps(d, indent=2)[:2000])
+    check("top level identifies the employee and the layout",
+          d["user_id"] == sales_emp["id"] and d["employee_id"] == sales_emp["employee_id"]
+          and d["name"] == "Sunil Kumar" and d["workspace"] == "sales"
+          and d["role"]["name"] == "Sales Officer", d)
+    check("period is echoed", set(d["period"]) == {"date_from", "date_to"}, d["period"])
+    check("sales summary keys",
+          set(d["summary"]) == {"today_sales", "orders_today", "period_sales", "period_orders",
+                                "assigned_customers", "visits_today", "pending_followups"},
+          d["summary"])
+    check("today's sale counted", d["summary"]["today_sales"] == 180
+          and d["summary"]["orders_today"] == 1, d["summary"])
+    check("assigned customers counted", d["summary"]["assigned_customers"] == 1, d["summary"])
+    check("visits / follow-ups are null until those modules exist",
+          d["summary"]["visits_today"] is None and d["summary"]["pending_followups"] is None, d["summary"])
+    check("performance is a per-day series",
+          len(d["performance"]) == 7
+          and all(set(p) == {"date", "sales_amount", "orders"} for p in d["performance"]),
+          d["performance"][:2])
+    check("today's point carries the sale",
+          d["performance"][-1]["sales_amount"] == 180 and d["performance"][-1]["orders"] == 1,
+          d["performance"][-1])
+    check("recent orders carry the customer and amount",
+          d["recent_orders"] and d["recent_orders"][0]["order_number"] == order["order_number"]
+          and d["recent_orders"][0]["customer_name"] == "Sharma Retail Store"
+          and d["recent_orders"][0]["amount"] == 180, d["recent_orders"][:1])
+    check("assigned customers list carries area / outstanding / last order",
+          d["assigned_customers"] and d["assigned_customers"][0]["name"] == "Sharma Retail Store"
+          and d["assigned_customers"][0]["area"] == "Karol Bagh"
+          and d["assigned_customers"][0]["last_order_date"] is not None
+          and d["assigned_customers"][0]["last_visit"] is None, d["assigned_customers"][:1])
+    check("recent activity has the order, newest first",
+          d["recent_activity"] and d["recent_activity"][0]["type"] == "order_created"
+          and d["recent_activity"][0]["order_number"] == order["order_number"], d["recent_activity"][:1])
+    check("delivery-only blocks are null on a sales overview",
+          d["vehicle"] is None and d["assigned_deliveries"] is None
+          and d["delivery_summary"] is None, d)
+    check("attendance reports absent before any check-in",
+          d["attendance"]["status"] == "absent" and d["attendance"]["check_in"] is None, d["attendance"])
+    client.post("/attendance/check-in", headers=sales_hdr, json={"type": "office_check_in"})
+    att = client.get(f"/users/{sales_emp['id']}/overview", headers=ah).json()["attendance"]
+    check("after a check-in it reports checked_in with a duration",
+          att["status"] == "checked_in" and att["check_in"] is not None
+          and att["active_duration_minutes"] is not None, att)
+
+    print("\n== 4. Delivery workspace overview ==")
+    dp, dp_hdr = staff("Ramesh", "Delivery Partner")
+    o2 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 60}]}).json()
+    client.patch(f"/orders/{o2['id']}/approve", headers=ah)
+    client.patch(f"/orders/{o2['id']}/assign-delivery-partner", headers=ah,
+                 json={"delivery_partner_id": dp["id"]})
+    o3 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 60}]}).json()
+    client.patch(f"/orders/{o3['id']}/approve", headers=ah)
+    client.patch(f"/orders/{o3['id']}/assign-delivery-partner", headers=ah,
+                 json={"delivery_partner_id": dp["id"]})
+    client.patch(f"/deliveries/{o3['id']}/status", headers=ah, json={"status": "Delivered"})
+    client.post(f"/customers/{cust['id']}/payments", headers=ah,
+                json={"amount": 60, "payment_mode": "cash", "order_id": o3["id"]})
+
+    r = client.get(f"/users/{dp['id']}/overview", headers=ah)
+    check("delivery overview -> 200", r.status_code == 200, r.text[:400])
+    dd = r.json()
+    print(json.dumps({k: dd[k] for k in ("workspace", "summary", "delivery_summary",
+                                         "vehicle", "assigned_deliveries")}, indent=2)[:1800])
+    check("workspace is delivery", dd["workspace"] == "delivery", dd["workspace"])
+    check("delivery summary keys",
+          set(dd["summary"]) == {"deliveries_today", "completed_today", "pending_today",
+                                 "partial_today", "failed_today", "delivery_value",
+                                 "amount_collected", "amount_receivable"}, dd["summary"])
+    check("today's deliveries split by outcome",
+          dd["summary"]["deliveries_today"] == 2 and dd["summary"]["completed_today"] == 1
+          and dd["summary"]["pending_today"] == 1, dd["summary"])
+    check("delivery value is today's assigned total",
+          dd["summary"]["delivery_value"] == 420, dd["summary"])
+    check("amount collected comes from payments on their orders",
+          dd["summary"]["amount_collected"] == 60, dd["summary"])
+    check("receivable is delivered minus collected",
+          dd["summary"]["amount_receivable"] == 60, dd["summary"])
+    check("delivery_summary breaks the period down",
+          dd["delivery_summary"]["successful"] == 1 and dd["delivery_summary"]["pending"] == 1
+          and dd["delivery_summary"]["pod_completed"] is None, dd["delivery_summary"])
+    check("performance is a per-day delivery series",
+          all(set(p) == {"date", "deliveries_completed", "delivery_amount"} for p in dd["performance"])
+          and dd["performance"][-1]["deliveries_completed"] == 1, dd["performance"][-1])
+    check("assigned deliveries list only the open ones",
+          [x["order_number"] for x in dd["assigned_deliveries"]] == [o2["order_number"]],
+          dd["assigned_deliveries"])
+    check("an assigned delivery carries payment type and amount due",
+          dd["assigned_deliveries"][0]["payment_type"] == "cod"
+          and dd["assigned_deliveries"][0]["amount_due"] == 300
+          and dd["assigned_deliveries"][0]["customer_name"] == "Sharma Retail Store",
+          dd["assigned_deliveries"][0])
+    check("recent activity has the completed delivery and the payment",
+          {"delivery_completed", "payment_received"} <= {a["type"] for a in dd["recent_activity"]},
+          [a["type"] for a in dd["recent_activity"]])
+    check("sales-only blocks are null on a delivery overview",
+          dd["recent_orders"] is None and dd["assigned_customers"] is None, dd)
+    check("no vehicle loading yet -> vehicle is null", dd["vehicle"] is None, dd["vehicle"])
+    client.post("/purchase-invoices", headers=ah, json={
+        "invoice_number": f"PI-{uuid.uuid4().hex[:6]}",
+        "supplier_id": client.post("/suppliers", headers=ah,
+                                   json={"name": "Sup", "phone": "9800000000"}).json()["id"],
+        "items": [{"product_id": prod["id"], "quantity": 50, "purchase_price": 40}]})
+    client.patch(f"/purchase-invoices/{client.get('/purchase-invoices', headers=ah).json()[0]['id']}/approve",
+                 headers=ah)
+    client.post("/vehicle-stock/loading", headers=ah, json={
+        "delivery_partner_id": dp["id"], "items": [{"product_id": prod["id"], "loaded_qty": 10}]})
+    veh = client.get(f"/users/{dp['id']}/overview", headers=ah).json()["vehicle"]
+    check("an open loading shows as the day's vehicle",
+          veh is not None and veh["items"] == 1 and veh["vehicle_number"] is None, veh)
+
+    print("\n== 5. Generic workspace ==")
+    acc, acc_hdr = staff("Asha", "Accountant")
+    g = client.get(f"/users/{acc['id']}/overview", headers=ah).json()
+    check("workspace is the role's own", g["workspace"] == "accounts", g["workspace"])
+    check("generic summary keys",
+          set(g["summary"]) == {"orders_created_period", "sales_amount_period",
+                                "assigned_customers", "days_present_period"}, g["summary"])
+    check("workspace-specific blocks are all null",
+          g["recent_orders"] is None and g["assigned_customers"] is None
+          and g["assigned_deliveries"] is None and g["vehicle"] is None
+          and g["delivery_summary"] is None, g)
+    check("attendance and location still reported",
+          "status" in g["attendance"] and g["current_location"]["available"] is False, g)
+    r = client.patch(f"/roles/{roles['Accountant']['id']}", headers=ah, json={"workspace": None})
+    g2 = client.get(f"/users/{acc['id']}/overview", headers=ah).json()
+    check("a role with no workspace still returns the generic layout",
+          r.status_code == 200 and g2["workspace"] is None and g2["summary"] is not None, g2["workspace"])
+
+    print("\n== 6. Filters, scoping and permissions ==")
+    check("date range sizes the performance series",
+          len(client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                         params={"date_from": "2026-08-01", "date_to": "2026-08-03"})
+              .json()["performance"]) == 3)
+    check("an old window reports no period sales",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                     params={"date_from": "2000-01-01", "date_to": "2000-01-05"})
+          .json()["summary"]["period_sales"] == 0)
+    check("date_from after date_to -> 400",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                     params={"date_from": "2026-08-10", "date_to": "2026-08-01"}).status_code == 400)
+    check("a bad date -> 400",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                     params={"date_from": "13-08-2026"}).status_code == 400)
+    check("another firm cannot read this employee's overview -> 404",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=oh).status_code == 404)
+    check("unknown employee -> 404",
+          client.get("/users/no-such-user/overview", headers=ah).status_code == 404)
+    check("staff cannot read the Staff Detail overview -> 403",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=sales_hdr).status_code == 403)
+    check("no token -> 403", client.get(f"/users/{sales_emp['id']}/overview").status_code == 403)
+
+
+_staff_detail_checks()
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

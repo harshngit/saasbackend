@@ -11,7 +11,9 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.permissions import DEFAULT_DATA_SCOPE
 from app.models.enums import UserRole
+from app.schemas.role import DataScopeOut
 
 
 class EmploymentType(str, Enum):
@@ -89,12 +91,18 @@ StringList = Annotated[list[str], BeforeValidator(_as_list)]
 
 
 class RoleBrief(BaseModel):
-    """Compact role info nested inside a user (name + permission matrix)."""
+    """The role as it appears nested inside an employee.
+
+    `workspace` is what the Staff Detail page switches on to pick a layout — read
+    that, not the role's name, since a firm can call its sales role anything.
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     name: str
+    workspace: str | None = None
+    data_scope: DataScopeOut = DEFAULT_DATA_SCOPE
     is_default: bool
     permissions: dict[str, dict[str, bool]]
 

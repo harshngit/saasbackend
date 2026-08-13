@@ -1,13 +1,16 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_system_role, require_unlocked_org
+from app.core.deps import get_current_user, require_system_role, require_unlocked_org
 from app.core.security import hash_password
 from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, User, VehicleLoading
 from app.schemas.auth import MessageResponse
 from app.schemas.employee_profile import EmployeeProfileIn, EmployeeProfileOut
+from app.schemas.staff_overview import LocationPing, LocationPingOut, StaffOverviewOut
 from app.schemas.user import (
     COLLECTION_COLUMN,
     AccountStatus,
@@ -22,6 +25,7 @@ from app.services import (
     employee_profile_service,
     password_service,
     role_service,
+    staff_overview_service,
 )
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -273,6 +277,71 @@ def list_staff(
     if reporting_manager_id is not None:
         query = query.filter(User.reporting_manager_id == reporting_manager_id)
     return query.order_by(User.created_at.desc()).all()
+
+
+@router.post("/me/location", response_model=LocationPingOut)
+def report_my_location(
+    payload: LocationPing,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> LocationPingOut:
+    """The field app posts the device's own GPS reading here.
+
+    Writes to the caller only — nobody can post a position for someone else. Only
+    the latest reading is kept; it is what `current_location` reports on
+    GET /users/{id}/overview, and until one arrives that block says
+    `available: false`. An employee's `work_location` is the office they are posted
+    to and is never treated as a live position.
+    """
+    user.last_latitude = payload.latitude
+    user.last_longitude = payload.longitude
+    user.last_location_accuracy_m = payload.accuracy_meters
+    user.last_location_label = payload.label
+    user.last_location_at = payload.captured_at or datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(user)
+    return LocationPingOut(
+        user_id=user.id,
+        latitude=user.last_latitude,
+        longitude=user.last_longitude,
+        accuracy_meters=user.last_location_accuracy_m,
+        label=user.last_location_label,
+        updated_at=user.last_location_at,
+    )
+
+
+@router.get("/{user_id}/overview", response_model=StaffOverviewOut)
+def staff_overview(
+    user_id: str,
+    date_from: str | None = Query(default=None, description="YYYY-MM-DD; defaults to 6 days ago"),
+    date_to: str | None = Query(default=None, description="YYYY-MM-DD; defaults to today"),
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> StaffOverviewOut:
+    """The operational half of the Staff Detail page, shaped by the employee's role.
+
+    GET /users/{id} stays the static profile; this is the live summary beside it.
+    Which blocks are filled depends on `role_detail.workspace`, and the response
+    repeats it as `workspace` so the page can pick a layout:
+
+    * `sales` — today's and the period's sales, assigned customers, recent orders,
+      a per-day performance series, attendance, last known location.
+    * `delivery` — today's deliveries split by outcome, delivery value, amount
+      collected and receivable, the open assigned deliveries, the day's vehicle
+      loading, attendance, last known location.
+    * anything else — a generic block: orders raised, sales value, assigned
+      customers and days present.
+
+    Blocks that do not apply to the workspace come back `null` rather than being
+    left out, so the shape never changes under the frontend.
+
+    `date_from` / `date_to` size the `performance` series and the period figures;
+    today's counters and the balances are always as of now. Visits and follow-ups
+    report `null` until those modules exist, and proof-of-delivery likewise.
+    """
+    return staff_overview_service.build_staff_overview(
+        db, _owned_user(db, user_id, admin), date_from=date_from, date_to=date_to
+    )
 
 
 @router.get("/{user_id}", response_model=EmployeeProfileOut)
