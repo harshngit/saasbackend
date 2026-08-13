@@ -28,8 +28,11 @@ class InvoiceItemOut(BaseModel):
     quantity: int
     unit_price: float
     discount: float
-    tax: float
+    tax: float = Field(description="Tax amount on the line")
+    tax_rate: float | None = Field(default=None, description="The rate it was billed at, as a %")
     line_total: float
+    delivery_item_id: str | None = None
+    order_item_id: str | None = None
 
 
 class CustomerBrief(BaseModel):
@@ -49,11 +52,15 @@ class InvoiceOut(BaseModel):
     order_id: str | None
     customer_id: str | None
     customer: CustomerBrief | None
+    delivery_id: str | None = None
     invoice_date: datetime
+    due_date: datetime | None = None
     status: str
     subtotal: float
     discount: float
     tax: float
+    additional_charges: float | None = None
+    round_off: float | None = None
     total: float
     amount_paid: float
     notes: str | None
@@ -73,11 +80,34 @@ class InvoiceOut(BaseModel):
     billing_address: str | None = None
 
 
+class InvoiceFromDelivery(BaseModel):
+    """Bill an order for what a delivery actually handed over.
+
+    Send `delivery_id` and the invoice is built from that delivery's **delivered**
+    quantities, at the rates and taxes the order line agreed. Send nothing to bill the
+    whole order as ordered — the older behaviour, still there for an order with no
+    delivery behind it.
+
+    Which of those a firm wants for a part-delivered order is its
+    `partial_delivery_invoice_mode` setting: `per_delivery` bills each delivery as it
+    happens, `after_full_order` waits until everything has been delivered and bills
+    once.
+    """
+
+    delivery_id: str | None = None
+
+
 class InvoiceCreate(BaseModel):
     customer_id: str
     invoice_date: datetime | None = None
     discount: float = Field(default=0, ge=0)
     tax: float = Field(default=0, ge=0)
+    additional_charges: float | None = Field(
+        default=None, description="Freight, packing or delivery fee added to the total"
+    )
+    round_off: float | None = Field(
+        default=None, description="Paise rounding, positive or negative, applied to the total"
+    )
     notes: str | None = None
     items: list[InvoiceItemIn] = Field(min_length=1)
 

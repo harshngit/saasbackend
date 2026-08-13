@@ -36,7 +36,15 @@ class Invoice(Base):
     customer_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Which delivery this bills. A partial delivery is billed for what was actually
+    # handed over, so one order can carry several invoices — see
+    # `partial_delivery_invoice_mode` in the firm's workflow settings.
+    delivery_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("deliveries.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     invoice_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    # When payment is due, from the order's payment terms. Drives the ageing buckets.
+    due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Copied from the customer when the invoice is raised — a bill must keep the
     # address it was issued to, even if the customer later moves.
     billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -46,6 +54,10 @@ class Invoice(Base):
     subtotal: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     tax: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    # Freight, packing, or a delivery fee added to the bill, and the paise rounding
+    # that makes the total a whole rupee. Both print on the detailed invoice.
+    additional_charges: Mapped[float | None] = mapped_column(Float, nullable=True)
+    round_off: Mapped[float | None] = mapped_column(Float, nullable=True)
     total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     amount_paid: Mapped[float] = mapped_column(Float, default=0, nullable=False)
 
@@ -90,5 +102,13 @@ class InvoiceItem(Base):
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
     tax_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The delivery line this bills, so an invoice traces back to what was handed over.
+    delivery_item_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("delivery_items.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    order_item_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sales_order_items.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     invoice: Mapped["Invoice"] = relationship(back_populates="items")

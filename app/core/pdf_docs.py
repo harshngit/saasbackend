@@ -1,6 +1,7 @@
 """On-the-fly PDF generation for receipts, invoices, and delivery challans."""
 
 from datetime import datetime
+from io import BytesIO
 
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
@@ -58,162 +59,6 @@ def payment_receipt_pdf(org, customer, payment) -> bytes:
     pdf.ln(8)
     pdf.set_font("Helvetica", "I", 8)
     pdf.cell(0, 5, f"Generated on {datetime.utcnow().date().isoformat()} - computer-generated receipt.",
-             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    return bytes(pdf.output())
-
-
-def invoice_pdf(org, customer, invoice) -> bytes:
-    """A clean, professional GST Tax Invoice using FPDF."""
-    pdf = FPDF()
-    pdf.add_page()
-    _org_header(pdf, org)
-
-    # Title
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 8, "TAX INVOICE", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(2)
-
-    # Billing & Invoice Info columns
-    pdf.set_font("Helvetica", size=9)
-    col_width = 90
-    
-    # Save Y position
-    start_y = pdf.get_y()
-    
-    # Left Column: Billed To
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(col_width, 5, "BILLED TO:", new_x=XPos.RIGHT, new_y=YPos.LAST)
-    
-    # Right Column: Invoice Details
-    pdf.set_x(col_width + 10)
-    pdf.cell(col_width, 5, "INVOICE DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    # Content rows
-    pdf.set_font("Helvetica", size=9)
-    # Row 1
-    pdf.cell(col_width, 5, _s(customer.business_name or customer.name), new_x=XPos.RIGHT, new_y=YPos.LAST)
-    pdf.set_x(col_width + 10)
-    pdf.cell(col_width, 5, _s(f"Invoice No: {invoice.invoice_number}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    # Row 2
-    cust_gst = f"GSTIN: {customer.gst_number}" if customer.gst_number else "GSTIN: Not Provided"
-    pdf.cell(col_width, 5, _s(cust_gst), new_x=XPos.RIGHT, new_y=YPos.LAST)
-    pdf.set_x(col_width + 10)
-    pdf.cell(col_width, 5, _s(f"Date: {invoice.invoice_date.date().isoformat()}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    # Row 3
-    addr = (customer.billing_address or "")[:45]
-    pdf.cell(col_width, 5, _s(addr), new_x=XPos.RIGHT, new_y=YPos.LAST)
-    pdf.set_x(col_width + 10)
-    order_num = invoice.order.order_number if invoice.order else "Direct Sale"
-    pdf.cell(col_width, 5, _s(f"Order Ref: {order_num}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    pdf.ln(5)
-
-    # Line Items Table. HSN/SAC is a statutory column on a GST invoice, so it sits
-    # right after the description — the product column gives up the width for it.
-    pdf.set_font("Helvetica", "B", 9)
-    widths = [58, 22, 25, 15, 20, 15, 35]
-    headers = ["Product / Service", "HSN/SAC", "Unit Price", "Qty", "Discount", "GST %", "Total"]
-
-    for w, h in zip(widths, headers):
-        pdf.cell(w, 7, h, border=1, align="C" if w != 58 else "L")
-    pdf.ln(7)
-    
-    pdf.set_font("Helvetica", size=9)
-    for item in invoice.items:
-        # Product Name
-        pdf.cell(widths[0], 7, _s(item.product_name[:30]), border=1)
-        # HSN / SAC — copied from the product when the invoice was raised
-        pdf.cell(widths[1], 7, _s(item.hsn_code or "-"), border=1, align="C")
-        # Unit Price
-        pdf.cell(widths[2], 7, _s(f"Rs {item.unit_price:,.2f}"), border=1, align="R")
-        # Qty
-        pdf.cell(widths[3], 7, _s(str(item.quantity)), border=1, align="C")
-        # Discount
-        pdf.cell(widths[4], 7, _s(f"Rs {item.discount:,.2f}"), border=1, align="R")
-        # GST Rate (derived from the line's tax; falls back to 18%)
-        gst_pct = f"{int(item.tax / (item.line_total - item.tax) * 100)}%" if (item.line_total - item.tax) > 0 and item.tax > 0 else "18%"
-        pdf.cell(widths[5], 7, _s(gst_pct), border=1, align="C")
-        # Total
-        pdf.cell(widths[6], 7, _s(f"Rs {item.line_total:,.2f}"), border=1, align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        
-    pdf.ln(3)
-
-    # Determine CGST/SGST/IGST breakdown from GSTIN state codes (first 2 digits)
-    state_org = org.gst_number[:2] if org and org.gst_number and len(org.gst_number) >= 2 else None
-    state_cust = customer.gst_number[:2] if customer and customer.gst_number and len(customer.gst_number) >= 2 else None
-    
-    # Default to intra-state (CGST + SGST) if either GSTIN is missing or state codes match
-    is_interstate = state_org and state_cust and state_org != state_cust
-    
-    total_tax = invoice.tax
-    cgst, sgst, igst = 0.0, 0.0, 0.0
-    if is_interstate:
-        igst = total_tax
-    else:
-        cgst = round(total_tax / 2, 2)
-        sgst = round(total_tax / 2, 2)
-        
-    # Totals section
-    pdf.set_font("Helvetica", size=9)
-    totals_col = 135
-    val_col = 55
-    
-    # Subtotal
-    pdf.set_x(totals_col)
-    pdf.cell(30, 5, "Subtotal:", align="R")
-    pdf.cell(val_col, 5, _s(f"Rs {invoice.subtotal:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    # Discount
-    if invoice.discount > 0:
-        pdf.set_x(totals_col)
-        pdf.cell(30, 5, "Discount:", align="R")
-        pdf.cell(val_col, 5, _s(f"- Rs {invoice.discount:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        
-    # GST Taxes
-    if is_interstate:
-        if igst > 0:
-            pdf.set_x(totals_col)
-            pdf.cell(30, 5, "IGST:", align="R")
-            pdf.cell(val_col, 5, _s(f"Rs {igst:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    else:
-        if cgst > 0 or sgst > 0:
-            pdf.set_x(totals_col)
-            pdf.cell(30, 5, "CGST:", align="R")
-            pdf.cell(val_col, 5, _s(f"Rs {cgst:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.set_x(totals_col)
-            pdf.cell(30, 5, "SGST:", align="R")
-            pdf.cell(val_col, 5, _s(f"Rs {sgst:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            
-    # Total
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_x(totals_col)
-    pdf.cell(30, 6, "Total (incl. GST):", align="R")
-    pdf.cell(val_col, 6, _s(f"Rs {invoice.total:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    # Amount Paid & Due
-    pdf.set_font("Helvetica", size=9)
-    if invoice.amount_paid > 0:
-        pdf.set_x(totals_col)
-        pdf.cell(30, 5, "Amount Paid:", align="R")
-        pdf.cell(val_col, 5, _s(f"Rs {invoice.amount_paid:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        
-    due = round(invoice.total - invoice.amount_paid, 2)
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_x(totals_col)
-    pdf.cell(30, 5, "Balance Due:", align="R")
-    pdf.cell(val_col, 5, _s(f"Rs {due:,.2f}"), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    
-    if invoice.notes:
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "I", size=8)
-        pdf.cell(0, 5, _s(f"Notes: {invoice.notes}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    # Footer
-    pdf.ln(8)
-    pdf.set_font("Helvetica", "I", 8)
-    pdf.cell(0, 5, f"Generated on {datetime.utcnow().date().isoformat()} - computer-generated tax invoice.",
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     return bytes(pdf.output())
 
@@ -467,3 +312,297 @@ def delivery_challan_pdf(org, delivery, order, customer, partner, vehicle) -> by
     pdf.cell(80, 5, "Dispatched by", border="T", align="C")
 
     return bytes(pdf.output())
+
+
+# --------------------- invoice: simple and detailed formats ---------------------
+# One invoice record, two printed formats. Both are driven by the firm's invoice
+# settings (GET/PATCH /invoice-settings): its paper size, brand colour, logo and the
+# fifteen show/hide toggles decide what gets drawn. A field the firm has switched off
+# simply does not appear, and no column is hardcoded on.
+
+_PAPER_FORMATS = {"a4": "A4", "a5": "A5", "thermal": (80, 250)}
+
+
+def _hex_rgb(value) -> tuple[int, int, int] | None:
+    """A #rrggbb brand colour as an RGB triple, or None when it is not usable."""
+    text = str(value or "").strip().lstrip("#")
+    if len(text) != 6:
+        return None
+    try:
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+    except ValueError:
+        return None
+
+
+def _money(value) -> str:
+    return f"{(value or 0):,.2f}"
+
+
+def _invoice_pdf_page(settings: dict) -> FPDF:
+    size = _PAPER_FORMATS.get(str(settings.get("paper_size") or "A4").lower(), "A4")
+    pdf = FPDF(format=size)
+    pdf.add_page()
+    return pdf
+
+
+def _usable_width(pdf: FPDF) -> float:
+    return pdf.w - pdf.l_margin - pdf.r_margin
+
+
+def _logo(pdf: FPDF, logo: bytes | None) -> None:
+    """Draw the firm's uploaded logo, if there is one it can read.
+
+    A logo the image library cannot decode must never cost the firm its invoice, so
+    a failure here just leaves the letterhead plain.
+    """
+    if not logo:
+        return
+    try:
+        pdf.image(BytesIO(logo), x=pdf.l_margin, y=pdf.t_margin, h=16)
+        pdf.ln(18)
+    except Exception:  # noqa: BLE001 - unreadable upload, print without it
+        pass
+
+
+def _branded_title(pdf: FPDF, settings: dict, title: str) -> None:
+    rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
+    if rgb:
+        pdf.set_text_color(*rgb)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, _s(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_text_color(0, 0, 0)
+
+
+def _two_column_rows(pdf: FPDF, rows: list[tuple[str, str]], column: float) -> None:
+    pdf.set_font("Helvetica", size=9)
+    for left, right in rows:
+        pdf.cell(column, 5, _s(left), new_x=XPos.RIGHT, new_y=YPos.LAST)
+        pdf.set_x(pdf.l_margin + column + 4)
+        pdf.cell(column, 5, _s(right), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+
+def _amount_row(pdf: FPDF, label: str, value, width: float, height: float = 5) -> None:
+    pdf.cell(width - 30, height, _s(f"{label}:"), align="R")
+    pdf.cell(30, height, _money(value), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+
+def _outstanding(invoice) -> float:
+    return round((invoice.total or 0) - (invoice.amount_paid or 0), 2)
+
+
+def _invoice_footer(pdf: FPDF, org, settings: dict, fields: dict) -> None:
+    """Bank, UPI, terms, notes, footer line and signature — each one a toggle."""
+    pdf.ln(3)
+    pdf.set_font("Helvetica", size=8)
+    if fields.get("show_bank_details") and org is not None:
+        bank = " | ".join(part for part in (
+            org.bank_name,
+            f"A/c {org.bank_account_holder}" if org.bank_account_holder else None,
+            f"IFSC {org.bank_ifsc}" if org.bank_ifsc else None,
+            org.bank_account_details,
+        ) if part)
+        if bank:
+            pdf.multi_cell(0, 4, _s(f"Bank: {bank}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if fields.get("show_upi_qr") and org is not None and org.upi_id:
+        pdf.multi_cell(0, 4, _s(f"UPI: {org.upi_id}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if fields.get("show_terms") and settings.get("terms"):
+        pdf.multi_cell(0, 4, _s(f"Terms: {settings['terms']}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if settings.get("notes"):
+        pdf.multi_cell(0, 4, _s(f"Note: {settings['notes']}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if settings.get("footer_text"):
+        pdf.ln(1)
+        pdf.multi_cell(0, 4, _s(settings["footer_text"]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if fields.get("show_signature"):
+        pdf.ln(8)
+        pdf.cell(0, 5, "Authorised signatory", border="T", align="R")
+
+
+def invoice_simple_pdf(org, customer, invoice, settings: dict, logo: bytes | None = None) -> bytes:
+    """The short customer copy: what was bought, what is owed, when it is due.
+
+    No tax breakdown, no GSTINs, no addresses — this is the one that goes out over
+    WhatsApp, so it stays to invoice number, order reference, items, total, payment
+    status and due date.
+    """
+    fields = settings.get("fields") or {}
+    pdf = _invoice_pdf_page(settings)
+    _logo(pdf, logo)
+    _org_header(pdf, org)
+    _branded_title(pdf, settings, "INVOICE")
+    pdf.ln(1)
+
+    width = _usable_width(pdf)
+    column = (width - 4) / 2
+    due = invoice.due_date.date().isoformat() if invoice.due_date else "-"
+    name = (customer.business_name or customer.name) if customer else "Cash Customer"
+    _two_column_rows(pdf, [
+        (name, f"Invoice No: {invoice.invoice_number}"),
+        (
+            f"Phone: {customer.phone}" if customer is not None and customer.phone else "",
+            f"Date: {invoice.invoice_date.date().isoformat()}",
+        ),
+        ("", f"Order Ref: {invoice.order.order_number}" if invoice.order else "Direct Sale"),
+        ("", f"Due Date: {due}"),
+        ("", f"Payment Status: {(invoice.status or 'unpaid').replace('_', ' ').title()}"),
+    ], column)
+    pdf.ln(4)
+
+    shares = [0.52, 0.12, 0.16, 0.20]
+    widths = [round(width * share, 2) for share in shares]
+    pdf.set_font("Helvetica", "B", 9)
+    for w, header, align in zip(widths, ["Item", "Qty", "Rate", "Amount"], "LRRR"):
+        pdf.cell(w, 7, header, border=1, align=align)
+    pdf.ln(7)
+
+    pdf.set_font("Helvetica", size=9)
+    for item in invoice.items:
+        cells = [
+            _s(item.product_name)[:44],
+            f"{item.quantity:g}",
+            _money(item.unit_price),
+            _money(item.line_total),
+        ]
+        for w, text, align in zip(widths, cells, "LRRR"):
+            pdf.cell(w, 6, text, border=1, align=align)
+        pdf.ln(6)
+
+    pdf.ln(2)
+    pdf.set_font("Helvetica", size=9)
+    _amount_row(pdf, "Subtotal", invoice.subtotal, width)
+    if invoice.discount:
+        _amount_row(pdf, "Discount", -(invoice.discount or 0), width)
+    if invoice.tax:
+        _amount_row(pdf, "Tax", invoice.tax, width)
+    pdf.set_font("Helvetica", "B", 11)
+    _amount_row(pdf, "Total", invoice.total, width, height=7)
+    pdf.set_font("Helvetica", size=9)
+    _amount_row(pdf, "Paid", invoice.amount_paid, width)
+    _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
+
+    # The short copy never carries bank details; everything else is the firm's choice.
+    _invoice_footer(pdf, org, settings, {**fields, "show_bank_details": False})
+    return bytes(pdf.output())
+
+
+def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | None = None) -> bytes:
+    """The full tax invoice: GSTINs, both addresses, HSN/SAC and the tax split.
+
+    Columns are assembled from the firm's toggles and then scaled to the paper, so a
+    firm that does not print HSN or MRP gets a table without those columns rather
+    than empty ones.
+    """
+    fields = settings.get("fields") or {}
+    pdf = _invoice_pdf_page(settings)
+    _logo(pdf, logo)
+    _org_header(pdf, org)
+    if fields.get("show_company_gstin") and org is not None and (org.gst_number or org.gstin_pan):
+        pdf.set_font("Helvetica", size=9)
+        pdf.cell(
+            0, 5, _s(f"GSTIN / PAN: {org.gst_number or org.gstin_pan}"),
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+        )
+    _branded_title(pdf, settings, "TAX INVOICE")
+    pdf.ln(1)
+
+    width = _usable_width(pdf)
+    column = (width - 4) / 2
+
+    left = [(customer.business_name or customer.name) if customer else "Cash Customer"]
+    if fields.get("show_customer_gstin"):
+        gstin = customer.gst_number if customer is not None else None
+        left.append(f"GSTIN: {gstin}" if gstin else "GSTIN: Not Provided")
+    if fields.get("show_billing_address"):
+        billing = invoice.billing_address or (customer.billing_address if customer else None)
+        left.append(f"Bill to: {str(billing or '-')[:44]}")
+    if fields.get("show_shipping_address"):
+        shipping = customer.delivery_address if customer is not None else None
+        left.append(f"Ship to: {str(shipping or '-')[:44]}")
+
+    right = [
+        f"Invoice No: {invoice.invoice_number}",
+        f"Date: {invoice.invoice_date.date().isoformat()}",
+        f"Order Ref: {invoice.order.order_number}" if invoice.order else "Direct Sale",
+        f"Due Date: {invoice.due_date.date().isoformat() if invoice.due_date else '-'}",
+        f"Payment Status: {(invoice.status or 'unpaid').replace('_', ' ').title()}",
+    ]
+    pad = [""] * abs(len(left) - len(right))
+    rows = list(zip(left + pad if len(left) < len(right) else left,
+                    right + pad if len(right) < len(left) else right))
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(column, 5, "BILLED TO:", new_x=XPos.RIGHT, new_y=YPos.LAST)
+    pdf.set_x(pdf.l_margin + column + 4)
+    pdf.cell(column, 5, "INVOICE DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    _two_column_rows(pdf, rows, column)
+    pdf.ln(4)
+
+    columns: list[tuple[str, float, str]] = [("Item", 44, "L")]
+    if fields.get("show_hsn_sac"):
+        columns.append(("HSN/SAC", 18, "C"))
+    if fields.get("show_batch_number"):
+        columns.append(("Batch", 16, "C"))
+    if fields.get("show_expiry_date"):
+        columns.append(("Expiry", 18, "C"))
+    if fields.get("show_mrp"):
+        columns.append(("MRP", 18, "R"))
+    columns.append(("Qty", 13, "R"))
+    columns.append(("Rate", 20, "R"))
+    if fields.get("show_discount"):
+        columns.append(("Disc", 16, "R"))
+    if fields.get("show_tax_rate"):
+        columns.append(("Tax %", 14, "R"))
+    if fields.get("show_tax_amount"):
+        columns.append(("Tax", 18, "R"))
+    columns.append(("Amount", 24, "R"))
+
+    scale = width / sum(w for _, w, _ in columns)
+    widths = [round(w * scale, 2) for _, w, _ in columns]
+
+    pdf.set_font("Helvetica", "B", 8)
+    for w, (header, _, align) in zip(widths, columns):
+        pdf.cell(w, 7, header, border=1, align=align)
+    pdf.ln(7)
+
+    pdf.set_font("Helvetica", size=8)
+    for item in invoice.items:
+        # Batch and expiry are per-item tracking, which no invoice line captures yet,
+        # so a firm that turns those columns on gets them empty rather than wrong.
+        values = {
+            "Item": _s(item.product_name)[:30],
+            "HSN/SAC": _s(item.hsn_code or "-"),
+            "Batch": "-",
+            "Expiry": "-",
+            "MRP": _money(item.unit_price),
+            "Qty": f"{item.quantity:g}",
+            "Rate": _money(item.unit_price),
+            "Disc": _money(item.discount),
+            "Tax %": f"{(item.tax_rate or 0):g}",
+            "Tax": _money(item.tax),
+            "Amount": _money(item.line_total),
+        }
+        for w, (header, _, align) in zip(widths, columns):
+            pdf.cell(w, 6, values[header], border=1, align=align)
+        pdf.ln(6)
+
+    pdf.ln(2)
+    pdf.set_font("Helvetica", size=9)
+    _amount_row(pdf, "Subtotal", invoice.subtotal, width)
+    if fields.get("show_discount") and invoice.discount:
+        _amount_row(pdf, "Discount", -(invoice.discount or 0), width)
+    if fields.get("show_tax_amount"):
+        _amount_row(pdf, "Tax", invoice.tax, width)
+    if invoice.additional_charges:
+        _amount_row(pdf, "Additional Charges", invoice.additional_charges, width)
+    if invoice.round_off:
+        _amount_row(pdf, "Round Off", invoice.round_off, width)
+    pdf.set_font("Helvetica", "B", 11)
+    _amount_row(pdf, "Grand Total", invoice.total, width, height=7)
+    pdf.set_font("Helvetica", size=9)
+    _amount_row(pdf, "Paid", invoice.amount_paid, width)
+    _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
+
+    _invoice_footer(pdf, org, settings, fields)
+    return bytes(pdf.output())
+
+
+INVOICE_PDF_FORMATS = {"simple": invoice_simple_pdf, "detailed": invoice_detailed_pdf}

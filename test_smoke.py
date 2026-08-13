@@ -3917,6 +3917,261 @@ def _phase1cf_checks():
 
 _phase1cf_checks()
 
+
+def _phase1ij_checks():
+    """Phase 1I + 1J: bill what was delivered, and print it in two formats."""
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": "Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+    inv, ah = firm("BillCo")
+    other, oh = firm("OtherBill")
+    roles = {r["name"]: r for r in client.get("/roles", headers=ah).json()}
+    dp_email = f"bdp_{uuid.uuid4().hex[:6]}@billco.com"
+    dp = client.post("/users", headers=ah, json={
+        "basic_information": {"first_name": "Suresh", "last_name": "Yadav"},
+        "contact_information": {"official_email": dp_email},
+        "login_security": {"password": "Dp@123456", "confirm_password": "Dp@123456"},
+        "employment_information": {"role_id": roles["Delivery Partner"]["id"]}}).json()
+    dp_hdr = hdr(client.post("/auth/login", json={
+        "email": dp_email, "password": "Dp@123456"}).json()["tokens"]["access_token"])
+
+    prod = client.post("/products", headers=ah, json={
+        "name": "Can 20L", "price": 100, "total_inventory": 200,
+        "tax_rate": 5, "hsn_code": "22011010"}).json()
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Sharma Traders", "phone": "9812345678"},
+        "address_information": {"billing_address": "12 MG Road", "shipping_address": "Warehouse 4"},
+        "business_tax_information": {"gst_number": "07AABCU9603R1ZM"}}).json()
+
+    def deliver(order, quantity):
+        """Plan, load, dispatch and confirm `quantity` against a fresh delivery."""
+        dlv = client.post("/deliveries", headers=ah, json={
+            "order_id": order["id"], "delivery_partner_id": dp["id"],
+            "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": quantity}]}).json()
+        client.post(f"/deliveries/{dlv['id']}/load", headers=ah)
+        client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah, json={"status": "in_transit"})
+        client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
+            "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": quantity}]})
+        return client.get(f"/deliveries/by-id/{dlv['id']}", headers=ah).json()
+
+    print("\n== 1. Invoice bills the delivered quantity, not the ordered one (Phase 1I) ==")
+    order = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "payment_terms_days": 15,
+        "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).json()
+    first = deliver(order, 12)
+    check("only 12 of 20 went out", first["delivered_total"] == 12, first["delivered_total"])
+    r = client.post(f"/orders/{order['id']}/invoice", headers=ah,
+                    json={"delivery_id": first["id"]})
+    check("POST /orders/{id}/invoice with a delivery_id -> 201", r.status_code == 201, r.text[:400])
+    bill = r.json()
+    print(json.dumps({k: bill[k] for k in ("invoice_number", "delivery_id", "due_date",
+                                           "subtotal", "tax", "total", "items")}, indent=2))
+    check("it bills 12, not 20", bill["items"][0]["quantity"] == 12, bill["items"][0])
+    check("at the order's agreed rate", bill["items"][0]["unit_price"] == 100)
+    check("subtotal is 12 x 100", bill["subtotal"] == 1200, bill["subtotal"])
+    check("tax is the line's own 5%", bill["tax"] == 60, bill["tax"])
+    check("total is 1260", bill["total"] == 1260, bill["total"])
+    check("the invoice names the delivery it bills", bill["delivery_id"] == first["id"])
+    check("the line points back at the delivery line",
+          bill["items"][0]["delivery_item_id"] == first["items"][0]["id"], bill["items"][0])
+    check("and at the order line",
+          bill["items"][0]["order_item_id"] == order["items"][0]["id"], bill["items"][0])
+    check("the tax rate is on the line", bill["items"][0]["tax_rate"] == 5, bill["items"][0])
+    check("HSN came across", bill["items"][0]["hsn_code"] == "22011010", bill["items"][0])
+
+    print("\n== 2. Due date comes from the order's payment terms ==")
+    from datetime import datetime as _dt
+    issued = _dt.fromisoformat(bill["invoice_date"].replace("Z", "+00:00"))
+    due = _dt.fromisoformat(bill["due_date"].replace("Z", "+00:00"))
+    check("due_date is issue date + 15 days", (due - issued).days == 15, bill["due_date"])
+    no_terms = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100}]}).json()
+    nb = client.post(f"/orders/{no_terms['id']}/invoice", headers=ah).json()
+    check("no agreed terms -> no due date", nb["due_date"] is None, nb["due_date"])
+
+    print("\n== 3. The same delivery cannot be billed twice ==")
+    again = client.post(f"/orders/{order['id']}/invoice", headers=ah,
+                        json={"delivery_id": first["id"]})
+    check("re-invoicing a billed delivery -> 400", again.status_code == 400, again.text[:250])
+    check("and says so plainly", "already been invoiced" in again.text, again.text[:250])
+
+    print("\n== 4. The rest of the order bills separately ==")
+    second = deliver(order, 8)
+    r = client.post(f"/orders/{order['id']}/invoice", headers=ah,
+                    json={"delivery_id": second["id"]})
+    check("the second delivery gets its own invoice -> 201", r.status_code == 201, r.text[:300])
+    rest = r.json()
+    check("billed for the remaining 8", rest["items"][0]["quantity"] == 8, rest["items"][0])
+    check("8 x 100 + 5% = 840", rest["total"] == 840, rest["total"])
+    check("two invoices against one order",
+          len([i for i in client.get("/invoices", headers=ah).json()
+               if i["order_id"] == order["id"]]) == 2)
+    billed = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    check("the customer was billed for both, not for the order",
+          billed["total_billed"] == 1260 + 840 + nb["total"], billed)
+
+    print("\n== 5. after_full_order waits for the whole order ==")
+    client.patch("/sales-workflow-settings", headers=ah, json={"partial_delivery_invoice_mode": "after_full_order"})
+    slow = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 100}]}).json()
+    part = deliver(slow, 4)
+    r = client.post(f"/orders/{slow['id']}/invoice", headers=ah, json={"delivery_id": part["id"]})
+    check("billing a part delivery under after_full_order -> 400", r.status_code == 400, r.text[:300])
+    check("the message names the setting", "after_full_order" in r.text, r.text[:300])
+    whole = deliver(slow, 6)
+    r = client.post(f"/orders/{slow['id']}/invoice", headers=ah, json={"delivery_id": whole["id"]})
+    check("once fully delivered it bills -> 201", r.status_code == 201, r.text[:300])
+    r = client.post(f"/orders/{slow['id']}/invoice", headers=ah, json={"delivery_id": part["id"]})
+    check("and the earlier delivery bills too", r.status_code == 201, r.text[:300])
+    check("for its own 4", r.json()["items"][0]["quantity"] == 4, r.json()["items"][0])
+    client.patch("/sales-workflow-settings", headers=ah, json={"partial_delivery_invoice_mode": "per_delivery"})
+
+    print("\n== 6. Guard rails ==")
+    empty = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 100}]}).json()
+    undelivered = client.post("/deliveries", headers=ah, json={
+        "order_id": empty["id"], "delivery_partner_id": dp["id"]}).json()
+    r = client.post(f"/orders/{empty['id']}/invoice", headers=ah,
+                    json={"delivery_id": undelivered["id"]})
+    check("billing a delivery that has delivered nothing -> 400", r.status_code == 400, r.text[:250])
+    check("another firm's delivery_id -> 400",
+          client.post(f"/orders/{empty['id']}/invoice", headers=ah,
+                      json={"delivery_id": str(uuid.uuid4())}).status_code == 400)
+    check("a delivery from a different order -> 400",
+          client.post(f"/orders/{empty['id']}/invoice", headers=ah,
+                      json={"delivery_id": first["id"]}).status_code == 400)
+    check("a foreign order -> 404",
+          client.post(f"/orders/{order['id']}/invoice", headers=oh).status_code == 404)
+
+    print("\n== 7. Billing the whole order still carries the order's totals ==")
+    flat = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "discount": 50,
+        "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 100}]}).json()
+    fb = client.post(f"/orders/{flat['id']}/invoice", headers=ah).json()
+    check("the order-level discount is billed", fb["discount"] == 50, fb["discount"])
+    check("and the total matches the order", fb["total"] == flat["total"], (fb["total"], flat["total"]))
+    check("billing the whole order twice -> 400",
+          client.post(f"/orders/{flat['id']}/invoice", headers=ah).status_code == 400)
+
+    print("\n== 8. Two PDF formats from one invoice (Phase 1J) ==")
+    r = client.get(f"/invoices/{bill['id']}/pdf", headers=ah, params={"format": "detailed"})
+    check("GET /invoices/{id}/pdf?format=detailed -> 200", r.status_code == 200, r.text[:200])
+    check("it is a PDF", r.content[:5] == b"%PDF-" and
+          r.headers["content-type"] == "application/pdf", r.headers)
+    detailed = r.content
+    r = client.get(f"/invoices/{bill['id']}/pdf", headers=ah, params={"format": "simple"})
+    check("GET /invoices/{id}/pdf?format=simple -> 200", r.status_code == 200, r.text[:200])
+    simple = r.content
+    check("simple is a PDF too", simple[:5] == b"%PDF-")
+    check("the two formats really differ", simple != detailed)
+    check("the short copy is the smaller document", len(simple) < len(detailed),
+          (len(simple), len(detailed)))
+    check("the filename names the format",
+          "-simple.pdf" in r.headers["content-disposition"], r.headers["content-disposition"])
+    check("no format defaults to the full tax invoice",
+          client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content[:5] == b"%PDF-")
+    check("an unknown format -> 422",
+          client.get(f"/invoices/{bill['id']}/pdf", headers=ah,
+                     params={"format": "fancy"}).status_code == 422)
+    check("another firm's invoice -> 404",
+          client.get(f"/invoices/{bill['id']}/pdf", headers=oh).status_code == 404)
+
+    print("\n== 9. The PDF is rendered from the firm's invoice settings ==")
+    client.patch("/invoice-settings", headers=ah, json={
+        "fields": {"show_hsn_sac": False, "show_tax_rate": False, "show_tax_amount": False,
+                   "show_billing_address": False, "show_shipping_address": False,
+                   "show_customer_gstin": False, "show_bank_details": False,
+                   "show_upi_qr": False, "show_signature": False}})
+    stripped = client.get(f"/invoices/{bill['id']}/pdf", headers=ah,
+                          params={"format": "detailed"}).content
+    check("switching nine fields off shrinks the tax invoice", len(stripped) < len(detailed),
+          (len(stripped), len(detailed)))
+    client.patch("/invoice-settings", headers=ah, json={
+        "fields": {"show_hsn_sac": True, "show_tax_rate": True, "show_tax_amount": True,
+                   "show_billing_address": True, "show_shipping_address": True,
+                   "show_customer_gstin": True, "show_bank_details": True,
+                   "show_upi_qr": True, "show_signature": True,
+                   "show_mrp": True, "show_batch_number": True, "show_expiry_date": True}})
+    check("turning every column on still renders",
+          client.get(f"/invoices/{bill['id']}/pdf", headers=ah,
+                     params={"format": "detailed"}).content[:5] == b"%PDF-")
+    client.patch("/invoice-settings", headers=ah, json={
+        "fields": {"show_mrp": False, "show_batch_number": False, "show_expiry_date": False},
+        "terms": "Payment within 15 days.", "footer_text": "Thank you for your business",
+        "notes": "Goods once sold are not returnable",
+        "branding": {"primary_color": "#0F62FE"}})
+    with_extras = client.get(f"/invoices/{bill['id']}/pdf", headers=ah,
+                             params={"format": "detailed"}).content
+    check("terms, notes and footer print", len(with_extras) > len(detailed),
+          (len(with_extras), len(detailed)))
+    check("a brand colour does not break it", with_extras[:5] == b"%PDF-")
+    check("the simple copy honours the settings too",
+          client.get(f"/invoices/{bill['id']}/pdf", headers=ah,
+                     params={"format": "simple"}).content[:5] == b"%PDF-")
+
+    print("\n== 10. Paper size, logo and a nonsense logo ==")
+    for paper in ("A5", "thermal", "A4"):
+        client.patch("/invoice-settings", headers=ah, json={"paper_size": paper})
+        check(f"paper_size {paper} renders",
+              client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content[:5] == b"%PDF-")
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+        "01f15c4890000000a49444154789c6300010000050001"
+        "0d0a2db40000000049454e44ae426082")
+    up = client.post("/files/upload", headers=ah,
+                     files={"file": ("logo.png", png, "image/png")}).json()
+    no_logo = client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content
+    client.patch("/invoice-settings", headers=ah, json={"branding": {"logo_file_id": up["url"]}})
+    logoed = client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content
+    check("a logo URL in the settings resolves and prints", logoed[:5] == b"%PDF-")
+    check("and the image really is embedded", len(logoed) > len(no_logo),
+          (len(no_logo), len(logoed)))
+    check("a bare file id works as well as the URL",
+          client.patch("/invoice-settings", headers=ah,
+                       json={"branding": {"logo_file_id": up["file_id"]}}).status_code == 200
+          and len(client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content) > len(no_logo))
+    junk = client.post("/files/upload", headers=ah,
+                       files={"file": ("logo.png", b"not an image at all", "image/png")}).json()
+    client.patch("/invoice-settings", headers=ah, json={"branding": {"logo_file_id": junk["file_id"]}})
+    check("an unreadable logo never costs the firm its invoice",
+          client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content[:5] == b"%PDF-")
+    client.patch("/invoice-settings", headers=ah, json={"branding": {"logo_file_id": None}})
+    check("no separate logo or colour endpoint exists",
+          not any(p.startswith("/invoice-settings/")
+                  for p in client.get("/openapi.json").json()["paths"]))
+
+    print("\n== 11. Freight and round off ==")
+    charged = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"], "tax": 20, "additional_charges": 150, "round_off": -0.4,
+        "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100}]})
+    check("POST /invoices takes additional_charges and round_off -> 201",
+          charged.status_code == 201, charged.text[:300])
+    ch = charged.json()
+    check("both are kept",
+          ch["additional_charges"] == 150 and ch["round_off"] == -0.4, ch)
+    check("and land in the total", ch["total"] == round(200 + 20 + 150 - 0.4, 2), ch["total"])
+    check("they print on the tax invoice",
+          client.get(f"/invoices/{ch['id']}/pdf", headers=ah,
+                     params={"format": "detailed"}).content[:5] == b"%PDF-")
+    plain = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100}]}).json()
+    check("leaving them out changes nothing", plain["total"] == 100, plain["total"])
+
+
+_phase1ij_checks()
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.
