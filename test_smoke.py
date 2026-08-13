@@ -3630,6 +3630,293 @@ def _phase1a_checks():
 
 _phase1a_checks()
 
+# -- Phase 1C-1F: delivery planning, loading, challan, dispatch, POD ------------
+# Wrapped in a function so this block's locals cannot shadow anything above it.
+
+
+def _phase1cf_checks():
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": "Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+
+    abc, ah = firm("DelivCo")
+    xyz, oh = firm("OtherD")
+    roles = {r["name"]: r for r in client.get("/roles", headers=ah).json()}
+    dp_email = f"dp_{uuid.uuid4().hex[:6]}@abc.com"
+    dp = client.post("/users", headers=ah, json={
+        "basic_information": {"first_name": "Ramesh", "last_name": "Kumar"},
+        "contact_information": {"official_email": dp_email},
+        "login_security": {"password": "Dp@123456", "confirm_password": "Dp@123456"},
+        "employment_information": {"role_id": roles["Delivery Partner"]["id"]}}).json()
+    dp_hdr = hdr(client.post("/auth/login", json={
+        "email": dp_email, "password": "Dp@123456"}).json()["tokens"]["access_token"])
+
+    prod = client.post("/products", headers=ah, json={
+        "name": "Water 20L", "price": 100, "total_inventory": 100, "tax_rate": 5}).json()
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Metro Stores"},
+        "address_information": {"shipping_address": "Opp. Cyber Towers"}}).json()
+
+    print("== 1. Vehicle master ==")
+    r = client.post("/vehicles", headers=ah, json={
+        "vehicle_number": "DL 8S AB 2481", "vehicle_type": "Tempo", "capacity_kg": 1500})
+    check("POST /vehicles -> 201", r.status_code == 201, r.text[:300])
+    veh = r.json()
+    check("duplicate number -> 409",
+          client.post("/vehicles", headers=ah, json={"vehicle_number": "DL 8S AB 2481"}).status_code == 409)
+    check("GET /vehicles lists it",
+          any(v["id"] == veh["id"] for v in client.get("/vehicles", headers=ah).json()))
+    check("cross-firm vehicle -> 404",
+          client.get(f"/vehicles/{veh['id']}", headers=oh).status_code == 404)
+
+    print("\n== 2. Plan a delivery (Phase 1C) ==")
+    order = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).json()
+    check("order starts reserved", order["fulfilment_status"] == "reserved", order["fulfilment_status"])
+    r = client.post("/deliveries", headers=ah, json={
+        "order_id": order["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
+        "scheduled_date": "2026-08-15",
+        "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": 20}]})
+    check("POST /deliveries -> 201", r.status_code == 201, r.text[:400])
+    dlv = r.json()
+    print(json.dumps({k: dlv[k] for k in ("delivery_number", "status", "order_number",
+                                          "planned_total", "loaded_total", "delivered_total",
+                                          "amount_due", "items")}, indent=2))
+    check("it has its own id and human code",
+          dlv["id"] and dlv["delivery_number"].startswith("DLV-"), dlv)
+    check("status is planned, NOT out for delivery", dlv["status"] == "planned", dlv["status"])
+    check("the line tracks planned / loaded / delivered / pending",
+          dlv["items"][0]["planned_quantity"] == 20 and dlv["items"][0]["loaded_quantity"] == 0
+          and dlv["items"][0]["delivered_quantity"] == 0
+          and dlv["items"][0]["pending_quantity"] == 20, dlv["items"][0])
+    check("it links to the order item", dlv["items"][0]["order_item_id"] == order["items"][0]["id"])
+    check("partner and vehicle resolved",
+          dlv["delivery_partner"]["name"] == "Ramesh Kumar"
+          and dlv["vehicle"]["vehicle_number"] == "DL 8S AB 2481", dlv)
+    check("delivery address defaulted from the customer",
+          dlv["delivery_address"] == "Opp. Cyber Towers", dlv["delivery_address"])
+    check("amount_due is the order's unpaid total", dlv["amount_due"] == order["total"], dlv["amount_due"])
+    after = client.get(f"/orders/{order['id']}", headers=ah).json()
+    check("planning moves the order to processing / planned",
+          after["status"] == "processing" and after["fulfilment_status"] == "planned", after)
+    check("planning did NOT touch physical stock",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["on_hand"] == 100)
+    check("the hold is still held",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["reserved"] == 20)
+    check("planning the same quantity twice -> 400",
+          client.post("/deliveries", headers=ah, json={
+              "order_id": order["id"],
+              "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": 5}]
+          }).status_code == 400)
+    check("a foreign order -> 400",
+          client.post("/deliveries", headers=oh, json={"order_id": order["id"]}).status_code == 400)
+
+    print("\n== 3. Delivery ID is the identifier ==")
+    r = client.get(f"/deliveries/by-id/{dlv['id']}", headers=ah)
+    check("GET /deliveries/by-id/{delivery_id} -> 200",
+          r.status_code == 200 and r.json()["id"] == dlv["id"], r.text[:200])
+    check("GET /deliveries lists it",
+          any(d["id"] == dlv["id"] for d in client.get("/deliveries", headers=ah).json()))
+    check("filter by status=planned",
+          any(d["id"] == dlv["id"] for d in client.get("/deliveries", headers=ah,
+                                                       params={"status": "planned"}).json()))
+    check("filter by order_id",
+          [d["id"] for d in client.get("/deliveries", headers=ah,
+                                       params={"order_id": order["id"]}).json()] == [dlv["id"]])
+    check("cross-firm delivery -> 404",
+          client.get(f"/deliveries/by-id/{dlv['id']}", headers=oh).status_code == 404)
+    check("the partner sees their own delivery",
+          any(d["id"] == dlv["id"] for d in client.get("/deliveries", headers=dp_hdr).json()))
+
+    print("\n== 4. Dispatch is refused before loading (Phase 1F) ==")
+    check("dispatching an unloaded delivery -> 400",
+          client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah,
+                       json={"status": "in_transit"}).status_code == 400)
+    check("confirming before dispatch -> 400",
+          client.post(f"/deliveries/{dlv['id']}/confirm", headers=ah, json={
+              "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": 5}]
+          }).status_code == 400)
+
+    print("\n== 5. Vehicle loading (Phase 1D) ==")
+    r = client.post("/vehicle-stock/loading", headers=ah, json={
+        "delivery_id": dlv["id"],
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "loaded_quantity": 12}]})
+    check("POST /vehicle-stock/loading against the delivery -> 201", r.status_code == 201, r.text[:400])
+    load = r.json()
+    print(json.dumps(load, indent=2))
+    check("response names the loading, delivery and new status",
+          load["delivery_id"] == dlv["id"] and load["status"] == "loaded" and load["loading_id"], load)
+    check("it reports the warehouse and vehicle figures after",
+          load["items"][0]["loaded_quantity"] == 12
+          and load["items"][0]["warehouse_on_hand_after"] == 88
+          and load["items"][0]["vehicle_stock_after"] == 12, load["items"][0])
+    stock = client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]}).json()[0]
+    check("warehouse on hand fell by what was loaded", stock["on_hand"] == 88, stock)
+    check("the hold shrank as it was consumed", stock["reserved"] == 8, stock)
+    check("available is unchanged — the goods were already promised",
+          stock["available"] == 80, stock)
+    check("a delivery_out movement was recorded",
+          any(m["movement_type"] == "delivery_out"
+              for m in client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]))
+    check("the order is now loaded",
+          client.get(f"/orders/{order['id']}", headers=ah).json()["fulfilment_status"] == "loaded")
+
+    print("\n-- idempotent: loading twice must not deduct twice --")
+    r = client.post("/vehicle-stock/loading", headers=ah, json={
+        "delivery_id": dlv["id"],
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "loaded_quantity": 12}]})
+    check("loading more than what is planned -> 400", r.status_code == 400, r.text[:250])
+    check("warehouse untouched by the refused call",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["on_hand"] == 88)
+    r = client.post(f"/deliveries/{dlv['id']}/load", headers=ah)
+    check("loading the remainder -> 200", r.status_code == 200, r.text[:250])
+    check("the whole planned quantity is now on the vehicle",
+          r.json()["loaded_total"] == 20 and r.json()["items"][0]["loaded_quantity"] == 20,
+          r.json()["items"][0])
+    check("warehouse fell by the rest only",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["on_hand"] == 80)
+    r = client.post(f"/deliveries/{dlv['id']}/load", headers=ah)
+    check("loading again when nothing is left -> 400", r.status_code == 400, r.text[:200])
+    check("and the warehouse is still 80 — never deducted twice",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["on_hand"] == 80)
+    check("the hold is fully consumed now",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["reserved"] == 0)
+
+    print("\n== 6. Challan PDF (Phase 1E) ==")
+    r = client.get(f"/deliveries/{dlv['id']}/challan/pdf", headers=ah)
+    check("challan renders", r.status_code == 200 and r.content[:4] == b"%PDF"
+          and r.headers["content-type"] == "application/pdf", r.status_code)
+    check("the partner can pull their own challan",
+          client.get(f"/deliveries/{dlv['id']}/challan/pdf", headers=dp_hdr).status_code == 200)
+    check("cross-firm challan -> 404",
+          client.get(f"/deliveries/{dlv['id']}/challan/pdf", headers=oh).status_code == 404)
+
+    print("\n== 7. Dispatch (Phase 1F) ==")
+    check("cancelling a loaded delivery -> 400",
+          client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah,
+                       json={"status": "cancelled"}).status_code == 400)
+    r = client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah, json={"status": "in_transit"})
+    check("dispatch -> in_transit with who and when",
+          r.status_code == 200 and r.json()["status"] == "in_transit"
+          and r.json()["dispatched_at"] and r.json()["dispatched_by_id"], r.text[:300])
+    check("the order is in transit too",
+          client.get(f"/orders/{order['id']}", headers=ah).json()["fulfilment_status"] == "in_transit")
+    check("only now does it show in the partner's assigned list",
+          any(o["id"] == order["id"] for o in client.get("/deliveries/assigned", headers=dp_hdr).json()))
+
+    print("\n== 8. Partial delivery + POD (Phase 1H) ==")
+    photo = client.post("/files/upload", headers=dp_hdr, files={
+        "file": ("pod.png", b"\x89PNG\r\n\x1a\n" + b"0" * 20, "image/png")}).json()
+    sign = client.post("/files/upload", headers=dp_hdr, files={
+        "file": ("sign.png", b"\x89PNG\r\n\x1a\n" + b"1" * 20, "image/png")}).json()
+    r = client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": 15}],
+        "pod_photo_file_ids": [photo["file_id"]],
+        "signature_file_id": sign["file_id"],
+        "notes": "Customer accepted partial delivery"})
+    check("POST /deliveries/{id}/confirm -> 200", r.status_code == 200, r.text[:400])
+    conf = r.json()
+    print(json.dumps({k: conf[k] for k in ("status", "planned_total", "loaded_total",
+                                           "delivered_total", "pod", "items")}, indent=2))
+    check("partial delivery is recorded as such", conf["status"] == "partially_delivered", conf["status"])
+    check("ordered 20, loaded 20, delivered 15, pending 5",
+          conf["items"][0]["planned_quantity"] == 20 and conf["items"][0]["loaded_quantity"] == 20
+          and conf["items"][0]["delivered_quantity"] == 15
+          and conf["items"][0]["pending_quantity"] == 5, conf["items"][0])
+    check("POD is stored", conf["pod"]["photo_file_ids"] == [photo["file_id"]]
+          and conf["pod"]["signature_file_id"] == sign["file_id"], conf["pod"])
+    check("the order is partially delivered",
+          client.get(f"/orders/{order['id']}", headers=ah).json()["fulfilment_status"]
+          == "partially_delivered")
+    check("the undelivered 5 stayed on the vehicle, NOT back in the warehouse",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["on_hand"] == 80)
+    veh_stock = client.get(f"/vehicle-stock/current/{dp['id']}", headers=ah).json()
+    check("vehicle shows 20 loaded and 15 delivered",
+          veh_stock["items"][0]["loaded_qty"] == 20 and veh_stock["items"][0]["delivered_qty"] == 15,
+          veh_stock["items"][0])
+    check("delivering more than is on the vehicle -> 400",
+          client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
+              "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": 50}]
+          }).status_code == 400)
+    r = client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": 5}]})
+    check("delivering the rest completes it", r.json()["status"] == "delivered"
+          and r.json()["items"][0]["pending_quantity"] == 0, r.json()["items"][0])
+    check("and completes the order",
+          client.get(f"/orders/{order['id']}", headers=ah).json()["status"] == "completed")
+    check("confirming a delivered delivery -> 400",
+          client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
+              "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": 1}]
+          }).status_code == 400)
+
+    print("\n== 9. Failed delivery ==")
+    o2 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 4, "unit_price": 100}]}).json()
+    d2 = client.post("/deliveries", headers=ah, json={
+        "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"]}).json()
+    check("omitting items plans the whole outstanding order",
+          d2["items"][0]["planned_quantity"] == 4, d2["items"])
+    client.post(f"/deliveries/{d2['id']}/load", headers=ah)
+    client.patch(f"/deliveries/by-id/{d2['id']}", headers=ah, json={"status": "in_transit"})
+    before = client.get(f"/vehicle-stock/current/{dp['id']}", headers=ah).json()["items"][0]["delivered_qty"]
+    r = client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr, json={
+        "failed": True, "failure_reason": "Customer unavailable"})
+    check("a failed delivery records the reason",
+          r.status_code == 200 and r.json()["status"] == "failed"
+          and r.json()["failure_reason"] == "Customer unavailable", r.text[:300])
+    check("failure without a reason -> 422",
+          client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr,
+                      json={"failed": True}).status_code == 422)
+    check("vehicle stock untouched by the failure",
+          client.get(f"/vehicle-stock/current/{dp['id']}", headers=ah)
+          .json()["items"][0]["delivered_qty"] == before)
+    check("the order records the failure",
+          client.get(f"/orders/{o2['id']}", headers=ah).json()["fulfilment_status"] == "failed")
+
+    print("\n== 10. Split an order across two deliveries ==")
+    o3 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 100}]}).json()
+    oi = o3["items"][0]["id"]
+    a = client.post("/deliveries", headers=ah, json={
+        "order_id": o3["id"], "delivery_partner_id": dp["id"],
+        "items": [{"order_item_id": oi, "planned_quantity": 6}]}).json()
+    b = client.post("/deliveries", headers=ah, json={
+        "order_id": o3["id"], "delivery_partner_id": dp["id"],
+        "items": [{"order_item_id": oi, "planned_quantity": 4}]})
+    check("the remaining 4 can be planned into a second delivery", b.status_code == 201, b.text[:250])
+    check("but a third planning attempt -> 400",
+          client.post("/deliveries", headers=ah, json={
+              "order_id": o3["id"],
+              "items": [{"order_item_id": oi, "planned_quantity": 1}]}).status_code == 400)
+    check("both deliveries belong to the same order",
+          len(client.get("/deliveries", headers=ah, params={"order_id": o3["id"]}).json()) == 2)
+    check("the older order-id route still works for existing clients",
+          client.get(f"/deliveries/{o3['id']}", headers=ah).status_code == 200)
+
+
+
+_phase1cf_checks()
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

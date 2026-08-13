@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import (
+    Delivery,
     Product,
     ProductVariant,
     StockMovement,
@@ -13,9 +14,12 @@ from app.models import (
     VehicleLoading,
     VehicleLoadingItem,
 )
+from app.services import delivery_service
 from app.schemas.vehicle_stock import (
+    DeliveryLoadOut,
     EndOfDayBody,
     ExtraLoadBody,
+    LoadedLineOut,
     VehicleLoadingCreate,
     VehicleLoadingOut,
 )
@@ -40,15 +44,61 @@ def _owned(db: Session, id: str, org_id: str) -> VehicleLoading:
     return loading
 
 
-@router.post("/loading", response_model=VehicleLoadingOut, status_code=status.HTTP_201_CREATED)
+@router.post("/loading", status_code=status.HTTP_201_CREATED,
+             response_model=DeliveryLoadOut | VehicleLoadingOut)
 def load_vehicle(
     payload: VehicleLoadingCreate,
     user: User = Depends(_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> VehicleLoading:
-    """Load a delivery vehicle at the start of the day. Deducts stock from warehouse."""
+) -> object:
+    """Load a delivery vehicle.
+
+    **Against a planned delivery** — send `delivery_id`, and per item a
+    `delivery_item_id` with its `loaded_quantity`. One transaction moves all four
+    figures:
+
+        warehouse on hand ↓   reservation consumed ↓   vehicle stock ↑   loaded_quantity ↑
+
+    Safe to call twice: a line can only ever be loaded up to its planned quantity, so
+    a repeat call loads whatever is left and then nothing. The same units are never
+    deducted twice. Returns the loading, the delivery's new status, and per line the
+    resulting warehouse and vehicle figures.
+
+    **Without a delivery** — send `delivery_partner_id` and plain product quantities
+    to stock a van for ad-hoc field sales, as before.
+    """
     org_id = _org_id(user)
+
+    if payload.delivery_id:
+        delivery = db.get(Delivery, payload.delivery_id)
+        if delivery is None or delivery.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="delivery_id is not a delivery in your firm",
+            )
+        if payload.delivery_partner_id and not delivery.delivery_partner_id:
+            delivery.delivery_partner_id = payload.delivery_partner_id
+        if payload.vehicle_id:
+            delivery.vehicle_id = payload.vehicle_id
+        wanted = (
+            [
+                {"delivery_item_id": it.delivery_item_id, "loaded_quantity": it.loaded_qty}
+                for it in payload.items
+                if it.delivery_item_id
+            ]
+            or None
+        )
+        loading, results = delivery_service.load(db, user, delivery, wanted=wanted)
+        db.commit()
+        db.refresh(delivery)
+        return DeliveryLoadOut(
+            loading_id=loading.id,
+            delivery_id=delivery.id,
+            status=delivery.status,
+            items=[LoadedLineOut(**row) for row in results],
+        )
+
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="delivery_partner_id is not a user in your firm")

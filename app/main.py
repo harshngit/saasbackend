@@ -33,6 +33,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Supplier,
     SupplierPayment,
     User,
+    Vehicle,
     Warehouse,
     WarehouseStock,
 )
@@ -63,6 +64,7 @@ from app.routers import (
     superadmin,
     users,
     vehicle_stock,
+    vehicles,
     warehouses,
     leads,
     quotations,
@@ -92,7 +94,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "phase1a-quotation-lifecycle"
+BUILD_TAG = "phase1cf-delivery-loading-dispatch-pod"
 
 
 @app.on_event("startup")
@@ -153,6 +155,7 @@ app.include_router(purchases.router, prefix="/purchases")
 app.include_router(invoices.router)
 app.include_router(invoices.orders_router)  # POST /orders/{id}/invoice
 app.include_router(vehicle_stock.router)
+app.include_router(vehicles.router)
 app.include_router(deliveries.router)
 app.include_router(expenses.router)
 app.include_router(attendance.router)

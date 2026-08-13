@@ -477,6 +477,118 @@ for approval), and a shortage refuses the conversion with `INSUFFICIENT_STOCK` a
 leaves the quotation untouched. Both records point at each other afterwards
 (`quotation.converted_order_id`, `order.quotation_id`).
 
+## Deliveries
+
+**Delivery ID is the identifier.** A Delivery is planned against a sales order,
+loaded onto a vehicle, dispatched, then confirmed — four separate steps because each
+is a different real event.
+
+```
+Sales Order ord_001
+  └── Delivery del_001            ← its own id, its own human code DLV-…
+        └── Delivery Item di_001  ← planned / loaded / delivered / pending
+```
+
+```
+POST   /deliveries                              plan one for an order
+GET    /deliveries                              ?status&order_id&delivery_partner_id&open_only
+GET    /deliveries/by-id/{delivery_id}
+PATCH  /deliveries/by-id/{delivery_id}          re-plan, or dispatch with status=in_transit
+POST   /deliveries/{delivery_id}/load           load everything planned
+POST   /deliveries/{delivery_id}/confirm        outcome + POD
+GET    /deliveries/{delivery_id}/challan/pdf
+GET    /vehicles   POST /vehicles   GET|PATCH|DELETE /vehicles/{id}
+```
+
+The older `GET /deliveries/{id}`, `PATCH /deliveries/{id}/status` and
+`GET /deliveries/{id}/receipt` take a **Sales Order** id and still work, so existing
+clients keep running. New code should use the Delivery-id routes above; that is why
+the detail and update sit under `/by-id/`.
+
+### Status
+
+`planned` → `loaded` → `in_transit` → `partially_delivered` / `delivered` / `failed`,
+plus `cancelled`. The order's `fulfilment_status` follows automatically, so the two
+never disagree.
+
+**Assigning a partner is planning, not dispatch.** A delivery only becomes live for
+the partner — and only appears in `GET /deliveries/assigned` — once it has been
+loaded *and* dispatched.
+
+### Planning
+
+```http
+POST /deliveries
+{ "order_id": "ord_001", "delivery_partner_id": "usr_001", "vehicle_id": "veh_001",
+  "scheduled_date": "2026-08-15",
+  "items": [{ "order_item_id": "oi_001", "planned_quantity": 20 }] }
+```
+
+Anyone with the `deliveries` create permission may plan — a dispatch or warehouse
+role, not only an Admin. Omit `items` to plan everything still outstanding on the
+order. A quantity already planned into another delivery cannot be planned again, so
+an order can be split across several deliveries without double-promising anything.
+
+### Loading — the one place stock leaves the warehouse
+
+```http
+POST /vehicle-stock/loading
+{ "delivery_id": "del_001",
+  "items": [{ "delivery_item_id": "di_001", "loaded_quantity": 20 }] }
+```
+
+One transaction moves all four figures:
+
+```
+warehouse on hand ↓    reservation consumed ↓    vehicle stock ↑    loaded_quantity ↑
+```
+
+Example: on hand 100, reserved 20 → load 20 → on hand 80, reserved 0, vehicle 20.
+
+**Safe to call twice.** A line can only ever be loaded up to its planned quantity, so
+a repeat call loads the remainder and then refuses — the same units are never
+deducted twice. `POST /deliveries/{id}/load` is the shortcut that loads everything
+planned. `POST /vehicle-stock/loading` still accepts plain product quantities with no
+delivery behind them, for a van doing ad-hoc field sales.
+
+### Challan
+
+`GET /deliveries/{delivery_id}/challan/pdf` — the document that travels with the
+vehicle: challan number, order, customer, address, planned / loaded / delivered
+quantities, vehicle, partner and dispatch date. It creates **no** revenue, receivable
+or payment, so it carries no totals or balances.
+
+### Dispatch
+
+```http
+PATCH /deliveries/by-id/{delivery_id}      { "status": "in_transit" }
+```
+
+Stamps `dispatched_at` and `dispatched_by_id`. Refused until something is loaded.
+`cancelled` abandons a plan, and is refused once goods are on the vehicle — those
+come back through the end-of-day return, not a status change.
+
+### Confirming, POD, partial and failed
+
+```http
+POST /deliveries/{delivery_id}/confirm
+{ "items": [{ "delivery_item_id": "di_001", "delivered_quantity": 15 }],
+  "pod_photo_file_ids": ["file_001"], "signature_file_id": "file_002",
+  "notes": "Customer accepted partial delivery" }
+```
+
+Ordered 20, loaded 20, delivered 15 → `pending_quantity` 5 and the delivery is
+`partially_delivered`. **Vehicle stock falls only by what was handed over**; the
+remaining 5 stays on the vehicle until a re-attempt or the end-of-day return, and is
+never silently put back into the warehouse. Confirm again to deliver the rest.
+
+A failed attempt is `{ "failed": true, "failure_reason": "Customer unavailable" }` —
+nothing is handed over and vehicle stock is untouched.
+
+POD photos and the signature are ordinary uploads: `POST /files/upload`, then send the
+`file_id`s. There is deliberately no route / stops / view-route data — that needs a
+real route-planning module.
+
 ## Admin dashboard
 
 `GET /dashboard/admin` (needs `dashboard.view`) returns every widget on the Admin

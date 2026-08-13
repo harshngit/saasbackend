@@ -36,6 +36,7 @@ from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
+from app.models.vehicle import Vehicle
 from app.models.vehicle_stock import VehicleLoading, VehicleLoadingItem
 from app.models.warehouse import (
     RESERVATION_STATUSES,
@@ -51,6 +52,7 @@ from app.models.sales_return import SalesReturn, ReturnItem
 
 __all__ = [
     "ActivityLog",
+    "Vehicle",
     "Warehouse",
     "WarehouseStock",
     "StockReservation",

@@ -375,3 +375,95 @@ def quotation_pdf(org, customer, quotation) -> bytes:
             pdf.multi_cell(0, 4, _s(f"{label}: {value}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     return bytes(pdf.output())
+
+
+def delivery_challan_pdf(org, delivery, order, customer, partner, vehicle) -> bytes:
+    """The delivery challan / goods-movement note that travels with the vehicle.
+
+    A challan documents goods leaving — it creates no revenue, no receivable and no
+    payment, so no totals or balances appear on it.
+    """
+    pdf = FPDF()
+    pdf.add_page()
+    _org_header(pdf, org)
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, "DELIVERY CHALLAN", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", size=8)
+    pdf.cell(
+        0, 5, "Goods movement document. Not a tax invoice.",
+        new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+    )
+    pdf.ln(2)
+
+    col = 90
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(col, 5, "DELIVER TO:", new_x=XPos.RIGHT, new_y=YPos.LAST)
+    pdf.set_x(col + 10)
+    pdf.cell(col, 5, "DISPATCH DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    dispatched = (
+        delivery.dispatched_at.date().isoformat() if delivery.dispatched_at else "not dispatched"
+    )
+    pdf.set_font("Helvetica", size=9)
+    rows = [
+        (
+            _s(customer.business_name or customer.name) if customer else "-",
+            _s(f"Challan No: {delivery.delivery_note_number}"),
+        ),
+        (
+            _s((delivery.delivery_address or "")[:45]),
+            _s(f"Order No: {order.order_number}") if order else "",
+        ),
+        (
+            _s(f"Phone: {customer.phone}" if customer and customer.phone else "Phone: N/A"),
+            _s(f"Dispatch date: {dispatched}"),
+        ),
+        (
+            _s(f"GSTIN: {customer.gst_number}" if customer and customer.gst_number else ""),
+            _s(f"Vehicle: {vehicle.vehicle_number}" if vehicle else "Vehicle: -"),
+        ),
+        ("", _s(f"Delivery partner: {partner.name}" if partner else "Delivery partner: -")),
+        ("", _s(f"Status: {delivery.status.replace('_', ' ').title()}")),
+    ]
+    for left, right in rows:
+        pdf.cell(col, 5, left, new_x=XPos.RIGHT, new_y=YPos.LAST)
+        pdf.set_x(col + 10)
+        pdf.cell(col, 5, right, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(4)
+
+    widths = [96, 32, 32, 30]
+    headers = ["Item", "Planned", "Loaded", "Delivered"]
+    pdf.set_font("Helvetica", "B", 9)
+    for w, header in zip(widths, headers):
+        pdf.cell(w, 7, header, border=1, align="L" if w == 96 else "R")
+    pdf.ln(7)
+
+    pdf.set_font("Helvetica", size=9)
+    for item in delivery.items:
+        cells = [
+            (_s(item.product_name)[:54], "L"),
+            (f"{item.planned_quantity:g}", "R"),
+            (f"{item.loaded_quantity:g}", "R"),
+            (f"{item.delivered_quantity:g}", "R"),
+        ]
+        for w, (text, align) in zip(widths, cells):
+            pdf.cell(w, 6, text, border=1, align=align)
+        pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(widths[0], 6, "Total", border=1)
+    totals = (delivery.planned_total, delivery.loaded_total, delivery.delivered_total)
+    for width, value in zip(widths[1:], totals):
+        pdf.cell(width, 6, f"{value:g}", border=1, align="R")
+    pdf.ln(10)
+
+    pdf.set_font("Helvetica", size=8)
+    if delivery.notes:
+        pdf.multi_cell(0, 4, _s(f"Notes: {delivery.notes}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(8)
+    pdf.cell(90, 5, "Receiver's signature", border="T", align="C")
+    pdf.set_x(110)
+    pdf.cell(80, 5, "Dispatched by", border="T", align="C")
+
+    return bytes(pdf.output())

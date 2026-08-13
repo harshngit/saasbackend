@@ -144,3 +144,30 @@ def sales_settings(org) -> dict:  # noqa: ANN001
 def invoice_settings(org) -> dict:  # noqa: ANN001
     """The firm's invoice template settings, defaults filled in."""
     return _merged(getattr(org, "invoice_template_settings", None), INVOICE_SETTINGS_DEFAULTS)
+
+
+# ------------------------------ deliveries --------------------------------
+# A Delivery is the record the fulfilment half of the flow turns on, and its own id
+# is the identifier every delivery endpoint takes. Its status tracks the goods:
+DELIVERY_STATUSES = (
+    "planned",              # partner and vehicle named, quantities planned
+    "loaded",               # goods physically on the vehicle
+    "in_transit",           # dispatched — only now is it live for the partner
+    "partially_delivered",
+    "delivered",
+    "failed",
+    "cancelled",
+)
+
+# The order's fulfilment_status each delivery status implies, so the two never drift.
+ORDER_FULFILMENT_FOR_DELIVERY = {
+    "planned": "planned",
+    "loaded": "loaded",
+    "in_transit": "in_transit",
+    "partially_delivered": "partially_delivered",
+    "delivered": "delivered",
+    "failed": "failed",
+}
+
+# Deliveries whose goods are still out with the partner.
+OPEN_DELIVERY_STATUSES = ("planned", "loaded", "in_transit", "partially_delivered")
