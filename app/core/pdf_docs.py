@@ -284,3 +284,94 @@ def delivery_receipt_pdf(org, customer, order) -> bytes:
     pdf.cell(0, 5, f"Generated on {datetime.utcnow().date().isoformat()} - Delivery Challan.",
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     return bytes(pdf.output())
+
+
+def quotation_pdf(org, customer, quotation) -> bytes:
+    """The quotation as the customer receives it: quoted lines, terms and validity.
+
+    A quotation is an offer, not a bill — there is no payment or balance on it.
+    """
+    pdf = FPDF()
+    pdf.add_page()
+    _org_header(pdf, org)
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 8, "QUOTATION", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    col = 90
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(col, 5, "QUOTED TO:", new_x=XPos.RIGHT, new_y=YPos.LAST)
+    pdf.set_x(col + 10)
+    pdf.cell(col, 5, "DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.set_font("Helvetica", size=9)
+    rows = [
+        (
+            _s(customer.business_name or customer.name) if customer else "-",
+            _s(f"Quotation No: {quotation.quotation_number}"),
+        ),
+        (
+            _s((quotation.billing_address or (customer.billing_address if customer else "") or "")[:45]),
+            _s(f"Date: {quotation.quotation_date.date().isoformat() if quotation.quotation_date else '-'}"),
+        ),
+        (
+            _s(f"Phone: {customer.phone}" if customer and customer.phone else "Phone: N/A"),
+            _s(f"Valid until: {quotation.valid_until.date().isoformat() if quotation.valid_until else '-'}"),
+        ),
+        (
+            _s(f"GSTIN: {customer.gst_number}" if customer and customer.gst_number else ""),
+            _s(f"Status: {(quotation.status or '').title()}"),
+        ),
+    ]
+    for left, right in rows:
+        pdf.cell(col, 5, left, new_x=XPos.RIGHT, new_y=YPos.LAST)
+        pdf.set_x(col + 10)
+        pdf.cell(col, 5, right, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(4)
+
+    widths = [78, 18, 26, 22, 16, 30]
+    headers = ["Item", "Qty", "Rate", "Discount", "Tax %", "Amount"]
+    pdf.set_font("Helvetica", "B", 9)
+    for w, header in zip(widths, headers):
+        pdf.cell(w, 7, header, border=1, align="L" if w == 78 else "R")
+    pdf.ln(7)
+
+    pdf.set_font("Helvetica", size=9)
+    for item in quotation.items:
+        cells = [
+            (_s(item.product_name)[:44], "L"),
+            (f"{item.quantity:g}", "R"),
+            (f"{item.unit_price:,.2f}", "R"),
+            (f"{(item.discount or 0):,.2f}", "R"),
+            (f"{(item.tax_rate or 0):g}", "R"),
+            (f"{item.line_total:,.2f}", "R"),
+        ]
+        for w, (text, align) in zip(widths, cells):
+            pdf.cell(w, 6, text, border=1, align=align)
+        pdf.ln(6)
+
+    pdf.ln(2)
+    pdf.set_font("Helvetica", size=10)
+    for label, value in (
+        ("Subtotal", quotation.subtotal),
+        ("Tax", quotation.tax_total),
+    ):
+        pdf.cell(sum(widths) - 30, 6, f"{label}:", align="R")
+        pdf.cell(30, 6, f"{value:,.2f}", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(sum(widths) - 30, 7, "Total:", align="R")
+    pdf.cell(30, 7, f"{quotation.total:,.2f}", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", size=8)
+    for label, value in (
+        ("Payment terms", quotation.payment_terms),
+        ("Delivery terms", quotation.delivery_terms),
+        ("Notes", quotation.notes),
+        ("Terms & conditions", quotation.terms_conditions),
+    ):
+        if value:
+            pdf.multi_cell(0, 4, _s(f"{label}: {value}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    return bytes(pdf.output())

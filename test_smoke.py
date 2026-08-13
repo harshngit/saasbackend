@@ -3463,6 +3463,173 @@ def _phase0_checks():
 
 _phase0_checks()
 
+# -- Phase 1A: quotation lifecycle, PATCH, convert-to-order, PDF ----------------
+# Wrapped in a function so this block's locals cannot shadow anything above it.
+
+
+def _phase1a_checks():
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": "Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+
+    abc, ah = firm("QuoteCo")
+    xyz, oh = firm("OtherQ")
+    prod = client.post("/products", headers=ah, json={
+        "name": "Water 20L", "price": 100, "total_inventory": 200, "tax_rate": 12}).json()
+    prod2 = client.post("/products", headers=ah, json={
+        "name": "Bottle 1L", "price": 25, "total_inventory": 50}).json()
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Fitness First Gym"},
+        "address_information": {"billing_address": "12 MG Road"}}).json()
+
+    print("== 1. Create with quoted discounts and taxes ==")
+    r = client.post("/quotations", headers=ah, json={
+        "customer_id": cust["id"], "valid_until": "2026-09-30",
+        "payment_terms": "Net 15", "delivery_terms": "Ex-works",
+        "terms_conditions": "Prices valid 30 days.",
+        "items": [
+            {"product_id": prod["id"], "quantity": 20, "unit_price": 100,
+             "discount": 200, "tax_rate": 18},
+            {"product_id": prod2["id"], "quantity": 4, "unit_price": 25},
+        ]})
+    check("POST /quotations -> 201", r.status_code == 201, r.text[:400])
+    q = r.json()
+    print(json.dumps({k: q[k] for k in ("quotation_number", "status", "subtotal", "tax_total",
+                                        "total", "item_count")}, indent=2))
+    check("starts as draft", q["status"] == "draft", q["status"])
+    check("line keeps its quoted discount and tax",
+          q["items"][0]["discount"] == 200 and q["items"][0]["tax_rate"] == 18
+          and q["items"][0]["line_total"] == 1800 and q["items"][0]["tax_amount"] == 324,
+          q["items"][0])
+    check("a line with no rate falls back to the product's",
+          q["items"][1]["tax_rate"] is None or q["items"][1]["tax_rate"] == 0, q["items"][1])
+    check("subtotal is net of discounts", q["subtotal"] == 1900, q["subtotal"])
+    check("total = subtotal + quoted tax", q["total"] == round(1900 + q["tax_total"], 2), q)
+    check("billing address auto-filled from the customer",
+          q["billing_address"] == "12 MG Road", q["billing_address"])
+    check("a bad status -> 422",
+          client.post("/quotations", headers=ah, json={
+              "customer_id": cust["id"], "status": "nonsense",
+              "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 10}]}).status_code == 422)
+    check("no lines -> 422",
+          client.post("/quotations", headers=ah, json={
+              "customer_id": cust["id"], "items": []}).status_code == 422)
+
+    print("\n== 2. PATCH /quotations/{id} ==")
+    r = client.patch(f"/quotations/{q['id']}", headers=ah, json={"status": "sent"})
+    check("status moves draft -> sent", r.json()["status"] == "sent", r.text[:200])
+    r = client.patch(f"/quotations/{q['id']}", headers=ah, json={
+        "payment_terms": "Net 30", "valid_until": "2026-10-31"})
+    check("terms update without touching the lines",
+          r.json()["payment_terms"] == "Net 30" and len(r.json()["items"]) == 2, r.text[:250])
+    r = client.patch(f"/quotations/{q['id']}", headers=ah, json={
+        "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 90,
+                   "discount": 0, "tax_rate": 5}]})
+    check("sending items replaces the whole line set",
+          len(r.json()["items"]) == 1 and r.json()["subtotal"] == 900
+          and r.json()["tax_total"] == 45, r.text[:300])
+    check("a bad status on PATCH -> 422",
+          client.patch(f"/quotations/{q['id']}", headers=ah, json={"status": "weird"}).status_code == 422)
+    check("setting converted by hand -> 400",
+          client.patch(f"/quotations/{q['id']}", headers=ah,
+                       json={"status": "converted"}).status_code == 400)
+    check("an empty item list -> 400",
+          client.patch(f"/quotations/{q['id']}", headers=ah, json={"items": []}).status_code == 400)
+    check("another firm's quotation -> 404",
+          client.patch(f"/quotations/{q['id']}", headers=oh, json={"status": "sent"}).status_code == 404)
+    client.patch(f"/quotations/{q['id']}", headers=ah, json={"status": "accepted"})
+
+    print("\n== 3. GET /quotations/{id}/pdf ==")
+    r = client.get(f"/quotations/{q['id']}/pdf", headers=ah)
+    check("PDF renders", r.status_code == 200 and r.content[:4] == b"%PDF"
+          and r.headers["content-type"] == "application/pdf", r.status_code)
+    check("cross-firm PDF -> 404",
+          client.get(f"/quotations/{q['id']}/pdf", headers=oh).status_code == 404)
+
+    print("\n== 4. Convert to order ==")
+    before = client.get("/warehouses/stock", headers=ah,
+                        params={"product_id": prod["id"]}).json()[0]
+    r = client.post(f"/quotations/{q['id']}/convert-to-order", headers=ah, json={
+        "delivery_date": "2026-08-15", "fulfilment_method": "delivery",
+        "payment_type": "credit", "payment_terms_days": 15})
+    check("POST /convert-to-order -> 201", r.status_code == 201, r.text[:400])
+    conv = r.json()
+    print(json.dumps(conv, indent=2))
+    check("response shape matches the spec",
+          set(conv) == {"quotation_id", "quotation_number", "quotation_status", "order"}, sorted(conv))
+    check("the quotation is now converted",
+          conv["quotation_status"] == "converted" and conv["quotation_id"] == q["id"], conv)
+    check("the order is placed and reserved",
+          conv["order"]["status"] == "placed"
+          and conv["order"]["fulfilment_status"] == "reserved", conv["order"])
+    order = client.get(f"/orders/{conv['order']['id']}", headers=ah).json()
+    check("no lines were resent, yet the order carries them",
+          len(order["items"]) == 1 and order["items"][0]["quantity"] == 10, order["items"])
+    check("the quoted rate, discount and tax came across",
+          order["items"][0]["unit_price"] == 90 and order["items"][0]["tax_rate"] == 5
+          and order["items"][0]["tax_amount"] == 45, order["items"][0])
+    check("the quoted total came across", order["total"] == 945, order["total"])
+    check("the fulfilment terms from the conversion body are on the order",
+          order["payment_type"] == "credit" and order["payment_terms_days"] == 15
+          and order["fulfilment_method"] == "delivery", order)
+    check("the order points back at the quotation", order["quotation_id"] == q["id"], order)
+    check("and the quotation points at the order",
+          client.get(f"/quotations/{q['id']}", headers=ah).json()["converted_order_id"]
+          == order["id"])
+    after = client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]}).json()[0]
+    check("converting reserved stock without deducting it",
+          after["on_hand"] == before["on_hand"] and after["reserved"] == before["reserved"] + 10,
+          {"before": before, "after": after})
+    check("no receivable from the conversion",
+          client.get(f"/customers/{cust['id']}", headers=ah)
+          .json()["financial_summary"]["outstanding_balance"] == 0)
+
+    print("\n-- a converted quotation is frozen --")
+    check("converting twice -> 400",
+          client.post(f"/quotations/{q['id']}/convert-to-order", headers=ah, json={}).status_code == 400)
+    check("editing it -> 400",
+          client.patch(f"/quotations/{q['id']}", headers=ah, json={"payment_terms": "x"}).status_code == 400)
+    check("deleting it -> 400",
+          client.delete(f"/quotations/{q['id']}", headers=ah).status_code == 400)
+
+    print("\n-- conversion guards --")
+    rej = client.post("/quotations", headers=ah, json={
+        "customer_id": cust["id"], "status": "rejected",
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 10}]}).json()
+    check("a rejected quotation cannot be converted",
+          client.post(f"/quotations/{rej['id']}/convert-to-order", headers=ah, json={}).status_code == 400)
+    big = client.post("/quotations", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod2["id"], "quantity": 9999, "unit_price": 25}]}).json()
+    r = client.post(f"/quotations/{big['id']}/convert-to-order", headers=ah, json={})
+    check("a shortage refuses the conversion",
+          r.status_code == 400 and r.json()["detail"]["error"] == "INSUFFICIENT_STOCK", r.text[:250])
+    check("and leaves the quotation unconverted",
+          client.get(f"/quotations/{big['id']}", headers=ah).json()["status"] != "converted")
+    check("another firm cannot convert it -> 404",
+          client.post(f"/quotations/{big['id']}/convert-to-order", headers=oh, json={}).status_code == 404)
+
+    print("\n-- the whole chain is linked --")
+    check("quotation -> order ids join up",
+          order["quotation_id"] == q["id"]
+          and client.get(f"/quotations/{q['id']}", headers=ah).json()["converted_order_id"] == order["id"])
+    check("human codes are on both",
+          q["quotation_number"].startswith("QT-") and order["order_number"].startswith("SO-"),
+          (q["quotation_number"], order["order_number"]))
+
+
+_phase1a_checks()
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.

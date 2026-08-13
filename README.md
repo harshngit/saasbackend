@@ -430,6 +430,53 @@ items, challan PDF, dispatch, POD, invoice from delivered quantity, simple/detai
 PDF formats, quick billing, ledger + ageing, the sales-return rework, and
 batch / serial tracking.
 
+## Quotations
+
+```
+POST   /quotations                          GET  /quotations        GET /quotations/{id}
+PATCH  /quotations/{id}                     DELETE /quotations/{id}
+POST   /quotations/{id}/convert-to-order
+GET    /quotations/{id}/pdf
+```
+
+Statuses: `draft` → `sent` → `accepted` / `rejected` / `expired`, and `converted`,
+which only the conversion endpoint sets.
+
+Lines carry the quoted terms — `quantity`, `unit_price`, `discount` and `tax_rate`
+(the line's own, else the product's) — and the quotation reports `subtotal`,
+`tax_total` and `total` from them.
+
+`PATCH` is a partial update; sending `items` replaces the whole line set, which is
+what the edit screen holds. Once converted a quotation is **frozen** — editing,
+re-converting and deleting all return 400, because the order now carries the agreed
+terms and the two must not drift apart.
+
+### Converting
+
+```http
+POST /quotations/{id}/convert-to-order
+{ "warehouse_id": "wh_001", "delivery_date": "2026-08-15",
+  "fulfilment_method": "delivery", "payment_type": "credit", "payment_terms_days": 15 }
+```
+
+**Send no lines.** The customer, products, variants, quantities, rates, discounts,
+taxes, terms and salesperson are all copied from the quotation; only the fulfilment
+terms the order needs come in the body.
+
+```json
+{ "quotation_id": "qt_001", "quotation_number": "QT-2026-1001",
+  "quotation_status": "converted",
+  "order": { "id": "ord_001", "order_number": "SO-2026-1002",
+             "status": "placed", "fulfilment_status": "reserved", "total": 945.0 } }
+```
+
+The order goes through exactly the same path as `POST /orders` —
+`app/services/order_service.place_order()` is the single implementation — so its
+stock is reserved, its status is `placed` (or `awaiting_approval` if the firm asks
+for approval), and a shortage refuses the conversion with `INSUFFICIENT_STOCK` and
+leaves the quotation untouched. Both records point at each other afterwards
+(`quotation.converted_order_id`, `order.quotation_id`).
+
 ## Admin dashboard
 
 `GET /dashboard/admin` (needs `dashboard.view`) returns every widget on the Admin

@@ -1,5 +1,19 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+# A quotation's life. `converted` is set by the conversion endpoint, never sent in.
+QUOTATION_STATUSES = ("draft", "sent", "accepted", "rejected", "expired", "converted")
+
+
+def _lower(value: object) -> object:
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+QuotationStatus = Annotated[
+    str, BeforeValidator(_lower), Field(pattern=f"^({'|'.join(QUOTATION_STATUSES)})$")
+]
 
 
 class QuotationCustomerBrief(BaseModel):
@@ -18,9 +32,15 @@ class QuotationSalespersonBrief(BaseModel):
 class QuotationItemBase(BaseModel):
     product_id: str | None = None
     variant_id: str | None = None
-    quantity: float
+    quantity: float = Field(gt=0)
     uom: str | None = None
-    unit_price: float
+    unit_price: float = Field(ge=0)
+    discount: float = Field(default=0, ge=0, description="Per line")
+    tax_rate: float | None = Field(
+        default=None, ge=0, le=100,
+        description="Per-line tax %. Falls back to the product's own rate; carried "
+                    "through to the order on conversion.",
+    )
 
 
 class QuotationItemCreate(QuotationItemBase):
@@ -31,6 +51,8 @@ class QuotationItemOut(QuotationItemBase):
     model_config = ConfigDict(from_attributes=True)
     id: str
     product_name: str
+    line_total: float = 0
+    tax_amount: float = 0
 
 
 class QuotationBase(BaseModel):
@@ -46,11 +68,56 @@ class QuotationBase(BaseModel):
     delivery_terms: str | None = None
     notes: str | None = None
     terms_conditions: str | None = None
-    status: str | None = Field(default=None, description="draft | sent | accepted | rejected | expired")
+    status: QuotationStatus | None = Field(
+        default=None,
+        description="draft | sent | accepted | rejected | expired. `converted` is set "
+                    "by POST /quotations/{id}/convert-to-order, not sent in.",
+    )
 
 
 class QuotationCreate(QuotationBase):
-    items: list[QuotationItemCreate]
+    items: list[QuotationItemCreate] = Field(min_length=1)
+
+
+class QuotationUpdate(QuotationBase):
+    """Partial update — only the fields you send change. Sending `items` replaces the
+    whole line set, which is what the edit screen holds. A converted quotation is
+    frozen: its order already exists."""
+
+    items: list[QuotationItemCreate] | None = None
+
+
+class ConvertToOrder(BaseModel):
+    """Turn an accepted quotation into a sales order.
+
+    Nothing about the lines is sent: the customer, products, variants, quantities,
+    rates, discounts, taxes, terms and salesperson are all copied from the quotation.
+    Only the fulfilment terms the order needs are given here.
+    """
+
+    warehouse_id: str | None = Field(
+        default=None, description="Which warehouse to reserve from. Defaults to the firm's default.")
+    delivery_date: datetime | None = None
+    fulfilment_method: str | None = Field(default=None, max_length=30, description="delivery | pickup")
+    payment_type: str | None = Field(default=None, max_length=20, description="cash | credit | upi | …")
+    payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+
+
+class ConvertedOrderBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    order_number: str
+    status: str
+    fulfilment_status: str | None = None
+    total: float = 0
+
+
+class ConversionOut(BaseModel):
+    quotation_id: str
+    quotation_number: str | None = None
+    quotation_status: str
+    order: ConvertedOrderBrief
 
 
 class QuotationOut(QuotationBase):
@@ -64,8 +131,12 @@ class QuotationOut(QuotationBase):
     items: list[QuotationItemOut]
     customer: QuotationCustomerBrief | None = None
     salesperson: QuotationSalespersonBrief | None = None
+    subtotal: float = 0
+    tax_total: float = 0
     total: float = 0
     item_count: int = 0
+    converted_order_id: str | None = None
+    converted_at: datetime | None = None
 
 
 class QuotationListItem(BaseModel):

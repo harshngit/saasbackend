@@ -41,6 +41,12 @@ class Quotation(Base):
     delivery_terms: Mapped[str | None] = mapped_column(String(200), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     terms_conditions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The order this quotation turned into, so the conversion is traceable both ways
+    # and a second conversion can be refused.
+    converted_order_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sales_orders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    converted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
@@ -56,9 +62,18 @@ class Quotation(Base):
 
 
     @property
+    def subtotal(self) -> float:
+        """Line totals after per-line discounts."""
+        return round(sum(i.line_total for i in self.items), 2)
+
+    @property
+    def tax_total(self) -> float:
+        return round(sum(i.tax_amount for i in self.items), 2)
+
+    @property
     def total(self) -> float:
-        """Sum of the line totals — what the list's Amount column shows."""
-        return round(sum((i.quantity or 0) * (i.unit_price or 0) for i in self.items), 2)
+        """What the list's Amount column shows — quoted lines plus quoted tax."""
+        return round(self.subtotal + self.tax_total, 2)
 
     @property
     def item_count(self) -> int:
@@ -82,5 +97,17 @@ class QuotationItem(Base):
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
     unit_price: Mapped[float] = mapped_column(Float, nullable=False)
+    # Quoted terms per line, carried through to the order on conversion so the
+    # customer is billed what they were quoted.
+    discount: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
+    tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    @property
+    def line_total(self) -> float:
+        return round((self.quantity or 0) * (self.unit_price or 0) - (self.discount or 0), 2)
+
+    @property
+    def tax_amount(self) -> float:
+        return round(self.line_total * (self.tax_rate or 0) / 100, 2)
 
     quotation: Mapped["Quotation"] = relationship(back_populates="items")

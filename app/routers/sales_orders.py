@@ -6,24 +6,16 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import (
-    Customer,
-    Product,
-    ProductVariant,
-    SalesOrder,
-    SalesOrderItem,
-    User,
-)
+from app.models import Customer, SalesOrder, User
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
     OrderCreate,
-    OrderItemIn,
     OrderOut,
     RejectBody,
 )
 from app.core import workflow
-from app.services import notification_service, numbering_service, lookup_service, stock_service
+from app.services import lookup_service, order_service, stock_service
 
 router = APIRouter(prefix="/orders", tags=["sales_orders"])
 
@@ -56,11 +48,6 @@ def _owned(db: Session, order_id: str, org_id: str, user: User | None = None) ->
     return record
 
 
-def _next_order_number(db: Session, org_id: str) -> str:
-    # max+1, not count+1: counting reissues a number after any deletion.
-    return numbering_service.next_number(db, org_id, SalesOrder.order_number, "SO")
-
-
 def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None) -> OrderOut:
     """The order plus what the warehouse now holds for it, so the sales screen sees
     the effect of placing it without a second call."""
@@ -79,24 +66,6 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
         out.stock_summary = summary
     out.warnings = warnings or []
     return out
-
-
-def _credit_warning(db: Session, customer: Customer, order_total: float, action: str) -> str | None:
-    """Whether this order takes the customer past their credit limit, and what the
-    firm's `credit_limit_action` says to do about it."""
-    limit = customer.credit_limit or 0
-    if action == "ignore" or limit <= 0:
-        return None
-    projected = round((customer.outstanding_balance or 0) + order_total, 2)
-    if projected <= limit:
-        return None
-    message = (
-        f"{customer.name} would be at Rs {projected:,.2f} against a credit limit of "
-        f"Rs {limit:,.2f}"
-    )
-    if action == "block":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
-    return message
 
 
 @router.get("", response_model=list[OrderOut])
@@ -158,120 +127,53 @@ def create_order(
     user: User = Depends(_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
-) -> SalesOrder:
+) -> OrderOut:
+    """Place a sales order.
+
+    Validated, priced, reserved and **placed** in one call — no Admin approval step
+    unless the firm has turned `order_requires_approval` on. Warehouse stock is held,
+    not deducted (that happens when a vehicle is loaded), and no receivable is
+    created (that starts at the invoice).
+
+    `warehouse_id` defaults to the firm's default warehouse. Each line snapshots the
+    tax rate it was sold at — its own `tax_rate`, else the product's — so an invoice
+    raised later bills the agreed figure.
+
+    A shortage returns 400 with `{"error": "INSUFFICIENT_STOCK", "shortages": [...]}`
+    naming what is short, unless the firm allows backorders. The response carries
+    `stock_summary` (on hand / reserved / available) and any `warnings`, such as the
+    customer going past their credit limit.
+    """
     org_id = _org_id(user)
-    settings = workflow.sales_settings(user.organization)
     customer = db.get(Customer, payload.customer_id)
     if customer is None or customer.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id is not a customer in your firm")
-    warehouse = stock_service.owned_warehouse(db, payload.warehouse_id, org_id)
-    if warehouse is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="warehouse_id is not a warehouse in your firm")
-
-    _order_no = _next_order_number(db, org_id)
-    order = SalesOrder(
-        organization_id=org_id,
-        order_number=_order_no,
-        # The sheet calls it Sales Order Number; same value, kept in its own
-        # column so either name works.
-        sales_order_number=_order_no,
-        customer_id=customer.id,
-        order_date=payload.order_date or datetime.now(timezone.utc),
-        salesperson_id=payload.salesperson_id,
-        order_status=payload.order_status or "Draft",
-        # Placed straight away — an Admin is not a step in every sale. A firm that
-        # turns order_requires_approval on gets the old awaiting-approval gate.
-        status="awaiting_approval" if settings["order_requires_approval"] else "placed",
-        fulfilment_status="not_started",
-        warehouse_id=warehouse.id,
-        quotation_id=payload.quotation_id,
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="customer_id is not a customer in your firm",
+        )
+    order, warnings = order_service.place_order(
+        db, user, customer,
+        lines=[
+            order_service.OrderLine(
+                product_id=it.product_id, variant_id=it.variant_id, quantity=it.quantity,
+                unit_price=it.unit_price, discount=it.discount, tax_rate=it.tax_rate,
+            )
+            for it in payload.items
+        ],
+        warehouse_id=payload.warehouse_id,
+        order_date=payload.order_date,
         delivery_date=payload.delivery_date,
         fulfilment_method=payload.fulfilment_method,
         payment_type=payload.payment_type,
         payment_terms_days=payload.payment_terms_days,
+        salesperson_id=payload.salesperson_id,
+        quotation_id=payload.quotation_id,
         source=payload.source,
-        created_by=user.id,
-        discount=payload.discount,
-        tax=payload.tax,
+        order_level_discount=payload.discount,
+        order_level_tax=payload.tax,
         notes=payload.notes,
+        order_status_label=payload.order_status,
     )
-
-    subtotal = 0.0
-    line_tax = 0.0
-    wanted: list[dict] = []
-    for it in payload.items:
-        product = db.get(Product, it.product_id)
-        if product is None or product.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An item's product is not in your firm")
-        variant = None
-        if it.variant_id:
-            variant = db.get(ProductVariant, it.variant_id)
-            if variant is None or variant.product_id != product.id:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An item's variant is invalid")
-        unit_price = it.unit_price if it.unit_price is not None else (variant.price if variant else product.price)
-        line_total = round(unit_price * it.quantity - it.discount, 2)
-        # The line's own rate, else the product's. Never a hardcoded figure — an
-        # invoice raised later bills this snapshot.
-        rate = it.tax_rate if it.tax_rate is not None else product.tax_rate
-        tax_amount = round(line_total * (rate or 0) / 100, 2)
-        subtotal += line_total
-        line_tax += tax_amount
-        order.items.append(
-            SalesOrderItem(
-                product_id=product.id,
-                variant_id=it.variant_id,
-                product_name=product.name if not variant else f"{product.name} ({variant.name})",
-                quantity=it.quantity,
-                unit_price=unit_price,
-                discount=it.discount,
-                tax_rate=rate,
-                tax_amount=tax_amount,
-                line_total=line_total,
-            )
-        )
-        wanted.append({
-            "product_id": product.id,
-            "variant_id": it.variant_id,
-            "quantity": it.quantity,
-            "product_name": product.name,
-        })
-
-    # Can the warehouse actually cover it? `available` is on-hand less what other
-    # orders already hold, so this is the check that stops overselling.
-    if not settings["allow_backorder"]:
-        short = stock_service.shortages(db, warehouse.id, wanted)
-        if short:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "INSUFFICIENT_STOCK", "shortages": short},
-            )
-
-    order.subtotal = round(subtotal, 2)
-    # An order-level tax overrides the per-line total when one is sent, so callers
-    # written against the old flat `tax` field keep working.
-    order.tax = payload.tax if payload.tax else round(line_tax, 2)
-    order.total = round(subtotal - payload.discount + order.tax, 2)
-
-    warnings = []
-    credit = _credit_warning(db, customer, order.total, settings["credit_limit_action"])
-    if credit:
-        warnings.append(credit)
-
-    db.add(order)
-    db.flush()
-
-    # Hold the stock. Nothing physical moves — on-hand only drops when a vehicle is
-    # loaded, so cancelling this order is a release, not an invented stock-in.
-    if settings["reserve_stock_on_order"]:
-        for reservation in stock_service.reserve_for_order(db, order, warehouse.id):
-            item = db.get(SalesOrderItem, reservation.order_item_id)
-            if item is not None:
-                item.reserved_quantity = reservation.reserved_quantity
-        order.fulfilment_status = "reserved"
-
-    notification_service.notify_org_admins(
-        db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
-        type="order", link=order.id)
     db.commit()
     db.refresh(order)
     return _order_out(db, order, warnings)
