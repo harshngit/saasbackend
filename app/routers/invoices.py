@@ -16,11 +16,10 @@ from app.models import (
     Product,
     ProductVariant,
     SalesOrder,
-    StockMovement,
     StoredFile,
     User,
 )
-from app.services import numbering_service, lookup_service
+from app.services import lookup_service, numbering_service, payment_service, stock_service
 from app.schemas.invoice import (
     CreditNoteBody,
     InvoiceCreate,
@@ -296,104 +295,195 @@ def create_direct_invoice(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Invoice:
-    """Direct sale invoice creation. Finalizes the sale, deducts stock, and updates receivables."""
-    org_id = _org_id(user)
-    customer = db.get(Customer, payload.customer_id)
-    if customer is None or customer.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id is not a customer in your firm")
+    """Quick billing — the retail counter, a shop sale, an immediate sale.
 
+    No sales order and no delivery: the goods leave the warehouse as the bill is
+    raised, and the invoice, the stock movements and the payment all land in one
+    transaction, so a failure anywhere leaves no half-finished sale behind.
+
+    The buyer is either `customer_id` or a `walk_in_customer` block. A walk-in is
+    snapshotted onto the invoice — no customer record is created, and an anonymous
+    sale that is paid in full opens no receivable ledger at all.
+
+    Tax is the line's `tax_rate` when given, else the product's own rate, so a counter
+    sale is taxed exactly like an order for the same goods. Nothing is hardcoded.
+
+    Send `payment` to settle it now and get back a paid invoice with its receipt
+    recorded; leave it out for a credit sale, which stands unpaid as a receivable.
+    """
+    org_id = _org_id(user)
+
+    customer = None
+    if payload.customer_id:
+        customer = db.get(Customer, payload.customer_id)
+        if customer is None or customer.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="customer_id is not a customer in your firm",
+            )
+    walk_in = payload.walk_in_customer
+    if customer is None and walk_in is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Send customer_id, or a walk_in_customer block for a counter sale",
+        )
+
+    warehouse = stock_service.owned_warehouse(db, payload.warehouse_id, org_id)
+    if payload.warehouse_id and warehouse is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="warehouse_id is not a warehouse in your firm",
+        )
+    if warehouse is None:
+        warehouse = stock_service.default_warehouse(db, org_id)
+
+    issued = payload.invoice_date or datetime.now(timezone.utc)
     invoice = Invoice(
         organization_id=org_id,
         invoice_number=_next_invoice_number(db, org_id),
         sales_id=numbering_service.next_number(db, org_id, Invoice.sales_id, "SALE"),
-        customer_id=customer.id,
-        invoice_date=payload.invoice_date or datetime.now(timezone.utc),
-        # Sheet marks Billing Address "copied from related record at creation time".
-        billing_address=payload.billing_address or customer.billing_address,
+        customer_id=customer.id if customer is not None else None,
+        walk_in_name=(walk_in.name if walk_in is not None else None),
+        walk_in_phone=(walk_in.mobile_number if walk_in is not None else None),
+        invoice_date=issued,
+        # The sheet marks Billing Address "copied from related record at creation time".
+        billing_address=payload.billing_address or (customer.billing_address if customer else None),
         sales_type=payload.sales_type or "Invoice",
-        sales_date=payload.sales_date or payload.invoice_date or datetime.now(timezone.utc),
+        sales_date=payload.sales_date or issued,
         sales_status=payload.sales_status or "Confirmed",
         invoice_status=payload.invoice_status or "Issued",
         payment_status=payload.payment_status or "Unpaid",
         status="unpaid",
         discount=payload.discount,
-        tax=payload.tax,
         additional_charges=payload.additional_charges,
         round_off=payload.round_off,
         notes=payload.notes,
         created_by=user.id,
     )
 
+    # One pass to resolve and price every line, so nothing moves until the whole
+    # basket is known to be valid and in stock.
+    lines: list[dict] = []
     subtotal = 0.0
-    for it in payload.items:
-        product = db.get(Product, it.product_id)
+    line_tax_total = 0.0
+    for entry in payload.items:
+        product = db.get(Product, entry.product_id)
         if product is None or product.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An item's product is not in your firm")
-        variant = None
-        if it.variant_id:
-            variant = db.get(ProductVariant, it.variant_id)
-            if variant is None or variant.product_id != product.id:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An item's variant is invalid")
-        
-        unit_price = it.unit_price if it.unit_price is not None else (variant.price if variant else product.price)
-        line_total = round(unit_price * it.quantity - it.discount, 2)
-        subtotal += line_total
-
-        # Deduct Main Warehouse Inventory instantly
-        current_inv = variant.inventory if variant else product.total_inventory
-        new_inv = current_inv - it.quantity
-        if new_inv < 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Insufficient stock for {product.name}",
+                detail="An item's product is not in your firm",
             )
-        if variant:
-            variant.inventory = new_inv
-        else:
-            product.total_inventory = new_inv
+        variant = None
+        if entry.variant_id:
+            variant = db.get(ProductVariant, entry.variant_id)
+            if variant is None or variant.product_id != product.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="An item's variant is invalid"
+                )
 
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=product.id,
-                variant_id=it.variant_id,
-                movement_type="sale_out",
-                quantity=-it.quantity,
-                balance_after=new_inv,
-                note=f"Direct Invoice {invoice.invoice_number}",
-                created_by=user.id,
-            )
+        unit_price = entry.unit_price
+        if unit_price is None:
+            unit_price = (variant.price if variant is not None else None) or product.price or 0
+        line_total = round(unit_price * entry.quantity - entry.discount, 2)
+        # The line's own rate, else the product's — never a hardcoded percentage.
+        rate = entry.tax_rate if entry.tax_rate is not None else product.tax_rate
+        if rate is not None:
+            tax_amount = round(line_total * rate / 100, 2)
+        else:
+            tax_amount = round(entry.tax, 2)
+        subtotal += line_total
+        line_tax_total += tax_amount
+        lines.append({
+            "product": product, "variant": variant, "quantity": entry.quantity,
+            "unit_price": unit_price, "discount": entry.discount, "line_total": line_total,
+            "tax_rate": rate, "tax_amount": tax_amount,
+        })
+
+    wanted = [
+        {"product_id": line["product"].id,
+         "variant_id": line["variant"].id if line["variant"] is not None else None,
+         "quantity": line["quantity"],
+         "product_name": line["product"].name}
+        for line in lines
+    ]
+    short = stock_service.shortages(db, warehouse.id, wanted)
+    if short:
+        detail = "; ".join(
+            f"{row['product_name']}: {row['available_quantity']} available, "
+            f"{row['required_quantity']} needed"
+            for row in short
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Not enough stock — {detail}"
         )
 
+    for line in lines:
+        variant = line["variant"]
+        product = line["product"]
+        stock_service.adjust_on_hand(
+            db, org_id, warehouse.id, product.id,
+            variant.id if variant is not None else None,
+            -line["quantity"],
+            movement_type="sale_out",
+            note=f"Direct Invoice {invoice.invoice_number}",
+            created_by=user.id,
+        )
         invoice.items.append(
             InvoiceItem(
                 product_id=product.id,
-                variant_id=it.variant_id,
-                product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                variant_id=variant.id if variant is not None else None,
+                product_name=product.name if variant is None else f"{product.name} ({variant.name})",
                 hsn_code=product.hsn_code,
-                quantity=it.quantity,
-                unit_price=unit_price,
-                discount=it.discount,
-                tax=it.tax,
-                line_total=line_total,
+                quantity=line["quantity"],
+                unit_price=line["unit_price"],
+                discount=line["discount"],
+                tax=line["tax_amount"],
+                tax_amount=line["tax_amount"],
+                tax_rate=line["tax_rate"],
+                line_total=line["line_total"],
             )
         )
 
     invoice.subtotal = round(subtotal, 2)
+    # An order-level `tax` in the body is still honoured for older clients; otherwise
+    # the tax is what the lines add up to.
+    invoice.tax = round(payload.tax, 2) if payload.tax else round(line_tax_total, 2)
     invoice.total = round(
-        subtotal
+        invoice.subtotal
         - payload.discount
-        + payload.tax
+        + invoice.tax
         + (payload.additional_charges or 0)
         + (payload.round_off or 0),
         2,
     )
 
-    # Add to the customer's receivables
-    customer.total_billed = round((customer.total_billed or 0) + invoice.total, 2)
-    customer.recompute_outstanding()
+    # A named customer owes this from now on. An anonymous walk-in has no ledger to
+    # open — the invoice itself carries whatever is unpaid.
+    if customer is not None:
+        customer.total_billed = round((customer.total_billed or 0) + invoice.total, 2)
+        customer.recompute_outstanding()
 
     db.add(invoice)
+    db.flush()
+
+    if payload.payment is not None:
+        try:
+            payment_service.record(
+                db, org_id,
+                customer=customer,
+                invoice=invoice,
+                amount=payload.payment.amount,
+                payment_mode=payload.payment.payment_method,
+                reference=payload.payment.transaction_reference,
+                received_on=payload.payment.received_on,
+                note=f"Counter payment against {invoice.invoice_number}",
+            )
+        except ValueError as exc:
+            # Nothing is committed yet, so a bad payment takes the whole sale with it
+            # rather than leaving a billed-but-unsold invoice behind.
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     db.commit()
     db.refresh(invoice)
     return invoice
@@ -497,6 +587,8 @@ def create_credit_note(
     if invoice.status == "returned":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invoice is already returned")
 
+    warehouse = stock_service.default_warehouse(db, org_id)
+
     # Reverse stock deduction
     for item in invoice.items:
         qty_to_return = item.quantity
@@ -507,31 +599,16 @@ def create_credit_note(
             else:
                 qty_to_return = 0
 
-        if qty_to_return <= 0:
+        if qty_to_return <= 0 or not item.product_id:
             continue
 
-        if item.variant_id:
-            variant = db.get(ProductVariant, item.variant_id)
-            if variant:
-                variant.inventory = (variant.inventory or 0) + qty_to_return
-                new_inv = variant.inventory
-        else:
-            product = db.get(Product, item.product_id)
-            if product:
-                product.total_inventory = (product.total_inventory or 0) + qty_to_return
-                new_inv = product.total_inventory
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=item.product_id,
-                variant_id=item.variant_id,
-                movement_type="sales_return",
-                quantity=qty_to_return,
-                balance_after=new_inv,
-                note=f"Credit Note Return for {invoice.invoice_number}",
-                created_by=user.id,
-            )
+        # Back into the warehouse the goods left, through the one stock path, so the
+        # warehouse row, the catalog counter and the movement ledger stay in step.
+        stock_service.adjust_on_hand(
+            db, org_id, warehouse.id, item.product_id, item.variant_id, qty_to_return,
+            movement_type="sales_return",
+            note=f"Credit Note Return for {invoice.invoice_number}",
+            created_by=user.id,
         )
 
     # Adjust customer receivables (reduce total_billed)

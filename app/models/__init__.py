@@ -47,7 +47,6 @@ from app.models.warehouse import (
 from app.models.lead import Lead
 from app.models.quotation import Quotation, QuotationItem
 from app.models.delivery import Delivery, DeliveryItem
-from app.models.payment_receipt import PaymentReceipt
 from app.models.sales_return import SalesReturn, ReturnItem
 
 __all__ = [
@@ -108,7 +107,6 @@ __all__ = [
     "QuotationItem",
     "Delivery",
     "DeliveryItem",
-    "PaymentReceipt",
     "SalesReturn",
     "ReturnItem",
 ]

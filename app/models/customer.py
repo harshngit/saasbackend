@@ -143,14 +143,24 @@ class Customer(Base):
 
 
 class CustomerPayment(Base):
-    """A payment received from a customer (reduces their outstanding balance)."""
+    """One payment received, and the receipt that acknowledges it.
+
+    This is the only table money-in is written to. The customer's payment history, the
+    receipts module and the cash taken with a quick bill all land here, so an
+    invoice's paid figure, the customer's balance and the ageing buckets are always
+    reading the same rows.
+    """
 
     __tablename__ = "customer_payments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    customer_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True
+    # Null for an anonymous walk-in sale: cash over the counter with no ledger behind it.
+    customer_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    # The receipt this payment is acknowledged by (RCPT-0001). Assigned on every
+    # payment, whichever surface took it, so any payment can be handed to a customer.
+    receipt_number: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )

@@ -4167,7 +4167,8 @@ def _phase1ij_checks():
     plain = client.post("/invoices", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100}]}).json()
-    check("leaving them out changes nothing", plain["total"] == 100, plain["total"])
+    check("leaving them out charges only the goods and their own tax",
+          plain["total"] == 105 and plain["items"][0]["tax_rate"] == 5, plain)
 
     print("\n== 12. An older invoice with nothing filled in still prints ==")
     # The shape a row written before these columns existed has: no tax rate, no HSN,
@@ -4193,6 +4194,367 @@ def _phase1ij_checks():
 
 
 _phase1ij_checks()
+
+
+def _phase1kn_checks():
+    """Phase 1K-1N: quick billing, walk-in buyers, receipts, and the customer ledger."""
+    import json
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": "Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+    shop, ah = firm("CounterCo")
+    other, oh = firm("OtherCounter")
+
+    prod = client.post("/products", headers=ah, json={
+        "name": "Bottle 1L", "price": 100, "total_inventory": 60,
+        "tax_rate": 18, "hsn_code": "22011010"}).json()
+    plainprod = client.post("/products", headers=ah, json={
+        "name": "Crate", "price": 50, "total_inventory": 20}).json()
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Gupta Kirana", "phone": "9800011122"},
+        "address_information": {"billing_address": "5 Station Road"},
+        "payment_information": {"credit_limit": 10000}}).json()
+
+    def on_hand():
+        rows = client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]}).json()
+        return rows[0]["on_hand"] if rows else None
+
+    print("\n== 1. Quick billing: one call, goods out, money in (Phase 1K) ==")
+    start = on_hand()
+    r = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"], "sales_type": "POS Sale",
+        "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100,
+                   "discount": 0, "tax_rate": 18}],
+        "payment": {"payment_method": "upi", "amount": 236,
+                    "transaction_reference": "UPI123456"}})
+    check("POST /invoices with a payment -> 201", r.status_code == 201, r.text[:400])
+    pos = r.json()
+    print(json.dumps({k: pos[k] for k in ("invoice_number", "sales_type", "status", "subtotal",
+                                          "tax", "total", "amount_paid", "outstanding_amount",
+                                          "items")}, indent=2))
+    check("2 x 100 = 200 billed", pos["subtotal"] == 200, pos["subtotal"])
+    check("18% is 36", pos["tax"] == 36, pos["tax"])
+    check("total is 236", pos["total"] == 236, pos["total"])
+    check("it is paid in full", pos["status"] == "paid" and pos["amount_paid"] == 236, pos)
+    check("nothing outstanding", pos["outstanding_amount"] == 0, pos["outstanding_amount"])
+    check("the line keeps the rate it was taxed at", pos["items"][0]["tax_rate"] == 18)
+    check("and the HSN", pos["items"][0]["hsn_code"] == "22011010")
+    check("the goods left the warehouse", on_hand() == start - 2, (start, on_hand()))
+    moves = client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]
+    check("and the movement is on the ledger",
+          any(m["movement_type"] == "sale_out" and m["quantity"] == -2 for m in moves),
+          moves[:2])
+
+    print("\n== 2. The payment is receipted, once, in one place ==")
+    receipts = client.get("/payment-receipts", headers=ah, params={"invoice_id": pos["id"]}).json()
+    check("the counter payment shows up as a receipt", len(receipts) == 1, receipts)
+    rc = receipts[0]
+    check("with its own RCPT number", (rc["receipt_number"] or "").startswith("RCPT-"), rc)
+    check("naming the invoice and the customer",
+          rc["invoice_id"] == pos["id"] and rc["customer_id"] == cust["id"], rc)
+    check("the method and reference came across",
+          rc["payment_method"] == "upi" and rc["transaction_reference"] == "UPI123456", rc)
+    check("and it reports where the invoice stands",
+          rc["invoice_total"] == 236 and rc["total_paid"] == 236
+          and rc["outstanding_amount"] == 0 and rc["payment_status"] == "paid", rc)
+    check("the same payment is in the customer's history, not duplicated",
+          [p["id"] for p in client.get(f"/customers/{cust['id']}/payments", headers=ah).json()]
+          == [rc["id"]])
+    money = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    check("the customer was billed and credited the same 236",
+          money["total_billed"] == 236 and money["total_received"] == 236
+          and money["outstanding_balance"] == 0, money)
+
+    print("\n== 3. A credit sale, and the product's own tax ==")
+    credit = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 1}]}).json()
+    check("no payment block leaves it unpaid", credit["status"] == "unpaid", credit["status"])
+    check("the product's own rate applied with no tax_rate sent",
+          credit["items"][0]["tax_rate"] == 18 and credit["total"] == 118, credit)
+    check("the price came from the product", credit["items"][0]["unit_price"] == 100)
+    check("a product with no tax rate is billed without tax",
+          client.post("/invoices", headers=ah, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": plainprod["id"], "quantity": 1}]}).json()["total"] == 50)
+    owed = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    check("and the receivable grew by the credit sales",
+          owed["outstanding_balance"] == 118 + 50, owed["outstanding_balance"])
+
+    print("\n== 4. A sale that cannot happen leaves nothing behind ==")
+    before_count = len(client.get("/invoices", headers=ah).json())
+    before_stock = on_hand()
+    r = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 9999}]})
+    check("more than the warehouse holds -> 400", r.status_code == 400, r.text[:250])
+    check("and it says what is short", "Not enough stock" in r.text, r.text[:250])
+    r = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 1}],
+        "payment": {"payment_method": "cash", "amount": 5000}})
+    check("paying more than the bill -> 400", r.status_code == 400, r.text[:250])
+    check("no half-finished sale was left",
+          len(client.get("/invoices", headers=ah).json()) == before_count, before_count)
+    check("and no stock moved for it", on_hand() == before_stock, (before_stock, on_hand()))
+    check("a foreign warehouse -> 400",
+          client.post("/invoices", headers=ah, json={
+              "customer_id": cust["id"], "warehouse_id": str(uuid.uuid4()),
+              "items": [{"product_id": prod["id"], "quantity": 1}]}).status_code == 400)
+    check("another firm's customer -> 400",
+          client.post("/invoices", headers=oh, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": prod["id"], "quantity": 1}]}).status_code == 400)
+
+    print("\n== 5. Walk-in buyer at the counter (Phase 1L) ==")
+    r = client.post("/invoices", headers=ah, json={
+        "walk_in_customer": {"name": "Cash Customer", "mobile_number": "9765432100"},
+        "sales_type": "POS Sale",
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100, "tax_rate": 18}],
+        "payment": {"payment_method": "cash", "amount": 118}})
+    check("a sale with no customer_id -> 201", r.status_code == 201, r.text[:400])
+    walk = r.json()
+    check("no customer record is attached", walk["customer_id"] is None and walk["customer"] is None, walk)
+    check("but who bought it is kept",
+          walk["walk_in_name"] == "Cash Customer" and walk["walk_in_phone"] == "9765432100", walk)
+    check("and it is paid", walk["status"] == "paid" and walk["outstanding_amount"] == 0, walk)
+    check("no customer was created for the walk-in",
+          len(client.get("/customers", headers=ah).json()) == 1)
+    check("the anonymous receipt carries no customer",
+          client.get("/payment-receipts", headers=ah,
+                     params={"invoice_id": walk["id"]}).json()[0]["customer_id"] is None)
+    unchanged = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    check("and no customer's ledger moved",
+          unchanged["total_received"] == 236, unchanged["total_received"])
+    check("neither a customer nor a walk-in -> 400",
+          client.post("/invoices", headers=ah, json={
+              "items": [{"product_id": prod["id"], "quantity": 1}]}).status_code == 400)
+    for shape in ("simple", "detailed"):
+        check(f"a walk-in invoice still prints as {shape}",
+              client.get(f"/invoices/{walk['id']}/pdf", headers=ah,
+                         params={"format": shape}).content[:5] == b"%PDF-")
+    check("a part-paid walk-in keeps its own balance",
+          client.post("/invoices", headers=ah, json={
+              "walk_in_customer": {"name": "Cash Customer"},
+              "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100, "tax_rate": 0}],
+              "payment": {"payment_method": "cash", "amount": 40}}).json()["outstanding_amount"] == 60)
+
+    print("\n== 6. Payment receipts derive the customer from the invoice (Phase 1M) ==")
+    bill = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 100, "tax_rate": 0}]}).json()
+    check("a 1000 credit sale", bill["total"] == 1000 and bill["status"] == "unpaid", bill)
+    r = client.post("/payment-receipts", headers=ah, json={
+        "invoice_reference_id": bill["id"], "amount_received": 400,
+        "payment_method": "bank_transfer", "transaction_reference": "UTR123456"})
+    check("POST /payment-receipts with no customer_id -> 201", r.status_code == 201, r.text[:400])
+    part = r.json()
+    print(json.dumps(part, indent=2, default=str))
+    check("the customer was derived from the invoice", part["customer_id"] == cust["id"], part)
+    check("it reports the invoice position",
+          part["invoice_total"] == 1000 and part["total_paid"] == 400
+          and part["outstanding_amount"] == 600 and part["payment_status"] == "partial", part)
+    after = client.get(f"/invoices/{bill['id']}", headers=ah).json()
+    check("the invoice moved to partial in the same call",
+          after["status"] == "partial" and after["amount_paid"] == 400
+          and after["payment_status"] == "Partial", after)
+    r = client.post("/payment-receipts", headers=ah, json={
+        "invoice_reference_id": bill["id"], "amount_received": 600, "payment_method": "cash"})
+    check("the balance clears it", r.json()["payment_status"] == "paid", r.json())
+    check("and the invoice says paid",
+          client.get(f"/invoices/{bill['id']}", headers=ah).json()["status"] == "paid")
+    r = client.post("/payment-receipts", headers=ah, json={
+        "invoice_reference_id": bill["id"], "amount_received": 1})
+    check("paying a settled invoice -> 400", r.status_code == 400, r.text[:250])
+    check("and it points at advances instead", "advance" in r.text.lower(), r.text[:250])
+
+    print("\n== 7. Over-payment, advances and guard rails ==")
+    small = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100, "tax_rate": 0}]}).json()
+    r = client.post("/payment-receipts", headers=ah, json={
+        "invoice_reference_id": small["id"], "amount_received": 5000})
+    check("more than the invoice owes -> 400", r.status_code == 400, r.text[:250])
+    check("the invoice was left alone",
+          client.get(f"/invoices/{small['id']}", headers=ah).json()["amount_paid"] == 0)
+    before = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    adv = client.post("/payment-receipts", headers=ah, json={
+        "customer_id": cust["id"], "amount_received": 5000, "payment_method": "cash",
+        "note": "Advance for next month"})
+    check("an advance with no invoice -> 201", adv.status_code == 201, adv.text[:300])
+    check("it settles no invoice", adv.json()["invoice_id"] is None, adv.json())
+    now_owed = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    check("but it does reduce what the customer owes",
+          now_owed["outstanding_balance"] == round(before["outstanding_balance"] - 5000, 2),
+          (before["outstanding_balance"], now_owed["outstanding_balance"]))
+    check("a customer_id that disagrees with the invoice -> 400",
+          client.post("/payment-receipts", headers=ah, json={
+              "invoice_reference_id": small["id"], "customer_id": str(uuid.uuid4()),
+              "amount_received": 10}).status_code == 400)
+    check("neither invoice nor customer -> 400",
+          client.post("/payment-receipts", headers=ah,
+                      json={"amount_received": 10}).status_code == 400)
+    check("zero or less -> 422",
+          client.post("/payment-receipts", headers=ah, json={
+              "customer_id": cust["id"], "amount_received": 0}).status_code == 422)
+    check("another firm's invoice -> 400",
+          client.post("/payment-receipts", headers=oh, json={
+              "invoice_reference_id": small["id"], "amount_received": 10}).status_code == 400)
+
+    print("\n== 8. Receipts: read, correct, void ==")
+    numbered = client.post("/payment-receipts", headers=ah, json={
+        "invoice_reference_id": small["id"], "amount_received": 60,
+        "receipt_number": "REC-COUNTER-001", "payment_method": "cash"}).json()
+    check("a custom receipt number is kept",
+          numbered["receipt_number"] == "REC-COUNTER-001", numbered)
+    check("reusing it -> 409",
+          client.post("/payment-receipts", headers=ah, json={
+              "invoice_reference_id": small["id"], "amount_received": 1,
+              "receipt_number": "REC-COUNTER-001"}).status_code == 409)
+    check("GET /payment-receipts/{id} -> 200",
+          client.get(f"/payment-receipts/{numbered['id']}", headers=ah).status_code == 200)
+    check("filter by customer",
+          all(x["customer_id"] == cust["id"] for x in client.get(
+              "/payment-receipts", headers=ah, params={"customer_id": cust["id"]}).json()))
+    check("cross-firm receipt -> 404",
+          client.get(f"/payment-receipts/{numbered['id']}", headers=oh).status_code == 404)
+    r = client.patch(f"/payment-receipts/{numbered['id']}", headers=ah, json={
+        "payment_method": "cheque", "transaction_reference": "CHQ-77"})
+    check("PATCH corrects the details -> 200",
+          r.status_code == 200 and r.json()["payment_method"] == "cheque"
+          and r.json()["transaction_reference"] == "CHQ-77", r.text[:250])
+    check("the amount is untouched by a correction", r.json()["amount_received"] == 60)
+    paid_before = client.get(f"/invoices/{small['id']}", headers=ah).json()["amount_paid"]
+    received_before = client.get(f"/customers/{cust['id']}",
+                                 headers=ah).json()["financial_summary"]["total_received"]
+    check("DELETE voids it -> 204",
+          client.delete(f"/payment-receipts/{numbered['id']}", headers=ah).status_code == 204)
+    voided_invoice = client.get(f"/invoices/{small['id']}", headers=ah).json()
+    check("the invoice gets its balance back",
+          voided_invoice["amount_paid"] == round(paid_before - 60, 2), voided_invoice["amount_paid"])
+    check("and its status is restated", voided_invoice["status"] == "unpaid", voided_invoice["status"])
+    check("the customer's received figure comes back too",
+          client.get(f"/customers/{cust['id']}", headers=ah).json()
+          ["financial_summary"]["total_received"] == round(received_before - 60, 2))
+    check("a voided receipt is gone",
+          client.get(f"/payment-receipts/{numbered['id']}", headers=ah).status_code == 404)
+
+    print("\n== 9. The customer ledger (Phase 1N) ==")
+    r = client.get(f"/customers/{cust['id']}/ledger", headers=ah)
+    check("GET /customers/{id}/ledger -> 200", r.status_code == 200, r.text[:300])
+    led = r.json()
+    print(json.dumps({"summary": led["summary"], "ageing": led["ageing"],
+                      "transactions": led["transactions"][:3]}, indent=2, default=str))
+    money = client.get(f"/customers/{cust['id']}", headers=ah).json()["financial_summary"]
+    check("the summary agrees with the customer",
+          led["summary"]["total_billed"] == money["total_billed"]
+          and led["summary"]["total_received"] == money["total_received"]
+          and led["summary"]["outstanding"] == money["outstanding_balance"], led["summary"])
+    check("the credit limit and what is left of it are there",
+          led["summary"]["credit_limit"] == 10000
+          and led["summary"]["available_credit"] == round(max(10000 - led["summary"]["outstanding"], 0), 2),
+          led["summary"])
+    check("every invoice debits and every payment credits",
+          all(t["debit"] > 0 and t["credit"] == 0
+              for t in led["transactions"] if t["type"] == "invoice")
+          and all(t["credit"] > 0 and t["debit"] == 0
+                  for t in led["transactions"] if t["type"] == "payment"),
+          led["transactions"][:4])
+    check("the running balance is the debits less the credits",
+          led["transactions"][-1]["balance"] == round(
+              sum(t["debit"] for t in led["transactions"])
+              - sum(t["credit"] for t in led["transactions"]), 2),
+          led["transactions"][-1])
+    check("invoices carry their number and status",
+          all(t["reference_number"] and t["status"]
+              for t in led["transactions"] if t["type"] == "invoice"))
+    check("receipts carry their RCPT number",
+          all(t["reference_number"] for t in led["transactions"] if t["type"] == "payment"))
+    check("the ledger is ordered oldest first",
+          led["transactions"] == sorted(led["transactions"], key=lambda t: t["date"]))
+    check("an anonymous counter sale is in nobody's ledger",
+          all(t["reference_number"] != walk["invoice_number"] for t in led["transactions"]))
+    check("another firm's customer -> 404",
+          client.get(f"/customers/{cust['id']}/ledger", headers=oh).status_code == 404)
+
+    print("\n== 10. Ageing buckets and what is overdue ==")
+    aged = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100, "tax_rate": 0}]}).json()
+    older = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100, "tax_rate": 0}]}).json()
+    # Age them the only honest way: move their dates back, as a real database would
+    # have them after a few months of trading.
+    from app.core.database import SessionLocal as _AgeSession
+    from sqlalchemy import text as _age_text
+    _adb = _AgeSession()
+    try:
+        _adb.execute(_age_text(
+            "UPDATE invoices SET invoice_date = :d, due_date = :d WHERE id = :i"),
+            {"d": _dt.now(_tz.utc) - _td(days=45), "i": aged["id"]})
+        _adb.execute(_age_text(
+            "UPDATE invoices SET invoice_date = :d, due_date = :d WHERE id = :i"),
+            {"d": _dt.now(_tz.utc) - _td(days=200), "i": older["id"]})
+        _adb.commit()
+    finally:
+        _adb.close()
+    led = client.get(f"/customers/{cust['id']}/ledger", headers=ah).json()
+    print(json.dumps(led["ageing"], indent=2))
+    check("a 45-day-old bill lands in 31_60", led["ageing"]["31_60"] >= 100, led["ageing"])
+    check("a 200-day-old bill lands in 90_plus", led["ageing"]["90_plus"] >= 200, led["ageing"])
+    unpaid_total = round(sum(
+        row["total"] - row["amount_paid"]
+        for row in client.get("/invoices", headers=ah).json()
+        if row["customer_id"] == cust["id"] and not row["is_credit_note"]), 2)
+    check("the buckets add up to every unpaid invoice",
+          round(sum(led["ageing"].values()), 2) == unpaid_total,
+          (led["ageing"], unpaid_total))
+    check("both overdue bills are counted as overdue",
+          led["summary"]["overdue_amount"] >= 300, led["summary"]["overdue_amount"])
+    check("a fresh unpaid bill sits in 0_30",
+          led["ageing"]["0_30"] > 0, led["ageing"])
+
+    print("\n== 11. An opening balance and a credit note are on the account ==")
+    opened = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Old Account"},
+        "payment_information": {"opening_balance": 2500, "credit_limit": 5000}}).json()
+    led = client.get(f"/customers/{opened['id']}/ledger", headers=ah).json()
+    check("the opening balance heads the ledger",
+          led["transactions"][0]["type"] == "opening_balance"
+          and led["transactions"][0]["debit"] == 2500, led["transactions"][:1])
+    check("and it is what they owe", led["summary"]["outstanding"] == 2500, led["summary"])
+    check("available credit is the limit less that",
+          led["summary"]["available_credit"] == 2500, led["summary"])
+    sold = on_hand()
+    cn_invoice = client.post("/invoices", headers=ah, json={
+        "customer_id": opened["id"],
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100, "tax_rate": 0}]}).json()
+    check("the counter sale took the stock", on_hand() == sold - 1, (sold, on_hand()))
+    client.post(f"/invoices/{cn_invoice['id']}/credit-note", headers=ah,
+                json={"reason": "Damaged in transit"})
+    check("the credit note puts it back in the warehouse, not just the catalog",
+          on_hand() == sold, (sold, on_hand()))
+    check("and the return is on the movement ledger",
+          any(m["movement_type"] == "sales_return"
+              for m in client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]))
+    led = client.get(f"/customers/{opened['id']}/ledger", headers=ah).json()
+    note = next((t for t in led["transactions"] if t["type"] == "credit_note"), None)
+    check("a credit note credits the account", note is not None and note["credit"] == 100, note)
+    check("its reason is on the line", note and note["description"] == "Damaged in transit", note)
+    check("and the receivable is back to the opening balance",
+          led["summary"]["outstanding"] == 2500, led["summary"])
+
+
+_phase1kn_checks()
 
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify

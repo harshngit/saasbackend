@@ -12,9 +12,16 @@ from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
 from app.core.files import save_upload
 from app.models import Customer, CustomerDocument, CustomerPayment, Invoice, StoredFile, User
-from app.services import customer_profile_service, lookup_service, numbering_service
+from app.services import (
+    customer_profile_service,
+    ledger_service,
+    lookup_service,
+    numbering_service,
+    payment_service,
+)
 from app.services.customer_profile_service import DOCUMENT_TYPES, OTHER_DOCUMENT_TYPE
 from app.schemas.customer_profile import CustomerProfileIn, CustomerProfileOut
+from app.schemas.ledger import CustomerLedger
 from app.schemas.customer import (
     CustomerCreate,
     CustomerDocumentOut,
@@ -72,16 +79,6 @@ def _owned_invoice(
     return invoice
 
 
-def _apply_to_invoice(invoice: Invoice, amount: float) -> None:
-    """Move an invoice's paid figure by `amount` (negative to void) and restate its
-    status. Clamped at zero so voiding can never push it negative."""
-    invoice.amount_paid = round(max((invoice.amount_paid or 0) + amount, 0), 2)
-    if invoice.amount_paid <= 0:
-        invoice.status = "unpaid"
-    elif invoice.amount_paid + 0.01 >= (invoice.total or 0):
-        invoice.status = "paid"
-    else:
-        invoice.status = "partial"
 
 
 def _attach_documents(db: Session, customer: Customer, section) -> None:
@@ -222,24 +219,50 @@ def record_customer_payment(
     """Record a payment received from a customer. Returns the customer with updated balances.
 
     Pass `invoice_id` to settle a specific invoice — that invoice's `amount_paid`
-    and `status` move with it. Omit it and the payment is an advance that only
-    reduces the customer's outstanding balance."""
+    and `status` move with it, and more than the invoice still owes is refused. Omit it
+    and the payment is an advance that only reduces the customer's outstanding balance.
+
+    Every payment is receipted: the row carries its own RCPT number, and the same
+    payment appears under GET /payment-receipts and in the customer's ledger."""
     org_id = _org_id(user)
     customer = _owned_customer(db, customer_id, user)
     invoice = _owned_invoice(db, payload.invoice_id, customer, org_id)
-    db.add(CustomerPayment(
-        customer_id=customer.id, organization_id=org_id, order_id=payload.order_id,
-        invoice_id=invoice.id if invoice else None,
-        amount=payload.amount, payment_mode=payload.payment_mode, reference=payload.reference,
-        note=payload.note, received_on=payload.received_on or datetime.now(timezone.utc),
-    ))
-    if invoice is not None:
-        _apply_to_invoice(invoice, payload.amount)
-    customer.total_received = round((customer.total_received or 0) + payload.amount, 2)
-    customer.recompute_outstanding()
+    try:
+        payment_service.record(
+            db, org_id,
+            customer=customer,
+            invoice=invoice,
+            amount=payload.amount,
+            payment_mode=payload.payment_mode,
+            reference=payload.reference,
+            note=payload.note,
+            received_on=payload.received_on,
+            order_id=payload.order_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     db.commit()
     db.refresh(customer)
     return customer
+
+
+@router.get("/{customer_id}/ledger", response_model=CustomerLedger)
+def customer_ledger(
+    customer_id: str, user: User = Depends(_pay_view), db: Session = Depends(get_db)
+) -> CustomerLedger:
+    """The customer's account: what they owe, how old it is, and every entry behind it.
+
+    `summary` is the standing position, including the credit still available against
+    their limit. `ageing` buckets the unpaid invoices by how long they have been
+    outstanding — from each invoice's due date where it has one, from its date where it
+    does not. `transactions` is the account itself, oldest first, with a running
+    balance: an invoice debits, a payment or a credit note credits.
+
+    The receivable starts at the invoice, never at the order — an order is a promise, an
+    invoice is a bill — so an unbilled order appears nowhere here.
+    """
+    customer = _owned_customer(db, customer_id, user)
+    return ledger_service.build(db, customer)
 
 
 @router.get("/{customer_id}/payments", response_model=list[CustomerPaymentOut])
@@ -289,13 +312,7 @@ def void_customer_payment(
     if payment is None or payment.customer_id != customer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
     # Undo whatever this payment did: the invoice it settled, or the advance balance.
-    if payment.invoice_id:
-        invoice = db.get(Invoice, payment.invoice_id)
-        if invoice is not None:
-            _apply_to_invoice(invoice, -payment.amount)
-    customer.total_received = round((customer.total_received or 0) - payment.amount, 2)
-    customer.recompute_outstanding()
-    db.delete(payment)
+    payment_service.void(db, payment)
     db.commit()
     db.refresh(customer)
     return customer

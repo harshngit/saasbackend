@@ -1,20 +1,52 @@
 from datetime import datetime
 from app.schemas.choices import InvoicePaymentStatus, SalesStatus, SalesType
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 
 class InvoiceItemIn(BaseModel):
+    """One line of a directly billed sale.
+
+    Send `tax_rate` as a percentage and the tax amount is worked out from the line.
+    Send neither and the product's own rate applies, so a counter sale is taxed the
+    same as an order for the same goods. `tax` as a flat amount is still accepted for
+    older clients.
+    """
+
     product_id: str
     variant_id: str | None = None
     quantity: int = Field(gt=0)
     unit_price: float | None = Field(default=None, ge=0)
     discount: float = Field(default=0, ge=0)
-    tax: float = Field(default=0, ge=0)
+    tax_rate: float | None = Field(
+        default=None, ge=0, le=100, description="Tax % on this line. Defaults to the product's rate"
+    )
+    tax: float = Field(default=0, ge=0, description="Flat tax amount. Ignored when tax_rate applies")
 
     @field_validator("variant_id", mode="before")
     @classmethod
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
+
+
+class WalkInCustomer(BaseModel):
+    """The buyer at the counter who is not worth a customer record.
+
+    Whatever they gave is snapshotted onto the invoice; no customer is created and no
+    receivable ledger is opened. A walk-in sale that is not fully paid still shows its
+    own balance on the invoice.
+    """
+
+    name: str | None = Field(default=None, max_length=200)
+    mobile_number: str | None = Field(default=None, max_length=20)
+
+
+class InvoicePaymentIn(BaseModel):
+    """The money taken at the counter, settled with the invoice in one transaction."""
+
+    payment_method: str | None = Field(default=None, max_length=30, description="cash | upi | card | …")
+    amount: float = Field(gt=0)
+    transaction_reference: str | None = Field(default=None, max_length=150)
+    received_on: datetime | None = None
 
 
 class InvoiceItemOut(BaseModel):
@@ -52,6 +84,8 @@ class InvoiceOut(BaseModel):
     order_id: str | None
     customer_id: str | None
     customer: CustomerBrief | None
+    walk_in_name: str | None = None
+    walk_in_phone: str | None = None
     delivery_id: str | None = None
     invoice_date: datetime
     due_date: datetime | None = None
@@ -79,6 +113,11 @@ class InvoiceOut(BaseModel):
     payment_status: str | None = None
     billing_address: str | None = None
 
+    @computed_field(description="What is still owed on this invoice")
+    @property
+    def outstanding_amount(self) -> float:
+        return round((self.total or 0) - (self.amount_paid or 0), 2)
+
 
 class InvoiceFromDelivery(BaseModel):
     """Bill an order for what a delivery actually handed over.
@@ -98,7 +137,24 @@ class InvoiceFromDelivery(BaseModel):
 
 
 class InvoiceCreate(BaseModel):
-    customer_id: str
+    """Bill a sale directly — the retail counter, a shop sale, a walk-in buyer.
+
+    No sales order and no delivery are involved: stock leaves the warehouse as the
+    invoice is raised. Send `payment` and the sale is settled and receipted in the
+    same transaction; leave it out and the invoice stands unpaid as a receivable.
+
+    The buyer is either a `customer_id` or a `walk_in_customer` block. One of the two
+    is needed — an invoice with neither belongs to nobody.
+    """
+
+    customer_id: str | None = None
+    walk_in_customer: WalkInCustomer | None = None
+    warehouse_id: str | None = Field(
+        default=None, description="Which warehouse the goods leave. Defaults to the firm's default"
+    )
+    payment: InvoicePaymentIn | None = Field(
+        default=None, description="Money taken now. Omit for a credit sale"
+    )
     invoice_date: datetime | None = None
     discount: float = Field(default=0, ge=0)
     tax: float = Field(default=0, ge=0)

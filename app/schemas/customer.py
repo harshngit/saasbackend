@@ -103,7 +103,10 @@ class CustomerPaymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    customer_id: str
+    customer_id: str | None
+    # Every payment is receipted, whichever surface took it, so the same row can be
+    # handed to the customer as RCPT-0001 and shows up under /payment-receipts.
+    receipt_number: str | None = None
     order_id: str | None
     invoice_id: str | None = None
     invoice: PaymentInvoiceBrief | None = None

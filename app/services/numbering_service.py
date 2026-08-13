@@ -95,7 +95,7 @@ SERIES: list[tuple[str, str, str]] = [
     ("Product", "product_id", "PROD"),
     ("Lead", "lead_id", "LEAD"),
     ("Quotation", "quotation_number", "QT"),
-    ("PaymentReceipt", "receipt_number", "RCPT"),
+    ("CustomerPayment", "receipt_number", "RCPT"),
     ("SalesReturn", "return_number", "RET"),
     ("Delivery", "delivery_note_number", "DN"),
 ]
