@@ -4169,6 +4169,28 @@ def _phase1ij_checks():
         "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100}]}).json()
     check("leaving them out changes nothing", plain["total"] == 100, plain["total"])
 
+    print("\n== 12. An older invoice with nothing filled in still prints ==")
+    # The shape a row written before these columns existed has: no tax rate, no HSN,
+    # no due date, no customer. A blank column must never cost the firm its invoice.
+    from app.core.database import SessionLocal as _BillSession
+    from sqlalchemy import text as _bill_text
+    _bdb = _BillSession()
+    try:
+        _bdb.execute(_bill_text(
+            "UPDATE invoice_items SET tax_rate = NULL, hsn_code = NULL, tax_amount = NULL, "
+            "uom = NULL WHERE invoice_id = :i"), {"i": plain["id"]})
+        _bdb.execute(_bill_text(
+            "UPDATE invoices SET customer_id = NULL, due_date = NULL, billing_address = NULL, "
+            "additional_charges = NULL, round_off = NULL, notes = NULL WHERE id = :i"),
+            {"i": plain["id"]})
+        _bdb.commit()
+    finally:
+        _bdb.close()
+    for shape in ("simple", "detailed"):
+        r = client.get(f"/invoices/{plain['id']}/pdf", headers=ah, params={"format": shape})
+        check(f"a bare legacy row prints as {shape}",
+              r.status_code == 200 and r.content[:5] == b"%PDF-", r.text[:200])
+
 
 _phase1ij_checks()
 
