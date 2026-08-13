@@ -54,7 +54,9 @@ TOP_N = 5
 RECENT_ORDERS = 10
 STOCK_WATCH_N = 10
 
-_TO_DELIVER = ("confirmed", "processing", "out_for_delivery", "partially_delivered")
+# Fulfilment states with work still to do. Order status and fulfilment are separate
+# axes now, so the "to deliver" tile reads the goods side.
+_TO_DELIVER = ("reserved", "planned", "loaded", "in_transit", "partially_delivered")
 
 
 def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, datetime]:
@@ -158,13 +160,13 @@ def _orders(db: Session, org_id: str, customer_id: str | None, df: datetime, dt:
     )
     if customer_id:
         query = query.filter(SalesOrder.customer_id == customer_id)
-    statuses = [row[0] for row in query.with_entities(SalesOrder.status).all()]
+    rows = query.with_entities(SalesOrder.status, SalesOrder.fulfilment_status).all()
     return DashboardOrders(
-        total=len(statuses),
-        pending=sum(1 for s in statuses if s == "pending"),
-        to_deliver=sum(1 for s in statuses if s in _TO_DELIVER),
-        delivered=sum(1 for s in statuses if s == "delivered"),
-        cancelled=sum(1 for s in statuses if s in ("cancelled", "returned", "rejected")),
+        total=len(rows),
+        pending=sum(1 for status_, _ in rows if status_ == "awaiting_approval"),
+        to_deliver=sum(1 for _, fulfilment in rows if fulfilment in _TO_DELIVER),
+        delivered=sum(1 for _, fulfilment in rows if fulfilment == "delivered"),
+        cancelled=sum(1 for status_, _ in rows if status_ == "cancelled"),
     )
 
 

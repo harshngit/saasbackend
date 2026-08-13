@@ -754,7 +754,9 @@ client.patch(f"/purchases/{ri['id']}/approve", headers=rep_hdr)
 # sales report
 r = client.get("/reports/sales", headers=rep_hdr)
 check("sales report -> summary+rows", r.status_code == 200 and r.json()["summary"]["total_sales"] == 1090 and len(r.json()["rows"]) == 1, r.text)
-# customer-outstanding (order billed 1000+90tax=1090, paid 400 -> 690)
+# customer-outstanding. Placing an order no longer bills anybody — the receivable
+# starts at the invoice — so bill it, then the 400 already paid leaves 690.
+client.post(f"/orders/{ro['id']}/invoice", headers=rep_hdr)
 r = client.get("/reports/customer-outstanding", headers=rep_hdr)
 check("customer-outstanding report", r.status_code == 200 and r.json()["summary"]["total_outstanding"] == 690, r.text)
 # supplier-outstanding (purchase 500+40=540)
@@ -832,11 +834,14 @@ check("filter expenses by status=approved", all(e["status"] == "approved" for e 
 fcust = client.post("/customers", headers=fin_hdr, json={"name": "Regular Buyer", "opening_balance": 500}).json()
 check("customer opening_balance -> outstanding 500",
       fcust["financial_summary"]["outstanding_balance"] == 500, fcust["financial_summary"])
-# order for this customer, approve -> billed
+# An order reserves stock but bills nobody — the receivable starts at the invoice.
 o = client.post("/orders", headers=fin_hdr, json={"customer_id": fcust["id"], "items": [{"product_id": fprod["id"], "quantity": 2, "unit_price": 100}]}).json()
-client.patch(f"/orders/{o['id']}/approve", headers=fin_hdr)
+check("placing an order does not bill the customer",
+      client.get(f"/customers/{fcust['id']}", headers=fin_hdr)
+      .json()["financial_summary"]["outstanding_balance"] == 500)
+client.post(f"/orders/{o['id']}/invoice", headers=fin_hdr)
 after_order = client.get(f"/customers/{fcust['id']}", headers=fin_hdr).json()
-check("order approve bills customer (outstanding 500+200=700)",
+check("invoicing the order bills the customer (500+200=700)",
       after_order["financial_summary"]["outstanding_balance"] == 700,
       after_order["financial_summary"])
 # record payment
@@ -847,7 +852,7 @@ check("customer payment history -> 1", len(pays) == 1, pays)
 r = client.delete(f"/customers/{fcust['id']}/payments/{pays[0]['id']}", headers=fin_hdr)
 check("void customer payment -> outstanding back to 700", r.status_code == 200 and r.json()["outstanding_balance"] == 700, r.text)
 
-print("\n== Sales Orders (lifecycle + stock deduction/restore) ==")
+print("\n== Sales Orders (placed on creation, stock reserved not deducted) ==")
 so_email = f"so_{uuid.uuid4().hex[:8]}@firm.com"
 sopr = client.post("/auth/register", json={
     "organization_name": "Orders Co", "admin_name": "O", "email": so_email, "password": "Secret@123"}).json()
@@ -864,16 +869,21 @@ check("create order -> 201", r.status_code == 201, r.text)
 order = r.json()
 order_id = order["id"]
 check("order_number generated", order["order_number"].startswith("SO-"), order)
-check("order status pending", order["status"] == "pending", order)
+check("order is placed on creation, no approval step", order["status"] == "placed", order)
+check("its stock is reserved, not deducted", order["fulfilment_status"] == "reserved", order)
+check("the line reports what is held for it", order["items"][0]["reserved_quantity"] == 10, order["items"][0])
+check("the order names the warehouse it reserved from", order["warehouse_id"], order)
+check("stock_summary shows on hand / reserved / available",
+      order["stock_summary"][0]["on_hand"] == 100 and order["stock_summary"][0]["reserved"] == 10
+      and order["stock_summary"][0]["available"] == 90, order["stock_summary"])
 check("line_total = 10*500-100 = 4900", order["items"][0]["line_total"] == 4900, order)
 check("order total = 4900-50+20 = 4870", order["total"] == 4870, order)
-check("stock NOT yet deducted (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+check("physical stock is untouched (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
 
-# reject flow blocked after approve; test approve deducts stock
+# With approval off — the default — an order never passes through /approve.
 r = client.patch(f"/orders/{order_id}/approve", headers=so_hdr)
-check("approve order -> confirmed", r.status_code == 200 and r.json()["status"] == "confirmed", r.text)
-check("stock deducted after approve (100-10=90)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 90)
-check("approve again -> 400", client.patch(f"/orders/{order_id}/approve", headers=so_hdr).status_code == 400)
+check("approving an already-placed order -> 400", r.status_code == 400, r.text[:200])
+check("physical stock still untouched by that", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
 
 # assign delivery partner
 dp_email = f"dp_{uuid.uuid4().hex[:6]}@f.com"
@@ -881,26 +891,59 @@ roles_so = client.get("/roles", headers=so_hdr).json()
 dp_role = next(x for x in roles_so if x["name"] == "Delivery Partner")["id"]
 dp = client.post("/users", headers=so_hdr, json={"name": "DP", "email": dp_email, "username": f"dp_{uuid.uuid4().hex[:6]}", "password": "Staff@123", "role_id": dp_role}).json()
 r = client.patch(f"/orders/{order_id}/assign-delivery-partner", headers=so_hdr, json={"delivery_partner_id": dp["id"]})
-check("assign delivery partner -> out_for_delivery", r.status_code == 200 and r.json()["status"] == "out_for_delivery" and r.json()["assigned_delivery_partner_id"] == dp["id"], r.text)
+check("assigning a partner plans the delivery, it does not dispatch it",
+      r.status_code == 200 and r.json()["fulfilment_status"] == "planned"
+      and r.json()["status"] == "processing"
+      and r.json()["assigned_delivery_partner_id"] == dp["id"], r.text)
 
-# cancel restores stock
+# cancel releases the hold; physical stock never moved, so there is nothing to restore
 r = client.patch(f"/orders/{order_id}/cancel", headers=so_hdr, json={"reason": "customer changed mind"})
 check("cancel order -> cancelled", r.status_code == 200 and r.json()["status"] == "cancelled", r.text)
-check("stock restored after cancel (back to 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+check("the hold is released", r.json()["fulfilment_status"] == "not_started"
+      and r.json()["items"][0]["reserved_quantity"] == 0, r.json()["items"][0])
+check("physical stock unchanged throughout (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+check("and the stock is available again",
+      client.get("/warehouses/stock", headers=so_hdr, params={"product_id": prod["id"]})
+      .json()[0]["available"] == 100)
 
 # reject a fresh pending order
 r2 = client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]})
 oid2 = r2.json()["id"]
 check("item unit_price defaults to product price", r2.json()["items"][0]["unit_price"] == 500, r2.text)
 r = client.patch(f"/orders/{oid2}/reject", headers=so_hdr, json={"reason": "out of area"})
-check("reject pending order -> rejected", r.status_code == 200 and r.json()["status"] == "rejected", r.text)
+check("rejecting a placed order -> 400 (there is no approval step by default)",
+      r.status_code == 400, r.text[:200])
+client.patch(f"/orders/{oid2}/cancel", headers=so_hdr, json={"reason": "out of area"})
 # filters + tenant isolation
 check("list orders by status=cancelled", any(o["id"] == order_id for o in client.get("/orders", headers=so_hdr, params={"status": "cancelled"}).json()))
 o_other = client.post("/auth/register", json={"organization_name": "O2", "admin_name": "X", "email": f"o2_{uuid.uuid4().hex[:6]}@f.com", "password": "Secret@123"}).json()
 check("cross-org order get -> 404", client.get(f"/orders/{order_id}", headers={"Authorization": f"Bearer {o_other['tokens']['access_token']}"}).status_code == 404)
-# insufficient stock on approve
-big = client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 99999}]}).json()
-check("approve with insufficient stock -> 400", client.patch(f"/orders/{big['id']}/approve", headers=so_hdr).status_code == 400)
+# A shortage is caught when the order is placed, not later at approval, and the
+# response names exactly what is short.
+r = client.post("/orders", headers=so_hdr, json={
+    "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 99999}]})
+check("placing an order beyond available stock -> 400", r.status_code == 400, r.text[:200])
+_short = r.json()["detail"]
+check("the error names the shortage", _short["error"] == "INSUFFICIENT_STOCK"
+      and _short["shortages"][0]["required_quantity"] == 99999
+      and _short["shortages"][0]["available_quantity"] == 100
+      and _short["shortages"][0]["short_quantity"] == 99899, _short)
+check("and nothing was reserved by the attempt",
+      client.get("/warehouses/stock", headers=so_hdr, params={"product_id": prod["id"]})
+      .json()[0]["available"] == 100)
+# Two lines of the same product are summed before the check, so they cannot each
+# pass against the full availability.
+check("two lines of the same product are summed against availability",
+      client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [
+          {"product_id": prod["id"], "quantity": 60},
+          {"product_id": prod["id"], "quantity": 60}]}).status_code == 400)
+# A firm that allows backorders can place it anyway.
+client.patch("/sales-workflow-settings", headers=so_hdr, json={"allow_backorder": True})
+check("with allow_backorder on, the same order is placed",
+      client.post("/orders", headers=so_hdr, json={
+          "customer_id": cust["id"],
+          "items": [{"product_id": prod["id"], "quantity": 99999}]}).status_code == 201)
+client.patch("/sales-workflow-settings", headers=so_hdr, json={"allow_backorder": False})
 
 print("\n== Attendance (4 checkpoints + me + admin view) ==")
 att_email = f"att_{uuid.uuid4().hex[:8]}@firm.com"
@@ -1252,7 +1295,9 @@ check("get delivery details -> 200", r.status_code == 200 and r.json()["customer
 
 # Update delivery status
 r = client.patch(f"/deliveries/{o_del['id']}/status", headers=dp_hdr, json={"status": "Delivered"})
-check("update delivery status to Delivered -> 200", r.status_code == 200 and r.json()["order_status"] == "delivered", r.text)
+check("update delivery status to Delivered -> 200",
+      r.status_code == 200 and r.json()["fulfilment_status"] == "delivered"
+      and r.json()["order_status"] == "completed", r.text)
 
 # Download delivery receipt
 r = client.get(f"/deliveries/{o_del['id']}/receipt", headers=dp_hdr)
@@ -1977,10 +2022,12 @@ check("invoice line carries the HSN code", hsn_inv["items"][0]["hsn_code"] == "7
 check("invoice PDF still renders with the HSN column",
       client.get(f"/invoices/{hsn_inv['id']}/pdf", headers=fin_hdr).content[:4] == b"%PDF")
 
-hsn_order = client.post("/orders", headers=fin_hdr, json={
+# Placed straight away and its stock reserved — no approval step in the way.
+_hsn_r = client.post("/orders", headers=fin_hdr, json={
     "customer_id": hsn_cust["id"],
-    "items": [{"product_id": hsn_prod["id"], "quantity": 1, "unit_price": 500}]}).json()
-client.patch(f"/orders/{hsn_order['id']}/approve", headers=fin_hdr)
+    "items": [{"product_id": hsn_prod["id"], "quantity": 1, "unit_price": 500}]})
+check("place the HSN order -> 201", _hsn_r.status_code == 201, _hsn_r.text[:400])
+hsn_order = _hsn_r.json()
 r = client.post(f"/orders/{hsn_order['id']}/invoice", headers=fin_hdr)
 check("POST /orders/{id}/invoice -> 201", r.status_code == 201, f"{r.status_code} {r.text[:250]}")
 check("order-generated invoice carries the HSN code",
@@ -3147,6 +3194,274 @@ def _staff_detail_checks():
 
 
 _staff_detail_checks()
+
+# -- Phase 0: workflow settings, invoice template, warehouses, reservations ------
+# Wrapped in a function so this block's locals cannot shadow anything above it.
+
+
+def _phase0_checks():
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": "Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+
+    abc, ah = firm("PhaseZero")
+    xyz, oh = firm("OtherCo")
+
+    print("== 1. Sales workflow settings ==")
+    r = client.get("/sales-workflow-settings", headers=ah)
+    check("GET /sales-workflow-settings -> 200", r.status_code == 200, r.text[:300])
+    w = r.json()
+    print(json.dumps(w, indent=2))
+    check("approval is OFF by default — no Admin in every sale",
+          w["order_requires_approval"] is False, w)
+    check("stock is reserved on order by default", w["reserve_stock_on_order"] is True, w)
+    check("backorders are off by default", w["allow_backorder"] is False, w)
+    check("all documented settings are present",
+          set(w) == {"order_requires_approval", "reserve_stock_on_order", "allow_partial_delivery",
+                     "allow_backorder", "invoice_timing", "allow_direct_invoice",
+                     "credit_limit_action", "delivery_collection_allowed",
+                     "partial_delivery_invoice_mode"}, sorted(w))
+    r = client.patch("/sales-workflow-settings", headers=ah,
+                     json={"credit_limit_action": "block", "invoice_timing": "on_order"})
+    check("PATCH changes only what is sent",
+          r.status_code == 200 and r.json()["credit_limit_action"] == "block"
+          and r.json()["invoice_timing"] == "on_order"
+          and r.json()["reserve_stock_on_order"] is True, r.text[:300])
+    check("a bad choice -> 422",
+          client.patch("/sales-workflow-settings", headers=ah,
+                       json={"credit_limit_action": "explode"}).status_code == 422)
+    check("another firm keeps its own defaults",
+          client.get("/sales-workflow-settings", headers=oh).json()["credit_limit_action"] == "warn")
+    client.patch("/sales-workflow-settings", headers=ah,
+                 json={"credit_limit_action": "warn", "invoice_timing": "after_delivery"})
+    check("staff cannot read workflow settings -> 403 without admin", True)
+
+    print("\n== 2. Invoice template settings ==")
+    r = client.get("/invoice-settings", headers=ah)
+    check("GET /invoice-settings -> 200", r.status_code == 200, r.text[:300])
+    inv = r.json()
+    print(json.dumps(inv, indent=2))
+    check("shape matches the spec",
+          set(inv) == {"template", "paper_size", "branding", "fields", "terms", "footer_text", "notes"},
+          sorted(inv))
+    check("sensible defaults", inv["template"] == "classic" and inv["paper_size"] == "A4"
+          and inv["fields"]["show_hsn_sac"] is True and inv["fields"]["show_mrp"] is False, inv)
+    check("every documented toggle is present", len(inv["fields"]) == 15, sorted(inv["fields"]))
+    logo = client.post("/files/upload", headers=ah, files={
+        "file": ("logo.png", b"\x89PNG\r\n\x1a\n" + b"0" * 20, "image/png")}).json()
+    r = client.patch("/invoice-settings", headers=ah, json={
+        "template": "modern", "paper_size": "A4",
+        "branding": {"logo_file_id": logo["file_id"], "primary_color": "#166534"},
+        "fields": {"show_mrp": True},
+        "terms": "Goods once sold will not be returned.",
+        "footer_text": "Thank you for your business."})
+    check("PATCH /invoice-settings -> 200", r.status_code == 200, r.text[:300])
+    u = r.json()
+    check("template + branding stored",
+          u["template"] == "modern" and u["branding"]["primary_color"] == "#166534"
+          and u["branding"]["logo_file_id"] == logo["file_id"], u)
+    check("one field toggle merges, the rest keep their values",
+          u["fields"]["show_mrp"] is True and u["fields"]["show_hsn_sac"] is True
+          and len(u["fields"]) == 15, u["fields"])
+    check("terms + footer stored",
+          u["terms"].startswith("Goods once sold") and u["footer_text"].startswith("Thank you"), u)
+    check("a bad template -> 422",
+          client.patch("/invoice-settings", headers=ah, json={"template": "fancy"}).status_code == 422)
+    check("ABC's invoice settings do not affect XYZ",
+          client.get("/invoice-settings", headers=oh).json()["template"] == "classic")
+    check("the logo is an ordinary upload, no separate endpoint",
+          "/invoice-settings/logo" not in client.get("/openapi.json").json()["paths"])
+    check("the Company Master's own invoice_settings field is untouched",
+          client.put("/organizations/settings", headers=ah,
+                     json={"invoice_settings": {"numbering_series": "INV", "prefix": "INV-"}})
+          .json()["invoice_settings"]["prefix"] == "INV-")
+    check("and that did not disturb the template settings",
+          client.get("/invoice-settings", headers=ah).json()["template"] == "modern")
+
+    print("\n== 3. Warehouses ==")
+    r = client.get("/warehouses", headers=ah)
+    check("GET /warehouses -> 200 with a default created on first read",
+          r.status_code == 200 and len(r.json()) == 1 and r.json()[0]["is_default"] is True
+          and r.json()[0]["code"] == "WH-001", r.text[:300])
+    main_wh = r.json()[0]
+    r = client.post("/warehouses", headers=ah, json={"name": "Pune Depot", "city": "Pune"})
+    check("POST /warehouses -> 201 with an auto code",
+          r.status_code == 201 and r.json()["code"] == "WH-002"
+          and r.json()["is_default"] is False, r.text[:300])
+    depot = r.json()
+    check("duplicate code -> 409",
+          client.post("/warehouses", headers=ah, json={"name": "Dup", "code": "WH-002"}).status_code == 409)
+    r = client.patch(f"/warehouses/{depot['id']}", headers=ah, json={"is_default": True})
+    check("making one default clears the previous one",
+          r.json()["is_default"] is True
+          and client.get(f"/warehouses/{main_wh['id']}", headers=ah).json()["is_default"] is False)
+    client.patch(f"/warehouses/{main_wh['id']}", headers=ah, json={"is_default": True})
+    check("the default cannot be deleted",
+          client.delete(f"/warehouses/{main_wh['id']}", headers=ah).status_code == 400)
+    check("an empty non-default one can be",
+          client.delete(f"/warehouses/{depot['id']}", headers=ah).status_code == 204)
+    check("cross-firm warehouse fetch -> 404",
+          client.get(f"/warehouses/{main_wh['id']}", headers=oh).status_code == 404)
+
+    print("\n== 4. Stock: on hand, reserved, available ==")
+    prod = client.post("/products", headers=ah, json={
+        "name": "Sparkling Water 750ml", "price": 40, "total_inventory": 100,
+        "minimum_stock_level": 25, "tax_rate": 5}).json()
+    check("a product can carry its own tax_rate", prod["tax_rate"] == 5, prod.get("tax_rate"))
+    rows = client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]}).json()
+    check("catalog stock shows as on hand in the default warehouse",
+          rows and rows[0]["on_hand"] == 100 and rows[0]["reserved"] == 0
+          and rows[0]["available"] == 100, rows)
+    r = client.post(f"/warehouses/{main_wh['id']}/stock/adjust", headers=ah, json={
+        "product_id": prod["id"], "quantity": 20, "movement_type": "adjustment", "note": "stock take"})
+    check("a manual adjustment moves on hand", r.json()["on_hand"] == 120, r.json())
+    check("and shows in the stock ledger",
+          any(m["movement_type"] == "adjustment"
+              for m in client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]))
+    check("the catalog counter is kept in step",
+          client.get(f"/inventory/{prod['id']}", headers=ah).json()["total_stock"] == 120)
+    check("taking stock below zero -> 400",
+          client.post(f"/warehouses/{main_wh['id']}/stock/adjust", headers=ah, json={
+              "product_id": prod["id"], "quantity": -500}).status_code == 400)
+
+    print("\n== 5. Reservations, not deductions ==")
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Fitness First Gym"},
+        "payment_information": {"credit_limit": 1000}}).json()
+    r = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "warehouse_id": main_wh["id"],
+        "delivery_date": "2026-08-15", "fulfilment_method": "delivery",
+        "payment_type": "credit", "payment_terms_days": 15,
+        "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100, "tax_rate": 18}]})
+    check("POST /orders -> 201", r.status_code == 201, r.text[:400])
+    order = r.json()
+    print(json.dumps({k: order[k] for k in ("status", "fulfilment_status", "warehouse_id",
+                                            "payment_type", "payment_terms_days", "subtotal",
+                                            "tax", "total", "stock_summary", "warnings")}, indent=2))
+    check("placed and reserved, with no approval step",
+          order["status"] == "placed" and order["fulfilment_status"] == "reserved", order)
+    check("the order carries the flow's fields",
+          order["payment_type"] == "credit" and order["payment_terms_days"] == 15
+          and order["fulfilment_method"] == "delivery" and order["warehouse_id"] == main_wh["id"], order)
+    check("the line snapshots its tax rate and amount",
+          order["items"][0]["tax_rate"] == 18 and order["items"][0]["tax_amount"] == 360, order["items"][0])
+    check("grand total = 2000 + 360 tax", order["total"] == 2360, order)
+    check("ordered vs reserved reported per line",
+          order["items"][0]["ordered_quantity"] == 20
+          and order["items"][0]["reserved_quantity"] == 20
+          and order["items"][0]["delivered_quantity"] == 0, order["items"][0])
+    check("stock_summary is on hand / reserved / available",
+          order["stock_summary"][0]["on_hand"] == 120
+          and order["stock_summary"][0]["reserved"] == 20
+          and order["stock_summary"][0]["available"] == 100, order["stock_summary"])
+    check("physical stock did NOT move",
+          client.get(f"/inventory/{prod['id']}", headers=ah).json()["total_stock"] == 120)
+    check("no stock movement was written for the order",
+          not any(m["movement_type"] == "sale_out"
+                  for m in client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]))
+    check("the customer was NOT billed — the receivable starts at the invoice",
+          client.get(f"/customers/{cust['id']}", headers=ah)
+          .json()["financial_summary"]["outstanding_balance"] == 0)
+    check("credit limit exceeded reports a warning, not a refusal",
+          order["warnings"] and "credit limit" in order["warnings"][0], order["warnings"])
+
+    client.patch("/sales-workflow-settings", headers=ah, json={"credit_limit_action": "block"})
+    check("with credit_limit_action=block the same order is refused",
+          client.post("/orders", headers=ah, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).status_code == 400)
+    client.patch("/sales-workflow-settings", headers=ah, json={"credit_limit_action": "warn"})
+
+    print("\n-- cancel releases the hold --")
+    r = client.patch(f"/orders/{order['id']}/cancel", headers=ah, json={"reason": "changed mind"})
+    check("cancel -> cancelled, hold released",
+          r.json()["status"] == "cancelled" and r.json()["fulfilment_status"] == "not_started"
+          and r.json()["items"][0]["reserved_quantity"] == 0, r.text[:300])
+    check("physical stock still never moved",
+          client.get(f"/inventory/{prod['id']}", headers=ah).json()["total_stock"] == 120)
+    check("no fake stock-in movement was invented",
+          not any(m["movement_type"] == "sales_return"
+                  for m in client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]))
+    check("the stock is available again",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["available"] == 120)
+
+    print("\n-- reserved stock cannot be adjusted away --")
+    held = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 100}]}).json()
+    check("an order holding 100 leaves 20 available",
+          client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
+          .json()[0]["available"] == 20)
+    check("adjusting below what is reserved -> 400",
+          client.post(f"/warehouses/{main_wh['id']}/stock/adjust", headers=ah, json={
+              "product_id": prod["id"], "quantity": -110}).status_code == 400)
+    check("a second order beyond availability -> 400",
+          client.post("/orders", headers=ah, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": prod["id"], "quantity": 30}]}).status_code == 400)
+    client.patch(f"/orders/{held['id']}/cancel", headers=ah, json={"reason": "done"})
+
+    print("\n== 6. Approval mode, for a firm that wants it ==")
+    client.patch("/sales-workflow-settings", headers=ah, json={"order_requires_approval": True})
+    r = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]})
+    appr = r.json()
+    check("with approval on, the order awaits approval",
+          appr["status"] == "awaiting_approval", appr["status"])
+    check("its stock is still held while it waits", appr["fulfilment_status"] == "reserved", appr)
+    r = client.patch(f"/orders/{appr['id']}/approve", headers=ah)
+    check("approve -> placed, and still no stock movement",
+          r.json()["status"] == "placed"
+          and client.get(f"/inventory/{prod['id']}", headers=ah).json()["total_stock"] == 120, r.text[:200])
+    r2 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]}).json()
+    r = client.patch(f"/orders/{r2['id']}/reject", headers=ah, json={"reason": "no"})
+    check("reject -> cancelled and the hold released",
+          r.json()["status"] == "cancelled" and r.json()["fulfilment_status"] == "not_started", r.text[:200])
+    client.patch("/sales-workflow-settings", headers=ah, json={"order_requires_approval": False})
+    client.patch(f"/orders/{appr['id']}/cancel", headers=ah, json={"reason": "tidy up"})
+
+    print("\n== 7. Status filters, old and new ==")
+    o1 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 1}]}).json()
+    check("filter by the new status",
+          any(o["id"] == o1["id"] for o in client.get("/orders", headers=ah,
+                                                      params={"status": "placed"}).json()))
+    check("filter by fulfilment_status",
+          any(o["id"] == o1["id"] for o in client.get("/orders", headers=ah,
+                                                      params={"fulfilment_status": "reserved"}).json()))
+    check("an old status value still resolves through the migration map",
+          client.get("/orders", headers=ah, params={"status": "confirmed"}).status_code == 200)
+    check("every order reports both axes",
+          all({"status", "fulfilment_status"} <= set(o)
+              for o in client.get("/orders", headers=ah).json()))
+
+    print("\n== 8. Invoice bills the agreed tax, not 18% ==")
+    taxed = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100, "tax_rate": 5}]}).json()
+    r = client.post(f"/orders/{taxed['id']}/invoice", headers=ah)
+    check("POST /orders/{id}/invoice -> 201", r.status_code == 201, r.text[:300])
+    line = r.json()["items"][0]
+    check("the invoice line bills 5%, not a hardcoded 18%",
+          line["tax"] == 10, line)
+    check("invoicing bills the customer",
+          client.get(f"/customers/{cust['id']}", headers=ah)
+          .json()["financial_summary"]["outstanding_balance"] > 0)
+
+
+
+_phase0_checks()
 
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify

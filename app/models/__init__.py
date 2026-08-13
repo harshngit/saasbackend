@@ -37,6 +37,12 @@ from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
 from app.models.vehicle_stock import VehicleLoading, VehicleLoadingItem
+from app.models.warehouse import (
+    RESERVATION_STATUSES,
+    StockReservation,
+    Warehouse,
+    WarehouseStock,
+)
 from app.models.lead import Lead
 from app.models.quotation import Quotation, QuotationItem
 from app.models.delivery import Delivery, DeliveryItem
@@ -45,6 +51,10 @@ from app.models.sales_return import SalesReturn, ReturnItem
 
 __all__ = [
     "ActivityLog",
+    "Warehouse",
+    "WarehouseStock",
+    "StockReservation",
+    "RESERVATION_STATUSES",
     "NumberSequence",
     "StoredFile",
     "Organization",

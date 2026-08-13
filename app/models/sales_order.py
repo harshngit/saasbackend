@@ -46,7 +46,28 @@ class SalesOrder(Base):
     customer_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    # The order's own lifecycle: draft | placed | awaiting_approval | processing |
+    # completed | cancelled. See app/core/workflow.py — rows written before the split
+    # are migrated from the old single-status vocabulary on startup.
+    status: Mapped[str] = mapped_column(String(30), default="placed", nullable=False, index=True)
+    # How far the goods have got, independently of the order's status:
+    # not_started | reserved | planned | loaded | in_transit | partially_delivered |
+    # delivered | failed. Payment and invoicing are deliberately not in either — a
+    # delivered, invoiced, unpaid order is normal for a credit customer.
+    fulfilment_status: Mapped[str | None] = mapped_column(
+        String(30), default="not_started", nullable=True, index=True
+    )
+    # Which warehouse the goods are promised out of.
+    warehouse_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("warehouses.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    delivery_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fulfilment_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    payment_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    payment_terms_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quotation_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("quotations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     # "office" (warehouse stock) or "delivery_vehicle" (field sale — vehicle stock, module pending)
     source: Mapped[str] = mapped_column(String(30), default="office", nullable=False)
 
@@ -96,5 +117,12 @@ class SalesOrderItem(Base):
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)  # line-level
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Snapshot of the tax the line was sold at, so an invoice raised later bills the
+    # agreed rate rather than a hardcoded one.
+    tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tax_amount: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
+    # How much of this line the warehouse is holding, and how much has gone out.
+    reserved_quantity: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
+    delivered_quantity: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
 
     order: Mapped["SalesOrder"] = relationship(back_populates="items")

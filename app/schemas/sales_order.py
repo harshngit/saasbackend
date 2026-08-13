@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class OrderItemIn(BaseModel):
@@ -9,6 +9,12 @@ class OrderItemIn(BaseModel):
     quantity: int = Field(gt=0)
     unit_price: float | None = Field(default=None, ge=0)  # defaults to product/variant price
     discount: float = Field(default=0, ge=0)              # per-line
+    tax_rate: float | None = Field(
+        default=None, ge=0, le=100,
+        description="Per-line tax %. Falls back to the product's own rate — never a "
+                    "hardcoded figure. Snapshotted on the line so an invoice raised "
+                    "later bills the agreed rate.",
+    )
 
     @field_validator("variant_id", mode="before")
     @classmethod
@@ -24,8 +30,13 @@ class OrderItemOut(BaseModel):
     variant_id: str | None
     product_name: str
     quantity: int
+    ordered_quantity: int = Field(default=0, description="Same as quantity, named as the flow does")
+    reserved_quantity: float = 0
+    delivered_quantity: float = 0
     unit_price: float
     discount: float
+    tax_rate: float | None = None
+    tax_amount: float = 0
     line_total: float
 
 
@@ -45,7 +56,19 @@ class OrderOut(BaseModel):
     order_number: str
     customer_id: str | None
     customer: CustomerBrief | None
-    status: str
+    status: str = Field(
+        description="draft | placed | awaiting_approval | processing | completed | cancelled")
+    fulfilment_status: str = Field(
+        default="not_started",
+        description="not_started | reserved | planned | loaded | in_transit | "
+                    "partially_delivered | delivered | failed",
+    )
+    warehouse_id: str | None = None
+    quotation_id: str | None = None
+    delivery_date: datetime | None = None
+    fulfilment_method: str | None = None
+    payment_type: str | None = None
+    payment_terms_days: int | None = None
     source: str
     assigned_delivery_partner_id: str | None
     created_by: str | None
@@ -66,9 +89,33 @@ class OrderOut(BaseModel):
     salesperson_id: str | None = None
     order_status: str | None = None
 
+    # What the warehouse holds for this order, reported so the sales screen can show
+    # the effect of placing it without a second call.
+    stock_summary: list[dict] = Field(default_factory=list)
+    # Non-blocking notices, e.g. the order taking a customer past their credit limit
+    # while the firm's credit_limit_action is "warn".
+    warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _mirror_quantities(self) -> "OrderOut":
+        """`ordered_quantity` is the flow's name for `quantity` — fill it in rather
+        than making every client know both."""
+        for item in self.items:
+            if not item.ordered_quantity:
+                item.ordered_quantity = item.quantity
+        return self
+
 
 class OrderCreate(BaseModel):
     customer_id: str
+    warehouse_id: str | None = Field(
+        default=None, description="Which warehouse to reserve from. Defaults to the firm's default.")
+    quotation_id: str | None = None
+    delivery_date: datetime | None = None
+    fulfilment_method: str | None = Field(
+        default=None, max_length=30, description="delivery | pickup")
+    payment_type: str | None = Field(default=None, max_length=20, description="cash | credit | upi | …")
+    payment_terms_days: int | None = Field(default=None, ge=0, le=365)
     source: str = Field(default="office", description="office | delivery_vehicle")
     discount: float = Field(default=0, ge=0)  # order-level
     tax: float = Field(default=0, ge=0)

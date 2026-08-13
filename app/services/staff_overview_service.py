@@ -53,8 +53,10 @@ RECENT_ORDERS = 10
 RECENT_ACTIVITY = 20
 ASSIGNED_ROWS = 20
 
-# Order statuses a delivery partner still has work to do on.
-_PENDING_DELIVERY = ("confirmed", "processing", "out_for_delivery")
+# Fulfilment states a delivery partner still has work to do on. Order status and
+# fulfilment are separate axes — see app/core/workflow.py.
+_PENDING_DELIVERY = ("reserved", "planned", "loaded", "in_transit")
+_DELIVERED = ("delivered", "partially_delivered")
 
 
 def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, datetime]:
@@ -359,15 +361,15 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
     todays = [o for o in all_assigned if order_day(o) == today]
     in_period = [o for o in all_assigned if start <= order_day(o) <= end]
 
-    def count(orders, *statuses) -> int:
-        return sum(1 for o in orders if o.status in statuses)
+    def count(orders, *states) -> int:
+        return sum(1 for o in orders if o.fulfilment_status in states)
 
     paid = _paid_by_order(db, [o.id for o in all_assigned])
-    delivered_period = [o for o in in_period if o.status in ("delivered", "partially_delivered")]
+    delivered_period = [o for o in in_period if o.fulfilment_status in _DELIVERED]
     receivable = sum(
         max((o.total or 0) - paid.get(o.id, 0), 0)
         for o in all_assigned
-        if o.status in ("delivered", "partially_delivered")
+        if o.fulfilment_status in _DELIVERED
     )
 
     payments = _payments_for(db, staff, [o.id for o in all_assigned], df, dt)
@@ -406,7 +408,7 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
             "delivered": "delivery_completed",
             "partially_delivered": "delivery_partial",
             "failed": "delivery_failed",
-        }.get(order.status)
+        }.get(order.fulfilment_status)
         if kind is None:
             continue
         note = notes.get(order.id)
@@ -437,7 +439,7 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
         )
     feed += _attendance_activity(db, staff, df, dt)
 
-    open_deliveries = [o for o in all_assigned if o.status in _PENDING_DELIVERY]
+    open_deliveries = [o for o in all_assigned if o.fulfilment_status in _PENDING_DELIVERY]
 
     return {
         "summary": DeliverySummary(

@@ -25,8 +25,10 @@ REPORT_TYPES = {
     "gst-summary", "sales-return", "purchase-return", "profit-loss",
 }
 
-# Order statuses that count as a realised sale.
-SALE_STATUSES = ("confirmed", "processing", "out_for_delivery", "delivered", "partially_delivered")
+# Order statuses that count as a realised sale. Sourced from the workflow module so
+# the reports, the dashboards and the order router can never disagree about what a
+# sale is — see app/core/workflow.py for the two status axes.
+from app.core.workflow import SALE_ORDER_STATUSES as SALE_STATUSES  # noqa: E402
 
 
 def _range(date_from: str | None, date_to: str | None) -> tuple[datetime | None, datetime | None]:

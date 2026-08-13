@@ -57,7 +57,13 @@ def list_assigned_deliveries(
         .filter(
             SalesOrder.organization_id == org_id,
             SalesOrder.assigned_delivery_partner_id == user.id,
-            SalesOrder.status == "out_for_delivery",
+            # The goods axis, not the order's own status. Everything still to do:
+            # planned once a partner is named, then loaded, in transit, or part
+            # delivered. `fulfilment_status` on each row is what the app shows —
+            # being assigned is not the same as being out for delivery.
+            SalesOrder.fulfilment_status.in_(
+                ("planned", "loaded", "in_transit", "partially_delivered")
+            ),
         )
     )
     return q.order_by(SalesOrder.created_at.desc()).all()
@@ -201,7 +207,8 @@ def update_delivery_status(
     # Deliver outcome mapping
     # choices: Delivered | Partial | Failed | Rescheduled
     if payload.status == "Delivered":
-        order.status = "delivered"
+        order.fulfilment_status = "delivered"
+        order.status = "completed"
         order.reject_reason = None
         
         # If source is vehicle stock, increment driver's loading delivered_qty
@@ -229,7 +236,8 @@ def update_delivery_status(
                         match.delivered_qty += item.quantity
 
     elif payload.status == "Partial":
-        order.status = "partially_delivered"
+        order.fulfilment_status = "partially_delivered"
+        order.status = "processing"
         order.reject_reason = payload.reason
         
         # Assume order items were partially delivered
@@ -257,17 +265,24 @@ def update_delivery_status(
                         match.delivered_qty += item.quantity
 
     elif payload.status == "Failed":
-        order.status = "failed"
+        order.fulfilment_status = "failed"
+        order.status = "processing"
         order.reject_reason = payload.reason
 
     elif payload.status == "Rescheduled":
-        # Keep it out for delivery, but log the rescheduling reason
-        order.status = "out_for_delivery"
+        # Still out with the partner; only the reason is recorded.
+        order.fulfilment_status = "in_transit"
+        order.status = "processing"
         order.reject_reason = f"Rescheduled: {payload.reason}"
 
     db.commit()
     db.refresh(order)
-    return {"status": "success", "order_status": order.status, "reject_reason": order.reject_reason}
+    return {
+        "status": "success",
+        "order_status": order.status,
+        "fulfilment_status": order.fulfilment_status,
+        "reject_reason": order.reject_reason,
+    }
 
 
 @router.get("/{id}/receipt")

@@ -76,7 +76,8 @@ def generate_from_order(
     if order is None or order.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
 
-    if order.status not in ("confirmed", "out_for_delivery", "delivered"):
+    # An order past approval can be billed; a draft or cancelled one cannot.
+    if order.status not in ("placed", "processing", "completed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot generate invoice for a '{order.status}' order. Order must be confirmed/delivered first.",
@@ -114,7 +115,9 @@ def generate_from_order(
     )
 
     for item in order.items:
-        # Resolve prices / tax if not present on order item
+        # Bill the rate the line was actually sold at, snapshotted on the order item
+        # when the order was placed. Never a hardcoded figure — a firm on 5% or 0%
+        # was being charged 18% before this.
         invoice.items.append(
             InvoiceItem(
                 product_id=item.product_id,
@@ -124,10 +127,23 @@ def generate_from_order(
                 quantity=item.quantity,
                 unit_price=item.unit_price,
                 discount=item.discount,
-                tax=round(item.line_total * 0.18, 2),  # Default 18% tax representation
+                tax=round(
+                    item.tax_amount
+                    if item.tax_amount is not None
+                    else item.line_total * (item.tax_rate or 0) / 100,
+                    2,
+                ),
                 line_total=item.line_total,
             )
         )
+
+    # The receivable starts here, not when the order was placed — an order is a
+    # promise, an invoice is a bill. The direct-invoice route below does the same.
+    if order.customer is not None:
+        order.customer.total_billed = round(
+            (order.customer.total_billed or 0) + invoice.total, 2
+        )
+        order.customer.recompute_outstanding()
 
     db.add(invoice)
     db.commit()

@@ -86,6 +86,10 @@ class Product(Base):
     # 5. Tax
     # HSN (goods) / SAC (services) code — printed per line item on the GST invoice.
     hsn_code: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    # The rate this product is sold at, as a percentage. Snapshotted onto every order
+    # line and invoice line so a later rate change never rewrites history — and so
+    # nothing has to fall back to a hardcoded figure.
+    tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     tax_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     tax_inclusive: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 

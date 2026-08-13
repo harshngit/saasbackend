@@ -311,6 +311,125 @@ Permissions are enforced on the API, not just hidden in the UI: `customers.delet
 = false` makes `DELETE /customers/{id}` return `403` regardless of what the
 frontend renders.
 
+## Sales flow: settings, warehouse stock, reservations
+
+**Phase 0 of the transaction-flow rework.** The flow is driven by per-organization
+settings, never by role names, and an Admin is not a step in every sale.
+
+### Workflow settings
+
+```
+GET   /sales-workflow-settings      PATCH /sales-workflow-settings     (Admin)
+GET   /invoice-settings             PATCH /invoice-settings            (Admin)
+```
+
+Partial updates; anything never set reads back as the documented default, so a
+setting added later needs no migration. Both always belong to the caller's firm.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `order_requires_approval` | **false** | Off: an order is validated, reserved and **placed** on creation. On: it lands in `awaiting_approval` and `/approve` + `/reject` apply — for that firm only |
+| `reserve_stock_on_order` | true | Hold stock when placed; on-hand only drops when a vehicle is loaded |
+| `allow_backorder` | false | Refuse an order the warehouse cannot cover |
+| `credit_limit_action` | `warn` | `warn` returns a `warnings[]` entry, `block` refuses with 400, `ignore` says nothing |
+| `invoice_timing` | `after_delivery` | `after_delivery` \| `on_order` |
+| `partial_delivery_invoice_mode` | `per_delivery` | `per_delivery` \| `after_full_order` |
+| `allow_partial_delivery`, `allow_direct_invoice`, `delivery_collection_allowed` | true | — |
+
+`/invoice-settings` holds `template` (classic / modern / compact / thermal),
+`paper_size`, `branding` (`logo_file_id` from `POST /files/upload`, `primary_color`),
+15 show/hide `fields`, `terms`, `footer_text` and `notes`. `branding` and `fields`
+merge key by key, so one toggle can be flipped without resending the rest. There is
+deliberately no separate logo endpoint.
+
+### Warehouses and stock
+
+```
+GET  /warehouses            POST /warehouses
+GET  /warehouses/{id}       PATCH /warehouses/{id}      DELETE /warehouses/{id}
+GET  /warehouses/stock      ?warehouse_id&product_id&low_stock_only
+POST /warehouses/{id}/stock/adjust
+```
+
+Gated by the `inventory` permission, so a warehouse or dispatch role can manage stock
+without being an Admin. Every firm's default warehouse is created on first read, and
+an item no warehouse tracks yet opens from its product's own `total_inventory`, so a
+firm that never opens a warehouse screen still sees correct figures. The legacy
+per-product / per-variant counters are kept equal to the sum across warehouses, so
+every existing product, inventory and report endpoint reports the same number it
+always did.
+
+The rule the whole flow rests on:
+
+```
+available = on_hand − outstanding reservations
+```
+
+`on_hand` moves only on a real goods movement. A manual adjustment is refused if it
+would take stock below what is already reserved for open orders.
+
+### Orders: two status axes
+
+`status` is the order's own lifecycle, `fulfilment_status` is how far the goods have
+got. Payment and invoicing are in neither — a delivered, invoiced, unpaid order is
+normal for a credit customer.
+
+```
+status            draft | placed | awaiting_approval | processing | completed | cancelled
+fulfilment_status not_started | reserved | planned | loaded | in_transit
+                  | partially_delivered | delivered | failed
+```
+
+Existing rows were migrated from the old single vocabulary on startup, and
+`?status=` still accepts the old values (`pending`, `confirmed`, `out_for_delivery`, …)
+through the same map — nothing broke on the day of the split. `?fulfilment_status=`
+filters the goods side.
+
+### What placing an order now does
+
+```
+Validate customer, products, warehouse
+  → check available stock
+  → create order + items (each snapshotting its own tax_rate)
+  → reserve stock
+  → status = placed, fulfilment_status = reserved
+```
+
+It does **not** deduct warehouse stock, **not** create a receivable, and **not** wait
+for an Admin. `POST /orders` accepts `warehouse_id`, `delivery_date`,
+`fulfilment_method`, `payment_type`, `payment_terms_days` and `quotation_id`, and
+returns `stock_summary` (on hand / reserved / available) plus any `warnings`.
+
+A shortage is caught when the order is placed, with the detail naming it:
+
+```json
+{ "error": "INSUFFICIENT_STOCK",
+  "shortages": [{ "product_id": "…", "product_name": "…",
+                  "required_quantity": 20, "available_quantity": 12,
+                  "short_quantity": 8 }] }
+```
+
+Lines for the same item are summed before the check, so two lines cannot each pass
+against the full availability.
+
+Other corrections in this phase:
+
+- **Cancelling** releases the reservations. Physical stock is untouched and no fake
+  stock-in movement is invented. Once goods are loaded or dispatched a plain cancel
+  is refused — that is the delivery-return flow.
+- **Assigning a delivery partner** plans the delivery (`fulfilment_status: planned`).
+  It no longer jumps straight to out-for-delivery.
+- **The receivable starts at the invoice**, not at the order.
+- **The hardcoded 18% is gone.** An invoice bills the `tax_rate` snapshotted on the
+  order line, which comes from the line or the product's own rate. Products carry a
+  `tax_rate` field for this.
+
+Still to come in later phases: quotation lifecycle and conversion, the unified
+Delivery record with Delivery ID as the identifier, vehicle loading against delivery
+items, challan PDF, dispatch, POD, invoice from delivered quantity, simple/detailed
+PDF formats, quick billing, ledger + ageing, the sales-return rework, and
+batch / serial tracking.
+
 ## Admin dashboard
 
 `GET /dashboard/admin` (needs `dashboard.view`) returns every widget on the Admin

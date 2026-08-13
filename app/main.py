@@ -29,12 +29,16 @@ from app.models import (  # noqa: F401  (register mappers)
     SalesOrder,
     SalesOrderItem,
     StockMovement,
+    StockReservation,
     Supplier,
     SupplierPayment,
     User,
+    Warehouse,
+    WarehouseStock,
 )
 from app.services.file_migration_service import convert_inline_uploads
 from app.services.numbering_service import backfill_missing_numbers
+from app.services.stock_service import migrate_order_statuses
 from app.routers import (
     attendance,
     auth,
@@ -54,10 +58,12 @@ from app.routers import (
     reports,
     roles,
     sales_orders,
+    settings as settings_router,
     suppliers,
     superadmin,
     users,
     vehicle_stock,
+    warehouses,
     leads,
     quotations,
     payment_receipts,
@@ -86,7 +92,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "staff-detail-workspace-overview"
+BUILD_TAG = "phase0-warehouse-stock-reservations"
 
 
 @app.on_event("startup")
@@ -107,6 +113,7 @@ def on_startup() -> None:
         ("add_columns_with_default", add_columns_with_default),
         ("auto_add_missing_columns", auto_add_missing_columns),
         ("backfill_missing_numbers", backfill_missing_numbers),
+        ("migrate_order_statuses", migrate_order_statuses),
         ("convert_inline_uploads", convert_inline_uploads),
     ):
         try:
@@ -138,6 +145,7 @@ app.include_router(customers.router)
 app.include_router(categories.router)
 app.include_router(products.router)
 app.include_router(inventory.router)
+app.include_router(warehouses.router)
 app.include_router(suppliers.router)
 app.include_router(sales_orders.router)
 app.include_router(purchases.router, prefix="/purchase-invoices")
@@ -153,6 +161,7 @@ app.include_router(dashboard.router)
 app.include_router(notifications.router)
 app.include_router(plans.router)
 app.include_router(organizations.router)
+app.include_router(settings_router.router)
 app.include_router(superadmin.router)
 app.include_router(leads.router)
 app.include_router(quotations.router)
