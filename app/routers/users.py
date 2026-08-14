@@ -313,7 +313,11 @@ def report_my_location(
 @router.get("/{user_id}/overview", response_model=StaffOverviewOut)
 def staff_overview(
     user_id: str,
-    date_from: str | None = Query(default=None, description="YYYY-MM-DD; defaults to 6 days ago"),
+    period: str = Query(
+        default="today", description="today | week (last 7 days) | month (last 30 days)"
+    ),
+    date_from: str | None = Query(
+        default=None, description="YYYY-MM-DD — a custom range instead of `period`"),
     date_to: str | None = Query(default=None, description="YYYY-MM-DD; defaults to today"),
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
@@ -335,12 +339,19 @@ def staff_overview(
     Blocks that do not apply to the workspace come back `null` rather than being
     left out, so the shape never changes under the frontend.
 
-    `date_from` / `date_to` size the `performance` series and the period figures;
-    today's counters and the balances are always as of now. Visits and follow-ups
-    report `null` until those modules exist, and proof-of-delivery likewise.
+    `period` sizes every figure and the `performance` series: `today`, `week` (the last
+    7 days) or `month` (the last 30). The response repeats it, with the exact
+    `period_from` / `period_to` it worked out. `date_from` / `date_to` are still accepted
+    for a custom range and win when sent.
+
+    Visits and follow-ups report `null` — not zero — until those modules exist. Current
+    location is real GPS only; the employee's `work_location` is never reported as a live
+    position. There is no route, stop list or view-route here: there is no
+    route-planning module to base one on.
     """
     return staff_overview_service.build_staff_overview(
-        db, _owned_user(db, user_id, admin), date_from=date_from, date_to=date_to
+        db, _owned_user(db, user_id, admin),
+        period=period, date_from=date_from, date_to=date_to,
     )
 
 

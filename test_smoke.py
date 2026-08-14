@@ -3048,38 +3048,45 @@ def _staff_detail_checks():
           d["user_id"] == sales_emp["id"] and d["employee_id"] == sales_emp["employee_id"]
           and d["name"] == "Sunil Kumar" and d["workspace"] == "sales"
           and d["role"]["name"] == "Sales Officer", d)
-    check("period is echoed", set(d["period"]) == {"date_from", "date_to"}, d["period"])
+    check("the period is named, with the dates it worked out",
+          d["period"] == "today" and d["period_from"] == d["period_to"],
+          (d["period"], d["period_from"], d["period_to"]))
     check("sales summary keys",
-          set(d["summary"]) == {"today_sales", "orders_today", "period_sales", "period_orders",
-                                "assigned_customers", "visits_today", "pending_followups"},
+          set(d["summary"]) == {"sales_amount", "orders", "assigned_customers",
+                                "visits", "pending_followups"},
           d["summary"])
-    check("today's sale counted", d["summary"]["today_sales"] == 180
-          and d["summary"]["orders_today"] == 1, d["summary"])
+    check("today's sale counted", d["summary"]["sales_amount"] == 180
+          and d["summary"]["orders"] == 1, d["summary"])
     check("assigned customers counted", d["summary"]["assigned_customers"] == 1, d["summary"])
     check("visits / follow-ups are null until those modules exist",
-          d["summary"]["visits_today"] is None and d["summary"]["pending_followups"] is None, d["summary"])
-    check("performance is a per-day series",
-          len(d["performance"]) == 7
+          d["summary"]["visits"] is None and d["summary"]["pending_followups"] is None, d["summary"])
+    check("performance is a per-day series, one point for today",
+          len(d["performance"]) == 1
           and all(set(p) == {"date", "sales_amount", "orders"} for p in d["performance"]),
           d["performance"][:2])
     check("today's point carries the sale",
           d["performance"][-1]["sales_amount"] == 180 and d["performance"][-1]["orders"] == 1,
           d["performance"][-1])
-    check("recent orders carry the customer and amount",
+    check("recent orders carry the customer as an object, and the amount",
           d["recent_orders"] and d["recent_orders"][0]["order_number"] == order["order_number"]
-          and d["recent_orders"][0]["customer_name"] == "Sharma Retail Store"
+          and d["recent_orders"][0]["customer"]["name"] == "Sharma Retail Store"
+          and d["recent_orders"][0]["customer"]["id"] == cust["id"]
           and d["recent_orders"][0]["amount"] == 180, d["recent_orders"][:1])
     check("assigned customers list carries area / outstanding / last order",
           d["assigned_customers"] and d["assigned_customers"][0]["name"] == "Sharma Retail Store"
           and d["assigned_customers"][0]["area"] == "Karol Bagh"
           and d["assigned_customers"][0]["last_order_date"] is not None
           and d["assigned_customers"][0]["last_visit"] is None, d["assigned_customers"][:1])
-    check("recent activity has the order, newest first",
+    check("recent activity nests the order and the customer, newest first",
           d["recent_activity"] and d["recent_activity"][0]["type"] == "order_created"
-          and d["recent_activity"][0]["order_number"] == order["order_number"], d["recent_activity"][:1])
+          and d["recent_activity"][0]["order"]["order_number"] == order["order_number"]
+          and d["recent_activity"][0]["order"]["amount"] == 180
+          and d["recent_activity"][0]["customer"]["name"] == "Sharma Retail Store",
+          d["recent_activity"][:1])
     check("delivery-only blocks are null on a sales overview",
-          d["vehicle"] is None and d["assigned_deliveries"] is None
-          and d["delivery_summary"] is None, d)
+          d["vehicle"] is None and d["assigned_deliveries"] is None, d)
+    check("role_detail's workspace and data_scope are on the badge too",
+          d["role"]["workspace"] == "sales" and d["role"]["data_scope"] == "own", d["role"])
     check("attendance reports absent before any check-in",
           d["attendance"]["status"] == "absent" and d["attendance"]["check_in"] is None, d["attendance"])
     client.post("/attendance/check-in", headers=sales_hdr, json={"type": "office_check_in"})
@@ -3109,42 +3116,50 @@ def _staff_detail_checks():
     r = client.get(f"/users/{dp['id']}/overview", headers=ah)
     check("delivery overview -> 200", r.status_code == 200, r.text[:400])
     dd = r.json()
-    print(json.dumps({k: dd[k] for k in ("workspace", "summary", "delivery_summary",
+    print(json.dumps({k: dd[k] for k in ("workspace", "period", "summary",
                                          "vehicle", "assigned_deliveries")}, indent=2)[:1800])
     check("workspace is delivery", dd["workspace"] == "delivery", dd["workspace"])
     check("delivery summary keys",
-          set(dd["summary"]) == {"deliveries_today", "completed_today", "pending_today",
-                                 "partial_today", "failed_today", "delivery_value",
-                                 "amount_collected", "amount_receivable"}, dd["summary"])
-    check("today's deliveries split by outcome",
-          dd["summary"]["deliveries_today"] == 2 and dd["summary"]["completed_today"] == 1
-          and dd["summary"]["pending_today"] == 1, dd["summary"])
-    check("delivery value is today's assigned total",
+          set(dd["summary"]) == {"deliveries", "completed", "pending", "partial", "failed",
+                                 "delivery_value", "amount_collected", "amount_receivable",
+                                 "pod_completed"}, dd["summary"])
+    check("their deliveries are split by outcome",
+          dd["summary"]["deliveries"] == 2 and dd["summary"]["completed"] == 1
+          and dd["summary"]["pending"] == 1, dd["summary"])
+    check("delivery value is the value behind those deliveries",
           dd["summary"]["delivery_value"] == 420, dd["summary"])
     check("amount collected comes from payments on their orders",
           dd["summary"]["amount_collected"] == 60, dd["summary"])
     check("receivable is delivered minus collected",
           dd["summary"]["amount_receivable"] == 60, dd["summary"])
-    check("delivery_summary breaks the period down",
-          dd["delivery_summary"]["successful"] == 1 and dd["delivery_summary"]["pending"] == 1
-          and dd["delivery_summary"]["pod_completed"] == 0, dd["delivery_summary"])
+    check("no POD was captured on either, so the count is zero",
+          dd["summary"]["pod_completed"] == 0, dd["summary"])
     check("performance is a per-day delivery series",
           all(set(p) == {"date", "deliveries_completed", "delivery_amount"} for p in dd["performance"])
           and dd["performance"][-1]["deliveries_completed"] == 1, dd["performance"][-1])
     check("assigned deliveries list only the open ones",
-          [x["order_number"] for x in dd["assigned_deliveries"]] == [o2["order_number"]],
+          [x["order"]["order_number"] for x in dd["assigned_deliveries"]] == [o2["order_number"]],
           dd["assigned_deliveries"])
-    check("an assigned delivery carries payment type and amount due",
+    check("a row is keyed on the delivery, not the order",
+          dd["assigned_deliveries"][0]["id"] != o2["id"]
+          and dd["assigned_deliveries"][0]["delivery_number"] is not None,
+          dd["assigned_deliveries"][0])
+    check("an assigned delivery carries payment type, amount due and the customer",
           dd["assigned_deliveries"][0]["payment_type"] == "cod"
           and dd["assigned_deliveries"][0]["amount_due"] == 300
-          and dd["assigned_deliveries"][0]["customer_name"] == "Sharma Retail Store",
+          and dd["assigned_deliveries"][0]["customer"]["name"] == "Sharma Retail Store",
           dd["assigned_deliveries"][0])
     check("recent activity has the completed delivery and the payment",
           {"delivery_completed", "payment_received"} <= {a["type"] for a in dd["recent_activity"]},
           [a["type"] for a in dd["recent_activity"]])
+    done = next(a for a in dd["recent_activity"] if a["type"] == "delivery_completed")
+    check("a delivery line nests the delivery, order and customer",
+          done["delivery"]["id"] and done["delivery"]["delivery_number"]
+          and done["order"]["order_number"] == o3["order_number"]
+          and done["customer"]["name"] == "Sharma Retail Store", done)
     check("sales-only blocks are null on a delivery overview",
           dd["recent_orders"] is None and dd["assigned_customers"] is None, dd)
-    check("no vehicle loading yet -> vehicle is null", dd["vehicle"] is None, dd["vehicle"])
+    check("no van named on any delivery -> vehicle is null", dd["vehicle"] is None, dd["vehicle"])
     client.post("/purchase-invoices", headers=ah, json={
         "invoice_number": f"PI-{uuid.uuid4().hex[:6]}",
         "supplier_id": client.post("/suppliers", headers=ah,
@@ -3155,20 +3170,21 @@ def _staff_detail_checks():
     client.post("/vehicle-stock/loading", headers=ah, json={
         "delivery_partner_id": dp["id"], "items": [{"product_id": prod["id"], "loaded_qty": 10}]})
     veh = client.get(f"/users/{dp['id']}/overview", headers=ah).json()["vehicle"]
-    check("an open loading shows as the day's vehicle",
-          veh is not None and veh["items"] == 1 and veh["vehicle_number"] is None, veh)
+    # A loading records what went onto a van; it does not name one. Without a vehicle
+    # from the fleet master there is nothing to report, so no placeholder is invented —
+    # the real badge is covered by the fleet checks further down.
+    check("a loading alone does not invent a vehicle", veh is None, veh)
 
     print("\n== 5. Generic workspace ==")
     acc, acc_hdr = staff("Asha", "Accountant")
     g = client.get(f"/users/{acc['id']}/overview", headers=ah).json()
     check("workspace is the role's own", g["workspace"] == "accounts", g["workspace"])
     check("generic summary keys",
-          set(g["summary"]) == {"orders_created_period", "sales_amount_period",
-                                "assigned_customers", "days_present_period"}, g["summary"])
+          set(g["summary"]) == {"orders", "sales_amount", "assigned_customers", "days_present"},
+          g["summary"])
     check("workspace-specific blocks are all null",
           g["recent_orders"] is None and g["assigned_customers"] is None
-          and g["assigned_deliveries"] is None and g["vehicle"] is None
-          and g["delivery_summary"] is None, g)
+          and g["assigned_deliveries"] is None and g["vehicle"] is None, g)
     check("attendance and location still reported",
           "status" in g["attendance"] and g["current_location"]["available"] is False, g)
     r = client.patch(f"/roles/{roles['Accountant']['id']}", headers=ah, json={"workspace": None})
@@ -3176,15 +3192,32 @@ def _staff_detail_checks():
     check("a role with no workspace still returns the generic layout",
           r.status_code == 200 and g2["workspace"] is None and g2["summary"] is not None, g2["workspace"])
 
-    print("\n== 6. Filters, scoping and permissions ==")
+    print("\n== 6. Period, scoping and permissions ==")
+    for name, points in (("today", 1), ("week", 7), ("month", 30)):
+        got = client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                         params={"period": name}).json()
+        check(f"?period={name} covers {points} day(s) and says so",
+              got["period"] == name and len(got["performance"]) == points,
+              (got["period"], len(got["performance"])))
+    check("today's sale is inside every window",
+          all(client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                         params={"period": name}).json()["summary"]["sales_amount"] == 180
+              for name in ("today", "week", "month")))
+    check("an unknown period -> 400",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                     params={"period": "quarter"}).status_code == 400)
+    check("explicit dates still work, and report themselves as custom",
+          client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
+                     params={"date_from": "2026-08-01", "date_to": "2026-08-03"})
+          .json()["period"] == "custom")
     check("date range sizes the performance series",
           len(client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
                          params={"date_from": "2026-08-01", "date_to": "2026-08-03"})
               .json()["performance"]) == 3)
-    check("an old window reports no period sales",
+    check("an old window reports no sales",
           client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
                      params={"date_from": "2000-01-01", "date_to": "2000-01-05"})
-          .json()["summary"]["period_sales"] == 0)
+          .json()["summary"]["sales_amount"] == 0)
     check("date_from after date_to -> 400",
           client.get(f"/users/{sales_emp['id']}/overview", headers=ah,
                      params={"date_from": "2026-08-10", "date_to": "2026-08-01"}).status_code == 400)
@@ -5016,7 +5049,7 @@ def _staff_overview_fleet_checks():
     print(json.dumps(over["vehicle"], indent=2, default=str))
     check("the real vehicle is reported, not a null placeholder",
           over["vehicle"] and over["vehicle"]["vehicle_number"] == "MH 12 KL 9087"
-          and over["vehicle"]["vehicle_id"] == veh["id"], over["vehicle"])
+          and over["vehicle"]["id"] == veh["id"], over["vehicle"])
     check("with its type", over["vehicle"]["vehicle_type"] == "Tempo", over["vehicle"])
     check("nothing is loaded onto it yet",
           over["vehicle"]["items"] == 0 and over["vehicle"]["loaded_at"] is None, over["vehicle"])
@@ -5039,7 +5072,7 @@ def _staff_overview_fleet_checks():
     check("a delivery with no POD reads as pending, not captured",
           delivered and delivered["pod_status"] == "pending", delivered)
     check("and none is counted as completed",
-          over["delivery_summary"]["pod_completed"] == 0, over["delivery_summary"])
+          over["summary"]["pod_completed"] == 0, over["summary"])
 
     photo = client.post("/files/upload", headers=dp_hdr, files={
         "file": ("pod.png", bytes.fromhex(
@@ -5063,7 +5096,7 @@ def _staff_overview_fleet_checks():
                 if a["type"] == "delivery_completed" and a["pod_status"] == "captured"]
     check("that delivery reads as captured", len(captured) == 1, over["recent_activity"][:3])
     check("and exactly one POD is counted for the period",
-          over["delivery_summary"]["pod_completed"] == 1, over["delivery_summary"])
+          over["summary"]["pod_completed"] == 1, over["summary"])
     check("no route, stops or view-route field was invented",
           not any(key in over for key in ("route", "route_status", "stops", "view_route")),
           sorted(over))

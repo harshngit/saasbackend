@@ -29,16 +29,18 @@ from app.models import (
 )
 from app.schemas.staff_overview import (
     DELIVERY,
+    PERIODS,
     SALES,
     AssignedCustomerRow,
     AssignedDeliveryRow,
     AttendanceToday,
     CurrentLocation,
-    DeliveryBreakdown,
+    CustomerRef,
     DeliveryPerformancePoint,
+    DeliveryRef,
     DeliverySummary,
     GenericSummary,
-    Period,
+    OrderRef,
     RecentOrderRow,
     RoleBadge,
     SalesPerformancePoint,
@@ -47,6 +49,8 @@ from app.schemas.staff_overview import (
     StaffOverviewOut,
     VehicleBadge,
 )
+from app.core.permissions import DEFAULT_DATA_SCOPE
+from app.core.workflow import OPEN_DELIVERY_STATUSES
 from app.services.report_service import SALE_STATUSES
 
 DEFAULT_DAYS = 7          # the window `performance` covers when none is asked for
@@ -56,7 +60,9 @@ ASSIGNED_ROWS = 20
 
 # Fulfilment states a delivery partner still has work to do on. Order status and
 # fulfilment are separate axes — see app/core/workflow.py.
-_PENDING_DELIVERY = ("reserved", "planned", "loaded", "in_transit")
+# A delivery the partner still has work to do on, and the ones that are done with.
+# These are Delivery statuses — see app/core/workflow.py.
+_OPEN_DELIVERY = OPEN_DELIVERY_STATUSES
 _DELIVERED = ("delivered", "partially_delivered")
 
 
@@ -73,17 +79,34 @@ def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, da
     return parsed, datetime.combine(parsed, time.max if end else time.min, tzinfo=timezone.utc)
 
 
-def _resolve_range(date_from: str | None, date_to: str | None):
-    """The window `performance` and the period figures cover — the last week by
-    default, so the page has a sparkline without asking for one."""
+def _resolve_range(period: str | None, date_from: str | None, date_to: str | None):
+    """The window every figure and the performance series cover.
+
+    `period` is what the page sends: `today`, `week` (the last 7 days) or `month` (the
+    last 30). Explicit dates are still accepted for a custom range and win when sent,
+    and the response says which of the two it ended up using.
+    """
     today = datetime.now(timezone.utc).date()
-    start, df = _day(date_from, today - timedelta(days=DEFAULT_DAYS - 1))
-    end, dt = _day(date_to, today, end=True)
-    if start > end:
+
+    if date_from or date_to:
+        start, df = _day(date_from, today - timedelta(days=DEFAULT_DAYS - 1))
+        end, dt = _day(date_to, today, end=True)
+        if start > end:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="date_from cannot be after date_to"
+            )
+        return "custom", start, end, df, dt
+
+    name = (period or "today").strip().lower()
+    if name not in PERIODS:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="date_from cannot be after date_to"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"period must be one of {', '.join(PERIODS)}",
         )
-    return start, end, df, dt
+    span = {"today": 1, "week": 7, "month": 30}[name]
+    start, df = _day((today - timedelta(days=span - 1)).isoformat(), today)
+    end, dt = _day(today.isoformat(), today, end=True)
+    return name, start, end, df, dt
 
 
 def _days(start: date, end: date) -> list[str]:
@@ -148,6 +171,31 @@ def _customer_label(customer: Customer | None) -> str | None:
     if customer is None:
         return None
     return customer.business_name or customer.name
+
+
+def _customer_ref(customer: Customer | None, customer_id: str | None = None) -> CustomerRef | None:
+    """The customer as `{id, name}` — the one shape every row points at them with."""
+    if customer is not None:
+        return CustomerRef(id=customer.id, name=_customer_label(customer))
+    if customer_id:
+        return CustomerRef(id=customer_id)
+    return None
+
+
+def _order_ref(order, amount: float | None = None) -> OrderRef | None:  # noqa: ANN001
+    if order is None:
+        return None
+    return OrderRef(
+        id=order.id,
+        order_number=order.order_number,
+        amount=round(order.total or 0, 2) if amount is None else amount,
+    )
+
+
+def _delivery_ref(delivery) -> DeliveryRef | None:  # noqa: ANN001
+    if delivery is None:
+        return None
+    return DeliveryRef(id=delivery.id, delivery_number=delivery.delivery_note_number)
 
 
 def _their_orders(db: Session, staff: User):
@@ -219,18 +267,17 @@ def _attendance_activity(db: Session, staff: User, df: datetime, dt: datetime) -
     return events
 
 
-def _vehicle_badge(db, staff, loading, notes, open_deliveries):  # noqa: ANN001
+def _vehicle_badge(db, staff, loading, open_deliveries):  # noqa: ANN001
     """The van this partner is out with, and what is on it.
 
     The vehicle comes from the delivery that names it — the fleet master records which
-    van, the loading records what went onto it. Either half can be missing: a firm that
-    never created a vehicle still gets its loading reported.
+    van, the loading records what went onto it. With no van named on any delivery there
+    is nothing to report, so the block is null rather than a placeholder.
     """
     vehicle = None
-    for order in open_deliveries:
-        note = notes.get(order.id)
-        if note is not None and note.vehicle_id:
-            vehicle = db.get(Vehicle, note.vehicle_id)
+    for delivery in open_deliveries:
+        if delivery.vehicle_id:
+            vehicle = db.get(Vehicle, delivery.vehicle_id)
             if vehicle is not None:
                 break
     if vehicle is None:
@@ -246,14 +293,13 @@ def _vehicle_badge(db, staff, loading, notes, open_deliveries):  # noqa: ANN001
         )
         if recent is not None:
             vehicle = db.get(Vehicle, recent.vehicle_id)
-
-    if loading is None and vehicle is None:
+    if vehicle is None:
         return None
+
     return VehicleBadge(
-        id=loading.id if loading is not None else vehicle.id,
-        vehicle_id=vehicle.id if vehicle is not None else None,
-        vehicle_number=vehicle.vehicle_number if vehicle is not None else None,
-        vehicle_type=vehicle.vehicle_type if vehicle is not None else None,
+        id=vehicle.id,
+        vehicle_number=vehicle.vehicle_number,
+        vehicle_type=vehicle.vehicle_type,
         loaded_at=loading.date if loading is not None else None,
         items=len(loading.items or []) if loading is not None else 0,
     )
@@ -280,8 +326,6 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
 
     def order_day(order: SalesOrder) -> date:
         return (order.order_date or order.created_at).date()
-
-    today_orders = [o for o in in_period if order_day(o) == today]
 
     customers = (
         db.query(Customer)
@@ -314,22 +358,21 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
         StaffActivity(
             type="order_created",
             at=order.created_at,
-            customer_id=order.customer_id,
-            customer_name=_customer_label(order.customer),
-            order_id=order.id,
-            order_number=order.order_number,
+            customer=_customer_ref(order.customer, order.customer_id),
+            order=_order_ref(order),
             amount=round(order.total or 0, 2),
             status=order.status,
         )
         for order in in_period
     ]
+    by_id = {order.id: order for order in in_period}
     for payment in _payments_for(db, staff, [o.id for o in in_period], df, dt):
         feed.append(
             StaffActivity(
                 type="payment_received",
                 at=payment.received_on,
-                customer_id=payment.customer_id,
-                order_id=payment.order_id,
+                customer=_customer_ref(None, payment.customer_id),
+                order=_order_ref(by_id.get(payment.order_id)),
                 amount=round(payment.amount or 0, 2),
             )
         )
@@ -337,12 +380,12 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
 
     return {
         "summary": SalesSummary(
-            today_sales=round(sum(o.total or 0 for o in today_orders), 2),
-            orders_today=len(today_orders),
-            period_sales=round(sum(o.total or 0 for o in in_period), 2),
-            period_orders=len(in_period),
+            sales_amount=round(sum(o.total or 0 for o in in_period), 2),
+            orders=len(in_period),
             assigned_customers=assigned_total,
-            visits_today=None,
+            # Real data only: there is no visits or follow-ups module yet, so these
+            # stay null rather than reporting a zero the page would draw as a figure.
+            visits=None,
             pending_followups=None,
         ),
         "performance": [
@@ -357,8 +400,7 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
             RecentOrderRow(
                 id=order.id,
                 order_number=order.order_number,
-                customer_id=order.customer_id,
-                customer_name=_customer_label(order.customer),
+                customer=_customer_ref(order.customer, order.customer_id),
                 amount=round(order.total or 0, 2),
                 status=order.status,
                 date=order_day(order).isoformat(),
@@ -389,56 +431,70 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
 
 
 def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datetime, dt: datetime) -> dict:
-    today = datetime.now(timezone.utc).date()
-    assigned = db.query(SalesOrder).filter(
-        SalesOrder.organization_id == staff.organization_id,
-        SalesOrder.assigned_delivery_partner_id == staff.id,
+    """The delivery workspace, built from the employee's actual assigned deliveries.
+
+    A Delivery is the record the fulfilment half of the flow turns on, so every figure
+    here counts deliveries — not the orders behind them. One order split across two
+    vans is two deliveries, which is what the partner actually has to do.
+    """
+    deliveries = (
+        db.query(Delivery)
+        .filter(
+            Delivery.organization_id == staff.organization_id,
+            Delivery.delivery_partner_id == staff.id,
+        )
+        .order_by(Delivery.created_at.desc())
+        .all()
     )
 
-    def order_day(order: SalesOrder) -> date:
-        return (order.order_date or order.created_at).date()
+    def delivery_day(delivery: Delivery) -> date:
+        moment = delivery.scheduled_date or delivery.created_at
+        return moment.date() if isinstance(moment, datetime) else moment
 
-    all_assigned = assigned.order_by(SalesOrder.created_at.desc()).all()
-    todays = [o for o in all_assigned if order_day(o) == today]
-    in_period = [o for o in all_assigned if start <= order_day(o) <= end]
+    in_period = [d for d in deliveries if start <= delivery_day(d) <= end]
+    orders = {
+        order.id: order
+        for order in db.query(SalesOrder).filter(
+            SalesOrder.id.in_([d.sales_order_id for d in deliveries if d.sales_order_id] or [""])
+        )
+    }
+    paid = _paid_by_order(db, list(orders))
 
-    def count(orders, *states) -> int:
-        return sum(1 for o in orders if o.fulfilment_status in states)
+    def order_of(delivery: Delivery):  # noqa: ANN202
+        return orders.get(delivery.sales_order_id) if delivery.sales_order_id else None
 
-    paid = _paid_by_order(db, [o.id for o in all_assigned])
-    delivered_period = [o for o in in_period if o.fulfilment_status in _DELIVERED]
-    receivable = sum(
-        max((o.total or 0) - paid.get(o.id, 0), 0)
-        for o in all_assigned
-        if o.fulfilment_status in _DELIVERED
-    )
+    def value_of(delivery: Delivery) -> float:
+        order = order_of(delivery)
+        return round(order.total or 0, 2) if order is not None else 0.0
 
-    payments = _payments_for(db, staff, [o.id for o in all_assigned], df, dt)
+    def count(rows, *states) -> int:
+        return sum(1 for d in rows if d.status in states)
+
+    def pod_status(delivery: Delivery) -> str | None:
+        """Whether proof of delivery was actually captured on this delivery."""
+        if delivery.pod_signature_file_id or (delivery.pod_photo_file_ids or []):
+            return "captured"
+        return "pending" if delivery.status in _DELIVERED else None
+
+    completed = [d for d in in_period if d.status in _DELIVERED]
+    open_rows = [d for d in deliveries if d.status in _OPEN_DELIVERY]
+
+    # Receivable is on the goods that have actually been handed over, whenever that was.
+    receivable = 0.0
+    for delivery in deliveries:
+        order = order_of(delivery)
+        if order is not None and delivery.status in _DELIVERED:
+            receivable += max((order.total or 0) - paid.get(order.id, 0), 0)
+
+    payments = _payments_for(db, staff, list(orders), df, dt)
     collected = round(sum(p.amount or 0 for p in payments), 2)
 
     by_day_count: dict[str, int] = defaultdict(int)
     by_day_amount: dict[str, float] = defaultdict(float)
-    for order in delivered_period:
-        key = order_day(order).isoformat()
+    for delivery in completed:
+        key = delivery_day(delivery).isoformat()
         by_day_count[key] += 1
-        by_day_amount[key] += order.total or 0
-
-    # Delivery notes, so a row can show its note number where one was raised.
-    notes = {
-        note.sales_order_id: note
-        for note in db.query(Delivery).filter(
-            Delivery.organization_id == staff.organization_id,
-            Delivery.sales_order_id.in_([o.id for o in all_assigned] or [""]),
-        )
-    }
-
-    def _pod_status(note) -> str | None:
-        """Whether proof of delivery was actually captured on this delivery."""
-        if note is None:
-            return None
-        if note.pod_signature_file_id or (note.pod_photo_file_ids or []):
-            return "captured"
-        return "pending" if note.status in ("delivered", "partially_delivered") else None
+        by_day_amount[key] += value_of(delivery)
 
     loading = (
         db.query(VehicleLoading)
@@ -452,28 +508,25 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
     )
 
     feed: list[StaffActivity] = []
-    for order in in_period:
+    for delivery in in_period:
         kind = {
             "delivered": "delivery_completed",
             "partially_delivered": "delivery_partial",
             "failed": "delivery_failed",
-        }.get(order.fulfilment_status)
+        }.get(delivery.status)
         if kind is None:
             continue
-        note = notes.get(order.id)
+        order = order_of(delivery)
         feed.append(
             StaffActivity(
                 type=kind,
-                at=order.updated_at,
-                customer_id=order.customer_id,
-                customer_name=_customer_label(order.customer),
-                order_id=order.id,
-                order_number=order.order_number,
-                delivery_id=note.id if note else None,
-                delivery_number=note.delivery_note_number if note else None,
-                amount=round(order.total or 0, 2),
-                status=order.status,
-                pod_status=_pod_status(note),
+                at=delivery.confirmed_at or delivery.updated_at,
+                customer=_customer_ref(delivery.customer, delivery.customer_id),
+                order=_order_ref(order),
+                delivery=_delivery_ref(delivery),
+                amount=value_of(delivery),
+                status=delivery.status,
+                pod_status=pod_status(delivery),
             )
         )
     for payment in payments:
@@ -481,25 +534,24 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
             StaffActivity(
                 type="payment_received",
                 at=payment.received_on,
-                customer_id=payment.customer_id,
-                order_id=payment.order_id,
+                customer=_customer_ref(None, payment.customer_id),
+                order=_order_ref(orders.get(payment.order_id)),
                 amount=round(payment.amount or 0, 2),
             )
         )
     feed += _attendance_activity(db, staff, df, dt)
 
-    open_deliveries = [o for o in all_assigned if o.fulfilment_status in _PENDING_DELIVERY]
-
     return {
         "summary": DeliverySummary(
-            deliveries_today=len(todays),
-            completed_today=count(todays, "delivered"),
-            pending_today=count(todays, *_PENDING_DELIVERY),
-            partial_today=count(todays, "partially_delivered"),
-            failed_today=count(todays, "failed"),
-            delivery_value=round(sum(o.total or 0 for o in todays), 2),
+            deliveries=len(in_period),
+            completed=count(in_period, "delivered"),
+            pending=count(in_period, *_OPEN_DELIVERY),
+            partial=count(in_period, "partially_delivered"),
+            failed=count(in_period, "failed"),
+            delivery_value=round(sum(value_of(d) for d in in_period), 2),
             amount_collected=collected,
             amount_receivable=round(receivable, 2),
+            pod_completed=sum(1 for d in completed if pod_status(d) == "captured"),
         ),
         "performance": [
             DeliveryPerformancePoint(
@@ -511,37 +563,34 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
         ],
         "assigned_deliveries": [
             AssignedDeliveryRow(
-                id=order.id,
-                order_id=order.id,
-                order_number=order.order_number,
-                delivery_number=(
-                    notes[order.id].delivery_note_number if order.id in notes else None
-                ),
-                customer_id=order.customer_id,
-                customer_name=_customer_label(order.customer),
-                scheduled_at=order.order_date or order.created_at,
-                # No payment-type column exists; a settled invoice means it is
-                # already paid for, anything else is collect-on-delivery.
-                payment_type="prepaid" if paid.get(order.id, 0) + 0.01 >= (order.total or 0) else "cod",
-                amount_due=round(max((order.total or 0) - paid.get(order.id, 0), 0), 2),
-                status=order.status,
+                id=delivery.id,
+                delivery_number=delivery.delivery_note_number,
+                order=_order_ref(order_of(delivery)),
+                customer=_customer_ref(delivery.customer, delivery.customer_id),
+                scheduled_at=delivery.scheduled_date or delivery.created_at,
+                # A settled invoice means it is already paid for; anything else is
+                # collect-on-delivery.
+                payment_type=_payment_type(order_of(delivery), paid),
+                amount_due=_amount_due(order_of(delivery), paid),
+                status=delivery.status,
             )
-            for order in open_deliveries[:ASSIGNED_ROWS]
+            for delivery in open_rows[:ASSIGNED_ROWS]
         ],
-        "delivery_summary": DeliveryBreakdown(
-            successful=count(in_period, "delivered"),
-            pending=count(in_period, *_PENDING_DELIVERY),
-            partial=count(in_period, "partially_delivered"),
-            failed=count(in_period, "failed"),
-            amount_collected=collected,
-            pod_completed=sum(
-                1 for order in in_period
-                if _pod_status(notes.get(order.id)) == "captured"
-            ),
-        ),
-        "vehicle": _vehicle_badge(db, staff, loading, notes, open_deliveries),
+        "vehicle": _vehicle_badge(db, staff, loading, open_rows),
         "recent_activity": _sorted_feed(feed),
     }
+
+
+def _payment_type(order, paid: dict[str, float]) -> str:  # noqa: ANN001
+    if order is None:
+        return "cod"
+    return "prepaid" if paid.get(order.id, 0) + 0.01 >= (order.total or 0) else "cod"
+
+
+def _amount_due(order, paid: dict[str, float]) -> float:  # noqa: ANN001
+    if order is None:
+        return 0.0
+    return round(max((order.total or 0) - paid.get(order.id, 0), 0), 2)
 
 
 # -------------------------------- generic --------------------------------
@@ -574,8 +623,8 @@ def _generic_blocks(db: Session, staff: User, start: date, end: date, df: dateti
     feed = [
         StaffActivity(
             type="order_created", at=order.created_at,
-            customer_id=order.customer_id, customer_name=_customer_label(order.customer),
-            order_id=order.id, order_number=order.order_number,
+            customer=_customer_ref(order.customer, order.customer_id),
+            order=_order_ref(order),
             amount=round(order.total or 0, 2), status=order.status,
         )
         for order in in_period
@@ -583,10 +632,10 @@ def _generic_blocks(db: Session, staff: User, start: date, end: date, df: dateti
 
     return {
         "summary": GenericSummary(
-            orders_created_period=len(in_period),
-            sales_amount_period=round(sum(o.total or 0 for o in in_period), 2),
+            orders=len(in_period),
+            sales_amount=round(sum(o.total or 0 for o in in_period), 2),
             assigned_customers=assigned,
-            days_present_period=present,
+            days_present=present,
         ),
         "performance": [
             SalesPerformancePoint(date=day, sales_amount=0, orders=0) for day in _days(start, end)
@@ -599,9 +648,13 @@ def _generic_blocks(db: Session, staff: User, start: date, end: date, df: dateti
 
 
 def build_staff_overview(
-    db: Session, staff: User, date_from: str | None = None, date_to: str | None = None
+    db: Session,
+    staff: User,
+    period: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> StaffOverviewOut:
-    start, end, df, dt = _resolve_range(date_from, date_to)
+    name, start, end, df, dt = _resolve_range(period, date_from, date_to)
     role = staff.role_detail
     workspace = (role.workspace if role is not None else None) or None
 
@@ -617,8 +670,16 @@ def build_staff_overview(
         employee_id=staff.employee_id,
         name=staff.name,
         workspace=workspace,
-        role=RoleBadge(id=role.id, name=role.name, workspace=role.workspace) if role else None,
-        period=Period(date_from=start.isoformat(), date_to=end.isoformat()),
+        role=(
+            RoleBadge(
+                id=role.id, name=role.name, workspace=role.workspace,
+                data_scope=role.data_scope or DEFAULT_DATA_SCOPE,
+            )
+            if role else None
+        ),
+        period=name,
+        period_from=start.isoformat(),
+        period_to=end.isoformat(),
         attendance=_attendance(db, staff),
         current_location=_location(staff),
         **blocks,

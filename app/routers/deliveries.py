@@ -584,6 +584,29 @@ def update_delivery_status(
         order.status = "processing"
         order.reject_reason = f"Rescheduled: {payload.reason}"
 
+    # Move the order's own Delivery records with it. This older route reports an
+    # outcome against the order; the Delivery is the record everything else reads, so
+    # leaving it behind would have the partner's own deliveries disagree with the order.
+    delivery_status = {
+        "Delivered": "delivered",
+        "Partial": "partially_delivered",
+        "Failed": "failed",
+        "Rescheduled": "in_transit",
+    }.get(payload.status)
+    if delivery_status:
+        for delivery in db.query(Delivery).filter(
+            Delivery.sales_order_id == order.id,
+            Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES),
+        ):
+            delivery.status = delivery_status
+            if delivery_status in ("delivered", "partially_delivered"):
+                delivery.confirmed_at = delivery.confirmed_at or datetime.now(timezone.utc)
+                for line in delivery.items:
+                    if not line.delivered_quantity:
+                        line.delivered_quantity = line.planned_quantity
+            if delivery_status == "failed":
+                delivery.failure_reason = payload.reason or delivery.failure_reason
+
     db.commit()
     db.refresh(order)
     return {

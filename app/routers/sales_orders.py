@@ -3,10 +3,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core import scoping, workflow
 from app.core.database import get_db
-from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, SalesOrder, User
+from app.models import Customer, Delivery, SalesOrder, User
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
@@ -14,8 +14,7 @@ from app.schemas.sales_order import (
     OrderOut,
     RejectBody,
 )
-from app.core import workflow
-from app.services import lookup_service, order_service, stock_service
+from app.services import delivery_service, lookup_service, order_service, stock_service
 
 router = APIRouter(prefix="/orders", tags=["sales_orders"])
 
@@ -243,9 +242,15 @@ def assign_delivery_partner(
 ) -> SalesOrder:
     """Name who will deliver the order.
 
-    Assigning somebody is planning, not dispatch: the order becomes `planned`, not
-    in transit. Goods go in transit when a vehicle has actually been loaded and the
+    Assigning somebody is planning, not dispatch: the order becomes `planned`, not in
+    transit. Goods go in transit when a vehicle has actually been loaded and the
     delivery is dispatched.
+
+    This also **plans a Delivery** for whatever is still outstanding on the order, so
+    assigned work means one thing everywhere — the deliveries list, the partner's app
+    and the Staff Detail overview all read the same records. An order whose lines are
+    already planned into a delivery just changes hands, since there is nothing left to
+    plan.
     """
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id)
@@ -262,6 +267,32 @@ def assign_delivery_partner(
         order.status = "processing"
     if order.fulfilment_status in (None, "not_started", "reserved"):
         order.fulfilment_status = "planned"
+
+    # Give the assignment a Delivery to hang off. Any delivery already raised for this
+    # order simply changes hands instead — there is nothing outstanding left to plan.
+    existing = (
+        db.query(Delivery)
+        .filter(
+            Delivery.sales_order_id == order.id,
+            Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES),
+        )
+        .all()
+    )
+    if existing:
+        for delivery in existing:
+            delivery.delivery_partner_id = partner.id
+    else:
+        try:
+            delivery_service.plan(
+                db, user, order, partner,
+                vehicle_id=None, warehouse_id=None, scheduled_date=None,
+                delivery_address=None, notes=None, wanted=None,
+            )
+        except HTTPException:
+            # Nothing outstanding to plan (already delivered, or fully planned
+            # elsewhere). The assignment itself still stands.
+            pass
+
     db.commit()
     db.refresh(order)
     return _order_out(db, order)

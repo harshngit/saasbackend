@@ -7,16 +7,22 @@ the `workspace` field in the response and renders the matching layout.
 
 Blocks that do not apply to a workspace come back as `null` rather than being
 omitted, so the shape is stable and a frontend never has to guard for a missing
-key.
+key. Figures a module for does not exist yet — visits, follow-ups — come back `null`
+rather than as a made-up zero.
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 # The two workspaces with a purpose-built layout. Anything else gets the generic one.
 SALES = "sales"
 DELIVERY = "delivery"
+
+# What `?period=` accepts. Anything else is rejected rather than silently widened.
+PERIODS = ("today", "week", "month")
+PeriodName = Literal["today", "week", "month", "custom"]
 
 
 class LocationPing(BaseModel):
@@ -27,11 +33,9 @@ class LocationPing(BaseModel):
     accuracy_meters: float | None = Field(default=None, ge=0)
     label: str | None = Field(
         default=None, max_length=200,
-        description="Optional place name. The device does the reverse geocoding — "
-                    "the backend never guesses one.",
-    )
+        description="Optional human label the app resolved, e.g. a street name")
     captured_at: datetime | None = Field(
-        default=None, description="When the reading was taken. Defaults to now.")
+        default=None, description="When the reading was taken. Defaults to now")
 
 
 class LocationPingOut(BaseModel):
@@ -44,11 +48,11 @@ class LocationPingOut(BaseModel):
 
 
 class CurrentLocation(BaseModel):
-    """Where the employee last reported being.
+    """Where the employee actually is, from real GPS only.
 
-    `available` is false until the field app has posted at least one reading. The
-    employee's `work_location` is the office they are posted to and is never used
-    here — it is not a live position.
+    `available` is false and every field null until the field app has posted a ping.
+    The employee's `work_location` is a posting on their profile, not a live position,
+    and is deliberately never reported here.
     """
 
     available: bool
@@ -60,7 +64,7 @@ class CurrentLocation(BaseModel):
 
 
 class AttendanceToday(BaseModel):
-    """Today's row from the attendance module, which records four checkpoints."""
+    """Today's attendance for this employee."""
 
     date: str | None = None
     status: str = Field(description="checked_in | checked_out | absent")
@@ -69,33 +73,51 @@ class AttendanceToday(BaseModel):
     return_to_office: datetime | None = None
     check_out: datetime | None = Field(default=None, description="final_check_out")
     active_duration_minutes: int | None = Field(
-        default=None, description="From check-in to check-out, or to now while still in")
+        default=None, description="Minutes between check-in and check-out (or now)")
 
 
 class RoleBadge(BaseModel):
     id: str
     name: str
     workspace: str | None = None
+    data_scope: str | None = None
 
 
-class Period(BaseModel):
-    date_from: str
-    date_to: str
+# ------------------------------- references -------------------------------
+# Every row that points at another record does it the same way: a small object with
+# the id and the one label the page shows, so the frontend never stitches
+# `*_id` and `*_name` fields back together itself.
+
+
+class CustomerRef(BaseModel):
+    id: str
+    name: str | None = None
+
+
+class OrderRef(BaseModel):
+    id: str
+    order_number: str | None = None
+    amount: float | None = None
+
+
+class DeliveryRef(BaseModel):
+    id: str
+    delivery_number: str | None = None
 
 
 # --------------------------------- sales ---------------------------------
 
 
 class SalesSummary(BaseModel):
-    today_sales: float
-    orders_today: int
-    period_sales: float
-    period_orders: int
+    """The sales cards, over the requested period."""
+
+    sales_amount: float
+    orders: int
     assigned_customers: int
-    visits_today: int | None = Field(
-        default=None, description="null until a visits module exists")
+    visits: int | None = Field(
+        default=None, description="null until a visits module exists — not a zero")
     pending_followups: int | None = Field(
-        default=None, description="null until a follow-ups module exists")
+        default=None, description="null until a follow-ups module exists — not a zero")
 
 
 class SalesPerformancePoint(BaseModel):
@@ -107,8 +129,7 @@ class SalesPerformancePoint(BaseModel):
 class RecentOrderRow(BaseModel):
     id: str
     order_number: str
-    customer_id: str | None = None
-    customer_name: str | None = None
+    customer: CustomerRef | None = None
     amount: float
     status: str
     date: str
@@ -131,14 +152,19 @@ class AssignedCustomerRow(BaseModel):
 
 
 class DeliverySummary(BaseModel):
-    deliveries_today: int
-    completed_today: int
-    pending_today: int
-    partial_today: int
-    failed_today: int
-    delivery_value: float = Field(description="Value of today's assigned deliveries")
-    amount_collected: float = Field(description="Payments received against their orders")
+    """The delivery cards, over the requested period, from the employee's own
+    assigned deliveries."""
+
+    deliveries: int
+    completed: int
+    pending: int
+    partial: int
+    failed: int
+    delivery_value: float = Field(description="Value of the orders behind those deliveries")
+    amount_collected: float = Field(description="Payments received against those orders")
     amount_receivable: float = Field(description="Delivered but not yet paid")
+    pod_completed: int = Field(
+        default=0, description="Of the completed ones, how many have a POD photo or signature")
 
 
 class DeliveryPerformancePoint(BaseModel):
@@ -148,29 +174,33 @@ class DeliveryPerformancePoint(BaseModel):
 
 
 class AssignedDeliveryRow(BaseModel):
-    id: str = Field(description="The sales order id — what /deliveries endpoints take")
-    order_id: str
-    order_number: str
-    delivery_number: str | None = Field(
-        default=None, description="From the delivery note, when one has been raised")
-    customer_id: str | None = None
-    customer_name: str | None = None
+    """One delivery this employee is carrying. `id` is the delivery's own id — what
+    every /deliveries endpoint takes."""
+
+    id: str
+    delivery_number: str | None = None
+    order: OrderRef | None = None
+    customer: CustomerRef | None = None
     scheduled_at: datetime | None = None
     payment_type: str = Field(
         description="prepaid when the order's invoices are settled, else cod")
     amount_due: float
-    status: str
+    status: str = Field(description="The delivery's own status: planned | loaded | in_transit | …")
 
 
-class DeliveryBreakdown(BaseModel):
-    successful: int
-    pending: int
-    partial: int
-    failed: int
-    amount_collected: float
-    pod_completed: int | None = Field(
-        default=None,
-        description="Deliveries in the period with a POD photo or signature captured")
+class VehicleBadge(BaseModel):
+    """The van this delivery partner is out with.
+
+    `id` and `vehicle_number` come from the fleet master, taken off the delivery that
+    names the van. `loaded_at` and `items` describe the open vehicle loading — what
+    actually went onto it — and stay null when nothing has been loaded yet.
+    """
+
+    id: str = Field(description="The vehicle's id")
+    vehicle_number: str | None = None
+    vehicle_type: str | None = None
+    loaded_at: datetime | None = None
+    items: int = Field(default=0, description="Distinct items currently on the vehicle")
 
 
 # -------------------------------- generic --------------------------------
@@ -179,14 +209,14 @@ class DeliveryBreakdown(BaseModel):
 class GenericSummary(BaseModel):
     """For any workspace without a purpose-built layout (accounts, HR, …)."""
 
-    orders_created_period: int
-    sales_amount_period: float
+    orders: int
+    sales_amount: float
     assigned_customers: int
-    days_present_period: int
+    days_present: int
 
 
 class StaffActivity(BaseModel):
-    """One line of the employee's activity feed. Which of the optional fields are
+    """One line of the employee's activity feed. Which of the optional blocks are
     filled depends on `type`."""
 
     type: str = Field(
@@ -194,12 +224,9 @@ class StaffActivity(BaseModel):
                     "delivery_failed | delivery_partial | attendance_check_in | "
                     "attendance_check_out")
     at: datetime
-    customer_id: str | None = None
-    customer_name: str | None = None
-    order_id: str | None = None
-    order_number: str | None = None
-    delivery_id: str | None = None
-    delivery_number: str | None = None
+    customer: CustomerRef | None = None
+    order: OrderRef | None = None
+    delivery: DeliveryRef | None = None
     amount: float | None = None
     status: str | None = None
     pod_status: str | None = Field(
@@ -213,9 +240,13 @@ class StaffOverviewOut(BaseModel):
     employee_id: str | None = None
     name: str
     workspace: str | None = Field(
-        default=None, description="From the role. Switch the page layout on this, not on the role name")
+        default=None,
+        description="From the role. Switch the page layout on this, not on the role name")
     role: RoleBadge | None = None
-    period: Period
+
+    period: PeriodName = Field(description="today | week | month (custom when dates were sent)")
+    period_from: str = Field(description="First day the figures cover, YYYY-MM-DD")
+    period_to: str = Field(description="Last day the figures cover, YYYY-MM-DD")
 
     attendance: AttendanceToday
     current_location: CurrentLocation
@@ -229,27 +260,5 @@ class StaffOverviewOut(BaseModel):
     assigned_customers: list[AssignedCustomerRow] | None = None
 
     # Delivery workspace only; null otherwise.
-    vehicle: "VehicleBadge | None" = None
+    vehicle: VehicleBadge | None = None
     assigned_deliveries: list[AssignedDeliveryRow] | None = None
-    delivery_summary: DeliveryBreakdown | None = None
-
-
-class VehicleBadge(BaseModel):
-    """The van this delivery partner is out with, and what is on it.
-
-    `vehicle_id` / `vehicle_number` / `vehicle_type` come from the fleet master, taken
-    off the delivery that names the van. `loaded_at` and `items` come from the open
-    vehicle loading — what actually went onto it. Either half can be missing: a firm
-    that has not created a vehicle still gets its loading reported, and a van assigned
-    with nothing loaded yet still shows the van.
-    """
-
-    id: str = Field(description="The open loading's id, else the vehicle's")
-    vehicle_id: str | None = None
-    vehicle_number: str | None = None
-    vehicle_type: str | None = None
-    loaded_at: datetime | None = None
-    items: int = Field(default=0, description="Distinct items currently on the vehicle")
-
-
-StaffOverviewOut.model_rebuild()
