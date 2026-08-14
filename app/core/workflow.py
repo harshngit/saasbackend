@@ -114,7 +114,7 @@ INVOICE_FIELD_DEFAULTS: dict[str, bool] = {
 INVOICE_SETTINGS_DEFAULTS: dict[str, object] = {
     "template": "classic",
     "paper_size": "A4",
-    "branding": {"logo_file_id": None, "primary_color": None},
+    "branding": {"logo_file_id": None, "signature_file_id": None, "primary_color": None},
     "fields": dict(INVOICE_FIELD_DEFAULTS),
     "terms": None,
     "footer_text": None,

@@ -96,7 +96,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "phase1op-returns-condition-check-batch-serial-barcode"
+BUILD_TAG = "invoice-templates-and-signature"
 
 
 @app.on_event("startup")

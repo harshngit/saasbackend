@@ -4154,9 +4154,55 @@ def _phase1ij_checks():
     check("an unreadable logo never costs the firm its invoice",
           client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content[:5] == b"%PDF-")
     client.patch("/invoice-settings", headers=ah, json={"branding": {"logo_file_id": None}})
-    check("no separate logo or colour endpoint exists",
+    check("no separate logo, signature or colour endpoint exists",
           not any(p.startswith("/invoice-settings/")
                   for p in client.get("/openapi.json").json()["paths"]))
+
+    print("\n== 10b. The template changes the print, and the signature prints ==")
+    prints = {}
+    for template in ("classic", "modern", "compact", "thermal"):
+        r = client.patch("/invoice-settings", headers=ah, json={"template": template})
+        check(f"PATCH template {template} -> 200",
+              r.status_code == 200 and r.json()["template"] == template, r.text[:200])
+        prints[template] = {
+            shape: client.get(f"/invoices/{bill['id']}/pdf", headers=ah,
+                              params={"format": shape}).content
+            for shape in ("simple", "detailed")
+        }
+        check(f"{template} still renders both formats",
+              all(doc[:5] == b"%PDF-" for doc in prints[template].values()))
+    for shape in ("simple", "detailed"):
+        check(f"all four templates print a different {shape} document",
+              len({prints[t][shape] for t in prints}) == 4,
+              {t: len(prints[t][shape]) for t in prints})
+    check("thermal prints on a till roll, so it is the shortest tax invoice",
+          len(prints["thermal"]["detailed"]) < len(prints["classic"]["detailed"]),
+          (len(prints["thermal"]["detailed"]), len(prints["classic"]["detailed"])))
+    check("an unknown template -> 422",
+          client.patch("/invoice-settings", headers=ah,
+                       json={"template": "sparkly"}).status_code == 422)
+    client.patch("/invoice-settings", headers=ah, json={"template": "classic"})
+
+    sign = client.post("/files/upload", headers=ah,
+                       files={"file": ("sign.png", png, "image/png")}).json()
+    unsigned = client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content
+    r = client.patch("/invoice-settings", headers=ah,
+                     json={"branding": {"signature_file_id": sign["file_id"]}})
+    check("PATCH branding.signature_file_id -> 200",
+          r.status_code == 200
+          and r.json()["branding"]["signature_file_id"] == sign["file_id"], r.text[:250])
+    signed = client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content
+    check("the signature image is embedded", len(signed) > len(unsigned),
+          (len(unsigned), len(signed)))
+    client.patch("/invoice-settings", headers=ah,
+                 json={"fields": {"show_signature": False}})
+    check("switching the signature off drops it again",
+          len(client.get(f"/invoices/{bill['id']}/pdf", headers=ah).content) < len(signed))
+    client.patch("/invoice-settings", headers=ah, json={"fields": {"show_signature": True}})
+    check("another firm's invoice settings are untouched by all of this",
+          client.get("/invoice-settings", headers=oh).json()["template"] == "classic"
+          and client.get("/invoice-settings", headers=oh).json()
+          ["branding"]["signature_file_id"] is None)
 
     print("\n== 11. Freight and round off ==")
     charged = client.post("/invoices", headers=ah, json={

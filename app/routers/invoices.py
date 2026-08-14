@@ -527,13 +527,13 @@ def get_invoice(id: str, user: User = Depends(_view), db: Session = Depends(get_
     return _owned(db, id, _org_id(user))
 
 
-def _invoice_logo(db: Session, org_id: str, settings: dict) -> bytes | None:
-    """The logo bytes behind `branding.logo_file_id`, if the firm has uploaded one.
+def _branding_file(db: Session, org_id: str, settings: dict, key: str) -> bytes | None:
+    """The bytes behind a branding file id — the firm's logo or its signature.
 
-    The setting holds whatever the upload handed back, so both a bare file id and a
-    full `/files/{id}` URL resolve. Another firm's file never does.
+    The setting holds whatever `POST /files/upload` handed back, so both a bare file id
+    and a full `/files/{id}` URL resolve. Another firm's file never does.
     """
-    reference = (settings.get("branding") or {}).get("logo_file_id")
+    reference = (settings.get("branding") or {}).get(key)
     if not reference:
         return None
     file_id = str(reference).rstrip("/").rsplit("/", 1)[-1]
@@ -564,9 +564,12 @@ def download_invoice_pdf(
     `format=simple` prints the short copy for the customer: items, quantity, amount,
     total, what is paid, the balance due, the due date and the payment status.
 
-    Both are rendered from the firm's own `GET /invoice-settings` — its paper size,
-    brand colour, logo, terms and footer, and the fifteen show/hide field toggles. A
-    field the firm has switched off does not print, so nothing here is hardcoded.
+    Both are rendered from the firm's own `GET /invoice-settings`: its **template**
+    (classic, modern, compact or thermal, which changes the type, the ruling and whether
+    the title sits in a band of the brand colour), its paper size, its brand colour, its
+    uploaded logo and signature, its terms, notes and footer, and the fifteen show/hide
+    field toggles. A field the firm has switched off does not print, so nothing here is
+    hardcoded.
     """
     org_id = _org_id(user)
     invoice = _owned(db, id, org_id)
@@ -577,7 +580,8 @@ def download_invoice_pdf(
         invoice.customer,
         invoice,
         settings,
-        _invoice_logo(db, org_id, settings),
+        _branding_file(db, org_id, settings, "logo_file_id"),
+        _branding_file(db, org_id, settings, "signature_file_id"),
     )
     return Response(
         content=pdf_bytes,

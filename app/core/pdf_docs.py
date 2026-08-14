@@ -322,6 +322,38 @@ def delivery_challan_pdf(org, delivery, order, customer, partner, vehicle) -> by
 
 _PAPER_FORMATS = {"a4": "A4", "a5": "A5", "thermal": (80, 250)}
 
+# What each template actually changes about the print. Not a designer — four honest
+# looks built from type size, row height, ruling and whether the title sits in a band
+# of the firm's colour.
+_TEMPLATE_STYLES = {
+    # The plain ruled invoice: every cell boxed, comfortable type.
+    "classic": {
+        "title_size": 14, "body_size": 9, "table_size": 8, "row_height": 6,
+        "header_band": False, "border": 1, "gap": 4, "margin": None,
+    },
+    # A coloured header band, the title reversed out of it, and horizontal rules only.
+    "modern": {
+        "title_size": 17, "body_size": 9, "table_size": 8, "row_height": 7,
+        "header_band": True, "border": "B", "gap": 5, "margin": None,
+    },
+    # Everything tightened so a long bill fits on one page.
+    "compact": {
+        "title_size": 11, "body_size": 7, "table_size": 6.5, "row_height": 4.5,
+        "header_band": False, "border": "B", "gap": 2, "margin": 8,
+    },
+    # A till roll: narrow, unruled, small type, printed on 80mm whatever the paper says.
+    "thermal": {
+        "title_size": 11, "body_size": 7, "table_size": 6.5, "row_height": 4,
+        "header_band": False, "border": 0, "gap": 2, "margin": 4,
+    },
+}
+
+
+def _style(settings: dict) -> dict:
+    """The look this firm has chosen, defaulting to classic."""
+    name = str(settings.get("template") or "classic").strip().lower()
+    return _TEMPLATE_STYLES.get(name, _TEMPLATE_STYLES["classic"])
+
 
 def _hex_rgb(value) -> tuple[int, int, int] | None:
     """A #rrggbb brand colour as an RGB triple, or None when it is not usable."""
@@ -339,8 +371,19 @@ def _money(value) -> str:
 
 
 def _invoice_pdf_page(settings: dict) -> FPDF:
+    """A page in the firm's paper size, with the margins its template wants.
+
+    The thermal template prints on a till roll whatever the paper size says — choosing
+    that look is choosing the paper.
+    """
+    style = _style(settings)
     size = _PAPER_FORMATS.get(str(settings.get("paper_size") or "A4").lower(), "A4")
+    if str(settings.get("template") or "").strip().lower() == "thermal":
+        size = _PAPER_FORMATS["thermal"]
     pdf = FPDF(format=size)
+    if style["margin"] is not None:
+        pdf.set_margins(style["margin"], style["margin"], style["margin"])
+        pdf.set_auto_page_break(True, margin=style["margin"])
     pdf.add_page()
     return pdf
 
@@ -365,20 +408,45 @@ def _logo(pdf: FPDF, logo: bytes | None) -> None:
 
 
 def _branded_title(pdf: FPDF, settings: dict, title: str) -> None:
+    """The document title, in the firm's colour — or reversed out of a band of it."""
+    style = _style(settings)
     rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
-    if rgb:
-        pdf.set_text_color(*rgb)
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 8, _s(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Helvetica", "B", style["title_size"])
+    if style["header_band"]:
+        band = rgb or (33, 37, 41)
+        pdf.set_fill_color(*band)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(
+            0, style["title_size"] * 0.75, _s(f"  {title}"), fill=True,
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+        )
+    else:
+        if rgb:
+            pdf.set_text_color(*rgb)
+        pdf.cell(0, 8, _s(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(0, 0, 0)
 
 
-def _two_column_rows(pdf: FPDF, rows: list[tuple[str, str]], column: float) -> None:
-    pdf.set_font("Helvetica", size=9)
+def _two_column_rows(
+    pdf: FPDF, rows: list[tuple[str, str]], column: float, style: dict | None = None
+) -> None:
+    """Who it is for on the left, the invoice's own details on the right.
+
+    A till roll is too narrow for two columns, so there the two sides simply stack.
+    """
+    style = style or _TEMPLATE_STYLES["classic"]
+    pdf.set_font("Helvetica", size=style["body_size"])
+    height = max(style["row_height"] - 1, 4)
+    if column < 60:
+        for left, right in rows:
+            for text in (left, right):
+                if text:
+                    pdf.cell(0, height, _s(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        return
     for left, right in rows:
-        pdf.cell(column, 5, _s(left), new_x=XPos.RIGHT, new_y=YPos.LAST)
+        pdf.cell(column, height, _s(left), new_x=XPos.RIGHT, new_y=YPos.LAST)
         pdf.set_x(pdf.l_margin + column + 4)
-        pdf.cell(column, 5, _s(right), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(column, height, _s(right), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
 def _amount_row(pdf: FPDF, label: str, value, width: float, height: float = 5) -> None:
@@ -390,7 +458,9 @@ def _outstanding(invoice) -> float:
     return round((invoice.total or 0) - (invoice.amount_paid or 0), 2)
 
 
-def _invoice_footer(pdf: FPDF, org, settings: dict, fields: dict) -> None:
+def _invoice_footer(
+    pdf: FPDF, org, settings: dict, fields: dict, signature: bytes | None = None
+) -> None:
     """Bank, UPI, terms, notes, footer line and signature — each one a toggle."""
     pdf.ln(3)
     pdf.set_font("Helvetica", size=8)
@@ -413,11 +483,26 @@ def _invoice_footer(pdf: FPDF, org, settings: dict, fields: dict) -> None:
         pdf.ln(1)
         pdf.multi_cell(0, 4, _s(settings["footer_text"]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if fields.get("show_signature"):
-        pdf.ln(8)
+        pdf.ln(4)
+        # The firm's uploaded signature sits above the line it signs. An unreadable
+        # upload just leaves the line blank to sign by hand.
+        drawn = False
+        if signature:
+            try:
+                pdf.image(
+                    BytesIO(signature), x=pdf.w - pdf.r_margin - 40, y=pdf.get_y(), h=12
+                )
+                drawn = True
+            except Exception:  # noqa: BLE001 - unreadable upload, sign it by hand
+                drawn = False
+        pdf.ln(13 if drawn else 8)
         pdf.cell(0, 5, "Authorised signatory", border="T", align="R")
 
 
-def invoice_simple_pdf(org, customer, invoice, settings: dict, logo: bytes | None = None) -> bytes:
+def invoice_simple_pdf(
+    org, customer, invoice, settings: dict, logo: bytes | None = None,
+    signature: bytes | None = None,
+) -> bytes:
     """The short customer copy: what was bought, what is owed, when it is due.
 
     No tax breakdown, no GSTINs, no addresses — this is the one that goes out over
@@ -425,6 +510,7 @@ def invoice_simple_pdf(org, customer, invoice, settings: dict, logo: bytes | Non
     status and due date.
     """
     fields = settings.get("fields") or {}
+    style = _style(settings)
     pdf = _invoice_pdf_page(settings)
     _logo(pdf, logo)
     _org_header(pdf, org)
@@ -480,11 +566,16 @@ def invoice_simple_pdf(org, customer, invoice, settings: dict, logo: bytes | Non
     _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
 
     # The short copy never carries bank details; everything else is the firm's choice.
-    _invoice_footer(pdf, org, settings, {**fields, "show_bank_details": False})
+    _invoice_footer(
+        pdf, org, settings, {**fields, "show_bank_details": False}, signature=signature
+    )
     return bytes(pdf.output())
 
 
-def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | None = None) -> bytes:
+def invoice_detailed_pdf(
+    org, customer, invoice, settings: dict, logo: bytes | None = None,
+    signature: bytes | None = None,
+) -> bytes:
     """The full tax invoice: GSTINs, both addresses, HSN/SAC and the tax split.
 
     Columns are assembled from the firm's toggles and then scaled to the paper, so a
@@ -492,6 +583,7 @@ def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | N
     than empty ones.
     """
     fields = settings.get("fields") or {}
+    style = _style(settings)
     pdf = _invoice_pdf_page(settings)
     _logo(pdf, logo)
     _org_header(pdf, org)
@@ -529,12 +621,15 @@ def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | N
     rows = list(zip(left + pad if len(left) < len(right) else left,
                     right + pad if len(right) < len(left) else right))
 
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(column, 5, "BILLED TO:", new_x=XPos.RIGHT, new_y=YPos.LAST)
-    pdf.set_x(pdf.l_margin + column + 4)
-    pdf.cell(column, 5, "INVOICE DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    _two_column_rows(pdf, rows, column)
-    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", style["body_size"] + 1)
+    if column < 60:
+        pdf.cell(0, 5, "BILLED TO:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    else:
+        pdf.cell(column, 5, "BILLED TO:", new_x=XPos.RIGHT, new_y=YPos.LAST)
+        pdf.set_x(pdf.l_margin + column + 4)
+        pdf.cell(column, 5, "INVOICE DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    _two_column_rows(pdf, rows, column, style)
+    pdf.ln(style["gap"])
 
     columns: list[tuple[str, float, str]] = [("Item", 44, "L")]
     if fields.get("show_hsn_sac"):
@@ -558,12 +653,13 @@ def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | N
     scale = width / sum(w for _, w, _ in columns)
     widths = [round(w * scale, 2) for _, w, _ in columns]
 
-    pdf.set_font("Helvetica", "B", 8)
+    row = style["row_height"]
+    pdf.set_font("Helvetica", "B", style["table_size"])
     for w, (header, _, align) in zip(widths, columns):
-        pdf.cell(w, 7, header, border=1, align=align)
-    pdf.ln(7)
+        pdf.cell(w, row + 1, header, border=style["border"], align=align)
+    pdf.ln(row + 1)
 
-    pdf.set_font("Helvetica", size=8)
+    pdf.set_font("Helvetica", size=style["table_size"])
     for item in invoice.items:
         # Batch and expiry come off the lot the goods actually left the shelf in.
         values = {
@@ -580,11 +676,11 @@ def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | N
             "Amount": _money(item.line_total),
         }
         for w, (header, _, align) in zip(widths, columns):
-            pdf.cell(w, 6, values[header], border=1, align=align)
-        pdf.ln(6)
+            pdf.cell(w, row, values[header], border=style["border"], align=align)
+        pdf.ln(row)
 
     pdf.ln(2)
-    pdf.set_font("Helvetica", size=9)
+    pdf.set_font("Helvetica", size=style["body_size"])
     _amount_row(pdf, "Subtotal", invoice.subtotal, width)
     if fields.get("show_discount") and invoice.discount:
         _amount_row(pdf, "Discount", -(invoice.discount or 0), width)
@@ -600,7 +696,7 @@ def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | N
     _amount_row(pdf, "Paid", invoice.amount_paid, width)
     _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
 
-    _invoice_footer(pdf, org, settings, fields)
+    _invoice_footer(pdf, org, settings, fields, signature=signature)
     return bytes(pdf.output())
 
 

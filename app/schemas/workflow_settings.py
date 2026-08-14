@@ -79,8 +79,18 @@ class SalesWorkflowSettingsUpdate(BaseModel):
 
 
 class InvoiceBranding(BaseModel):
+    """The firm's marks on its invoice.
+
+    Both files are uploaded through the universal `POST /files/upload` and stored here
+    by the id (or URL) it hands back. There is deliberately no separate logo or
+    signature endpoint.
+    """
+
     logo_file_id: str | None = Field(
         default=None, description="file_id from POST /files/upload — no separate logo endpoint")
+    signature_file_id: str | None = Field(
+        default=None,
+        description="file_id from POST /files/upload — printed above the signatory line")
     primary_color: str | None = Field(
         default=None, max_length=9, description="Hex, e.g. #166534")
 
