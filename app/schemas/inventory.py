@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, computed_field, ConfigDict, Field, field_validator
 
 from app.models import STOCK_MOVEMENT_TYPES
 
@@ -86,3 +86,60 @@ class SetStock(BaseModel):
     @classmethod
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
+
+
+class BatchOut(BaseModel):
+    """One lot of a product in one warehouse, and what is left of it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    warehouse_id: str
+    product_id: str
+    variant_id: str | None = None
+    batch_number: str | None = None
+    manufacturing_date: datetime | None = None
+    expiry_date: datetime | None = None
+    quantity: float
+    received_quantity: float
+    mrp: float | None = None
+
+    @computed_field(description="Days until it expires; negative once it has")
+    @property
+    def days_to_expiry(self) -> int | None:
+        if self.expiry_date is None:
+            return None
+        expiry = self.expiry_date
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return (expiry - datetime.now(timezone.utc)).days
+
+    @computed_field(description="Whether this lot is already past its expiry date")
+    @property
+    def is_expired(self) -> bool:
+        days = self.days_to_expiry
+        return days is not None and days < 0
+
+
+class SerialOut(BaseModel):
+    """One physical unit, and where it is now."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    product_id: str
+    variant_id: str | None = None
+    warehouse_id: str | None = None
+    serial_number: str
+    status: str
+    invoice_item_id: str | None = None
+    delivery_item_id: str | None = None
+    sold_at: datetime | None = None
+    created_at: datetime
+
+
+class ExpiringBatch(BatchOut):
+    """A lot near or past its expiry, with the product named."""
+
+    product_name: str | None = None
+    warehouse_name: str | None = None

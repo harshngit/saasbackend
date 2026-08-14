@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -66,8 +66,16 @@ class Invoice(Base):
     amount_paid: Mapped[float] = mapped_column(Float, default=0, nullable=False)
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # A credit note is its own document, raised against the invoice it credits — the
+    # original bill stays on the account as the debit it always was.
     is_credit_note: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     credit_note_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    credit_note_for_invoice_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("invoices.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # A plain column rather than a foreign key: sales_returns already points at
+    # invoices, and a constraint both ways is a cycle the schema cannot be created in.
+    sales_return_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
@@ -114,5 +122,10 @@ class InvoiceItem(Base):
     order_item_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("sales_order_items.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Which lot and which units this line was for. Written when the goods actually
+    # move, so a bill or a challan can be traced to the batch that left the shelf.
+    batch_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    expiry_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    serial_numbers: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     invoice: Mapped["Invoice"] = relationship(back_populates="items")

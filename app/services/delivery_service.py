@@ -29,6 +29,7 @@ from app.models import (
     VehicleLoading,
     VehicleLoadingItem,
 )
+from app.services.tracking_service import TrackingError
 from app.services import numbering_service, stock_service
 
 
@@ -280,13 +281,31 @@ def load(
                 detail=f"{item.product_name}: only {on_hand:g} on hand in {warehouse.name}",
             )
 
-        # Warehouse ↓ and the ledger row for it.
-        after = stock_service.adjust_on_hand(
-            db, org_id, warehouse.id, item.product_id, item.variant_id,
-            -quantity, "delivery_out",
-            note=f"Loaded onto vehicle for {delivery.delivery_note_number}",
-            created_by=user.id,
-        )
+        # Warehouse ↓ and the ledger row for it. For a tracked product the lot and the
+        # units go with it — the order line's request if it named one, else earliest
+        # expiry first — and the challan then says which lot the customer received.
+        order_line = db.get(SalesOrderItem, item.order_item_id) if item.order_item_id else None
+        requested_batch = getattr(order_line, "batch_number", None)
+        requested_serials = getattr(order_line, "serial_numbers", None)
+        try:
+            after, tracked = stock_service.move_tracked(
+                db, org_id, warehouse.id, item.product_id, item.variant_id,
+                -quantity, "delivery_out",
+                note=f"Loaded onto vehicle for {delivery.delivery_note_number}",
+                created_by=user.id,
+                batch={"batch_number": requested_batch} if requested_batch else None,
+                serial_numbers=requested_serials,
+            )
+        except TrackingError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
+        if tracked["batch_number"]:
+            item.batch_number = tracked["batch_number"]
+        if tracked["expiry_date"]:
+            item.expiry_date = tracked["expiry_date"]
+        if tracked["serial_numbers"]:
+            item.serial_numbers = (item.serial_numbers or []) + tracked["serial_numbers"]
         # The hold is now taken rather than promised.
         if delivery.sales_order_id:
             _consume_reservations(db, delivery.sales_order_id, item, quantity)

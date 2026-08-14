@@ -62,15 +62,37 @@ class StockRow(BaseModel):
     minimum_stock_level: int | None = None
 
 
+class BatchIn(BaseModel):
+    """The lot the goods belong to.
+
+    Only meaningful for a product with batch or expiry tracking on. On the way in it
+    creates or tops up the lot; on the way out it says which lot to take from.
+    """
+
+    batch_number: str | None = Field(default=None, max_length=60)
+    manufacturing_date: datetime | None = None
+    expiry_date: datetime | None = None
+    mrp: float | None = None
+
+
 class StockAdjustment(BaseModel):
-    """A manual correction — a stock take, a write-off, an opening balance."""
+    """A manual correction — a stock take, a write-off, an opening balance, goods received.
+
+    For a batch-tracked product, send `batch` and the lot is created or topped up with
+    it; for a serial-tracked one, send `serial_numbers` and each unit is recorded. Leave
+    them out and the goods go into (or come out of) the untracked pool, oldest first.
+    """
 
     product_id: str
     variant_id: str | None = None
     quantity: float = Field(description="Signed: positive adds, negative removes")
     movement_type: str = Field(
         default="adjustment",
-        pattern="^(opening|adjustment|damaged|expired)$",
-        description="opening | adjustment | damaged | expired",
+        pattern="^(opening|adjustment|damaged|expired|purchase_in)$",
+        description="opening | adjustment | damaged | expired | purchase_in",
     )
     note: str | None = Field(default=None, max_length=300)
+    batch: BatchIn | None = None
+    serial_numbers: list[str] | None = Field(
+        default=None, description="One per unit, for a serial-tracked product"
+    )

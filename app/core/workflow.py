@@ -171,3 +171,29 @@ ORDER_FULFILMENT_FOR_DELIVERY = {
 
 # Deliveries whose goods are still out with the partner.
 OPEN_DELIVERY_STATUSES = ("planned", "loaded", "in_transit", "partially_delivered")
+
+
+# ------------------------------ sales returns ------------------------------
+# Goods coming back are a request first, not a stock movement. Nothing re-enters the
+# warehouse until someone has physically received the goods, looked at them, and said
+# they are fit to sell again.
+RETURN_STATUSES = (
+    "requested",   # the customer has asked to return goods
+    "received",    # the goods are physically back with the firm
+    "approved",    # checked and accepted — restocked if saleable, credit note raised
+    "rejected",    # refused: nothing restocked, nothing credited
+    "cancelled",   # withdrawn before it was decided
+)
+
+# A return can still be edited or withdrawn while it is in one of these.
+OPEN_RETURN_STATUSES = ("requested", "received")
+
+# The one condition that lets goods go back on the shelf. Anything else — damaged,
+# expired, opened, whatever the firm writes — is accepted as a note on the line but
+# never becomes saleable stock again.
+SALEABLE_CONDITION = "saleable"
+
+
+def is_saleable(condition: str | None) -> bool:
+    """Whether goods in this condition may re-enter sellable stock."""
+    return (condition or "").strip().lower() == SALEABLE_CONDITION

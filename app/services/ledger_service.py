@@ -59,6 +59,7 @@ def build(db: Session, customer: Customer) -> CustomerLedger:
     )
 
     entries: list[tuple[datetime, LedgerTransaction]] = []
+    credited_for = {row.id: row.invoice_number for row in invoices}
 
     # An opening balance is money already owed when the account was created, so it
     # heads the ledger rather than hiding inside the summary.
@@ -74,6 +75,15 @@ def build(db: Session, customer: Customer) -> CustomerLedger:
     ageing = {"0_30": 0.0, "31_60": 0.0, "61_90": 0.0, "90_plus": 0.0}
     overdue = 0.0
 
+    # What has been credited back against each invoice, so a returned bill is not
+    # still shown as money owed.
+    credited: dict[str, float] = {}
+    for note in invoices:
+        if note.is_credit_note and note.credit_note_for_invoice_id:
+            credited[note.credit_note_for_invoice_id] = round(
+                credited.get(note.credit_note_for_invoice_id, 0) + (note.total or 0), 2
+            )
+
     for invoice in invoices:
         when = _aware(invoice.invoice_date) or now
         if invoice.is_credit_note:
@@ -83,7 +93,12 @@ def build(db: Session, customer: Customer) -> CustomerLedger:
                 reference_id=invoice.id,
                 reference_number=invoice.invoice_number,
                 date=when,
-                description=invoice.credit_note_reason or "Credit note",
+                description=(
+                    invoice.credit_note_reason or "Credit note"
+                ) + (
+                    f" against {credited_for[invoice.credit_note_for_invoice_id]}"
+                    if invoice.credit_note_for_invoice_id in credited_for else ""
+                ),
                 credit=round(invoice.total or 0, 2),
                 status=invoice.status,
             )))
@@ -100,7 +115,9 @@ def build(db: Session, customer: Customer) -> CustomerLedger:
             status=invoice.status,
         )))
 
-        unpaid = round((invoice.total or 0) - (invoice.amount_paid or 0), 2)
+        unpaid = round(
+            (invoice.total or 0) - (invoice.amount_paid or 0) - credited.get(invoice.id, 0), 2
+        )
         if unpaid > 0:
             days = _age_in_days(invoice, now)
             ageing[_bucket(days)] = round(ageing[_bucket(days)] + unpaid, 2)

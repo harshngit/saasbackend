@@ -23,11 +23,13 @@ from app.models import (  # noqa: F401  (register mappers)
     StoredFile,
     Plan,
     Product,
+    ProductSerial,
     ProductVariant,
     RefreshToken,
     Role,
     SalesOrder,
     SalesOrderItem,
+    StockBatch,
     StockMovement,
     StockReservation,
     Supplier,
@@ -94,7 +96,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "phase1kn-quick-billing-walkin-receipts-ledger"
+BUILD_TAG = "phase1op-returns-condition-check-batch-serial-barcode"
 
 
 @app.on_event("startup")

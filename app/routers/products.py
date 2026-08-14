@@ -2,15 +2,24 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
-from app.models import Category, Product, ProductVariant, Supplier, User
+from app.models import (
+    Category,
+    Product,
+    ProductSerial,
+    ProductVariant,
+    StockBatch,
+    Supplier,
+    User,
+)
 from app.services import numbering_service, lookup_service
 from app.schemas.category import BulkDelete, BulkDeleteResult
+from app.schemas.inventory import BatchOut, SerialOut
 from app.schemas.product import (
     ProductAttachment,
     ProductCreate,
@@ -117,6 +126,9 @@ def bulk_delete_products(
 def list_products(
     user: User = Depends(_view),
     search: str | None = Query(default=None, description="matches product code / name / sku / barcode / brand / vendor"),
+    barcode: str | None = Query(
+        default=None, description="Exact barcode — what a scanner sends. Matches a variant's too"
+    ),
     category_id: str | None = Query(default=None),
     preferred_supplier_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
@@ -136,6 +148,18 @@ def list_products(
                 Product.product_id.ilike(like),
             )
         )
+    if barcode:
+        # A scanned code is an exact match, on the product or on one of its variants —
+        # scanning a variant's barcode has to find the product it belongs to.
+        scanned = barcode.strip()
+        variant_products = (
+            db.query(ProductVariant.product_id)
+            .filter(ProductVariant.barcode == scanned)
+            .subquery()
+        )
+        query = query.filter(
+            or_(Product.barcode == scanned, Product.id.in_(select(variant_products)))
+        )
     if category_id is not None:
         query = query.filter(Product.category_id == category_id)
     if preferred_supplier_id is not None:
@@ -148,6 +172,58 @@ def list_products(
 @router.get("/{product_id}", response_model=ProductOut)
 def get_product(product_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> Product:
     return _owned(db, product_id, _org_id(user))
+
+
+@router.get("/{product_id}/batches", response_model=list[BatchOut])
+def product_batches(
+    product_id: str,
+    user: User = Depends(_view),
+    warehouse_id: str | None = Query(default=None),
+    in_stock_only: bool = Query(default=True, description="Hide lots that are used up"),
+    db: Session = Depends(get_db),
+) -> list[StockBatch]:
+    """The lots this product is in stock as, earliest expiry first.
+
+    Empty for a product that is not batch or expiry tracked — its stock is just a count.
+    """
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
+    query = db.query(StockBatch).filter(
+        StockBatch.organization_id == org_id, StockBatch.product_id == product.id
+    )
+    if warehouse_id:
+        query = query.filter(StockBatch.warehouse_id == warehouse_id)
+    if in_stock_only:
+        query = query.filter(StockBatch.quantity > 0)
+    rows = query.all()
+    return sorted(
+        rows,
+        key=lambda row: (row.expiry_date is None, row.expiry_date or row.created_at),
+    )
+
+
+@router.get("/{product_id}/serials", response_model=list[SerialOut])
+def product_serials(
+    product_id: str,
+    user: User = Depends(_view),
+    status_filter: str | None = Query(
+        default=None, alias="status", description="in_stock | sold | returned"
+    ),
+    db: Session = Depends(get_db),
+) -> list[ProductSerial]:
+    """Every unit of this product on record, and where each one is.
+
+    A unit that has gone out keeps the invoice line it went out on, which is what makes
+    a warranty claim traceable back to the sale.
+    """
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
+    query = db.query(ProductSerial).filter(
+        ProductSerial.organization_id == org_id, ProductSerial.product_id == product.id
+    )
+    if status_filter:
+        query = query.filter(ProductSerial.status == status_filter)
+    return query.order_by(ProductSerial.created_at, ProductSerial.id).all()
 
 
 @router.patch("/{product_id}", response_model=ProductOut)

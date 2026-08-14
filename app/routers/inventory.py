@@ -4,8 +4,10 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Product, ProductVariant, StockMovement, User
+from app.models import Product, ProductVariant, StockMovement, User, Warehouse
+from app.services import tracking_service
 from app.schemas.inventory import (
+    ExpiringBatch,
     InventoryDetailOut,
     InventoryItemOut,
     SetStock,
@@ -62,6 +64,36 @@ def _apply_movement(
     )
     db.add(movement)
     return movement
+
+
+@router.get("/expiring", response_model=list[ExpiringBatch])
+def expiring_stock(
+    user: User = Depends(_view),
+    within_days: int = Query(default=30, ge=0, le=3650, description="How far ahead to look"),
+    include_expired: bool = Query(default=True),
+    db: Session = Depends(get_db),
+) -> list[ExpiringBatch]:
+    """Batches that are expired or expiring, soonest first.
+
+    Only batch or expiry tracked products have lots, so only their stock appears here.
+    """
+    org_id = _org_id(user)
+    rows = tracking_service.expiring(db, org_id, within_days, include_expired)
+    out = []
+    for row in rows:
+        product = db.get(Product, row.product_id)
+        warehouse = db.get(Warehouse, row.warehouse_id)
+        out.append(ExpiringBatch(
+            **{
+                field: getattr(row, field) for field in (
+                    "id", "warehouse_id", "product_id", "variant_id", "batch_number",
+                    "manufacturing_date", "expiry_date", "quantity", "received_quantity", "mrp",
+                )
+            },
+            product_name=product.name if product is not None else None,
+            warehouse_name=warehouse.name if warehouse is not None else None,
+        ))
+    return out
 
 
 @router.get("", response_model=list[InventoryItemOut])

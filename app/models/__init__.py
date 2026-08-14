@@ -33,6 +33,7 @@ from app.models.product import Product, ProductVariant
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role
 from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
+from app.models.tracking import ProductSerial, StockBatch
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
@@ -66,6 +67,8 @@ __all__ = [
     "Category",
     "Product",
     "ProductVariant",
+    "ProductSerial",
+    "StockBatch",
     "Supplier",
     "SupplierPayment",
     "StockMovement",

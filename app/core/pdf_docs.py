@@ -565,13 +565,12 @@ def invoice_detailed_pdf(org, customer, invoice, settings: dict, logo: bytes | N
 
     pdf.set_font("Helvetica", size=8)
     for item in invoice.items:
-        # Batch and expiry are per-item tracking, which no invoice line captures yet,
-        # so a firm that turns those columns on gets them empty rather than wrong.
+        # Batch and expiry come off the lot the goods actually left the shelf in.
         values = {
             "Item": _s(item.product_name)[:30],
             "HSN/SAC": _s(item.hsn_code or "-"),
-            "Batch": "-",
-            "Expiry": "-",
+            "Batch": _s(item.batch_number or "-"),
+            "Expiry": item.expiry_date.date().isoformat() if item.expiry_date else "-",
             "MRP": _money(item.unit_price),
             "Qty": f"{item.quantity:g}",
             "Rate": _money(item.unit_price),

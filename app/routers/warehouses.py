@@ -18,6 +18,7 @@ from app.schemas.warehouse import (
     WarehouseUpdate,
 )
 from app.services import stock_service
+from app.services.tracking_service import TrackingError
 
 router = APIRouter(prefix="/warehouses", tags=["warehouses"])
 
@@ -238,11 +239,17 @@ def adjust_stock(
             detail=f"{held} unit(s) are reserved for open orders — cannot reduce below that",
         )
 
-    stock_service.adjust_on_hand(
-        db, org_id, warehouse.id, payload.product_id, payload.variant_id,
-        payload.quantity, payload.movement_type,
-        note=payload.note or f"Manual {payload.movement_type}", created_by=user.id,
-    )
+    try:
+        stock_service.adjust_on_hand(
+            db, org_id, warehouse.id, payload.product_id, payload.variant_id,
+            payload.quantity, payload.movement_type,
+            note=payload.note or f"Manual {payload.movement_type}", created_by=user.id,
+            batch=payload.batch.model_dump() if payload.batch is not None else None,
+            serial_numbers=payload.serial_numbers,
+        )
+    except TrackingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     db.commit()
     summary = stock_service.stock_summary(db, warehouse.id, payload.product_id, payload.variant_id)
     variant = db.get(ProductVariant, payload.variant_id) if payload.variant_id else None

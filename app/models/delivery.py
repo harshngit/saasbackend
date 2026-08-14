@@ -118,6 +118,11 @@ class DeliveryItem(Base):
     planned_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     loaded_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     delivered_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    # Which lot and which units this line was for. Written when the goods actually
+    # move, so a bill or a challan can be traced to the batch that left the shelf.
+    batch_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    expiry_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    serial_numbers: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     delivery: Mapped["Delivery"] = relationship(back_populates="items")
 

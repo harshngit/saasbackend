@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -124,5 +124,9 @@ class SalesOrderItem(Base):
     # How much of this line the warehouse is holding, and how much has gone out.
     reserved_quantity: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
     delivered_quantity: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
+    # The lot and the units the customer asked for, if they asked for particular ones.
+    # A request, not a hold: which lot actually goes out is settled at loading.
+    batch_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    serial_numbers: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     order: Mapped["SalesOrder"] = relationship(back_populates="items")

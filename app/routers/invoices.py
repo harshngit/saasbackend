@@ -19,7 +19,14 @@ from app.models import (
     StoredFile,
     User,
 )
-from app.services import lookup_service, numbering_service, payment_service, stock_service
+from app.services.tracking_service import TrackingError
+from app.services import (
+    lookup_service,
+    numbering_service,
+    payment_service,
+    return_service,
+    stock_service,
+)
 from app.schemas.invoice import (
     CreditNoteBody,
     InvoiceCreate,
@@ -397,6 +404,7 @@ def create_direct_invoice(
             "product": product, "variant": variant, "quantity": entry.quantity,
             "unit_price": unit_price, "discount": entry.discount, "line_total": line_total,
             "tax_rate": rate, "tax_amount": tax_amount,
+            "batch_number": entry.batch_number, "serial_numbers": entry.serial_numbers,
         })
 
     wanted = [
@@ -420,16 +428,25 @@ def create_direct_invoice(
     for line in lines:
         variant = line["variant"]
         product = line["product"]
-        stock_service.adjust_on_hand(
-            db, org_id, warehouse.id, product.id,
-            variant.id if variant is not None else None,
-            -line["quantity"],
-            movement_type="sale_out",
-            note=f"Direct Invoice {invoice.invoice_number}",
-            created_by=user.id,
-        )
+        try:
+            _, tracked = stock_service.move_tracked(
+                db, org_id, warehouse.id, product.id,
+                variant.id if variant is not None else None,
+                -line["quantity"],
+                movement_type="sale_out",
+                note=f"Direct Invoice {invoice.invoice_number}",
+                created_by=user.id,
+                batch={"batch_number": line["batch_number"]} if line["batch_number"] else None,
+                serial_numbers=line["serial_numbers"],
+            )
+        except TrackingError as exc:
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         invoice.items.append(
             InvoiceItem(
+                batch_number=tracked["batch_number"],
+                expiry_date=tracked["expiry_date"],
+                serial_numbers=tracked["serial_numbers"] or None,
                 product_id=product.id,
                 variant_id=variant.id if variant is not None else None,
                 product_name=product.name if variant is None else f"{product.name} ({variant.name})",
@@ -580,48 +597,82 @@ def create_credit_note(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Invoice:
-    """Record a credit note (sales return). Reverses stock and reduces receivables."""
+    """Credit an invoice straight away — the shortcut for goods already back in hand.
+
+    This raises a **credit note of its own**, against this invoice: the original bill
+    stays on the account as the debit it always was, and the credit note is the entry
+    that cancels it. The customer's outstanding balance falls by the credited amount,
+    and the goods go back into the warehouse.
+
+    Send `items` to credit part of the invoice, or nothing to credit all of it. Because
+    the goods are taken as saleable here, they re-enter stock; a return whose condition
+    still has to be checked belongs on POST /sales-returns instead, which restocks only
+    what someone has confirmed is fit to sell.
+    """
     org_id = _org_id(user)
     invoice = _owned(db, id, org_id)
 
-    if invoice.status == "returned":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invoice is already returned")
+    if invoice.is_credit_note:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That is already a credit note",
+        )
+    already = return_service.credited_against(db, invoice.id)
+    if already + 0.01 >= (invoice.total or 0):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invoice is already fully credited"
+        )
 
     warehouse = stock_service.default_warehouse(db, org_id)
 
-    # Reverse stock deduction
+    lines = []
     for item in invoice.items:
-        qty_to_return = item.quantity
+        quantity = item.quantity
         if payload.items:
-            match = next((x for x in payload.items if x.product_id == item.product_id and x.variant_id == item.variant_id), None)
-            if match:
-                qty_to_return = match.quantity
-            else:
-                qty_to_return = 0
-
-        if qty_to_return <= 0 or not item.product_id:
+            match = next(
+                (
+                    row for row in payload.items
+                    if row.product_id == item.product_id and row.variant_id == item.variant_id
+                ),
+                None,
+            )
+            quantity = match.quantity if match else 0
+        if quantity <= 0:
             continue
 
-        # Back into the warehouse the goods left, through the one stock path, so the
-        # warehouse row, the catalog counter and the movement ledger stay in step.
-        stock_service.adjust_on_hand(
-            db, org_id, warehouse.id, item.product_id, item.variant_id, qty_to_return,
-            movement_type="sales_return",
-            note=f"Credit Note Return for {invoice.invoice_number}",
-            created_by=user.id,
+        if item.product_id:
+            # Back into the warehouse the goods left, through the one stock path, so the
+            # warehouse row, the catalog counter and the movement ledger stay in step.
+            stock_service.adjust_on_hand(
+                db, org_id, warehouse.id, item.product_id, item.variant_id, quantity,
+                movement_type="sales_return",
+                note=f"Credit Note for {invoice.invoice_number}",
+                created_by=user.id,
+            )
+
+        share = quantity / (item.quantity or 1)
+        lines.append({
+            "product_id": item.product_id,
+            "variant_id": item.variant_id,
+            "product_name": item.product_name,
+            "hsn_code": item.hsn_code,
+            "quantity": quantity,
+            "unit_price": item.unit_price,
+            "tax_rate": item.tax_rate,
+            "line_total": round((item.line_total or 0) * share, 2),
+        })
+
+    if not lines:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="None of those items are on this invoice",
         )
 
-    # Adjust customer receivables (reduce total_billed)
-    if invoice.customer:
-        customer = invoice.customer
-        customer.total_billed = round((customer.total_billed or 0) - invoice.total, 2)
-        customer.recompute_outstanding()
-
-    invoice.status = "returned"
-    invoice.is_credit_note = True
-    if payload.reason:
-        invoice.credit_note_reason = payload.reason
-
+    note = return_service.credit_note(
+        db, org_id, invoice=invoice, lines=lines,
+        reason=payload.reason, created_by=user.id,
+    )
     db.commit()
-    db.refresh(invoice)
-    return invoice
+    db.refresh(note)
+    return note
+

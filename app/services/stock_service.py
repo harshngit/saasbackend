@@ -25,6 +25,7 @@ from app.models import (
     Warehouse,
     WarehouseStock,
 )
+from app.services import tracking_service
 
 DEFAULT_WAREHOUSE_NAME = "Main Warehouse"
 DEFAULT_WAREHOUSE_CODE = "WH-001"
@@ -229,11 +230,41 @@ def adjust_on_hand(
     movement_type: str,
     note: str | None = None,
     created_by: str | None = None,
+    batch: dict | None = None,
+    serial_numbers: list[str] | None = None,
 ) -> float:
     """Move physical stock and record it in the ledger. Returns the new on-hand.
 
     Every caller goes through here so the warehouse row, the legacy catalog
     counters and the stock_movements ledger can never drift apart.
+
+    For a product whose tracking flags are on, the lots and the serial numbers move
+    with it — see `move_tracked` when the caller needs to know which lot it got.
+    """
+    return move_tracked(
+        db, org_id, warehouse_id, product_id, variant_id, delta, movement_type,
+        note=note, created_by=created_by, batch=batch, serial_numbers=serial_numbers,
+    )[0]
+
+
+def move_tracked(
+    db: Session,
+    org_id: str,
+    warehouse_id: str,
+    product_id: str,
+    variant_id: str | None,
+    delta: float,
+    movement_type: str,
+    note: str | None = None,
+    created_by: str | None = None,
+    batch: dict | None = None,
+    serial_numbers: list[str] | None = None,
+) -> tuple[float, dict]:
+    """The same movement, and the batch / serials it actually moved.
+
+    Returns `(on_hand, {batch_number, expiry_date, serial_numbers})`. A sale keeps that
+    snapshot on its line, so an invoice or a challan can say which lot went out and
+    which units — which is the whole point of tracking them.
     """
     row = _row(db, org_id, warehouse_id, product_id, variant_id)
     row.on_hand_quantity = round((row.on_hand_quantity or 0) + delta, 3)
@@ -255,7 +286,13 @@ def adjust_on_hand(
         )
     )
     db.flush()
-    return row.on_hand_quantity
+
+    # Lots and serials move with the goods, whichever part of the app moved them.
+    snapshot = tracking_service.apply(
+        db, org_id, warehouse_id, product_id, variant_id, delta,
+        batch=batch, serial_numbers=serial_numbers,
+    )
+    return row.on_hand_quantity, snapshot
 
 
 def _sync_catalog_counter(db: Session, org_id: str, product_id: str, variant_id: str | None) -> None:

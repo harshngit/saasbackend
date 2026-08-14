@@ -2163,7 +2163,6 @@ sales_ret_payload = {
     "customer_id": fcust["id"],
     "invoice_reference_id": inv_ref["id"],
     "return_reason": "Defective product",
-    "return_status": "Approved",
     "items": [{"product_id": fprod["id"], "quantity_returned": 2}]
 }
 r = client.post("/sales-returns", headers=fin_hdr, json=sales_ret_payload)
@@ -2171,8 +2170,16 @@ check("POST /sales-returns -> 201", r.status_code == 201, r.text)
 ret_obj = r.json()
 check("return_number matches", ret_obj["return_number"] == "RET-2026-001")
 
+# A request is only a request: the goods are not back yet, so no stock has moved.
 new_stock = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
-check("sales return reverses stock", new_stock == old_stock + 2, f"Old: {old_stock}, New: {new_stock}")
+check("a return request moves no stock", new_stock == old_stock, f"Old: {old_stock}, New: {new_stock}")
+r = client.patch(f"/sales-returns/{ret_obj['id']}/approve", headers=fin_hdr, json={
+    "items": [{"return_item_id": ret_obj["items"][0]["id"], "received_quantity": 2,
+               "condition": "saleable", "restock": True}]})
+check("approving it -> 200", r.status_code == 200 and r.json()["status"] == "approved", r.text[:300])
+new_stock = client.get(f"/inventory/{fprod['id']}", headers=fin_hdr).json()["total_stock"]
+check("approval puts the saleable goods back", new_stock == old_stock + 2,
+      f"Old: {old_stock}, New: {new_stock}")
 
 r = client.get("/sales-returns", headers=fin_hdr)
 check("GET /sales-returns list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.text)
@@ -4549,12 +4556,376 @@ def _phase1kn_checks():
     led = client.get(f"/customers/{opened['id']}/ledger", headers=ah).json()
     note = next((t for t in led["transactions"] if t["type"] == "credit_note"), None)
     check("a credit note credits the account", note is not None and note["credit"] == 100, note)
-    check("its reason is on the line", note and note["description"] == "Damaged in transit", note)
+    check("its reason and the invoice it credits are on the line",
+          note and note["description"].startswith("Damaged in transit")
+          and cn_invoice["invoice_number"] in note["description"], note)
+    check("and it is a credit note document of its own",
+          note and note["reference_number"].startswith("CN-"), note)
     check("and the receivable is back to the opening balance",
           led["summary"]["outstanding"] == 2500, led["summary"])
 
 
 _phase1kn_checks()
+
+
+def _phase1op_checks():
+    """Phase 1O + 1P: returns with a condition check, and batch / serial / barcode."""
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+    def firm(name):
+        reg = client.post("/auth/register", json={
+            "organization_name": name, "admin_name": "Admin",
+            "email": f"{name.lower()}_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+        return reg, hdr(reg["tokens"]["access_token"])
+
+    ret, ah = firm("ReturnCo")
+    other, oh = firm("OtherReturn")
+
+    prod = client.post("/products", headers=ah, json={
+        "name": "Bottle 1L", "price": 100, "total_inventory": 100, "tax_rate": 0,
+        "barcode": "8901234567890"}).json()
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Mehta Stores"},
+        "payment_information": {"credit_limit": 50000}}).json()
+    warehouse_id = client.get("/warehouses", headers=ah).json()[0]["id"]
+
+    def on_hand(product_id=None):
+        rows = client.get("/warehouses/stock", headers=ah,
+                          params={"product_id": product_id or prod["id"]}).json()
+        return rows[0]["on_hand"] if rows else 0
+
+    def owed():
+        return client.get(f"/customers/{cust['id']}", headers=ah).json(
+        )["financial_summary"]["outstanding_balance"]
+
+    print("\n== 1. A return is a request, not a stock movement (Phase 1O) ==")
+    bill = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 100, "tax_rate": 0}]}).json()
+    sold_stock = on_hand()
+    billed = owed()
+    r = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": bill["id"], "reason": "Damaged goods",
+        "items": [{"invoice_item_id": bill["items"][0]["id"], "quantity_returned": 4}]})
+    check("POST /sales-returns -> 201", r.status_code == 201, r.text[:400])
+    req = r.json()
+    print(json.dumps({k: req[k] for k in ("return_number", "status", "return_status",
+                                          "customer_id", "credit_amount", "items")},
+                     indent=2, default=str))
+    check("it comes back as a request", req["status"] == "requested", req["status"])
+    check("with a RET number", req["return_number"].startswith("RET-"), req["return_number"])
+    check("the customer came from the invoice", req["customer_id"] == cust["id"], req)
+    check("the line is priced as it was billed",
+          req["items"][0]["unit_price"] == 100 and req["items"][0]["line_total"] == 400,
+          req["items"][0])
+    check("and points at the invoice line",
+          req["items"][0]["invoice_item_id"] == bill["items"][0]["id"])
+    check("NO stock came back yet", on_hand() == sold_stock, (sold_stock, on_hand()))
+    check("and nothing was credited yet", owed() == billed, (billed, owed()))
+    check("no credit note exists yet", req["credit_note_id"] is None, req)
+
+    print("\n== 2. What can be returned is capped by what was invoiced ==")
+    r = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": bill["id"],
+        "items": [{"invoice_item_id": bill["items"][0]["id"], "quantity_returned": 7}]})
+    check("more than is left of the line -> 400", r.status_code == 400, r.text[:250])
+    check("and it says how much is left", "only 6" in r.text, r.text[:250])
+    check("a line from another invoice -> 400",
+          client.post("/sales-returns", headers=ah, json={
+              "invoice_reference_id": bill["id"],
+              "items": [{"invoice_item_id": str(uuid.uuid4()), "quantity_returned": 1}]
+          }).status_code == 400)
+    check("no items -> 422",
+          client.post("/sales-returns", headers=ah, json={
+              "invoice_reference_id": bill["id"], "items": []}).status_code == 422)
+    check("neither invoice nor customer -> 400",
+          client.post("/sales-returns", headers=ah, json={
+              "items": [{"product_id": prod["id"], "quantity_returned": 1}]}).status_code == 400)
+    check("another firm's invoice -> 400",
+          client.post("/sales-returns", headers=oh, json={
+              "invoice_reference_id": bill["id"],
+              "items": [{"product_id": prod["id"], "quantity_returned": 1}]}).status_code == 400)
+
+    print("\n== 3. Goods arrive: still no stock movement ==")
+    r = client.patch(f"/sales-returns/{req['id']}/receive", headers=ah, json={
+        "items": [{"return_item_id": req["items"][0]["id"], "received_quantity": 3}]})
+    check("PATCH /receive -> 200", r.status_code == 200, r.text[:300])
+    received = r.json()
+    check("it moves to received", received["status"] == "received", received["status"])
+    check("recording only 3 of the 4 asked for",
+          received["items"][0]["received_quantity"] == 3, received["items"][0])
+    check("received_at is stamped", received["received_at"] is not None)
+    check("still no stock back", on_hand() == sold_stock, (sold_stock, on_hand()))
+    check("receiving more than was asked for -> 400",
+          client.patch(f"/sales-returns/{req['id']}/receive", headers=ah, json={
+              "items": [{"return_item_id": req["items"][0]["id"], "received_quantity": 99}]
+          }).status_code == 400)
+
+    print("\n== 4. Damaged goods never go back on the shelf ==")
+    r = client.patch(f"/sales-returns/{req['id']}/approve", headers=ah, json={
+        "items": [{"return_item_id": req["items"][0]["id"], "received_quantity": 3,
+                   "condition": "damaged", "restock": True}]})
+    check("asking to restock damaged goods -> 400", r.status_code == 400, r.text[:300])
+    check("and it says why", "saleable" in r.text, r.text[:300])
+    check("the return was left open",
+          client.get(f"/sales-returns/{req['id']}", headers=ah).json()["status"] == "received")
+    r = client.patch(f"/sales-returns/{req['id']}/approve", headers=ah, json={
+        "items": [{"return_item_id": req["items"][0]["id"], "received_quantity": 3,
+                   "condition": "damaged", "restock": False}]})
+    check("approving them as damaged -> 200", r.status_code == 200, r.text[:300])
+    done = r.json()
+    check("it is approved", done["status"] == "approved", done["status"])
+    check("nothing was restocked",
+          done["items"][0]["restocked_quantity"] == 0 and on_hand() == sold_stock,
+          (done["items"][0], sold_stock, on_hand()))
+    check("but the customer was still credited 300",
+          done["credit_amount"] == 300, done["credit_amount"])
+    check("a credit note was raised", done["credit_note_id"] is not None, done)
+    note = client.get(f"/invoices/{done['credit_note_id']}", headers=ah).json()
+    check("the credit note is its own document",
+          note["is_credit_note"] and note["invoice_number"].startswith("CN-")
+          and note["total"] == 300, note)
+    check("it names the invoice it credits", note["id"] != bill["id"], note["id"])
+    check("the original invoice is still a bill",
+          client.get(f"/invoices/{bill['id']}", headers=ah).json()["is_credit_note"] is False)
+    check("and the receivable came down by the credit",
+          owed() == round(billed - 300, 2), (billed, owed()))
+    check("an approved return cannot be approved twice",
+          client.patch(f"/sales-returns/{req['id']}/approve", headers=ah,
+                       json={}).status_code == 400)
+    check("nor edited",
+          client.patch(f"/sales-returns/{req['id']}", headers=ah,
+                       json={"return_reason": "Changed"}).status_code == 400)
+    check("nor deleted",
+          client.delete(f"/sales-returns/{req['id']}", headers=ah).status_code == 409)
+
+    print("\n== 5. Saleable goods do go back ==")
+    before = on_hand()
+    good = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": bill["id"], "reason": "Over-ordered",
+        "items": [{"invoice_item_id": bill["items"][0]["id"], "quantity_returned": 2}]}).json()
+    r = client.patch(f"/sales-returns/{good['id']}/approve", headers=ah, json={
+        "items": [{"return_item_id": good["items"][0]["id"], "received_quantity": 2,
+                   "condition": "saleable", "restock": True}]})
+    check("approving saleable goods -> 200", r.status_code == 200, r.text[:300])
+    check("they are back in the warehouse", on_hand() == before + 2, (before, on_hand()))
+    check("the line records what was restocked",
+          r.json()["items"][0]["restocked_quantity"] == 2, r.json()["items"][0])
+    check("the return is on the movement ledger",
+          any(m["movement_type"] == "sales_return"
+              for m in client.get(f"/inventory/{prod['id']}", headers=ah).json()["movements"]))
+
+    print("\n== 6. Rejecting a return, and withdrawing one ==")
+    bad = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": bill["id"],
+        "items": [{"invoice_item_id": bill["items"][0]["id"], "quantity_returned": 1}]}).json()
+    stock_now, owed_now = on_hand(), owed()
+    r = client.patch(f"/sales-returns/{bad['id']}/reject", headers=ah,
+                     json={"reason": "Returned after the window"})
+    check("PATCH /reject -> 200 rejected", r.status_code == 200 and r.json()["status"] == "rejected",
+          r.text[:250])
+    check("the reason is kept", r.json()["rejected_reason"] == "Returned after the window")
+    check("nothing restocked and nothing credited",
+          on_hand() == stock_now and owed() == owed_now, (stock_now, on_hand(), owed_now, owed()))
+    check("a rejected return has no credit note", r.json()["credit_note_id"] is None)
+    withdrawn = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": bill["id"],
+        "items": [{"invoice_item_id": bill["items"][0]["id"], "quantity_returned": 1}]}).json()
+    check("DELETE withdraws an open request -> 204",
+          client.delete(f"/sales-returns/{withdrawn['id']}", headers=ah).status_code == 204)
+    check("and it is gone",
+          client.get(f"/sales-returns/{withdrawn['id']}", headers=ah).status_code == 404)
+    check("its quantity is free to return again",
+          client.post("/sales-returns", headers=ah, json={
+              "invoice_reference_id": bill["id"],
+              "items": [{"invoice_item_id": bill["items"][0]["id"],
+                         "quantity_returned": 1}]}).status_code == 201)
+    check("filter by status",
+          all(x["status"] == "approved" for x in client.get(
+              "/sales-returns", headers=ah, params={"status": "approved"}).json()))
+    check("cross-firm return -> 404",
+          client.get(f"/sales-returns/{req['id']}", headers=oh).status_code == 404)
+    check("the return shows on the customer's ledger as a credit",
+          any(t["type"] == "credit_note" and t["credit"] == 300
+              for t in client.get(f"/customers/{cust['id']}/ledger", headers=ah).json()["transactions"]))
+
+    print("\n== 7. Goods received in batches (Phase 1P) ==")
+    batched = client.post("/products", headers=ah, json={
+        "name": "Milk 500ml", "price": 30, "total_inventory": 0,
+        "batch_tracking": True, "expiry_tracking": True, "barcode": "8909998887776"}).json()
+    r = client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
+        "product_id": batched["id"], "quantity": 50, "movement_type": "purchase_in",
+        "batch": {"batch_number": "B-2408", "manufacturing_date": "2026-07-01T00:00:00Z",
+                  "expiry_date": "2027-02-01T00:00:00Z", "mrp": 35}})
+    check("receiving a batch -> 200", r.status_code == 200, r.text[:300])
+    check("the warehouse count went up", r.json()["on_hand"] == 50, r.json())
+    r = client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
+        "product_id": batched["id"], "quantity": 30, "movement_type": "purchase_in",
+        "batch": {"batch_number": "B-2409", "expiry_date": "2026-09-01T00:00:00Z"}})
+    check("a second batch -> 200", r.status_code == 200 and r.json()["on_hand"] == 80, r.text[:200])
+    lots = client.get(f"/products/{batched['id']}/batches", headers=ah).json()
+    print(json.dumps(lots, indent=2, default=str))
+    check("GET /products/{id}/batches lists both", len(lots) == 2, lots)
+    check("earliest expiry first", lots[0]["batch_number"] == "B-2409", [l["batch_number"] for l in lots])
+    check("the quantities are per lot",
+          {l["batch_number"]: l["quantity"] for l in lots} == {"B-2409": 30, "B-2408": 50}, lots)
+    check("the manufacturing date and MRP were kept",
+          any(l["batch_number"] == "B-2408" and l["mrp"] == 35
+              and l["manufacturing_date"] is not None for l in lots), lots)
+    check("days to expiry is worked out", all(l["days_to_expiry"] is not None for l in lots), lots)
+    check("an untracked product has no lots",
+          client.get(f"/products/{prod['id']}/batches", headers=ah).json() == [])
+
+    print("\n== 8. A sale takes the oldest stock first, or the lot you name ==")
+    sale = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": batched["id"], "quantity": 10, "unit_price": 30, "tax_rate": 0}]}).json()
+    check("the line records the lot it came out of",
+          sale["items"][0]["batch_number"] == "B-2409", sale["items"][0])
+    check("with its expiry date", sale["items"][0]["expiry_date"] is not None, sale["items"][0])
+    lots = {l["batch_number"]: l["quantity"]
+            for l in client.get(f"/products/{batched['id']}/batches", headers=ah).json()}
+    check("and that lot went down", lots == {"B-2409": 20, "B-2408": 50}, lots)
+    named = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": batched["id"], "quantity": 5, "unit_price": 30,
+                   "tax_rate": 0, "batch_number": "B-2408"}]}).json()
+    check("naming a lot sells from it", named["items"][0]["batch_number"] == "B-2408",
+          named["items"][0])
+    lots = {l["batch_number"]: l["quantity"]
+            for l in client.get(f"/products/{batched['id']}/batches", headers=ah).json()}
+    check("the named lot went down", lots == {"B-2409": 20, "B-2408": 45}, lots)
+    check("the lots still add up to the warehouse count",
+          sum(lots.values()) == on_hand(batched["id"]), (lots, on_hand(batched["id"])))
+    r = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": batched["id"], "quantity": 1, "unit_price": 30,
+                   "batch_number": "B-NOPE"}]})
+    check("a lot that is not in stock -> 400", r.status_code == 400, r.text[:250])
+    r = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": batched["id"], "quantity": 40, "unit_price": 30,
+                   "batch_number": "B-2409"}]})
+    check("more than that lot holds -> 400", r.status_code == 400, r.text[:250])
+    check("and the batch says how much is left", "20 left" in r.text, r.text[:250])
+    check("the tax invoice prints the batch and expiry",
+          client.get(f"/invoices/{sale['id']}/pdf", headers=ah, params={
+              "format": "detailed"}).content[:5] == b"%PDF-")
+
+    print("\n== 9. Expiring stock ==")
+    soon = client.get("/inventory/expiring", headers=ah, params={"within_days": 30}).json()
+    check("GET /inventory/expiring finds the near-dated lot",
+          any(row["batch_number"] == "B-2409" for row in soon), soon)
+    check("it names the product and warehouse",
+          all(row["product_name"] and row["warehouse_name"] for row in soon), soon)
+    check("the far-dated lot is not in a 30-day window",
+          all(row["batch_number"] != "B-2408" for row in soon), soon)
+    check("a wider window finds it",
+          any(row["batch_number"] == "B-2408" for row in client.get(
+              "/inventory/expiring", headers=ah, params={"within_days": 400}).json()))
+    check("another firm sees none of it",
+          client.get("/inventory/expiring", headers=oh, params={"within_days": 400}).json() == [])
+
+    print("\n== 10. Serial-tracked units ==")
+    serialed = client.post("/products", headers=ah, json={
+        "name": "Water Purifier", "price": 8000, "total_inventory": 0,
+        "serial_number_tracking": True}).json()
+    r = client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
+        "product_id": serialed["id"], "quantity": 3, "movement_type": "purchase_in",
+        "serial_numbers": ["SN001", "SN002", "SN003"]})
+    check("receiving three units with their serials -> 200", r.status_code == 200, r.text[:300])
+    units = client.get(f"/products/{serialed['id']}/serials", headers=ah).json()
+    check("all three are on record and in stock",
+          len(units) == 3 and all(u["status"] == "in_stock" for u in units), units)
+    check("a serial count that disagrees with the quantity -> 400",
+          client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
+              "product_id": serialed["id"], "quantity": 2, "movement_type": "purchase_in",
+              "serial_numbers": ["SN010"]}).status_code == 400)
+    check("a serial already in stock -> 400",
+          client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
+              "product_id": serialed["id"], "quantity": 1, "movement_type": "purchase_in",
+              "serial_numbers": ["SN001"]}).status_code == 400)
+    sold = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": serialed["id"], "quantity": 1, "unit_price": 8000,
+                   "tax_rate": 0, "serial_numbers": ["SN002"]}]}).json()
+    check("the invoice line records the unit sold",
+          sold["items"][0]["serial_numbers"] == ["SN002"], sold["items"][0])
+    units = {u["serial_number"]: u["status"]
+             for u in client.get(f"/products/{serialed['id']}/serials", headers=ah).json()}
+    check("that unit is sold, the others are not",
+          units == {"SN001": "in_stock", "SN002": "sold", "SN003": "in_stock"}, units)
+    check("selling it again -> 400",
+          client.post("/invoices", headers=ah, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": serialed["id"], "quantity": 1, "unit_price": 8000,
+                         "serial_numbers": ["SN002"]}]}).status_code == 400)
+    check("a serial that is not on record -> 400",
+          client.post("/invoices", headers=ah, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": serialed["id"], "quantity": 1, "unit_price": 8000,
+                         "serial_numbers": ["SN999"]}]}).status_code == 400)
+    check("filter by status",
+          [u["serial_number"] for u in client.get(
+              f"/products/{serialed['id']}/serials", headers=ah,
+              params={"status": "sold"}).json()] == ["SN002"])
+    auto = client.post("/invoices", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": serialed["id"], "quantity": 1, "unit_price": 8000,
+                   "tax_rate": 0}]}).json()
+    check("no serial sent sells the oldest unit in stock",
+          auto["items"][0]["serial_numbers"] == ["SN001"], auto["items"][0])
+
+    print("\n== 11. A returned unit goes back on the shelf ==")
+    back = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": sold["id"], "reason": "Wrong model",
+        "items": [{"invoice_item_id": sold["items"][0]["id"], "quantity_returned": 1}]}).json()
+    client.patch(f"/sales-returns/{back['id']}/approve", headers=ah, json={
+        "items": [{"return_item_id": back["items"][0]["id"], "received_quantity": 1,
+                   "condition": "saleable", "restock": True}]})
+    units = {u["serial_number"]: u["status"]
+             for u in client.get(f"/products/{serialed['id']}/serials", headers=ah).json()}
+    check("SN002 is back in stock", units["SN002"] == "in_stock", units)
+    check("and it can be sold again",
+          client.post("/invoices", headers=ah, json={
+              "customer_id": cust["id"],
+              "items": [{"product_id": serialed["id"], "quantity": 1, "unit_price": 8000,
+                         "serial_numbers": ["SN002"]}]}).status_code == 201)
+    milk_back = client.post("/sales-returns", headers=ah, json={
+        "invoice_reference_id": named["id"], "reason": "Over-ordered",
+        "items": [{"invoice_item_id": named["items"][0]["id"], "quantity_returned": 5}]}).json()
+    client.patch(f"/sales-returns/{milk_back['id']}/approve", headers=ah, json={
+        "items": [{"return_item_id": milk_back["items"][0]["id"], "received_quantity": 5,
+                   "condition": "saleable", "restock": True}]})
+    lots = {l["batch_number"]: l["quantity"]
+            for l in client.get(f"/products/{batched['id']}/batches", headers=ah).json()}
+    check("a returned batch goes back into the lot it was sold from",
+          lots["B-2408"] == 50, lots)
+    check("and the lots still match the warehouse",
+          sum(lots.values()) == on_hand(batched["id"]), (lots, on_hand(batched["id"])))
+
+    print("\n== 12. Barcode lookup ==")
+    r = client.get("/products", headers=ah, params={"barcode": "8901234567890"})
+    check("GET /products?barcode= finds the one product",
+          r.status_code == 200 and [p["id"] for p in r.json()] == [prod["id"]], r.text[:250])
+    check("an unknown barcode finds nothing",
+          client.get("/products", headers=ah, params={"barcode": "0000000000"}).json() == [])
+    check("another firm's barcode finds nothing",
+          client.get("/products", headers=oh, params={"barcode": "8901234567890"}).json() == [])
+    check("the product code route still resolves a barcode",
+          client.get(f"/products/8901234567890", headers=ah).json()["id"] == prod["id"])
+    variant_product = client.post("/products", headers=ah, json={
+        "name": "Juice", "price": 60,
+        "variations": [{"name": "1L", "price": 60, "barcode": "7771112223334"}]}).json()
+    check("scanning a variant's barcode finds its product",
+          [p["id"] for p in client.get("/products", headers=ah, params={
+              "barcode": "7771112223334"}).json()] == [variant_product["id"]])
+
+
+_phase1op_checks()
 
 print("\n== every model column made nullable is relaxed on Postgres too ==")
 # SQLite ignores a NOT NULL that Postgres enforces, so a column made nullable in the

@@ -21,6 +21,12 @@ class InvoiceItemIn(BaseModel):
         default=None, ge=0, le=100, description="Tax % on this line. Defaults to the product's rate"
     )
     tax: float = Field(default=0, ge=0, description="Flat tax amount. Ignored when tax_rate applies")
+    batch_number: str | None = Field(
+        default=None, max_length=60, description="Sell from this lot. Otherwise earliest expiry first"
+    )
+    serial_numbers: list[str] | None = Field(
+        default=None, description="The exact units sold, for a serial-tracked product"
+    )
 
     @field_validator("variant_id", mode="before")
     @classmethod
@@ -63,6 +69,10 @@ class InvoiceItemOut(BaseModel):
     tax: float = Field(description="Tax amount on the line")
     tax_rate: float | None = Field(default=None, description="The rate it was billed at, as a %")
     line_total: float
+    # Which lot and which units went out on this line.
+    batch_number: str | None = None
+    expiry_date: datetime | None = None
+    serial_numbers: list[str] | None = None
     delivery_item_id: str | None = None
     order_item_id: str | None = None
 
