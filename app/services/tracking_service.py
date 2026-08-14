@@ -141,7 +141,9 @@ def serial_rows(
     )
     if status:
         query = query.filter(ProductSerial.status == status)
-    return query.order_by(ProductSerial.created_at, ProductSerial.id).all()
+    # Oldest received first. Units received together tie on the timestamp, so the
+    # serial number breaks the tie — otherwise the pick is a random UUID's order.
+    return query.order_by(ProductSerial.created_at, ProductSerial.serial_number).all()
 
 
 # ------------------------------ the movement -------------------------------

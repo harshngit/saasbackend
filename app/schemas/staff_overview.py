@@ -169,7 +169,8 @@ class DeliveryBreakdown(BaseModel):
     failed: int
     amount_collected: float
     pod_completed: int | None = Field(
-        default=None, description="null — proof of delivery is not captured yet")
+        default=None,
+        description="Deliveries in the period with a POD photo or signature captured")
 
 
 # -------------------------------- generic --------------------------------
@@ -202,7 +203,9 @@ class StaffActivity(BaseModel):
     amount: float | None = None
     status: str | None = None
     pod_status: str | None = Field(
-        default=None, description="null — proof of delivery is not captured yet")
+        default=None,
+        description="captured when a POD photo or signature is on the delivery, "
+                    "pending when it was delivered without one, else null")
 
 
 class StaffOverviewOut(BaseModel):
@@ -232,16 +235,21 @@ class StaffOverviewOut(BaseModel):
 
 
 class VehicleBadge(BaseModel):
-    """The delivery partner's open vehicle loading for the day.
+    """The van this delivery partner is out with, and what is on it.
 
-    There is no vehicle master yet, so `vehicle_number` is null — a loading records
-    who is out with stock, not which van. `id` is the loading's id.
+    `vehicle_id` / `vehicle_number` / `vehicle_type` come from the fleet master, taken
+    off the delivery that names the van. `loaded_at` and `items` come from the open
+    vehicle loading — what actually went onto it. Either half can be missing: a firm
+    that has not created a vehicle still gets its loading reported, and a van assigned
+    with nothing loaded yet still shows the van.
     """
 
-    id: str
+    id: str = Field(description="The open loading's id, else the vehicle's")
+    vehicle_id: str | None = None
     vehicle_number: str | None = None
+    vehicle_type: str | None = None
     loaded_at: datetime | None = None
-    items: int = 0
+    items: int = Field(default=0, description="Distinct items currently on the vehicle")
 
 
 StaffOverviewOut.model_rebuild()

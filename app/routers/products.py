@@ -223,7 +223,7 @@ def product_serials(
     )
     if status_filter:
         query = query.filter(ProductSerial.status == status_filter)
-    return query.order_by(ProductSerial.created_at, ProductSerial.id).all()
+    return query.order_by(ProductSerial.created_at, ProductSerial.serial_number).all()
 
 
 @router.patch("/{product_id}", response_model=ProductOut)

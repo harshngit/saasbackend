@@ -24,6 +24,7 @@ from app.models import (
     Invoice,
     SalesOrder,
     User,
+    Vehicle,
     VehicleLoading,
 )
 from app.schemas.staff_overview import (
@@ -218,6 +219,46 @@ def _attendance_activity(db: Session, staff: User, df: datetime, dt: datetime) -
     return events
 
 
+def _vehicle_badge(db, staff, loading, notes, open_deliveries):  # noqa: ANN001
+    """The van this partner is out with, and what is on it.
+
+    The vehicle comes from the delivery that names it — the fleet master records which
+    van, the loading records what went onto it. Either half can be missing: a firm that
+    never created a vehicle still gets its loading reported.
+    """
+    vehicle = None
+    for order in open_deliveries:
+        note = notes.get(order.id)
+        if note is not None and note.vehicle_id:
+            vehicle = db.get(Vehicle, note.vehicle_id)
+            if vehicle is not None:
+                break
+    if vehicle is None:
+        recent = (
+            db.query(Delivery)
+            .filter(
+                Delivery.organization_id == staff.organization_id,
+                Delivery.delivery_partner_id == staff.id,
+                Delivery.vehicle_id.isnot(None),
+            )
+            .order_by(Delivery.updated_at.desc())
+            .first()
+        )
+        if recent is not None:
+            vehicle = db.get(Vehicle, recent.vehicle_id)
+
+    if loading is None and vehicle is None:
+        return None
+    return VehicleBadge(
+        id=loading.id if loading is not None else vehicle.id,
+        vehicle_id=vehicle.id if vehicle is not None else None,
+        vehicle_number=vehicle.vehicle_number if vehicle is not None else None,
+        vehicle_type=vehicle.vehicle_type if vehicle is not None else None,
+        loaded_at=loading.date if loading is not None else None,
+        items=len(loading.items or []) if loading is not None else 0,
+    )
+
+
 def _sorted_feed(events: list[StaffActivity]) -> list[StaffActivity]:
     def when(event: StaffActivity) -> datetime:
         moment = event.at
@@ -391,6 +432,14 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
         )
     }
 
+    def _pod_status(note) -> str | None:
+        """Whether proof of delivery was actually captured on this delivery."""
+        if note is None:
+            return None
+        if note.pod_signature_file_id or (note.pod_photo_file_ids or []):
+            return "captured"
+        return "pending" if note.status in ("delivered", "partially_delivered") else None
+
     loading = (
         db.query(VehicleLoading)
         .filter(
@@ -424,7 +473,7 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
                 delivery_number=note.delivery_note_number if note else None,
                 amount=round(order.total or 0, 2),
                 status=order.status,
-                pod_status=None,
+                pod_status=_pod_status(note),
             )
         )
     for payment in payments:
@@ -485,18 +534,12 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
             partial=count(in_period, "partially_delivered"),
             failed=count(in_period, "failed"),
             amount_collected=collected,
-            pod_completed=None,
+            pod_completed=sum(
+                1 for order in in_period
+                if _pod_status(notes.get(order.id)) == "captured"
+            ),
         ),
-        "vehicle": (
-            VehicleBadge(
-                id=loading.id,
-                vehicle_number=None,
-                loaded_at=loading.date,
-                items=len(loading.items or []),
-            )
-            if loading is not None
-            else None
-        ),
+        "vehicle": _vehicle_badge(db, staff, loading, notes, open_deliveries),
         "recent_activity": _sorted_feed(feed),
     }
 

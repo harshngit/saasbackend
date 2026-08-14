@@ -96,7 +96,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "invoice-templates-and-signature"
+BUILD_TAG = "staff-overview-real-vehicle-and-pod"
 
 
 @app.on_event("startup")

@@ -3127,7 +3127,7 @@ def _staff_detail_checks():
           dd["summary"]["amount_receivable"] == 60, dd["summary"])
     check("delivery_summary breaks the period down",
           dd["delivery_summary"]["successful"] == 1 and dd["delivery_summary"]["pending"] == 1
-          and dd["delivery_summary"]["pod_completed"] is None, dd["delivery_summary"])
+          and dd["delivery_summary"]["pod_completed"] == 0, dd["delivery_summary"])
     check("performance is a per-day delivery series",
           all(set(p) == {"date", "deliveries_completed", "delivery_amount"} for p in dd["performance"])
           and dd["performance"][-1]["deliveries_completed"] == 1, dd["performance"][-1])
@@ -4972,6 +4972,107 @@ def _phase1op_checks():
 
 
 _phase1op_checks()
+
+
+def _staff_overview_fleet_checks():
+    """The delivery workspace overview reports the van and the proof of delivery."""
+    import json
+
+    def hdr(t):
+        return {"Authorization": f"Bearer {t}"}
+
+    reg = client.post("/auth/register", json={
+        "organization_name": "FleetView", "admin_name": "Admin",
+        "email": f"fleet_{uuid.uuid4().hex[:8]}@f.com", "password": "Secret@123"}).json()
+    ah = hdr(reg["tokens"]["access_token"])
+
+    roles = {r["name"]: r for r in client.get("/roles", headers=ah).json()}
+    dp_email = f"fdp_{uuid.uuid4().hex[:6]}@f.com"
+    dp = client.post("/users", headers=ah, json={
+        "basic_information": {"first_name": "Imran", "last_name": "Khan"},
+        "contact_information": {"official_email": dp_email},
+        "login_security": {"password": "Dp@123456", "confirm_password": "Dp@123456"},
+        "employment_information": {"role_id": roles["Delivery Partner"]["id"]}}).json()
+    dp_hdr = hdr(client.post("/auth/login", json={
+        "email": dp_email, "password": "Dp@123456"}).json()["tokens"]["access_token"])
+
+    veh = client.post("/vehicles", headers=ah, json={
+        "vehicle_number": "MH 12 KL 9087", "vehicle_type": "Tempo", "capacity_kg": 1200}).json()
+    prod = client.post("/products", headers=ah, json={
+        "name": "Jar 20L", "price": 60, "total_inventory": 50}).json()
+    cust = client.post("/customers", headers=ah, json={
+        "basic_information": {"customer_name": "Corner Cafe"}}).json()
+
+    order = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 60}]}).json()
+    dlv = client.post("/deliveries", headers=ah, json={
+        "order_id": order["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
+        "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": 5}]}).json()
+
+    print("\n== The van is on the overview while the delivery is still out ==")
+    over = client.get(f"/users/{dp['id']}/overview", headers=ah).json()
+    check("workspace is delivery", over["workspace"] == "delivery", over["workspace"])
+    print(json.dumps(over["vehicle"], indent=2, default=str))
+    check("the real vehicle is reported, not a null placeholder",
+          over["vehicle"] and over["vehicle"]["vehicle_number"] == "MH 12 KL 9087"
+          and over["vehicle"]["vehicle_id"] == veh["id"], over["vehicle"])
+    check("with its type", over["vehicle"]["vehicle_type"] == "Tempo", over["vehicle"])
+    check("nothing is loaded onto it yet",
+          over["vehicle"]["items"] == 0 and over["vehicle"]["loaded_at"] is None, over["vehicle"])
+
+    client.post("/vehicle-stock/loading", headers=ah, json={
+        "delivery_id": dlv["id"],
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "loaded_quantity": 5}]})
+    over = client.get(f"/users/{dp['id']}/overview", headers=ah).json()
+    check("once loaded, the badge carries the van and its load",
+          over["vehicle"]["vehicle_number"] == "MH 12 KL 9087"
+          and over["vehicle"]["items"] == 1
+          and over["vehicle"]["loaded_at"] is not None, over["vehicle"])
+
+    print("\n== Proof of delivery is counted only when it was actually captured ==")
+    client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah, json={"status": "in_transit"})
+    client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "delivered_quantity": 5}]})
+    over = client.get(f"/users/{dp['id']}/overview", headers=ah).json()
+    delivered = next((a for a in over["recent_activity"] if a["type"] == "delivery_completed"), None)
+    check("a delivery with no POD reads as pending, not captured",
+          delivered and delivered["pod_status"] == "pending", delivered)
+    check("and none is counted as completed",
+          over["delivery_summary"]["pod_completed"] == 0, over["delivery_summary"])
+
+    photo = client.post("/files/upload", headers=dp_hdr, files={
+        "file": ("pod.png", bytes.fromhex(
+            "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+            "01f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"),
+        "image/png")}).json()
+    o2 = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 60}]}).json()
+    d2 = client.post("/deliveries", headers=ah, json={
+        "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
+        "items": [{"order_item_id": o2["items"][0]["id"], "planned_quantity": 3}]}).json()
+    client.post(f"/deliveries/{d2['id']}/load", headers=ah)
+    client.patch(f"/deliveries/by-id/{d2['id']}", headers=ah, json={"status": "in_transit"})
+    r = client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr, json={
+        "items": [{"delivery_item_id": d2["items"][0]["id"], "delivered_quantity": 3}],
+        "pod_photo_file_ids": [photo["file_id"]], "signature_file_id": photo["file_id"]})
+    check("confirming with a POD -> 200", r.status_code == 200, r.text[:300])
+    over = client.get(f"/users/{dp['id']}/overview", headers=ah).json()
+    captured = [a for a in over["recent_activity"]
+                if a["type"] == "delivery_completed" and a["pod_status"] == "captured"]
+    check("that delivery reads as captured", len(captured) == 1, over["recent_activity"][:3])
+    check("and exactly one POD is counted for the period",
+          over["delivery_summary"]["pod_completed"] == 1, over["delivery_summary"])
+    check("no route, stops or view-route field was invented",
+          not any(key in over for key in ("route", "route_status", "stops", "view_route")),
+          sorted(over))
+    check("current location stays unavailable without a real ping",
+          over["current_location"]["available"] is False
+          and over["current_location"]["latitude"] is None, over["current_location"])
+
+
+_staff_overview_fleet_checks()
 
 print("\n== every model column made nullable is relaxed on Postgres too ==")
 # SQLite ignores a NOT NULL that Postgres enforces, so a column made nullable in the
