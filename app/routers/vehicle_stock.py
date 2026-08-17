@@ -77,6 +77,15 @@ def load_vehicle(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="delivery_id is not a delivery in your firm",
             )
+        # Enforce new workflow: deliveries must be marked `ready` before loading.
+        if delivery.status != "ready":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Delivery must be marked ready before loading. "
+                    f"Current status: {delivery.status}. Call POST /deliveries/{payload.delivery_id}/ready first."
+                ),
+            )
         if payload.delivery_partner_id and not delivery.delivery_partner_id:
             delivery.delivery_partner_id = payload.delivery_partner_id
         if payload.vehicle_id:

@@ -1199,10 +1199,23 @@ o_inv = client.post("/orders", headers=fin_hdr, json={
 }).json()
 # Approve order
 client.patch(f"/orders/{o_inv['id']}/approve", headers=fin_hdr)
+
+# Temporarily switch org to on_order billing so we can invoice without a delivery
+# (Phase 2 now requires deliveries in after_delivery mode; this test predates that)
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "on_order"})
+
 # Generate invoice from order
 r = client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr)
 check("generate invoice from order -> 201", r.status_code == 201, r.text)
-invoice_obj = r.json()
+
+# Restore default after_delivery mode
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "after_delivery"})
+
+# Defensive: only proceed if we got an invoice back
+if r.status_code == 201:
+    invoice_obj = r.json()
+else:
+    invoice_obj = {"id": None}  # sentinel to prevent KeyError crash
 # Duplicate generation should fail
 check("duplicate generate invoice -> 400", client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr).status_code == 400)
 # Get and List

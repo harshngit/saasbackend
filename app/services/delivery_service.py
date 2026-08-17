@@ -349,7 +349,7 @@ def load(
 
 def dispatch(db: Session, user: User, delivery: Delivery) -> None:
     """Send it out. Only now is the delivery live for the partner."""
-    if delivery.status not in ("loaded", "planned"):
+    if delivery.status != "loaded":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"A '{delivery.status}' delivery cannot be dispatched",

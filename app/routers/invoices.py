@@ -165,6 +165,7 @@ def generate_from_order(
         )
 
     delivery = None
+    lines = None
     if payload is not None and payload.delivery_id:
         delivery = db.get(Delivery, payload.delivery_id)
         if delivery is None or delivery.organization_id != org_id:
@@ -192,19 +193,70 @@ def generate_from_order(
                        "(partial_delivery_invoice_mode = after_full_order)",
             )
     else:
-        # Billing the whole order: only once, as before.
-        existing = (
-            db.query(Invoice)
-            .filter(Invoice.order_id == order_id, Invoice.is_credit_note.is_(False))
-            .first()
-        )
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invoice already generated for this order (Invoice ID: {existing.id})",
+        # No delivery_id provided. Decision depends on the firm's invoice timing.
+        if settings["invoice_timing"] == "on_order":
+            # Billing the whole order: only once, as before.
+            existing = (
+                db.query(Invoice)
+                .filter(Invoice.order_id == order_id, Invoice.is_credit_note.is_(False))
+                .first()
             )
+            if existing:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invoice already generated for this order (Invoice ID: {existing.id})",
+                )
+        else:
+            # invoice_timing == 'after_delivery'
+            # 3a: if zero deliveries exist for this order, refuse
+            any_delivery = (
+                db.query(Delivery)
+                .filter(Delivery.sales_order_id == order.id, Delivery.organization_id == org_id)
+                .first()
+            )
+            if not any_delivery:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No deliveries recorded yet. This organization bills after delivery.",
+                )
+            mode = settings.get("partial_delivery_invoice_mode")
+            if mode == "per_delivery":
+                # 3b: require explicit delivery_id
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This organization bills per delivery. Please specify delivery_id.",
+                )
+            # 3c: after_full_order
+            if mode == "after_full_order":
+                if order.fulfilment_status != "delivered":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="This organization bills after the full order is delivered.",
+                    )
+                # Aggregate delivered qty across order items, subtract already invoiced qty
+                agg_lines: list[dict] = []
+                for item in order.items:
+                    delivered = float(item.delivered_quantity or 0)
+                    already = sum(
+                        (row.quantity or 0)
+                        for row in db.query(InvoiceItem).join(Invoice, InvoiceItem.invoice_id == Invoice.id)
+                        .filter(
+                            InvoiceItem.order_item_id == item.id,
+                            Invoice.is_credit_note.is_(False),
+                        )
+                    )
+                    outstanding = round(delivered - (already or 0), 3)
+                    if outstanding > 0:
+                        agg_lines.append({"order_item": item, "delivery_item_id": None, "quantity": outstanding})
+                if not agg_lines:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Everything delivered has already been invoiced",
+                    )
+                lines = agg_lines
 
-    lines = _billable_lines(db, order, delivery)
+    if lines is None:
+        lines = _billable_lines(db, order, delivery)
     if not lines:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

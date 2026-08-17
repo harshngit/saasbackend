@@ -6,6 +6,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_valida
 
 
 class VariantIn(BaseModel):
+    id: str | None = None
     name: str = Field(min_length=1, max_length=150)
     sku: str | None = Field(default=None, max_length=100)
     barcode: str | None = Field(default=None, max_length=100)

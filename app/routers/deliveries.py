@@ -26,6 +26,7 @@ from app.schemas.delivery import (
     DeliveryPlanCreate,
     DeliveryPlanUpdate,
     DeliveryStatusUpdate,
+    DeliveryPickBody,
 )
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
@@ -142,6 +143,12 @@ def plan_delivery(
             detail="This order is still awaiting approval",
         )
 
+    if order.status == "draft":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot plan delivery for a draft order. Please confirm the order first.",
+        )
+
     partner = None
     if payload.delivery_partner_id:
         partner = db.get(User, payload.delivery_partner_id)
@@ -206,6 +213,72 @@ def list_deliveries(
     return [
         _delivery_out(db, d) for d in query.order_by(Delivery.created_at.desc()).all()
     ]
+
+
+@router.post("/{delivery_id}/pick", response_model=DeliveryOut)
+def pick_items(
+    delivery_id: str,
+    payload: DeliveryPickBody,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Record picked quantities for a delivery (warehouse picking). This is a
+    preparatory step: it does not move stock, only records how many units were
+    picked from shelves for each delivery item.
+    """
+    delivery = _owned_delivery(db, delivery_id, user)
+    if delivery.status != "planned":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Picking may only be done for planned deliveries")
+
+    # Map items by id for quick lookup
+    items_by_id = {i.id: i for i in delivery.items}
+    any_changed = False
+    for it in payload.items:
+        di = items_by_id.get(it.delivery_item_id)
+        if di is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown delivery_item_id: {it.delivery_item_id}")
+        if it.picked_quantity < 0 or it.picked_quantity > (di.planned_quantity or 0):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid picked_quantity for item {it.delivery_item_id}")
+        if di.picked_quantity != it.picked_quantity:
+            di.picked_quantity = it.picked_quantity
+            any_changed = True
+
+    # Update picking_status
+    if any(i.picked_quantity and i.picked_quantity > 0 for i in delivery.items):
+        if all((i.picked_quantity or 0) >= (i.planned_quantity or 0) for i in delivery.items):
+            delivery.picking_status = "picked"
+        else:
+            delivery.picking_status = "picking"
+    else:
+        delivery.picking_status = "not_started"
+
+    db.commit()
+    db.refresh(delivery)
+    return _delivery_out(db, delivery)
+
+
+@router.post("/{delivery_id}/ready", response_model=DeliveryOut)
+def mark_ready(
+    delivery_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Mark a delivery as `ready` once picking is complete. This moves the
+    delivery into the `ready` lifecycle step — loading may only proceed from
+    `ready`.
+    """
+    delivery = _owned_delivery(db, delivery_id, user)
+    if delivery.status != "planned":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only mark planned deliveries as ready")
+    if delivery.picking_status != "picked":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All items must be fully picked before marking ready")
+
+    delivery.status = "ready"
+    db.commit()
+    db.refresh(delivery)
+    return _delivery_out(db, delivery)
 
 
 @router.get("/by-id/{delivery_id}", response_model=DeliveryOut)

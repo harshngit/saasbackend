@@ -113,6 +113,15 @@ class DeliveryPlanCreate(BaseModel):
     items: list[DeliveryPlanItem] | None = None
 
 
+class DeliveryPickItem(BaseModel):
+    delivery_item_id: str
+    picked_quantity: float = Field(gt=0)
+
+
+class DeliveryPickBody(BaseModel):
+    items: list[DeliveryPickItem]
+
+
 class DeliveryPlanUpdate(BaseModel):
     """Re-plan or dispatch a delivery. Only the fields you send change.
 

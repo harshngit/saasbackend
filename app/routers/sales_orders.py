@@ -144,6 +144,7 @@ def create_order(
     customer going past their credit limit.
     """
     org_id = _org_id(user)
+    settings = workflow.sales_settings(user.organization)
     customer = db.get(Customer, payload.customer_id)
     if customer is None or customer.organization_id != org_id:
         raise HTTPException(
@@ -172,7 +173,24 @@ def create_order(
         order_level_tax=payload.tax,
         notes=payload.notes,
         order_status_label=payload.order_status,
+        create_as_draft=settings["draft_orders_enabled"],
     )
+    db.commit()
+    db.refresh(order)
+    return _order_out(db, order, warnings)
+
+
+@router.post("/{order_id}/confirm", response_model=OrderOut)
+def confirm_order_endpoint(
+    order_id: str,
+    user: User = Depends(_create),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Confirm a draft order: perform stock checks, reserve and move to placed/awaiting_approval."""
+    org_id = _org_id(user)
+    order = _owned(db, order_id, org_id, user)
+    order, warnings = order_service.confirm_order(db, user, order)
     db.commit()
     db.refresh(order)
     return _order_out(db, order, warnings)
@@ -258,6 +276,11 @@ def assign_delivery_partner(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot assign delivery on a '{order.status}' order",
+        )
+    if order.status == "draft":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot assign delivery to a draft order. Please confirm the order first.",
         )
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:

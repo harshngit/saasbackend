@@ -246,10 +246,37 @@ def update_product(
         data.pop("has_variants", None)  # NOT NULL column — never write a null into it
     for field, value in data.items():
         setattr(product, field, value)
-    if variations is not None:  # full replace of the variant set
-        product.variations = _build_variants([VariantIn(**v) for v in variations])
+
+    # Variants upsert behavior: None = no-op; [] = explicit no-op (do not delete);
+    # non-empty list = perform in-place updates for supplied ids and create for new ones.
+    if variations is not None and len(variations) > 0:
+        seen_ids: set[str] = set()
+        for v in variations:
+            # Validate payload shape using VariantIn
+            vobj = VariantIn(**v)
+            vid = vobj.id
+            if vid:
+                if vid in seen_ids:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="duplicate variant id in payload")
+                seen_ids.add(vid)
+                variant = db.get(ProductVariant, vid)
+                if variant is None or variant.product_id != product.id:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="variant id not found or does not belong to this product")
+                # Update only fields provided in the incoming dict
+                for key, val in v.items():
+                    if key == "id":
+                        continue
+                    setattr(variant, key, val)
+            else:
+                # Create new variant and attach to the product
+                new_data = {k: val for k, val in v.items() if k != "id"}
+                variant = ProductVariant(product_id=product.id, **new_data)
+                product.variations.append(variant)
+
+        # Only set has_variants to True when client provided a non-empty variations list
         if "has_variants" not in data:
-            product.has_variants = bool(variations)
+            product.has_variants = True
+
     db.commit()
     db.refresh(product)
     return product
