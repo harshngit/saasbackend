@@ -161,6 +161,46 @@ def plan(
     return delivery
 
 
+def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
+    """Partner accepts a planned delivery. Does not commit."""
+    if delivery.status != "planned":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only planned deliveries can be accepted (this delivery is '{delivery.status}')",
+        )
+    if delivery.delivery_partner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This delivery is not assigned to you",
+        )
+    delivery.status = "accepted"
+    return delivery
+
+
+def reject(db: Session, user: User, delivery: Delivery, reason: str | None = None) -> Delivery:
+    """Partner rejects a planned delivery. Clears partner + vehicle. Does not commit."""
+    if delivery.status != "planned":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only planned deliveries can be rejected (this delivery is '{delivery.status}')",
+        )
+    if delivery.delivery_partner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This delivery is not assigned to you",
+        )
+    delivery.status = "rejected"
+    reason_str = reason.strip() if reason and reason.strip() else "no reason given"
+    note_text = f"Rejected by partner: {reason_str}"
+    if delivery.notes:
+        delivery.notes = f"{delivery.notes}\n{note_text}"
+    else:
+        delivery.notes = note_text
+    delivery.delivery_partner_id = None
+    delivery.vehicle_id = None
+    return delivery
+
+
 def _open_loading(db: Session, org_id: str, partner_id: str) -> VehicleLoading | None:
     return (
         db.query(VehicleLoading)
@@ -214,6 +254,16 @@ def load(
     if delivery.status == "cancelled":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery was cancelled"
+        )
+    if delivery.status == "planned":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The delivery partner has not accepted this delivery yet",
+        )
+    if delivery.status == "rejected":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This delivery was rejected and needs to be reassigned",
         )
     if not delivery.delivery_partner_id:
         raise HTTPException(

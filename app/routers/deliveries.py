@@ -19,12 +19,13 @@ from app.models import (
     Delivery,
     DeliveryItem,
 )
-from app.services import delivery_service, numbering_service
+from app.services import delivery_service, notification_service, numbering_service
 from app.schemas.delivery import (
     DeliveryConfirm,
     DeliveryOut,
     DeliveryPlanCreate,
     DeliveryPlanUpdate,
+    DeliveryRejectBody,
     DeliveryStatusUpdate,
     DeliveryPickBody,
 )
@@ -179,6 +180,19 @@ def plan_delivery(
             if payload.items is not None else None
         ),
     )
+    if partner is not None:
+        try:
+            notification_service.notify(
+                db,
+                user_id=partner.id,
+                title="New delivery assigned",
+                body=f"Delivery {delivery.delivery_number} needs your acceptance",
+                type="delivery",
+                link=delivery.id,
+                organization_id=org_id,
+            )
+        except Exception:
+            pass
     db.commit()
     db.refresh(delivery)
     return _delivery_out(db, delivery)
@@ -354,6 +368,49 @@ def update_delivery(
 
     db.commit()
     db.refresh(delivery)
+    return _delivery_out(db, delivery)
+
+
+@router.post("/{delivery_id}/accept", response_model=DeliveryOut)
+def accept_delivery(
+    delivery_id: str,
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Accept a planned delivery. Partner-specific action that marks status as accepted."""
+    delivery = _owned_delivery(db, delivery_id, user)
+    delivery_service.accept(db, user, delivery)
+    db.commit()
+    db.refresh(delivery)
+    return _delivery_out(db, delivery)
+
+
+@router.post("/{delivery_id}/reject", response_model=DeliveryOut)
+def reject_delivery(
+    delivery_id: str,
+    payload: DeliveryRejectBody = DeliveryRejectBody(),
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Reject a planned delivery. Partner-specific action that clears partner & vehicle and notifies admins."""
+    delivery = _owned_delivery(db, delivery_id, user)
+    delivery_service.reject(db, user, delivery, reason=payload.reason if payload else None)
+    db.commit()
+    db.refresh(delivery)
+    try:
+        notification_service.notify_org_admins(
+            db,
+            organization_id=delivery.organization_id,
+            title="Delivery rejected",
+            body=f"{delivery.delivery_number} was rejected by the partner — needs reassignment",
+            type="delivery",
+            link=delivery.id,
+        )
+        db.commit()
+    except Exception:
+        pass
     return _delivery_out(db, delivery)
 
 

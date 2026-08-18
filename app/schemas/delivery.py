@@ -21,6 +21,10 @@ class DeliveryStatusUpdate(BaseModel):
         return self
 
 
+class DeliveryRejectBody(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class DeliveryItemBase(BaseModel):
     product_id: str | None = None
     variant_id: str | None = None

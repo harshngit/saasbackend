@@ -156,6 +156,8 @@ def invoice_settings(org) -> dict:  # noqa: ANN001
 # is the identifier every delivery endpoint takes. Its status tracks the goods:
 DELIVERY_STATUSES = (
     "planned",              # partner and vehicle named, quantities planned
+    "accepted",             # accepted by assigned partner
+    "rejected",             # rejected by assigned partner
     "ready",                # picked and ready for loading
     "loaded",               # goods physically on the vehicle
     "in_transit",           # dispatched — only now is it live for the partner
@@ -168,6 +170,8 @@ DELIVERY_STATUSES = (
 # The order's fulfilment_status each delivery status implies, so the two never drift.
 ORDER_FULFILMENT_FOR_DELIVERY = {
     "planned": "planned",
+    "accepted": "planned",
+    "rejected": "planned",
     "ready": "planned",
     "loaded": "loaded",
     "in_transit": "in_transit",
@@ -177,7 +181,7 @@ ORDER_FULFILMENT_FOR_DELIVERY = {
 }
 
 # Deliveries whose goods are still out with the partner.
-OPEN_DELIVERY_STATUSES = ("planned", "ready", "loaded", "in_transit", "partially_delivered")
+OPEN_DELIVERY_STATUSES = ("planned", "accepted", "ready", "loaded", "in_transit", "partially_delivered")
 
 
 # ------------------------------ sales returns ------------------------------
