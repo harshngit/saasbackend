@@ -77,8 +77,8 @@ def load_vehicle(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="delivery_id is not a delivery in your firm",
             )
-        # Enforce new workflow: deliveries must be marked `ready` before loading.
-        if delivery.status != "ready":
+        # Enforce workflow: deliveries must be marked `ready` before initial loading.
+        if delivery.status not in ("ready", "loaded"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -130,6 +130,7 @@ def load_vehicle(
     loading = VehicleLoading(
         organization_id=org_id,
         delivery_partner_id=partner.id,
+        vehicle_id=payload.vehicle_id,
         date=payload.date or datetime.now(timezone.utc),
         status="active",
     )

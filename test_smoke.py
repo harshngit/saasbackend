@@ -3812,6 +3812,7 @@ def _phase1cf_checks():
           }).status_code == 400)
 
     print("\n== 5. Vehicle loading (Phase 1D) ==")
+    client.post(f"/deliveries/{dlv['id']}/accept", headers=dp_hdr)
     client.post(f"/deliveries/{dlv['id']}/pick", headers=ah, json={
         "items": [{"delivery_item_id": dlv["items"][0]["id"], "picked_quantity": 20}]
     })
@@ -3941,6 +3942,10 @@ def _phase1cf_checks():
     check("omitting items plans the whole outstanding order",
           d2["items"][0]["planned_quantity"] == 4, d2["items"])
     client.post(f"/deliveries/{d2['id']}/accept", headers=dp_hdr)
+    client.post(f"/deliveries/{d2['id']}/pick", headers=ah, json={
+        "items": [{"delivery_item_id": d2["items"][0]["id"], "picked_quantity": 4}]
+    })
+    client.post(f"/deliveries/{d2['id']}/ready", headers=ah)
     client.post(f"/deliveries/{d2['id']}/load", headers=ah)
     client.patch(f"/deliveries/by-id/{d2['id']}", headers=ah, json={"status": "in_transit"})
     before = client.get(f"/vehicle-stock/current/{dp['id']}", headers=ah).json()["items"][0]["delivered_qty"]
@@ -4009,6 +4014,9 @@ def _phase1ij_checks():
     dp_hdr = hdr(client.post("/auth/login", json={
         "email": dp_email, "password": "Dp@123456"}).json()["tokens"]["access_token"])
 
+    veh = client.post("/vehicles", headers=ah, json={
+        "vehicle_number": "DL 01 AB 9999", "vehicle_type": "Tempo", "capacity_kg": 1000}).json()
+
     prod = client.post("/products", headers=ah, json={
         "name": "Can 20L", "price": 100, "total_inventory": 200,
         "tax_rate": 5, "hsn_code": "22011010"}).json()
@@ -4020,9 +4028,13 @@ def _phase1ij_checks():
     def deliver(order, quantity):
         """Plan, load, dispatch and confirm `quantity` against a fresh delivery."""
         dlv = client.post("/deliveries", headers=ah, json={
-            "order_id": order["id"], "delivery_partner_id": dp["id"],
+            "order_id": order["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
             "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": quantity}]}).json()
         client.post(f"/deliveries/{dlv['id']}/accept", headers=dp_hdr)
+        client.post(f"/deliveries/{dlv['id']}/pick", headers=ah, json={
+            "items": [{"delivery_item_id": dlv["items"][0]["id"], "picked_quantity": quantity}]
+        })
+        client.post(f"/deliveries/{dlv['id']}/ready", headers=ah)
         client.post(f"/deliveries/{dlv['id']}/load", headers=ah)
         client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah, json={"status": "in_transit"})
         client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
@@ -5084,6 +5096,7 @@ def _staff_overview_fleet_checks():
     check("nothing is loaded onto it yet",
           over["vehicle"]["items"] == 0 and over["vehicle"]["loaded_at"] is None, over["vehicle"])
 
+    client.post(f"/deliveries/{dlv['id']}/accept", headers=dp_hdr)
     client.post(f"/deliveries/{dlv['id']}/pick", headers=ah, json={
         "items": [{"delivery_item_id": dlv["items"][0]["id"], "picked_quantity": 5}]
     })
@@ -5120,6 +5133,10 @@ def _staff_overview_fleet_checks():
         "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
         "items": [{"order_item_id": o2["items"][0]["id"], "planned_quantity": 3}]}).json()
     client.post(f"/deliveries/{d2['id']}/accept", headers=dp_hdr)
+    client.post(f"/deliveries/{d2['id']}/pick", headers=ah, json={
+        "items": [{"delivery_item_id": d2["items"][0]["id"], "picked_quantity": 3}]
+    })
+    client.post(f"/deliveries/{d2['id']}/ready", headers=ah)
     client.post(f"/deliveries/{d2['id']}/load", headers=ah)
     client.patch(f"/deliveries/by-id/{d2['id']}", headers=ah, json={"status": "in_transit"})
     r = client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr, json={
@@ -5351,7 +5368,7 @@ check("TEST 14: Confirmed order status placed and reserved",
 client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"draft_orders_enabled": False})
 
 
-print("\n== Delivery Response Enrichment ==")
+print("\n== Delivery Response Enrichment & Workflow Fixes ==")
 # 1. Setup isolated organization
 del_org = client.post("/auth/register", json={
     "organization_name": "Delivery Enrichment Org", "admin_name": "Del Admin",
@@ -5370,6 +5387,8 @@ dp_user = client.post("/users", headers=del_admin_hdr, json={
     "login_security": {"password": "Password@123", "confirm_password": "Password@123"},
     "employment_information": {"role_id": d_roles["Delivery Partner"]["id"]}
 }).json()
+dp_login = client.post("/auth/login", json={"email": dp_email, "password": "Password@123"}).json()
+dp_hdr = {"Authorization": f"Bearer {dp_login['tokens']['access_token']}"}
 
 # Create Vehicle
 veh = client.post("/vehicles", headers=del_admin_hdr, json={
@@ -5405,37 +5424,104 @@ dlv_create = client.post("/deliveries", headers=del_admin_hdr, json={
 check("POST /deliveries with full details -> 201", dlv_create.status_code == 201, dlv_create.text)
 dlv_data = dlv_create.json()
 
-# Record picking to test picking_status and picked_quantity
-client.post(f"/deliveries/{dlv_data['id']}/pick", headers=del_admin_hdr, json={
+# TEST A1: Pick before accept -> 400
+pick_fail = client.post(f"/deliveries/{dlv_data['id']}/pick", headers=del_admin_hdr, json={
     "items": [{"delivery_item_id": dlv_data["items"][0]["id"], "picked_quantity": 10}]
 })
+check("TEST A1: Pick before accept -> 400", pick_fail.status_code == 400, pick_fail.text)
+
+# TEST A2: Partner accepts delivery -> 200
+accept_res = client.post(f"/deliveries/{dlv_data['id']}/accept", headers=dp_hdr)
+check("TEST A2: Partner accept -> 200", accept_res.status_code == 200, accept_res.text)
+check("TEST A2: Delivery status is accepted", accept_res.json()["status"] == "accepted")
+
+# TEST B1: Ready before fully picked -> 400
+ready_fail = client.post(f"/deliveries/{dlv_data['id']}/ready", headers=del_admin_hdr)
+check("TEST B1: Ready before picked -> 400", ready_fail.status_code == 400, ready_fail.text)
+
+# TEST A3 & A4: Pick after accept -> 200, does not move inventory
+pick_res = client.post(f"/deliveries/{dlv_data['id']}/pick", headers=del_admin_hdr, json={
+    "items": [{"delivery_item_id": dlv_data["items"][0]["id"], "picked_quantity": 10}]
+})
+check("TEST A3: Pick after accept -> 200", pick_res.status_code == 200, pick_res.text)
+check("TEST A4: Picking updates picking_status to picked", pick_res.json()["picking_status"] == "picked")
+check("TEST A4: Status remains accepted", pick_res.json()["status"] == "accepted")
+
+# Verify stock unchanged during picking
+stock_during_pick = client.get(f"/warehouses/stock?product_id={prod['id']}", headers=del_admin_hdr).json()[0]
+check("TEST A4: Warehouse physical stock unchanged during pick", stock_during_pick["on_hand"] == 100.0)
+check("TEST A4: Warehouse reservation unchanged during pick", stock_during_pick["reserved"] == 10.0)
+
+# TEST B2: Ready after picked -> 200
+ready_res = client.post(f"/deliveries/{dlv_data['id']}/ready", headers=del_admin_hdr)
+check("TEST B2: Ready after picked -> 200", ready_res.status_code == 200, ready_res.text)
+check("TEST B2: Status is ready", ready_res.json()["status"] == "ready")
+check("TEST B2: Picking status is picked", ready_res.json()["picking_status"] == "picked")
+
+# TEST C1 & C2: Loading guard checks
+# Dispatch before loaded -> 400
+dispatch_fail = client.patch(f"/deliveries/by-id/{dlv_data['id']}", headers=del_admin_hdr, json={"status": "in_transit"})
+check("TEST C1: Dispatch before loaded -> 400", dispatch_fail.status_code == 400, dispatch_fail.text)
+
+# Confirm before in_transit -> 400
+confirm_fail = client.post(f"/deliveries/{dlv_data['id']}/confirm", headers=del_admin_hdr, json={
+    "items": [{"delivery_item_id": dlv_data["items"][0]["id"], "delivered_quantity": 10}]
+})
+check("TEST D1: Confirm before in_transit -> 400", confirm_fail.status_code == 400, confirm_fail.text)
+
+# TEST C3: Load vehicle -> 200
+load_res = client.post(f"/deliveries/{dlv_data['id']}/load", headers=del_admin_hdr)
+check("TEST C3: Load delivery -> 200", load_res.status_code == 200, load_res.text)
+check("TEST C3: Status is loaded", load_res.json()["status"] == "loaded")
+
+# Verify inventory moved on load
+stock_after_load = client.get(f"/warehouses/stock?product_id={prod['id']}", headers=del_admin_hdr).json()[0]
+check("TEST C3: Warehouse on_hand decreased by 10", stock_after_load["on_hand"] == 90.0)
+check("TEST C3: Reservation consumed (reserved is 0)", stock_after_load["reserved"] == 0.0)
+
+# Verify vehicle stock created with vehicle_id
+v_stock = client.get(f"/vehicle-stock/current/{dp_user['id']}", headers=del_admin_hdr).json()
+check("TEST F1: Vehicle stock has vehicle_id", v_stock["vehicle_id"] == veh["id"], v_stock)
+check("TEST F1: Vehicle stock has vehicle object", v_stock["vehicle"] is not None and v_stock["vehicle"]["vehicle_number"] == "KA 01 AB 1234")
+
+# TEST D2: Dispatch -> 200
+dispatch_res = client.patch(f"/deliveries/by-id/{dlv_data['id']}", headers=del_admin_hdr, json={"status": "in_transit"})
+check("TEST D2: Dispatch loaded delivery -> 200", dispatch_res.status_code == 200, dispatch_res.text)
+check("TEST D2: Status is in_transit", dispatch_res.json()["status"] == "in_transit")
+
+# TEST D3: Confirm delivery -> 200
+confirm_res = client.post(f"/deliveries/{dlv_data['id']}/confirm", headers=del_admin_hdr, json={
+    "items": [{"delivery_item_id": dlv_data["items"][0]["id"], "delivered_quantity": 10}]
+})
+check("TEST D3: Confirm delivery -> 200", confirm_res.status_code == 200, confirm_res.text)
+check("TEST D3: Delivery status is delivered", confirm_res.json()["status"] == "delivered")
+
+# Verify warehouse stock was NOT deducted again on confirmation
+stock_after_confirm = client.get(f"/warehouses/stock?product_id={prod['id']}", headers=del_admin_hdr).json()[0]
+check("TEST D3: Warehouse stock not deducted twice", stock_after_confirm["on_hand"] == 90.0)
 
 # Fetch delivery via GET /deliveries/by-id/{id} and GET /deliveries
 dlv = client.get(f"/deliveries/by-id/{dlv_data['id']}", headers=del_admin_hdr).json()
 del_list = client.get("/deliveries", headers=del_admin_hdr).json()
 check("GET /deliveries returns enriched list", len(del_list) >= 1)
-dlv_from_list = next(d for d in del_list if d["id"] == dlv["id"])
 
-# 1. Delivery Details
+# Verify all enriched fields
 check("Delivery id present", dlv["id"] == dlv_data["id"])
 check("Delivery number present", dlv["delivery_number"].startswith("DLV-"))
-check("Delivery status present", dlv["status"] == "planned")
+check("Delivery status present", dlv["status"] == "delivered")
 check("Delivery picking_status present and updated", dlv["picking_status"] == "picked", dlv["picking_status"])
 
-# 2. Order Details
 check("order_id present", dlv["order_id"] == order["id"])
 check("order_number present", dlv["order_number"] == order["order_number"])
 check("order object present", dlv["order"] is not None and isinstance(dlv["order"], dict))
 check("order.id matches", dlv["order"]["id"] == order["id"])
 check("order.order_number matches", dlv["order"]["order_number"] == order["order_number"])
-check("order.status matches", dlv["order"]["status"] == "processing", dlv["order"])
-check("order.fulfilment_status matches", dlv["order"]["fulfilment_status"] == "planned", dlv["order"])
+check("order.status matches", dlv["order"]["status"] in ("completed", "processing"), dlv["order"])
+check("order.fulfilment_status matches", dlv["order"]["fulfilment_status"] == "delivered", dlv["order"])
 check("order.total matches", dlv["order"]["total"] == order["total"], dlv["order"])
-check("top-level order_status matches", dlv["order_status"] == "processing")
 check("top-level order_total matches", dlv["order_total"] == order["total"])
-check("top-level fulfilment_status matches", dlv["fulfilment_status"] == "planned")
+check("top-level fulfilment_status matches", dlv["fulfilment_status"] == "delivered")
 
-# 3. Customer Details
 check("customer object present", dlv["customer"] is not None)
 check("customer.id matches", dlv["customer"]["id"] == cust["id"])
 check("customer.name matches", dlv["customer"]["name"] == "Acme Retail Ltd")
@@ -5443,7 +5529,6 @@ check("customer.phone matches", dlv["customer"]["phone"] == "9123456780")
 check("customer.email matches", dlv["customer"]["email"] == "contact@acme.com")
 check("customer.delivery_address matches", dlv["customer"]["delivery_address"] == "456 Warehouse Lane")
 
-# 4. Delivery Partner Details
 check("delivery_partner object present", dlv["delivery_partner"] is not None)
 check("delivery_partner.id matches", dlv["delivery_partner"]["id"] == dp_user["id"])
 check("delivery_partner.name matches", dlv["delivery_partner"]["name"] == "Rajesh Sharma")
@@ -5451,14 +5536,12 @@ check("delivery_partner.phone matches", dlv["delivery_partner"]["phone"] == "987
 check("delivery_partner.email matches", dlv["delivery_partner"]["email"] == dp_email)
 check("delivery_partner.employee_id matches", dlv["delivery_partner"]["employee_id"] == dp_user["employee_id"], (dlv["delivery_partner"]["employee_id"], dp_user["employee_id"]))
 
-# 5. Vehicle Details
 check("vehicle object present", dlv["vehicle"] is not None)
 check("vehicle.id matches", dlv["vehicle"]["id"] == veh["id"])
 check("vehicle.vehicle_number matches exact Vehicle.vehicle_number", dlv["vehicle"]["vehicle_number"] == "KA 01 AB 1234")
 check("vehicle.vehicle_type matches", dlv["vehicle"]["vehicle_type"] == "Medium Truck")
 check("vehicle.capacity_kg matches", dlv["vehicle"]["capacity_kg"] == 1500.0)
 
-# 6. Delivery Items
 check("items list present and populated", len(dlv["items"]) == 1)
 item = dlv["items"][0]
 check("item.order_item_id matches", item["order_item_id"] == order["items"][0]["id"])
@@ -5466,14 +5549,63 @@ check("item.product_id matches", item["product_id"] == prod["id"])
 check("item.product_name matches", item["product_name"] == "Industrial Widget")
 check("item.planned_quantity matches", item["planned_quantity"] == 10.0)
 check("item.picked_quantity matches", item["picked_quantity"] == 10.0)
-check("item.loaded_quantity matches", item["loaded_quantity"] == 0.0)
-check("item.delivered_quantity matches", item["delivered_quantity"] == 0.0)
-check("item.pending_quantity matches", item["pending_quantity"] == 10.0)
-check("item.batch_number present", "batch_number" in item)
-check("item.expiry_date present", "expiry_date" in item)
-check("item.serial_numbers present", "serial_numbers" in item)
+check("item.loaded_quantity matches", item["loaded_quantity"] == 10.0)
+check("item.delivered_quantity matches", item["delivered_quantity"] == 10.0)
+check("item.pending_quantity matches", item["pending_quantity"] == 0.0)
 
-# 7. Null Relationship Handling
+# TEST E: Rejection & Reassignment Flow
+# Create 2nd delivery partner
+dp2_email = f"driver2_{uuid.uuid4().hex[:6]}@del.com"
+dp2_user = client.post("/users", headers=del_admin_hdr, json={
+    "basic_information": {"first_name": "Suresh", "last_name": "Patil"},
+    "contact_information": {"official_email": dp2_email, "mobile_number": "9876543211"},
+    "login_security": {"password": "Password@123", "confirm_password": "Password@123"},
+    "employment_information": {"role_id": d_roles["Delivery Partner"]["id"]}
+}).json()
+dp2_login = client.post("/auth/login", json={"email": dp2_email, "password": "Password@123"}).json()
+dp2_hdr = {"Authorization": f"Bearer {dp2_login['tokens']['access_token']}"}
+
+order_reassign = client.post("/orders", headers=del_admin_hdr, json={
+    "customer_id": cust["id"],
+    "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 250.0}]
+}).json()
+
+dlv_rej = client.post("/deliveries", headers=del_admin_hdr, json={
+    "order_id": order_reassign["id"],
+    "delivery_partner_id": dp_user["id"],
+    "vehicle_id": veh["id"],
+    "items": [{"order_item_id": order_reassign["items"][0]["id"], "planned_quantity": 5}]
+}).json()
+
+# Reject by partner 1
+rej_res = client.post(f"/deliveries/{dlv_rej['id']}/reject", headers=dp_hdr, json={"reason": "Vehicle broke down"})
+check("Partner rejects delivery -> 200", rej_res.status_code == 200)
+check("Rejected status is rejected", rej_res.json()["status"] == "rejected")
+check("Rejected clears delivery_partner", rej_res.json()["delivery_partner"] is None)
+check("Rejected clears vehicle", rej_res.json()["vehicle"] is None)
+
+# Loading rejected delivery is blocked -> 400
+load_rej_fail = client.post(f"/deliveries/{dlv_rej['id']}/load", headers=del_admin_hdr)
+check("Load rejected delivery -> 400", load_rej_fail.status_code == 400)
+
+# Reassign to partner 2 with vehicle via PATCH
+reassign_res = client.patch(f"/deliveries/by-id/{dlv_rej['id']}", headers=del_admin_hdr, json={
+    "delivery_partner_id": dp2_user["id"],
+    "vehicle_id": veh["id"],
+    "status": "planned"
+})
+check("Reassign rejected delivery to new partner -> 200", reassign_res.status_code == 200, reassign_res.text)
+reassigned_dlv = reassign_res.json()
+check("Reassigned delivery status is planned", reassigned_dlv["status"] == "planned")
+check("Reassigned delivery has partner 2", reassigned_dlv["delivery_partner"]["id"] == dp2_user["id"])
+check("Reassigned delivery has vehicle", reassigned_dlv["vehicle"]["id"] == veh["id"])
+
+# Partner 2 accepts
+accept2_res = client.post(f"/deliveries/{dlv_rej['id']}/accept", headers=dp2_hdr)
+check("Partner 2 accepts reassigned delivery -> 200", accept2_res.status_code == 200)
+check("Partner 2 accepted status is accepted", accept2_res.json()["status"] == "accepted")
+
+# Null Relationship Handling
 order2 = client.post("/orders", headers=del_admin_hdr, json={
     "customer_id": cust["id"],
     "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 250.0}]

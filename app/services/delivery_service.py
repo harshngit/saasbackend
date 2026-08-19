@@ -251,26 +251,26 @@ def load(
     it never deducts the same units twice.
     """
     org_id = delivery.organization_id
-    if delivery.status == "cancelled":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery was cancelled"
-        )
-    if delivery.status == "planned":
+    if delivery.status not in ("ready", "loaded"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The delivery partner has not accepted this delivery yet",
-        )
-    if delivery.status == "rejected":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This delivery was rejected and needs to be reassigned",
+            detail="Delivery must be ready before vehicle loading",
         )
     if not delivery.delivery_partner_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Name a delivery partner before loading — the stock goes onto their vehicle",
         )
-    warehouse = stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
+    if not delivery.vehicle_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Assign a vehicle before loading — vehicle is required for loading",
+        )
+    warehouse = (
+        stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
+        if delivery.warehouse_id
+        else None
+    )
     if warehouse is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery has no valid warehouse"
@@ -297,11 +297,20 @@ def load(
         loading = VehicleLoading(
             organization_id=org_id,
             delivery_partner_id=delivery.delivery_partner_id,
+            vehicle_id=delivery.vehicle_id,
             date=datetime.now(timezone.utc),
             status="active",
         )
         db.add(loading)
         db.flush()
+    else:
+        if loading.vehicle_id is None and delivery.vehicle_id:
+            loading.vehicle_id = delivery.vehicle_id
+        elif loading.vehicle_id and delivery.vehicle_id and loading.vehicle_id != delivery.vehicle_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The active vehicle loading session for this delivery partner belongs to a different vehicle",
+            )
 
     results = []
     for line in lines:
@@ -441,10 +450,10 @@ def confirm(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"This delivery is already {delivery.status}",
         )
-    if delivery.status == "planned":
+    if delivery.status not in ("in_transit", "partially_delivered"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Load and dispatch the delivery before confirming an outcome",
+            detail="Delivery must be in transit before confirmation",
         )
 
     delivery.pod_photo_file_ids = list(pod_photo_file_ids or [])

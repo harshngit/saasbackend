@@ -257,8 +257,11 @@ def pick_items(
     picked from shelves for each delivery item.
     """
     delivery = _owned_delivery(db, delivery_id, user)
-    if delivery.status != "planned":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Picking may only be done for planned deliveries")
+    if delivery.status != "accepted":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Delivery must be accepted before picking",
+        )
 
     # Map items by id for quick lookup
     items_by_id = {i.id: i for i in delivery.items}
@@ -299,10 +302,16 @@ def mark_ready(
     `ready`.
     """
     delivery = _owned_delivery(db, delivery_id, user)
-    if delivery.status != "planned":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only mark planned deliveries as ready")
+    if delivery.status != "accepted":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Can only mark accepted deliveries as ready",
+        )
     if delivery.picking_status != "picked":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All items must be fully picked before marking ready")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="All items must be fully picked before marking ready",
+        )
 
     delivery.status = "ready"
     db.commit()
@@ -374,12 +383,35 @@ def update_delivery(
             )
         delivery.status = "cancelled"
     elif new_status == "planned":
-        if delivery.status not in ("planned", "loaded"):
+        if delivery.status == "rejected":
+            partner_id = data.get("delivery_partner_id") or delivery.delivery_partner_id
+            if not partner_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A new delivery partner is required to reassign a rejected delivery",
+                )
+            delivery.status = "planned"
+            new_partner = db.get(User, partner_id)
+            if new_partner:
+                try:
+                    notification_service.notify(
+                        db,
+                        user_id=new_partner.id,
+                        title="New delivery assigned",
+                        body=f"Delivery {delivery.delivery_number} has been reassigned to you",
+                        type="delivery",
+                        link=delivery.id,
+                        organization_id=org_id,
+                    )
+                except Exception:
+                    pass
+        elif delivery.status not in ("planned", "loaded"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"A '{delivery.status}' delivery cannot go back to planned",
             )
-        delivery.status = "planned"
+        else:
+            delivery.status = "planned"
 
     db.commit()
     db.refresh(delivery)
