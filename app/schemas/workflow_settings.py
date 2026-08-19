@@ -49,6 +49,7 @@ class SalesWorkflowSettings(BaseModel):
         str, BeforeValidator(_lower), Field(pattern="^(warn|block|ignore)$")
     ] = "warn"
     delivery_collection_allowed: bool = True
+    draft_orders_enabled: bool = False
     partial_delivery_invoice_mode: Annotated[
         str, BeforeValidator(_lower), Field(pattern="^(per_delivery|after_full_order)$")
     ] = Field(
@@ -73,6 +74,7 @@ class SalesWorkflowSettingsUpdate(BaseModel):
         str, BeforeValidator(_lower), Field(pattern="^(warn|block|ignore)$")
     ] | None = None
     delivery_collection_allowed: bool | None = None
+    draft_orders_enabled: bool | None = None
     partial_delivery_invoice_mode: Annotated[
         str, BeforeValidator(_lower), Field(pattern="^(per_delivery|after_full_order)$")
     ] | None = None

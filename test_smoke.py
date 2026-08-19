@@ -756,7 +756,9 @@ r = client.get("/reports/sales", headers=rep_hdr)
 check("sales report -> summary+rows", r.status_code == 200 and r.json()["summary"]["total_sales"] == 1090 and len(r.json()["rows"]) == 1, r.text)
 # customer-outstanding. Placing an order no longer bills anybody — the receivable
 # starts at the invoice — so bill it, then the 400 already paid leaves 690.
+client.patch("/sales-workflow-settings", headers=rep_hdr, json={"invoice_timing": "on_order"})
 client.post(f"/orders/{ro['id']}/invoice", headers=rep_hdr)
+client.patch("/sales-workflow-settings", headers=rep_hdr, json={"invoice_timing": "after_delivery"})
 r = client.get("/reports/customer-outstanding", headers=rep_hdr)
 check("customer-outstanding report", r.status_code == 200 and r.json()["summary"]["total_outstanding"] == 690, r.text)
 # supplier-outstanding (purchase 500+40=540)
@@ -839,7 +841,9 @@ o = client.post("/orders", headers=fin_hdr, json={"customer_id": fcust["id"], "i
 check("placing an order does not bill the customer",
       client.get(f"/customers/{fcust['id']}", headers=fin_hdr)
       .json()["financial_summary"]["outstanding_balance"] == 500)
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "on_order"})
 client.post(f"/orders/{o['id']}/invoice", headers=fin_hdr)
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "after_delivery"})
 after_order = client.get(f"/customers/{fcust['id']}", headers=fin_hdr).json()
 check("invoicing the order bills the customer (500+200=700)",
       after_order["financial_summary"]["outstanding_balance"] == 700,
@@ -2036,6 +2040,7 @@ check("invoice PDF still renders with the HSN column",
       client.get(f"/invoices/{hsn_inv['id']}/pdf", headers=fin_hdr).content[:4] == b"%PDF")
 
 # Placed straight away and its stock reserved — no approval step in the way.
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "on_order"})
 _hsn_r = client.post("/orders", headers=fin_hdr, json={
     "customer_id": hsn_cust["id"],
     "items": [{"product_id": hsn_prod["id"], "quantity": 1, "unit_price": 500}]})
@@ -2045,6 +2050,7 @@ r = client.post(f"/orders/{hsn_order['id']}/invoice", headers=fin_hdr)
 check("POST /orders/{id}/invoice -> 201", r.status_code == 201, f"{r.status_code} {r.text[:250]}")
 check("order-generated invoice carries the HSN code",
       r.json()["items"][0]["hsn_code"] == "7306", r.json()["items"][0])
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "after_delivery"})
 
 r = client.post(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr,
                 json={"amount": 500, "invoice_id": hsn_inv["id"], "payment_mode": "upi"})
@@ -3282,7 +3288,7 @@ def _phase0_checks():
     check("all documented settings are present",
           set(w) == {"order_requires_approval", "reserve_stock_on_order", "allow_partial_delivery",
                      "allow_backorder", "invoice_timing", "allow_direct_invoice",
-                     "credit_limit_action", "delivery_collection_allowed",
+                     "credit_limit_action", "delivery_collection_allowed", "draft_orders_enabled",
                      "partial_delivery_invoice_mode"}, sorted(w))
     r = client.patch("/sales-workflow-settings", headers=ah,
                      json={"credit_limit_action": "block", "invoice_timing": "on_order"})
@@ -3500,6 +3506,7 @@ def _phase0_checks():
               for o in client.get("/orders", headers=ah).json()))
 
     print("\n== 8. Invoice bills the agreed tax, not 18% ==")
+    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "on_order"})
     taxed = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100, "tax_rate": 5}]}).json()
@@ -3511,6 +3518,7 @@ def _phase0_checks():
     check("invoicing bills the customer",
           client.get(f"/customers/{cust['id']}", headers=ah)
           .json()["financial_summary"]["outstanding_balance"] > 0)
+    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "after_delivery"})
 
 
 
@@ -3804,6 +3812,10 @@ def _phase1cf_checks():
           }).status_code == 400)
 
     print("\n== 5. Vehicle loading (Phase 1D) ==")
+    client.post(f"/deliveries/{dlv['id']}/pick", headers=ah, json={
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "picked_quantity": 20}]
+    })
+    client.post(f"/deliveries/{dlv['id']}/ready", headers=ah)
     r = client.post("/vehicle-stock/loading", headers=ah, json={
         "delivery_id": dlv["id"],
         "items": [{"delivery_item_id": dlv["items"][0]["id"], "loaded_quantity": 12}]})
@@ -3928,6 +3940,7 @@ def _phase1cf_checks():
         "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"]}).json()
     check("omitting items plans the whole outstanding order",
           d2["items"][0]["planned_quantity"] == 4, d2["items"])
+    client.post(f"/deliveries/{d2['id']}/accept", headers=dp_hdr)
     client.post(f"/deliveries/{d2['id']}/load", headers=ah)
     client.patch(f"/deliveries/by-id/{d2['id']}", headers=ah, json={"status": "in_transit"})
     before = client.get(f"/vehicle-stock/current/{dp['id']}", headers=ah).json()["items"][0]["delivered_qty"]
@@ -4009,6 +4022,7 @@ def _phase1ij_checks():
         dlv = client.post("/deliveries", headers=ah, json={
             "order_id": order["id"], "delivery_partner_id": dp["id"],
             "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": quantity}]}).json()
+        client.post(f"/deliveries/{dlv['id']}/accept", headers=dp_hdr)
         client.post(f"/deliveries/{dlv['id']}/load", headers=ah)
         client.patch(f"/deliveries/by-id/{dlv['id']}", headers=ah, json={"status": "in_transit"})
         client.post(f"/deliveries/{dlv['id']}/confirm", headers=dp_hdr, json={
@@ -4048,8 +4062,9 @@ def _phase1ij_checks():
     no_terms = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100}]}).json()
-    nb = client.post(f"/orders/{no_terms['id']}/invoice", headers=ah).json()
-    check("no agreed terms -> no due date", nb["due_date"] is None, nb["due_date"])
+    no_del = deliver(no_terms, 2)
+    nb = client.post(f"/orders/{no_terms['id']}/invoice", headers=ah, json={"delivery_id": no_del["id"]}).json()
+    check("no agreed terms -> no due date", nb["due_date"] is None, nb)
 
     print("\n== 3. The same delivery cannot be billed twice ==")
     again = client.post(f"/orders/{order['id']}/invoice", headers=ah,
@@ -4108,6 +4123,7 @@ def _phase1ij_checks():
           client.post(f"/orders/{order['id']}/invoice", headers=oh).status_code == 404)
 
     print("\n== 7. Billing the whole order still carries the order's totals ==")
+    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "on_order"})
     flat = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "discount": 50,
         "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 100}]}).json()
@@ -4116,6 +4132,7 @@ def _phase1ij_checks():
     check("and the total matches the order", fb["total"] == flat["total"], (fb["total"], flat["total"]))
     check("billing the whole order twice -> 400",
           client.post(f"/orders/{flat['id']}/invoice", headers=ah).status_code == 400)
+    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "after_delivery"})
 
     print("\n== 8. Two PDF formats from one invoice (Phase 1J) ==")
     r = client.get(f"/invoices/{bill['id']}/pdf", headers=ah, params={"format": "detailed"})
@@ -5067,6 +5084,10 @@ def _staff_overview_fleet_checks():
     check("nothing is loaded onto it yet",
           over["vehicle"]["items"] == 0 and over["vehicle"]["loaded_at"] is None, over["vehicle"])
 
+    client.post(f"/deliveries/{dlv['id']}/pick", headers=ah, json={
+        "items": [{"delivery_item_id": dlv["items"][0]["id"], "picked_quantity": 5}]
+    })
+    client.post(f"/deliveries/{dlv['id']}/ready", headers=ah)
     client.post("/vehicle-stock/loading", headers=ah, json={
         "delivery_id": dlv["id"],
         "items": [{"delivery_item_id": dlv["items"][0]["id"], "loaded_quantity": 5}]})
@@ -5098,6 +5119,7 @@ def _staff_overview_fleet_checks():
     d2 = client.post("/deliveries", headers=ah, json={
         "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
         "items": [{"order_item_id": o2["items"][0]["id"], "planned_quantity": 3}]}).json()
+    client.post(f"/deliveries/{d2['id']}/accept", headers=dp_hdr)
     client.post(f"/deliveries/{d2['id']}/load", headers=ah)
     client.patch(f"/deliveries/by-id/{d2['id']}", headers=ah, json={"status": "in_transit"})
     r = client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr, json={
@@ -5138,6 +5160,195 @@ for _table, _column in _relax:
           _model_table is not None and _column in _model_table.c
           and _model_table.c[_column].nullable,
           f"{_table}.{_column} is listed as relaxed but the model requires it")
+
+
+print("\n== Sales Order Hardening & Data-Scope Security ==")
+
+# 1. Setup isolated organization
+so_sec_org = client.post("/auth/register", json={
+    "organization_name": "Sales Security Org", "admin_name": "Sec Admin",
+    "email": f"sec_admin_{uuid.uuid4().hex[:6]}@sec.com", "password": "Secret@123"
+}).json()
+sec_admin_hdr = {"Authorization": f"Bearer {so_sec_org['tokens']['access_token']}"}
+
+# Get default roles
+sec_roles = client.get("/roles", headers=sec_admin_hdr).json()
+sec_so_role = next(x for x in sec_roles if x["name"] == "Sales Officer")["id"]
+sec_dp_role = next(x for x in sec_roles if x["name"] == "Delivery Partner")["id"]
+sec_acc_role = next(x for x in sec_roles if x["name"] == "Accountant")["id"]
+
+# Create Sales Officer A
+so_a_email = f"so_a_{uuid.uuid4().hex[:6]}@sec.com"
+so_a = client.post("/users", headers=sec_admin_hdr, json={
+    "name": "Sales Officer A", "email": so_a_email,
+    "password": "Password@123", "role_id": sec_so_role
+}).json()
+so_a_login = client.post("/auth/login", json={"email": so_a_email, "password": "Password@123"}).json()
+so_a_hdr = {"Authorization": f"Bearer {so_a_login['tokens']['access_token']}"}
+
+# Create Sales Officer B
+so_b_email = f"so_b_{uuid.uuid4().hex[:6]}@sec.com"
+so_b = client.post("/users", headers=sec_admin_hdr, json={
+    "name": "Sales Officer B", "email": so_b_email,
+    "password": "Password@123", "role_id": sec_so_role
+}).json()
+so_b_login = client.post("/auth/login", json={"email": so_b_email, "password": "Password@123"}).json()
+so_b_hdr = {"Authorization": f"Bearer {so_b_login['tokens']['access_token']}"}
+
+# Create Delivery Partner
+sec_dp = client.post("/users", headers=sec_admin_hdr, json={
+    "name": "Sec DP", "email": f"sec_dp_{uuid.uuid4().hex[:6]}@sec.com",
+    "password": "Password@123", "role_id": sec_dp_role
+}).json()
+
+# Create Accountant
+sec_acc = client.post("/users", headers=sec_admin_hdr, json={
+    "name": "Sec Accountant", "email": f"sec_acc_{uuid.uuid4().hex[:6]}@sec.com",
+    "password": "Password@123", "role_id": sec_acc_role
+}).json()
+
+# Create Customer and Product
+sec_cust = client.post("/customers", headers=sec_admin_hdr, json={"name": "Sec Customer"}).json()
+sec_prod = client.post("/products", headers=sec_admin_hdr, json={"name": "Sec Widget", "price": 100, "total_inventory": 500}).json()
+
+# TEST 4: Sales Officer create without salesperson_id -> auto salesperson_id = current_user.id
+order_a_res = client.post("/orders", headers=so_a_hdr, json={
+    "customer_id": sec_cust["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 2, "unit_price": 100}]
+})
+check("TEST 4: Sales Officer A creates order without salesperson_id -> 201", order_a_res.status_code == 201, order_a_res.text)
+order_a = order_a_res.json()
+check("TEST 4: Order A salesperson_id auto-assigned to SO A", order_a["salesperson_id"] == so_a["id"], order_a)
+
+# TEST 5: Sales Officer cannot impersonate another salesperson
+order_a_spoof = client.post("/orders", headers=so_a_hdr, json={
+    "customer_id": sec_cust["id"],
+    "salesperson_id": so_b["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 1, "unit_price": 100}]
+}).json()
+check("TEST 5: Sales Officer spoofing salesperson_id is forced to own user id", order_a_spoof["salesperson_id"] == so_a["id"], order_a_spoof)
+
+# Sales Officer B creates an order
+order_b = client.post("/orders", headers=so_b_hdr, json={
+    "customer_id": sec_cust["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 3, "unit_price": 100}]
+}).json()
+check("Order B created for SO B", order_b["salesperson_id"] == so_b["id"], order_b)
+
+# TEST 1: Sales Officer list isolation
+so_a_orders = client.get("/orders", headers=so_a_hdr).json()
+so_a_order_ids = [o["id"] for o in so_a_orders]
+check("TEST 1: SO A sees their own order", order_a["id"] in so_a_order_ids, so_a_order_ids)
+check("TEST 1: SO A does NOT see SO B's order", order_b["id"] not in so_a_order_ids, so_a_order_ids)
+
+# TEST 2: Sales Officer direct ID protection
+check("TEST 2: SO A accessing SO B's order by ID returns 404",
+      client.get(f"/orders/{order_b['id']}", headers=so_a_hdr).status_code == 404)
+
+# TEST 3: Query filter cannot bypass scope
+search_b_res = client.get("/orders", headers=so_a_hdr, params={"search": order_b["order_number"]}).json()
+check("TEST 3: SO A searching for SO B's order_number returns empty",
+      len(search_b_res) == 0, search_b_res)
+cust_filter_res = client.get("/orders", headers=so_a_hdr, params={"customer_id": sec_cust["id"]}).json()
+check("TEST 3: SO A filtering by customer_id sees only own orders",
+      all(o["salesperson_id"] == so_a["id"] for o in cust_filter_res), cust_filter_res)
+
+# TEST 6: Admin can assign salesperson
+admin_order_res = client.post("/orders", headers=sec_admin_hdr, json={
+    "customer_id": sec_cust["id"],
+    "salesperson_id": so_b["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 1, "unit_price": 100}]
+})
+check("TEST 6: Admin can assign salesperson_id explicitly -> 201", admin_order_res.status_code == 201, admin_order_res.text)
+check("TEST 6: Admin created order assigned to SO B", admin_order_res.json()["salesperson_id"] == so_b["id"])
+
+# Cross-org salesperson assignment rejected for admin
+other_firm = client.post("/auth/register", json={
+    "organization_name": "Other Firm", "admin_name": "Other Admin",
+    "email": f"other_{uuid.uuid4().hex[:6]}@other.com", "password": "Secret@123"
+}).json()
+check("TEST 6: Admin assigning cross-org salesperson -> 400",
+      client.post("/orders", headers=sec_admin_hdr, json={
+          "customer_id": sec_cust["id"],
+          "salesperson_id": other_firm["user"]["id"],
+          "items": [{"product_id": sec_prod["id"], "quantity": 1}]
+      }).status_code == 400)
+
+# TEST 7: Sales Officer cannot assign delivery partner on another salesperson's order
+check("TEST 7: SO A cannot assign delivery partner on SO B's order -> 404",
+      client.patch(f"/orders/{order_b['id']}/assign-delivery-partner", headers=so_a_hdr,
+                   json={"delivery_partner_id": sec_dp["id"]}).status_code == 404)
+
+# TEST 8: Sales Officer cannot cancel another salesperson's order
+check("TEST 8: SO A cannot cancel SO B's order -> 404",
+      client.patch(f"/orders/{order_b['id']}/cancel", headers=so_a_hdr,
+                   json={"reason": "Malicious cancel"}).status_code == 404)
+
+# TEST 9: Sales Officer cannot approve another salesperson's order
+# Turn on approval requirement for the org
+client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"order_requires_approval": True})
+order_b_approval = client.post("/orders", headers=so_b_hdr, json={
+    "customer_id": sec_cust["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 1}]
+}).json()
+check("Order created awaiting approval", order_b_approval["status"] == "awaiting_approval")
+check("TEST 9: SO A without approve permission cannot approve -> 403",
+      client.patch(f"/orders/{order_b_approval['id']}/approve", headers=so_a_hdr).status_code == 403)
+check("TEST 9: SO A without approve permission cannot reject -> 403",
+      client.patch(f"/orders/{order_b_approval['id']}/reject", headers=so_a_hdr, json={"reason": "No"}).status_code == 403)
+# Admin approves successfully
+check("Admin approves order awaiting approval -> 200",
+      client.patch(f"/orders/{order_b_approval['id']}/approve", headers=sec_admin_hdr).status_code == 200)
+client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"order_requires_approval": False})
+
+# TEST 10: Invalid delivery partner (e.g. assigning Accountant or Sales Officer)
+check("TEST 10: Assigning Accountant as delivery partner -> 400",
+      client.patch(f"/orders/{order_a['id']}/assign-delivery-partner", headers=sec_admin_hdr,
+                   json={"delivery_partner_id": sec_acc["id"]}).status_code == 400)
+check("TEST 10: Assigning Sales Officer as delivery partner -> 400",
+      client.patch(f"/orders/{order_a['id']}/assign-delivery-partner", headers=sec_admin_hdr,
+                   json={"delivery_partner_id": so_b["id"]}).status_code == 400)
+
+# TEST 11: Cross-organization delivery partner
+other_dp = client.post("/users", headers={"Authorization": f"Bearer {other_firm['tokens']['access_token']}"}, json={
+    "name": "Other DP", "email": f"other_dp_{uuid.uuid4().hex[:6]}@other.com",
+    "password": "Password@123", "role": "delivery_partner"
+}).json()
+check("TEST 11: Assigning cross-org delivery partner -> 400",
+      client.patch(f"/orders/{order_a['id']}/assign-delivery-partner", headers=sec_admin_hdr,
+                   json={"delivery_partner_id": other_dp["id"]}).status_code == 400)
+
+# TEST 12: Valid delivery partner
+valid_assign = client.patch(f"/orders/{order_a['id']}/assign-delivery-partner", headers=sec_admin_hdr,
+                            json={"delivery_partner_id": sec_dp["id"]})
+check("TEST 12: Valid delivery partner assignment -> 200", valid_assign.status_code == 200, valid_assign.text)
+va_json = valid_assign.json()
+check("TEST 12: assigned_delivery_partner_id updated", va_json["assigned_delivery_partner_id"] == sec_dp["id"])
+check("TEST 12: fulfilment_status moved to planned", va_json["fulfilment_status"] == "planned")
+check("TEST 12: status moved to processing", va_json["status"] == "processing")
+
+# TEST 13: Existing normal order flow
+norm_order = client.post("/orders", headers=sec_admin_hdr, json={
+    "customer_id": sec_cust["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 5, "unit_price": 100}]
+}).json()
+check("TEST 13: Normal order placed on creation", norm_order["status"] == "placed" and norm_order["fulfilment_status"] == "reserved")
+cancel_res = client.patch(f"/orders/{norm_order['id']}/cancel", headers=sec_admin_hdr, json={"reason": "test cancel"})
+check("TEST 13: Order cancelled and reservation released",
+      cancel_res.status_code == 200 and cancel_res.json()["status"] == "cancelled" and cancel_res.json()["fulfilment_status"] == "not_started")
+
+# TEST 14: Existing draft/confirm flow
+client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"draft_orders_enabled": True})
+draft_order = client.post("/orders", headers=sec_admin_hdr, json={
+    "customer_id": sec_cust["id"],
+    "items": [{"product_id": sec_prod["id"], "quantity": 4, "unit_price": 100}]
+}).json()
+check("TEST 14: Order created as draft", draft_order["status"] == "draft" and draft_order["fulfilment_status"] == "not_started")
+confirm_res = client.post(f"/orders/{draft_order['id']}/confirm", headers=sec_admin_hdr)
+check("TEST 14: Draft confirmed -> 200", confirm_res.status_code == 200, confirm_res.text)
+check("TEST 14: Confirmed order status placed and reserved",
+      confirm_res.json()["status"] == "placed" and confirm_res.json()["fulfilment_status"] == "reserved")
+client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"draft_orders_enabled": False})
 
 
 print("\n== auto-migration adds missing columns to an existing table ==")

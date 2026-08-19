@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, Delivery, SalesOrder, User
+from app.models import Customer, Delivery, Role, SalesOrder, User, UserRole
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
@@ -28,6 +28,27 @@ def _org_id(user: User) -> str:
     if not user.organization_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No organization on this account")
     return user.organization_id
+
+
+def _is_delivery_partner(db: Session, partner: User) -> bool:
+    """Verify that the target user is a legitimate delivery partner."""
+    if partner.role == UserRole.DELIVERY_PARTNER:
+        return True
+    if partner.role_id:
+        role = db.get(Role, partner.role_id)
+        if role:
+            if role.workspace == "delivery":
+                return True
+            if role.name and role.name.strip().lower().replace("_", " ").replace("-", " ") == "delivery partner":
+                return True
+            perms = role.permissions or {}
+            if (
+                perms.get("deliveries", {}).get("view")
+                or perms.get("deliveries", {}).get("create")
+                or perms.get("deliveries", {}).get("edit")
+            ):
+                return True
+    return False
 
 
 def _owned(db: Session, order_id: str, org_id: str, user: User | None = None) -> SalesOrder:
@@ -151,6 +172,20 @@ def create_order(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="customer_id is not a customer in your firm",
         )
+
+    # Own-scope users (Sales Officers) are strictly forced to their own user ID
+    if scoping.scope_to_own(db, user):
+        salesperson_id = user.id
+    else:
+        salesperson_id = payload.salesperson_id
+        if salesperson_id:
+            sp = db.get(User, salesperson_id)
+            if sp is None or sp.organization_id != org_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="salesperson_id is not a user in your firm",
+                )
+
     order, warnings = order_service.place_order(
         db, user, customer,
         lines=[
@@ -166,7 +201,7 @@ def create_order(
         fulfilment_method=payload.fulfilment_method,
         payment_type=payload.payment_type,
         payment_terms_days=payload.payment_terms_days,
-        salesperson_id=payload.salesperson_id,
+        salesperson_id=salesperson_id,
         quotation_id=payload.quotation_id,
         source=payload.source,
         order_level_discount=payload.discount,
@@ -212,7 +247,7 @@ def approve_order(
     order was placed and leaves the warehouse when a vehicle is loaded; the
     receivable starts at the invoice.
     """
-    order = _owned(db, order_id, _org_id(user))
+    order = _owned(db, order_id, _org_id(user), user)
     if order.status != "awaiting_approval":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -235,7 +270,7 @@ def reject_order(
 ) -> SalesOrder:
     """Decline an order that was waiting for approval. Its reservations are released,
     so the stock is free for someone else immediately."""
-    order = _owned(db, order_id, _org_id(user))
+    order = _owned(db, order_id, _org_id(user), user)
     if order.status != "awaiting_approval":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -271,7 +306,7 @@ def assign_delivery_partner(
     plan.
     """
     org_id = _org_id(user)
-    order = _owned(db, order_id, org_id)
+    order = _owned(db, order_id, org_id, user)
     if order.status == "cancelled" or order.fulfilment_status == "delivered":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -285,6 +320,8 @@ def assign_delivery_partner(
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="delivery_partner_id is not a user in your firm")
+    if not _is_delivery_partner(db, partner):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected user is not a delivery partner")
     order.assigned_delivery_partner_id = partner.id
     if order.status == "placed":
         order.status = "processing"
@@ -338,7 +375,7 @@ def cancel_order(
     are out of the warehouse, and bringing them back is the delivery-return /
     return-to-warehouse flow, not a status change.
     """
-    order = _owned(db, order_id, _org_id(user))
+    order = _owned(db, order_id, _org_id(user), user)
     if order.status == "cancelled":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This order is already cancelled")
     if order.fulfilment_status in workflow.DISPATCHED_FULFILMENT:
