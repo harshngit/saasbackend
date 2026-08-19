@@ -535,6 +535,16 @@ def sync_delivery_view(db: Session, delivery: Delivery) -> dict:
     return {
         # `delivery_number` and `order_id` come off the model as properties.
         "order_number": order.order_number if order is not None else None,
+        "order_status": order.status if order is not None else None,
+        "order_total": order.total if order is not None else None,
+        "fulfilment_status": order.fulfilment_status if order is not None else None,
+        "order": {
+            "id": order.id,
+            "order_number": order.order_number,
+            "status": order.status,
+            "fulfilment_status": order.fulfilment_status,
+            "total": order.total,
+        } if order is not None else None,
         "amount_due": amount_due(db, delivery),
         "pod": {
             "photo_file_ids": list(delivery.pod_photo_file_ids or []),

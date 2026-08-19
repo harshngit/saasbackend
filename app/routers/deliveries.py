@@ -22,12 +22,15 @@ from app.models import (
 from app.services import delivery_service, notification_service, numbering_service
 from app.schemas.delivery import (
     DeliveryConfirm,
+    DeliveryCustomerBrief,
     DeliveryOut,
+    DeliveryPartnerBrief,
+    DeliveryPickBody,
     DeliveryPlanCreate,
     DeliveryPlanUpdate,
     DeliveryRejectBody,
     DeliveryStatusUpdate,
-    DeliveryPickBody,
+    VehicleBrief,
 )
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
@@ -103,10 +106,22 @@ def _delivery_out(db: Session, delivery: Delivery) -> DeliveryOut:
     out = DeliveryOut.model_validate(delivery)
     for key, value in delivery_service.sync_delivery_view(db, delivery).items():
         setattr(out, key, value)
-    out.vehicle = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
-    out.delivery_partner = (
+
+    cust = delivery.customer
+    if cust is None and delivery.customer_id:
+        cust = db.get(Customer, delivery.customer_id)
+    if cust is None and delivery.sales_order and delivery.sales_order.customer:
+        cust = delivery.sales_order.customer
+    out.customer = DeliveryCustomerBrief.model_validate(cust) if cust else None
+
+    veh = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
+    out.vehicle = VehicleBrief.model_validate(veh) if veh else None
+
+    partner = (
         db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
     )
+    out.delivery_partner = DeliveryPartnerBrief.model_validate(partner) if partner else None
+
     return out
 
 

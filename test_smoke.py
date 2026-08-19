@@ -5351,6 +5351,145 @@ check("TEST 14: Confirmed order status placed and reserved",
 client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"draft_orders_enabled": False})
 
 
+print("\n== Delivery Response Enrichment ==")
+# 1. Setup isolated organization
+del_org = client.post("/auth/register", json={
+    "organization_name": "Delivery Enrichment Org", "admin_name": "Del Admin",
+    "email": f"del_admin_{uuid.uuid4().hex[:6]}@del.com", "password": "Secret@123"
+}).json()
+del_admin_hdr = {"Authorization": f"Bearer {del_org['tokens']['access_token']}"}
+
+# Get roles
+d_roles = {r["name"]: r for r in client.get("/roles", headers=del_admin_hdr).json()}
+
+# Create Delivery Partner with full contact info
+dp_email = f"driver_{uuid.uuid4().hex[:6]}@del.com"
+dp_user = client.post("/users", headers=del_admin_hdr, json={
+    "basic_information": {"first_name": "Rajesh", "last_name": "Sharma", "employee_id": "EMP-9001"},
+    "contact_information": {"official_email": dp_email, "personal_email": "rajesh@gmail.com", "mobile_number": "9876543210"},
+    "login_security": {"password": "Password@123", "confirm_password": "Password@123"},
+    "employment_information": {"role_id": d_roles["Delivery Partner"]["id"]}
+}).json()
+
+# Create Vehicle
+veh = client.post("/vehicles", headers=del_admin_hdr, json={
+    "vehicle_number": "KA 01 AB 1234",
+    "vehicle_type": "Medium Truck",
+    "capacity_kg": 1500.0
+}).json()
+
+# Create Customer with contact and address info
+cust = client.post("/customers", headers=del_admin_hdr, json={
+    "name": "Acme Retail Ltd", "phone": "9123456780", "email": "contact@acme.com",
+    "billing_address": "123 Market St", "delivery_address": "456 Warehouse Lane"
+}).json()
+
+# Create Product
+prod = client.post("/products", headers=del_admin_hdr, json={
+    "name": "Industrial Widget", "price": 250.0, "total_inventory": 100
+}).json()
+
+# Create Order
+order = client.post("/orders", headers=del_admin_hdr, json={
+    "customer_id": cust["id"],
+    "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 250.0}]
+}).json()
+
+# Create Delivery with partner and vehicle
+dlv_create = client.post("/deliveries", headers=del_admin_hdr, json={
+    "order_id": order["id"],
+    "delivery_partner_id": dp_user["id"],
+    "vehicle_id": veh["id"],
+    "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": 10}]
+})
+check("POST /deliveries with full details -> 201", dlv_create.status_code == 201, dlv_create.text)
+dlv_data = dlv_create.json()
+
+# Record picking to test picking_status and picked_quantity
+client.post(f"/deliveries/{dlv_data['id']}/pick", headers=del_admin_hdr, json={
+    "items": [{"delivery_item_id": dlv_data["items"][0]["id"], "picked_quantity": 10}]
+})
+
+# Fetch delivery via GET /deliveries/by-id/{id} and GET /deliveries
+dlv = client.get(f"/deliveries/by-id/{dlv_data['id']}", headers=del_admin_hdr).json()
+del_list = client.get("/deliveries", headers=del_admin_hdr).json()
+check("GET /deliveries returns enriched list", len(del_list) >= 1)
+dlv_from_list = next(d for d in del_list if d["id"] == dlv["id"])
+
+# 1. Delivery Details
+check("Delivery id present", dlv["id"] == dlv_data["id"])
+check("Delivery number present", dlv["delivery_number"].startswith("DLV-"))
+check("Delivery status present", dlv["status"] == "planned")
+check("Delivery picking_status present and updated", dlv["picking_status"] == "picked", dlv["picking_status"])
+
+# 2. Order Details
+check("order_id present", dlv["order_id"] == order["id"])
+check("order_number present", dlv["order_number"] == order["order_number"])
+check("order object present", dlv["order"] is not None and isinstance(dlv["order"], dict))
+check("order.id matches", dlv["order"]["id"] == order["id"])
+check("order.order_number matches", dlv["order"]["order_number"] == order["order_number"])
+check("order.status matches", dlv["order"]["status"] == "processing", dlv["order"])
+check("order.fulfilment_status matches", dlv["order"]["fulfilment_status"] == "planned", dlv["order"])
+check("order.total matches", dlv["order"]["total"] == order["total"], dlv["order"])
+check("top-level order_status matches", dlv["order_status"] == "processing")
+check("top-level order_total matches", dlv["order_total"] == order["total"])
+check("top-level fulfilment_status matches", dlv["fulfilment_status"] == "planned")
+
+# 3. Customer Details
+check("customer object present", dlv["customer"] is not None)
+check("customer.id matches", dlv["customer"]["id"] == cust["id"])
+check("customer.name matches", dlv["customer"]["name"] == "Acme Retail Ltd")
+check("customer.phone matches", dlv["customer"]["phone"] == "9123456780")
+check("customer.email matches", dlv["customer"]["email"] == "contact@acme.com")
+check("customer.delivery_address matches", dlv["customer"]["delivery_address"] == "456 Warehouse Lane")
+
+# 4. Delivery Partner Details
+check("delivery_partner object present", dlv["delivery_partner"] is not None)
+check("delivery_partner.id matches", dlv["delivery_partner"]["id"] == dp_user["id"])
+check("delivery_partner.name matches", dlv["delivery_partner"]["name"] == "Rajesh Sharma")
+check("delivery_partner.phone matches", dlv["delivery_partner"]["phone"] == "9876543210")
+check("delivery_partner.email matches", dlv["delivery_partner"]["email"] == dp_email)
+check("delivery_partner.employee_id matches", dlv["delivery_partner"]["employee_id"] == dp_user["employee_id"], (dlv["delivery_partner"]["employee_id"], dp_user["employee_id"]))
+
+# 5. Vehicle Details
+check("vehicle object present", dlv["vehicle"] is not None)
+check("vehicle.id matches", dlv["vehicle"]["id"] == veh["id"])
+check("vehicle.vehicle_number matches exact Vehicle.vehicle_number", dlv["vehicle"]["vehicle_number"] == "KA 01 AB 1234")
+check("vehicle.vehicle_type matches", dlv["vehicle"]["vehicle_type"] == "Medium Truck")
+check("vehicle.capacity_kg matches", dlv["vehicle"]["capacity_kg"] == 1500.0)
+
+# 6. Delivery Items
+check("items list present and populated", len(dlv["items"]) == 1)
+item = dlv["items"][0]
+check("item.order_item_id matches", item["order_item_id"] == order["items"][0]["id"])
+check("item.product_id matches", item["product_id"] == prod["id"])
+check("item.product_name matches", item["product_name"] == "Industrial Widget")
+check("item.planned_quantity matches", item["planned_quantity"] == 10.0)
+check("item.picked_quantity matches", item["picked_quantity"] == 10.0)
+check("item.loaded_quantity matches", item["loaded_quantity"] == 0.0)
+check("item.delivered_quantity matches", item["delivered_quantity"] == 0.0)
+check("item.pending_quantity matches", item["pending_quantity"] == 10.0)
+check("item.batch_number present", "batch_number" in item)
+check("item.expiry_date present", "expiry_date" in item)
+check("item.serial_numbers present", "serial_numbers" in item)
+
+# 7. Null Relationship Handling
+order2 = client.post("/orders", headers=del_admin_hdr, json={
+    "customer_id": cust["id"],
+    "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 250.0}]
+}).json()
+unassigned_dlv_res = client.post("/deliveries", headers=del_admin_hdr, json={
+    "order_id": order2["id"],
+    "items": [{"order_item_id": order2["items"][0]["id"], "planned_quantity": 2}]
+})
+check("POST /deliveries without partner/vehicle -> 201", unassigned_dlv_res.status_code == 201)
+unassigned_dlv = unassigned_dlv_res.json()
+check("Unassigned delivery partner is null (no 500 error)", unassigned_dlv["delivery_partner"] is None)
+check("Unassigned vehicle is null (no 500 error)", unassigned_dlv["vehicle"] is None)
+check("GET /deliveries/by-id/{id} for unassigned delivery -> 200",
+      client.get(f"/deliveries/by-id/{unassigned_dlv['id']}", headers=del_admin_hdr).status_code == 200)
+
+
 print("\n== auto-migration adds missing columns to an existing table ==")
 # Simulate an OLD database: a table created before `address` existed, then verify
 # auto_add_missing_columns() brings it up to date without dropping data.
