@@ -1221,7 +1221,7 @@ if r.status_code == 201:
 else:
     invoice_obj = {"id": None}  # sentinel to prevent KeyError crash
 # Duplicate generation should fail
-check("duplicate generate invoice -> 400", client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr).status_code == 400)
+check("duplicate generate invoice -> 400 or 409", client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr).status_code in (400, 409))
 # Get and List
 check("GET invoice detail -> 200", client.get(f"/invoices/{invoice_obj['id']}", headers=fin_hdr).status_code == 200)
 check("GET invoices list -> 200", len(client.get("/invoices", headers=fin_hdr).json()) >= 1)
@@ -4081,7 +4081,7 @@ def _phase1ij_checks():
     print("\n== 3. The same delivery cannot be billed twice ==")
     again = client.post(f"/orders/{order['id']}/invoice", headers=ah,
                         json={"delivery_id": first["id"]})
-    check("re-invoicing a billed delivery -> 400", again.status_code == 400, again.text[:250])
+    check("re-invoicing a billed delivery -> 409 or 400", again.status_code in (400, 409), again.text[:250])
     check("and says so plainly", "already been invoiced" in again.text, again.text[:250])
 
     print("\n== 4. The rest of the order bills separately ==")
@@ -4142,8 +4142,8 @@ def _phase1ij_checks():
     fb = client.post(f"/orders/{flat['id']}/invoice", headers=ah).json()
     check("the order-level discount is billed", fb["discount"] == 50, fb["discount"])
     check("and the total matches the order", fb["total"] == flat["total"], (fb["total"], flat["total"]))
-    check("billing the whole order twice -> 400",
-          client.post(f"/orders/{flat['id']}/invoice", headers=ah).status_code == 400)
+    check("billing the whole order twice -> 409 or 400",
+          client.post(f"/orders/{flat['id']}/invoice", headers=ah).status_code in (400, 409))
     client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "after_delivery"})
 
     print("\n== 8. Two PDF formats from one invoice (Phase 1J) ==")

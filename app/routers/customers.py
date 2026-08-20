@@ -246,23 +246,28 @@ def record_customer_payment(
     return customer
 
 
+@router.get("/{customer_id}/account-statement", response_model=CustomerLedger)
 @router.get("/{customer_id}/ledger", response_model=CustomerLedger)
 def customer_ledger(
-    customer_id: str, user: User = Depends(_pay_view), db: Session = Depends(get_db)
+    customer_id: str,
+    date_from: str | None = Query(default=None, description="Start date filter (YYYY-MM-DD)"),
+    date_to: str | None = Query(default=None, description="End date filter (YYYY-MM-DD)"),
+    user: User = Depends(_pay_view),
+    db: Session = Depends(get_db),
 ) -> CustomerLedger:
-    """The customer's account: what they owe, how old it is, and every entry behind it.
+    """The customer's account statement: summary, ageing, and chronologically computed transactions.
 
     `summary` is the standing position, including the credit still available against
     their limit. `ageing` buckets the unpaid invoices by how long they have been
     outstanding — from each invoice's due date where it has one, from its date where it
     does not. `transactions` is the account itself, oldest first, with a running
-    balance: an invoice debits, a payment or a credit note credits.
+    balance (and balance_after): an invoice debits, a payment or a credit note credits.
 
     The receivable starts at the invoice, never at the order — an order is a promise, an
     invoice is a bill — so an unbilled order appears nowhere here.
     """
     customer = _owned_customer(db, customer_id, user)
-    return ledger_service.build(db, customer)
+    return ledger_service.build(db, customer, date_from=date_from, date_to=date_to)
 
 
 @router.get("/{customer_id}/payments", response_model=list[CustomerPaymentOut])
