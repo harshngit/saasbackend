@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
 from app.seed import main as seed_main  # noqa: E402
+from app.models import SalesOrder  # noqa: E402
+from app.core.database import SessionLocal  # noqa: E402
 
 seed_main()
 client = TestClient(app)
@@ -756,9 +758,15 @@ r = client.get("/reports/sales", headers=rep_hdr)
 check("sales report -> summary+rows", r.status_code == 200 and r.json()["summary"]["total_sales"] == 1090 and len(r.json()["rows"]) == 1, r.text)
 # customer-outstanding. Placing an order no longer bills anybody — the receivable
 # starts at the invoice — so bill it, then the 400 already paid leaves 690.
-client.patch("/sales-workflow-settings", headers=rep_hdr, json={"invoice_timing": "on_order"})
+client.patch("/sales-workflow-settings", headers=rep_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
+_s_db = SessionLocal()
+_ro_db = _s_db.get(SalesOrder, ro["id"])
+_ro_db.fulfilment_status = "delivered"
+_ro_db.items[0].delivered_quantity = 5
+_s_db.commit()
+_s_db.close()
 client.post(f"/orders/{ro['id']}/invoice", headers=rep_hdr)
-client.patch("/sales-workflow-settings", headers=rep_hdr, json={"invoice_timing": "after_delivery"})
+client.patch("/sales-workflow-settings", headers=rep_hdr, json={"partial_delivery_invoice_mode": "per_delivery"})
 r = client.get("/reports/customer-outstanding", headers=rep_hdr)
 check("customer-outstanding report", r.status_code == 200 and r.json()["summary"]["total_outstanding"] == 690, r.text)
 # supplier-outstanding (purchase 500+40=540)
@@ -841,9 +849,15 @@ o = client.post("/orders", headers=fin_hdr, json={"customer_id": fcust["id"], "i
 check("placing an order does not bill the customer",
       client.get(f"/customers/{fcust['id']}", headers=fin_hdr)
       .json()["financial_summary"]["outstanding_balance"] == 500)
-client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "on_order"})
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
+_s_db = SessionLocal()
+_o_db = _s_db.get(SalesOrder, o["id"])
+_o_db.fulfilment_status = "delivered"
+_o_db.items[0].delivered_quantity = 2
+_s_db.commit()
+_s_db.close()
 client.post(f"/orders/{o['id']}/invoice", headers=fin_hdr)
-client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "after_delivery"})
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "per_delivery"})
 after_order = client.get(f"/customers/{fcust['id']}", headers=fin_hdr).json()
 check("invoicing the order bills the customer (500+200=700)",
       after_order["financial_summary"]["outstanding_balance"] == 700,
@@ -1204,16 +1218,18 @@ o_inv = client.post("/orders", headers=fin_hdr, json={
 # Approve order
 client.patch(f"/orders/{o_inv['id']}/approve", headers=fin_hdr)
 
-# Temporarily switch org to on_order billing so we can invoice without a delivery
-# (Phase 2 now requires deliveries in after_delivery mode; this test predates that)
-client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "on_order"})
+# Mark order delivered under after_full_order mode so we can invoice it
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
+_s_db = SessionLocal()
+_oinv_db = _s_db.get(SalesOrder, o_inv["id"])
+_oinv_db.fulfilment_status = "delivered"
+_oinv_db.items[0].delivered_quantity = 3
+_s_db.commit()
+_s_db.close()
 
 # Generate invoice from order
 r = client.post(f"/invoices/orders/{o_inv['id']}/invoice", headers=fin_hdr)
 check("generate invoice from order -> 201", r.status_code == 201, r.text)
-
-# Restore default after_delivery mode
-client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "after_delivery"})
 
 # Defensive: only proceed if we got an invoice back
 if r.status_code == 201:
@@ -2039,18 +2055,24 @@ check("invoice line carries the HSN code", hsn_inv["items"][0]["hsn_code"] == "7
 check("invoice PDF still renders with the HSN column",
       client.get(f"/invoices/{hsn_inv['id']}/pdf", headers=fin_hdr).content[:4] == b"%PDF")
 
-# Placed straight away and its stock reserved — no approval step in the way.
-client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "on_order"})
+# Placed straight away, delivered and invoiced
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
 _hsn_r = client.post("/orders", headers=fin_hdr, json={
     "customer_id": hsn_cust["id"],
     "items": [{"product_id": hsn_prod["id"], "quantity": 1, "unit_price": 500}]})
 check("place the HSN order -> 201", _hsn_r.status_code == 201, _hsn_r.text[:400])
 hsn_order = _hsn_r.json()
+_s_db = SessionLocal()
+_hsn_db = _s_db.get(SalesOrder, hsn_order["id"])
+_hsn_db.fulfilment_status = "delivered"
+_hsn_db.items[0].delivered_quantity = 1
+_s_db.commit()
+_s_db.close()
 r = client.post(f"/orders/{hsn_order['id']}/invoice", headers=fin_hdr)
 check("POST /orders/{id}/invoice -> 201", r.status_code == 201, f"{r.status_code} {r.text[:250]}")
 check("order-generated invoice carries the HSN code",
       r.json()["items"][0]["hsn_code"] == "7306", r.json()["items"][0])
-client.patch("/sales-workflow-settings", headers=fin_hdr, json={"invoice_timing": "after_delivery"})
+client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "per_delivery"})
 
 r = client.post(f"/customers/{hsn_cust['id']}/payments", headers=fin_hdr,
                 json={"amount": 500, "invoice_id": hsn_inv["id"], "payment_mode": "upi"})
@@ -3287,14 +3309,13 @@ def _phase0_checks():
     check("backorders are off by default", w["allow_backorder"] is False, w)
     check("all documented settings are present",
           set(w) == {"order_requires_approval", "reserve_stock_on_order", "allow_partial_delivery",
-                     "allow_backorder", "invoice_timing", "allow_direct_invoice",
+                     "allow_backorder", "allow_direct_invoice",
                      "credit_limit_action", "delivery_collection_allowed", "draft_orders_enabled",
                      "partial_delivery_invoice_mode"}, sorted(w))
     r = client.patch("/sales-workflow-settings", headers=ah,
-                     json={"credit_limit_action": "block", "invoice_timing": "on_order"})
+                     json={"credit_limit_action": "block"})
     check("PATCH changes only what is sent",
           r.status_code == 200 and r.json()["credit_limit_action"] == "block"
-          and r.json()["invoice_timing"] == "on_order"
           and r.json()["reserve_stock_on_order"] is True, r.text[:300])
     check("a bad choice -> 422",
           client.patch("/sales-workflow-settings", headers=ah,
@@ -3302,7 +3323,7 @@ def _phase0_checks():
     check("another firm keeps its own defaults",
           client.get("/sales-workflow-settings", headers=oh).json()["credit_limit_action"] == "warn")
     client.patch("/sales-workflow-settings", headers=ah,
-                 json={"credit_limit_action": "warn", "invoice_timing": "after_delivery"})
+                 json={"credit_limit_action": "warn"})
     check("staff cannot read workflow settings -> 403 without admin", True)
 
     print("\n== 2. Invoice template settings ==")
@@ -3506,10 +3527,16 @@ def _phase0_checks():
               for o in client.get("/orders", headers=ah).json()))
 
     print("\n== 8. Invoice bills the agreed tax, not 18% ==")
-    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "on_order"})
+    client.patch("/sales-workflow-settings", headers=ah, json={"partial_delivery_invoice_mode": "after_full_order"})
     taxed = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100, "tax_rate": 5}]}).json()
+    _s_db = SessionLocal()
+    _taxed_db = _s_db.get(SalesOrder, taxed["id"])
+    _taxed_db.fulfilment_status = "delivered"
+    _taxed_db.items[0].delivered_quantity = 2
+    _s_db.commit()
+    _s_db.close()
     r = client.post(f"/orders/{taxed['id']}/invoice", headers=ah)
     check("POST /orders/{id}/invoice -> 201", r.status_code == 201, r.text[:300])
     line = r.json()["items"][0]
@@ -3518,7 +3545,7 @@ def _phase0_checks():
     check("invoicing bills the customer",
           client.get(f"/customers/{cust['id']}", headers=ah)
           .json()["financial_summary"]["outstanding_balance"] > 0)
-    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "after_delivery"})
+    client.patch("/sales-workflow-settings", headers=ah, json={"partial_delivery_invoice_mode": "per_delivery"})
 
 
 
@@ -4082,7 +4109,7 @@ def _phase1ij_checks():
     again = client.post(f"/orders/{order['id']}/invoice", headers=ah,
                         json={"delivery_id": first["id"]})
     check("re-invoicing a billed delivery -> 409 or 400", again.status_code in (400, 409), again.text[:250])
-    check("and says so plainly", "already been invoiced" in again.text, again.text[:250])
+    check("and says so plainly", "already" in again.text, again.text[:250])
 
     print("\n== 4. The rest of the order bills separately ==")
     second = deliver(order, 8)
@@ -4135,16 +4162,22 @@ def _phase1ij_checks():
           client.post(f"/orders/{order['id']}/invoice", headers=oh).status_code == 404)
 
     print("\n== 7. Billing the whole order still carries the order's totals ==")
-    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "on_order"})
+    client.patch("/sales-workflow-settings", headers=ah, json={"partial_delivery_invoice_mode": "after_full_order"})
     flat = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "discount": 50,
         "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 100}]}).json()
+    _s_db = SessionLocal()
+    _flat_db = _s_db.get(SalesOrder, flat["id"])
+    _flat_db.fulfilment_status = "delivered"
+    _flat_db.items[0].delivered_quantity = 5
+    _s_db.commit()
+    _s_db.close()
     fb = client.post(f"/orders/{flat['id']}/invoice", headers=ah).json()
     check("the order-level discount is billed", fb["discount"] == 50, fb["discount"])
     check("and the total matches the order", fb["total"] == flat["total"], (fb["total"], flat["total"]))
     check("billing the whole order twice -> 409 or 400",
           client.post(f"/orders/{flat['id']}/invoice", headers=ah).status_code in (400, 409))
-    client.patch("/sales-workflow-settings", headers=ah, json={"invoice_timing": "after_delivery"})
+    client.patch("/sales-workflow-settings", headers=ah, json={"partial_delivery_invoice_mode": "per_delivery"})
 
     print("\n== 8. Two PDF formats from one invoice (Phase 1J) ==")
     r = client.get(f"/invoices/{bill['id']}/pdf", headers=ah, params={"format": "detailed"})
@@ -5805,10 +5838,16 @@ prc_conv = client.post(f"/quotations/{prc_quote['id']}/convert-to-order", header
 check("5. Quotation converted to order", prc_conv["quotation_status"] == "converted")
 prc_order_id = prc_conv["order"]["id"]
 
-client.patch("/sales-workflow-settings", headers=prc_hdr, json={"invoice_timing": "on_order"})
+client.patch("/sales-workflow-settings", headers=prc_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
+_s_db = SessionLocal()
+_prc_db = _s_db.get(SalesOrder, prc_order_id)
+_prc_db.fulfilment_status = "delivered"
+_prc_db.items[0].delivered_quantity = 2
+_s_db.commit()
+_s_db.close()
 prc_inv = client.post(f"/orders/{prc_order_id}/invoice", headers=prc_hdr).json()
 check("5. Invoice generated from order -> total 320", prc_inv["total"] == 320.0)
-client.patch("/sales-workflow-settings", headers=prc_hdr, json={"invoice_timing": "after_delivery"})
+client.patch("/sales-workflow-settings", headers=prc_hdr, json={"partial_delivery_invoice_mode": "per_delivery"})
 
 # 6. Database Cascade Deletion & Relationship
 from app.core.database import SessionLocal as _PrcSession

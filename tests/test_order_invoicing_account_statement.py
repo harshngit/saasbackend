@@ -132,10 +132,10 @@ def run_tests():
     cust2 = c2_res.json()
     cust2_id = cust2["id"]
 
-    print("\n--- PART 1: ORDER -> INVOICE FLOW ---")
+    print("\n--- PART 1: ORDER -> INVOICE FLOW (SIMPLIFIED FIXED RULES) ---")
 
-    # Set workflow settings to invoice_timing = "on_order" for whole order test
-    client.patch("/sales-workflow-settings", json={"invoice_timing": "on_order"}, headers=auth1)
+    # Set workflow settings to partial_delivery_invoice_mode = "after_full_order"
+    client.patch("/sales-workflow-settings", json={"partial_delivery_invoice_mode": "after_full_order"}, headers=auth1)
 
     # Place Sales Order for Customer 1 (20 wafers @ 30 = 600 + 12% tax = 72 => total 672)
     so1_res = client.post("/orders", json={
@@ -155,11 +155,64 @@ def run_tests():
     assert so1_res.status_code == 201, so1_res.text
     so1 = so1_res.json()
     so1_id = so1["id"]
+    so1_item_id = so1["items"][0]["id"]
     assert_eq(so1["total"], 672.0, "Sales Order total calculated: 20 * 30 + 12% GST = 672")
 
-    # TEST 1 & 2 & 3: Generate invoice using POST /orders/{id}/invoice with empty body
+    # TEST A: Delivered Qty = 0 -> POST /orders/{id}/invoice returns 400 Bad Request
+    inv_zero_res = client.post(f"/orders/{so1_id}/invoice", json={}, headers=auth1)
+    assert_eq(inv_zero_res.status_code, 400, "Invoicing with 0 delivered returns HTTP 400")
+    assert_eq(inv_zero_res.json().get("detail"), "No delivered quantity is available for invoicing", "Error detail is 'No delivered quantity is available for invoicing'")
+
+    # Deliver partially (12 units) on order 1 under after_full_order mode
+    deliv_part_res = client.post("/deliveries", json={
+        "order_id": so1_id,
+        "warehouse_id": wh1_id,
+        "items": [{"order_item_id": so1_item_id, "planned_quantity": 12}],
+    }, headers=auth1)
+    assert deliv_part_res.status_code == 201, deliv_part_res.text
+    deliv_part_id = deliv_part_res.json()["id"]
+
+    db_session = SessionLocal()
+    deliv_part_db = db_session.get(Delivery, deliv_part_id)
+    for item in deliv_part_db.items:
+        item.delivered_quantity = 12.0
+    deliv_part_db.status = "delivered"
+    so1_item_db = db_session.get(SalesOrderItem, so1_item_id)
+    so1_item_db.delivered_quantity = 12.0
+    so1_db = db_session.get(SalesOrder, so1_id)
+    so1_db.fulfilment_status = "partially_delivered"
+    db_session.commit()
+    db_session.close()
+
+    # In after_full_order mode, partial delivery must be blocked
+    inv_part_block_res = client.post(f"/orders/{so1_id}/invoice", json={}, headers=auth1)
+    assert_eq(inv_part_block_res.status_code, 400, "Incomplete delivery in after_full_order mode returns HTTP 400")
+    assert_eq(inv_part_block_res.json().get("detail"), "Order still has pending delivery quantity", "Error detail is 'Order still has pending delivery quantity'")
+
+    # Deliver remaining 8 units -> Fully Delivered (20 units)
+    deliv_rest_res = client.post("/deliveries", json={
+        "order_id": so1_id,
+        "warehouse_id": wh1_id,
+        "items": [{"order_item_id": so1_item_id, "planned_quantity": 8}],
+    }, headers=auth1)
+    assert deliv_rest_res.status_code == 201, deliv_rest_res.text
+    deliv_rest_id = deliv_rest_res.json()["id"]
+
+    db_session = SessionLocal()
+    deliv_rest_db = db_session.get(Delivery, deliv_rest_id)
+    for item in deliv_rest_db.items:
+        item.delivered_quantity = 8.0
+    deliv_rest_db.status = "delivered"
+    so1_item_db = db_session.get(SalesOrderItem, so1_item_id)
+    so1_item_db.delivered_quantity = 20.0
+    so1_db = db_session.get(SalesOrder, so1_id)
+    so1_db.fulfilment_status = "delivered"
+    db_session.commit()
+    db_session.close()
+
+    # TEST B: Fully Delivered (20 units) -> POST /orders/{id}/invoice with {} succeeds
     inv1_res = client.post(f"/orders/{so1_id}/invoice", json={}, headers=auth1)
-    assert_eq(inv1_res.status_code, 201, "POST /orders/{id}/invoice with empty body succeeds")
+    assert_eq(inv1_res.status_code, 201, "POST /orders/{id}/invoice with empty body succeeds when fully delivered")
     inv1 = inv1_res.json()
     inv1_id = inv1["id"]
 
@@ -184,11 +237,11 @@ def run_tests():
     else:
         fail("Invoice due_date is missing")
 
-    # TEST 4: Duplicate Invoice Prevention (Full order returns HTTP 409)
+    # TEST D: Duplicate Invoice Prevention (Full order returns HTTP 409)
     inv1_dup = client.post(f"/orders/{so1_id}/invoice", json={}, headers=auth1)
     assert_eq(inv1_dup.status_code, 409, "Duplicate full order invoice returns HTTP 409 Conflict")
 
-    # TEST 5: GET /invoices?order_id={id} filter
+    # TEST F: GET /invoices?order_id={id} filter
     inv_list_res = client.get(f"/invoices?order_id={so1_id}", headers=auth1)
     assert_eq(inv_list_res.status_code, 200, "GET /invoices?order_id={id} returns 200")
     inv_list = inv_list_res.json()
@@ -200,10 +253,9 @@ def run_tests():
     inv_empty_res = client.get(f"/invoices?order_id={dummy_order_id}", headers=auth1)
     assert_eq(len(inv_empty_res.json()), 0, "GET /invoices?order_id={dummy} returns empty list")
 
-    # TEST 6: Partial Delivery Invoicing & Invoice Timing
-    print("\n--- PARTIAL DELIVERY INVOICING & INVOICE TIMING ---")
+    # TEST C: per_delivery Partial Delivery Invoicing Mode
+    print("\n--- TEST C: PER-DELIVERY INVOICING MODE ---")
     client.patch("/sales-workflow-settings", json={
-        "invoice_timing": "after_delivery",
         "partial_delivery_invoice_mode": "per_delivery",
     }, headers=auth1)
 
@@ -217,11 +269,11 @@ def run_tests():
     so2_id = so2["id"]
     so2_item_id = so2["items"][0]["id"]
 
-    # Invoicing before delivery when invoice_timing=after_delivery must be rejected
-    inv_premature = client.post(f"/orders/{so2_id}/invoice", json={}, headers=auth1)
-    assert_eq(inv_premature.status_code, 400, "Invoicing before delivery rejected with HTTP 400 (after_delivery timing)")
+    # In per_delivery mode, invoicing without delivery_id must be rejected
+    inv_no_deliv = client.post(f"/orders/{so2_id}/invoice", json={}, headers=auth1)
+    assert_eq(inv_no_deliv.status_code, 400, "Invoicing without delivery_id in per_delivery mode rejected with HTTP 400")
 
-    # Create Partial Delivery: planned 12, delivered 12
+    # Create Partial Delivery 1: planned 12, delivered 12
     deliv1_res = client.post("/deliveries", json={
         "order_id": so2_id,
         "warehouse_id": wh1_id,

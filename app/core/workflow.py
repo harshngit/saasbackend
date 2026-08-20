@@ -72,7 +72,6 @@ SALES_WORKFLOW_DEFAULTS: dict[str, object] = {
     "allow_partial_delivery": True,
     # Refuse to place an order the warehouse cannot cover.
     "allow_backorder": False,
-    "invoice_timing": "after_delivery",        # after_delivery | on_order
     "allow_direct_invoice": True,
     # What to do when an order would take a customer past their credit limit.
     "credit_limit_action": "warn",             # warn | block | ignore
@@ -87,7 +86,6 @@ SALES_WORKFLOW_DEFAULTS: dict[str, object] = {
 SALES_WORKFLOW_DEFAULTS["draft_orders_enabled"] = False
 
 SALES_WORKFLOW_CHOICES: dict[str, tuple[str, ...]] = {
-    "invoice_timing": ("after_delivery", "on_order"),
     "credit_limit_action": ("warn", "block", "ignore"),
     "partial_delivery_invoice_mode": ("per_delivery", "after_full_order"),
 }

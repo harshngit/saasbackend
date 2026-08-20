@@ -198,7 +198,7 @@ def generate_from_order(
                 detail=f"Invoice already exists for this delivery (Invoice ID: {existing_del.id})",
             )
         if (
-            settings["partial_delivery_invoice_mode"] == "after_full_order"
+            settings.get("partial_delivery_invoice_mode") == "after_full_order"
             and order.fulfilment_status != "delivered"
         ):
             raise HTTPException(
@@ -207,81 +207,61 @@ def generate_from_order(
                        "(partial_delivery_invoice_mode = after_full_order)",
             )
     else:
-        # No delivery_id provided. Decision depends on the firm's invoice timing.
-        if settings["invoice_timing"] == "on_order":
-            # Billing the whole order: only once, as before.
-            existing = (
-                db.query(Invoice)
-                .filter(Invoice.order_id == order_id, Invoice.is_credit_note.is_(False))
-                .first()
+        # No delivery_id provided. Check actual delivered quantity on the order.
+        total_delivered = sum(float(item.delivered_quantity or 0) for item in order.items)
+        if total_delivered <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No delivered quantity is available for invoicing",
             )
-            if existing:
+
+        mode = settings.get("partial_delivery_invoice_mode", "per_delivery")
+        if mode == "per_delivery":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This organization bills per delivery. Please specify delivery_id.",
+            )
+        elif mode == "after_full_order":
+            if order.fulfilment_status != "delivered":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Order still has pending delivery quantity",
+                )
+            # Aggregate delivered qty across order items, subtract already invoiced qty
+            agg_lines: list[dict] = []
+            for item in order.items:
+                delivered = float(item.delivered_quantity or 0)
+                already = sum(
+                    (row.quantity or 0)
+                    for row in db.query(InvoiceItem).join(Invoice, InvoiceItem.invoice_id == Invoice.id)
+                    .filter(
+                        InvoiceItem.order_item_id == item.id,
+                        Invoice.is_credit_note.is_(False),
+                    )
+                )
+                outstanding = round(delivered - (already or 0), 3)
+                if outstanding > 0:
+                    agg_lines.append({"order_item": item, "delivery_item_id": None, "quantity": outstanding})
+            if not agg_lines:
+                existing_ord = (
+                    db.query(Invoice)
+                    .filter(
+                        Invoice.order_id == order.id,
+                        Invoice.organization_id == org_id,
+                        Invoice.is_credit_note.is_(False),
+                    )
+                    .first()
+                )
+                detail = (
+                    f"Invoice already exists for this order (Invoice ID: {existing_ord.id})"
+                    if existing_ord
+                    else "Everything delivered has already been invoiced"
+                )
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Invoice already exists for this order (Invoice ID: {existing.id})",
+                    detail=detail,
                 )
-        else:
-            # invoice_timing == 'after_delivery'
-            # 3a: if zero deliveries exist for this order, refuse
-            any_delivery = (
-                db.query(Delivery)
-                .filter(Delivery.sales_order_id == order.id, Delivery.organization_id == org_id)
-                .first()
-            )
-            if not any_delivery:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No deliveries recorded yet. This organization bills after delivery.",
-                )
-            mode = settings.get("partial_delivery_invoice_mode")
-            if mode == "per_delivery":
-                # 3b: require explicit delivery_id
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="This organization bills per delivery. Please specify delivery_id.",
-                )
-            # 3c: after_full_order
-            if mode == "after_full_order":
-                if order.fulfilment_status != "delivered":
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="This organization bills after the full order is delivered.",
-                    )
-                # Aggregate delivered qty across order items, subtract already invoiced qty
-                agg_lines: list[dict] = []
-                for item in order.items:
-                    delivered = float(item.delivered_quantity or 0)
-                    already = sum(
-                        (row.quantity or 0)
-                        for row in db.query(InvoiceItem).join(Invoice, InvoiceItem.invoice_id == Invoice.id)
-                        .filter(
-                            InvoiceItem.order_item_id == item.id,
-                            Invoice.is_credit_note.is_(False),
-                        )
-                    )
-                    outstanding = round(delivered - (already or 0), 3)
-                    if outstanding > 0:
-                        agg_lines.append({"order_item": item, "delivery_item_id": None, "quantity": outstanding})
-                if not agg_lines:
-                    existing_ord = (
-                        db.query(Invoice)
-                        .filter(
-                            Invoice.order_id == order.id,
-                            Invoice.organization_id == org_id,
-                            Invoice.is_credit_note.is_(False),
-                        )
-                        .first()
-                    )
-                    detail = (
-                        f"Invoice already exists for this order (Invoice ID: {existing_ord.id})"
-                        if existing_ord
-                        else "Everything delivered has already been invoiced"
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=detail,
-                    )
-                lines = agg_lines
+            lines = agg_lines
 
     if lines is None:
         lines = _billable_lines(db, order, delivery)

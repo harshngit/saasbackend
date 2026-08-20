@@ -40,9 +40,6 @@ class SalesWorkflowSettings(BaseModel):
     allow_partial_delivery: bool = True
     allow_backorder: bool = Field(
         default=False, description="Allow placing an order the warehouse cannot cover")
-    invoice_timing: Annotated[
-        str, BeforeValidator(_lower), Field(pattern="^(after_delivery|on_order)$")
-    ] = "after_delivery"
     allow_direct_invoice: bool = Field(
         default=True, description="Allow quick billing with no order or delivery")
     credit_limit_action: Annotated[
@@ -66,9 +63,6 @@ class SalesWorkflowSettingsUpdate(BaseModel):
     reserve_stock_on_order: bool | None = None
     allow_partial_delivery: bool | None = None
     allow_backorder: bool | None = None
-    invoice_timing: Annotated[
-        str, BeforeValidator(_lower), Field(pattern="^(after_delivery|on_order)$")
-    ] | None = None
     allow_direct_invoice: bool | None = None
     credit_limit_action: Annotated[
         str, BeforeValidator(_lower), Field(pattern="^(warn|block|ignore)$")
