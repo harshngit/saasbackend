@@ -23,6 +23,7 @@ from app.models import (  # noqa: F401  (register mappers)
     StoredFile,
     Plan,
     Product,
+    ProductPricing,
     ProductSerial,
     ProductVariant,
     RefreshToken,
@@ -41,6 +42,7 @@ from app.models import (  # noqa: F401  (register mappers)
 )
 from app.services.file_migration_service import convert_inline_uploads
 from app.services.numbering_service import backfill_missing_numbers
+from app.services.product_pricing_service import backfill_product_pricing
 from app.services.stock_service import migrate_order_statuses
 from app.routers import (
     attendance,
@@ -119,6 +121,7 @@ def on_startup() -> None:
         ("backfill_missing_numbers", backfill_missing_numbers),
         ("migrate_order_statuses", migrate_order_statuses),
         ("convert_inline_uploads", convert_inline_uploads),
+        ("backfill_product_pricing", backfill_product_pricing),
     ):
         try:
             step()

@@ -10,7 +10,9 @@ from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
 from app.models import (
     Category,
+    Organization,
     Product,
+    ProductPricing,
     ProductSerial,
     ProductVariant,
     StockBatch,
@@ -90,13 +92,36 @@ def create_product(
     data = payload.model_dump()
     variations = data.pop("variations")
     has_variants = data.pop("has_variants")
+    pricing_data = data.pop("pricing", None) or {}
+
+    # Default currency from organization if not provided
+    if not pricing_data.get("currency"):
+        org = db.get(Organization, org_id)
+        pricing_data["currency"] = (org.currency if org and org.currency else "INR")
+
     data.setdefault("product_id", None)
     if not data.get("product_id"):
         data["product_id"] = numbering_service.next_number(db, org_id, Product.product_id, "PROD")
+
+    # Sync price on Product model with selling_price for backward compatibility
+    selling_p = pricing_data.get("selling_price", 0.0)
+    purchase_p = pricing_data.get("purchase_price", 0.0)
+    data["price"] = selling_p
     product = Product(organization_id=org_id, **data)
     product.variations = _build_variants([VariantIn(**v) for v in variations])
     # Left unset, the toggle just follows whether variants were actually sent.
     product.has_variants = bool(variations) if has_variants is None else has_variants
+
+    product.pricing = ProductPricing(
+        purchase_price=purchase_p,
+        selling_price=selling_p,
+        mrp=pricing_data.get("mrp"),
+        wholesale_price=pricing_data.get("wholesale_price"),
+        dealer_price=pricing_data.get("dealer_price"),
+        discount_percent=pricing_data.get("discount_percent"),
+        tax_inclusive=pricing_data.get("tax_inclusive", False),
+        currency=pricing_data.get("currency"),
+    )
     db.add(product)
     db.commit()
     db.refresh(product)
@@ -242,10 +267,36 @@ def update_product(
     if "preferred_supplier_id" in data:
         _validate_supplier(db, org_id, data["preferred_supplier_id"])
     variations = data.pop("variations", None)
+    pricing_data = data.pop("pricing", None)
     if data.get("has_variants") is None:
         data.pop("has_variants", None)  # NOT NULL column — never write a null into it
     for field, value in data.items():
         setattr(product, field, value)
+
+    if pricing_data is not None:
+        if product.pricing is None:
+            p_price = pricing_data.get("purchase_price", 0.0) if pricing_data.get("purchase_price") is not None else 0.0
+            s_price = pricing_data.get("selling_price", 0.0) if pricing_data.get("selling_price") is not None else product.price or 0.0
+            if not pricing_data.get("currency"):
+                org = db.get(Organization, org_id)
+                pricing_data["currency"] = (org.currency if org and org.currency else "INR")
+            product.pricing = ProductPricing(
+                product_id=product.id,
+                purchase_price=p_price,
+                selling_price=s_price,
+                mrp=pricing_data.get("mrp"),
+                wholesale_price=pricing_data.get("wholesale_price"),
+                dealer_price=pricing_data.get("dealer_price"),
+                discount_percent=pricing_data.get("discount_percent"),
+                tax_inclusive=pricing_data.get("tax_inclusive", False),
+                currency=pricing_data.get("currency"),
+            )
+        else:
+            for p_field, p_value in pricing_data.items():
+                if p_value is not None:
+                    setattr(product.pricing, p_field, p_value)
+        if product.pricing and product.pricing.selling_price is not None:
+            product.price = product.pricing.selling_price
 
     # Variants upsert behavior: None = no-op; [] = explicit no-op (do not delete);
     # non-empty list = perform in-place updates for supplied ids and create for new ones.

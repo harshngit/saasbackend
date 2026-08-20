@@ -624,7 +624,7 @@ check("update category -> 200", r.status_code == 200 and r.json()["description"]
 
 # --- Products with variants ---
 r = client.post("/products", headers=cp_hdr, json={
-    "name": "Thums Up", "description": "Soft drink", "price": "40", "brand": "Coca-Cola", "sku": "TU-001",
+    "name": "Thums Up", "description": "Soft drink", "pricing": {"purchase_price": 30, "selling_price": 40}, "brand": "Coca-Cola", "sku": "TU-001",
     "category_id": cat_id, "cover_image": "data:image/png;base64,BBB", "images": ["data:image/png;base64,CCC"],
     "variations": [
         {"name": "200ml", "price": "20", "inventory": 100, "weight": 0.2},
@@ -641,7 +641,7 @@ check("total_stock = sum of variant inventory", prod["total_stock"] == 180, prod
 check("product linked to category", prod["category_id"] == cat_id, prod)
 
 # no-variant product uses total_inventory
-r = client.post("/products", headers=cp_hdr, json={"name": "Water Bottle", "price": 10, "total_inventory": 500})
+r = client.post("/products", headers=cp_hdr, json={"name": "Water Bottle", "pricing": {"purchase_price": 5, "selling_price": 10}, "total_inventory": 500})
 check("no-variant product total_stock=total_inventory", r.json()["total_stock"] == 500, r.text)
 prod2_id = r.json()["id"]
 
@@ -694,7 +694,7 @@ nt_hdr = {"Authorization": f"Bearer {ntr['tokens']['access_token']}"}
 
 # order creation notifies the admin
 ncust = client.post("/customers", headers=nt_hdr, json={"name": "C"}).json()
-nprod = client.post("/products", headers=nt_hdr, json={"name": "P", "total_inventory": 50}).json()
+nprod = client.post("/products", headers=nt_hdr, json={"name": "P", "pricing": {"purchase_price": 50, "selling_price": 100}, "total_inventory": 50}).json()
 client.post("/orders", headers=nt_hdr, json={"customer_id": ncust["id"], "items": [{"product_id": nprod["id"], "quantity": 2, "unit_price": 100}]})
 check("unread-count after order = 1", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 1)
 notes = client.get("/notifications", headers=nt_hdr).json()
@@ -742,7 +742,7 @@ rpr = client.post("/auth/register", json={
 rep_hdr = {"Authorization": f"Bearer {rpr['tokens']['access_token']}"}
 # seed some data: customer + product + order (approved = sale) + expense + supplier + purchase
 rc = client.post("/customers", headers=rep_hdr, json={"name": "Hotel X"}).json()
-rp = client.post("/products", headers=rep_hdr, json={"name": "Item", "total_inventory": 100}).json()
+rp = client.post("/products", headers=rep_hdr, json={"name": "Item", "pricing": {"purchase_price": 50, "selling_price": 200}, "total_inventory": 100}).json()
 ro = client.post("/orders", headers=rep_hdr, json={"customer_id": rc["id"], "tax": 90, "items": [{"product_id": rp["id"], "quantity": 5, "unit_price": 200}]}).json()
 client.patch(f"/orders/{ro['id']}/approve", headers=rep_hdr)
 client.post(f"/customers/{rc['id']}/payments", headers=rep_hdr, json={"amount": 400, "payment_mode": "cash"})
@@ -797,7 +797,7 @@ fin_hdr = {"Authorization": f"Bearer {fpr['tokens']['access_token']}"}
 
 # --- Purchases: approve adds stock + bumps supplier.total_purchases ---
 fsup = client.post("/suppliers", headers=fin_hdr, json={"name": "Bulk Supplier", "opening_balance": 0}).json()
-fprod = client.post("/products", headers=fin_hdr, json={"name": "Sugar", "total_inventory": 20}).json()
+fprod = client.post("/products", headers=fin_hdr, json={"name": "Sugar", "pricing": {"purchase_price": 40, "selling_price": 60}, "total_inventory": 20}).json()
 r = client.post("/purchases", headers=fin_hdr, json={
     "invoice_number": "INV-100", "supplier_id": fsup["id"], "discount": 100, "tax": 50,
     "items": [{"product_id": fprod["id"], "quantity": 30, "purchase_price": 40, "tax": 10}]})
@@ -863,7 +863,7 @@ sopr = client.post("/auth/register", json={
 so_hdr = {"Authorization": f"Bearer {sopr['tokens']['access_token']}"}
 # a customer + a product with stock
 cust = client.post("/customers", headers=so_hdr, json={"name": "Hotel Grand"}).json()
-prod = client.post("/products", headers=so_hdr, json={"name": "Rice Bag", "price": 500, "total_inventory": 100}).json()
+prod = client.post("/products", headers=so_hdr, json={"name": "Rice Bag", "pricing": {"purchase_price": 400, "selling_price": 500}, "total_inventory": 100}).json()
 
 # create order
 r = client.post("/orders", headers=so_hdr, json={
@@ -1029,8 +1029,8 @@ ipr = client.post("/auth/register", json={
 inv_hdr = {"Authorization": f"Bearer {ipr['tokens']['access_token']}"}
 
 # a no-variant product and a variant product
-p_novar = client.post("/products", headers=inv_hdr, json={"name": "Salt", "total_inventory": 100}).json()
-p_var = client.post("/products", headers=inv_hdr, json={"name": "Cola", "variations": [
+p_novar = client.post("/products", headers=inv_hdr, json={"name": "Salt", "pricing": {"purchase_price": 10, "selling_price": 20}, "total_inventory": 100}).json()
+p_var = client.post("/products", headers=inv_hdr, json={"name": "Cola", "pricing": {"purchase_price": 20, "selling_price": 40}, "variations": [
     {"name": "500ml", "inventory": 50}, {"name": "1L", "inventory": 20}]}).json()
 var_id = p_var["variations"][0]["id"]
 
@@ -1507,7 +1507,7 @@ _ycust = client.post("/customers", headers=fin_hdr,
 check("customer gets an auto CUST-YYYY-#### id",
       bool(_re.fullmatch(r"CUST-\d{4}-\d+", _ycust.get("customer_id") or "")), _ycust.get("customer_id"))
 _yprod = client.post("/products", headers=fin_hdr,
-                     json={"name": "Auto Number Widget", "price": 100, "total_inventory": 50}).json()
+                     json={"name": "Auto Number Widget", "pricing": {"purchase_price": 50, "selling_price": 100}, "total_inventory": 50}).json()
 check("product gets an auto PROD id",
       bool(_re.fullmatch(r"PROD-\d{4}-\d+", _yprod.get("product_id") or "")), _yprod.get("product_id"))
 
@@ -1543,7 +1543,7 @@ check("lead gets an auto LEAD id",
 _ycat = client.post("/categories", headers=fin_hdr, json={"name": "Auto Ref Category"}).json()
 _ysup = client.post("/suppliers", headers=fin_hdr, json={"name": "Auto Ref Supplier"}).json()
 _yp2 = client.post("/products", headers=fin_hdr, json={
-    "name": "Linked Widget", "price": 20, "total_inventory": 10,
+    "name": "Linked Widget", "pricing": {"purchase_price": 10, "selling_price": 20}, "total_inventory": 10,
     "category_id": _ycat["id"], "preferred_supplier_id": _ysup["id"]}).json()
 check("product resolves category + supplier from their ids",
       _yp2["category"]["name"] == "Auto Ref Category"
@@ -1729,7 +1729,7 @@ check("returns filename / type / size",
 check("that URL serves the file", client.get("/files/" + _gj["file_id"]).status_code == 200)
 check("the URL can be sent straight into a record",
       client.post("/products", headers=fin_hdr,
-                  json={"name": "Generic Upload Product", "price": 5,
+                  json={"name": "Generic Upload Product", "pricing": {"purchase_price": 2, "selling_price": 5},
                         "cover_image": _gj["url"]}).json()["cover_image"] == _gj["url"])
 check("generic upload accepts any type",
       client.post("/files/upload", headers=fin_hdr,
@@ -1746,7 +1746,7 @@ print("\n== Fetch by the human-facing code, not just the UUID ==")
 _lcust = client.post("/customers", headers=fin_hdr,
                      json={"name": "Code Lookup Co", "phone": "9800005555"}).json()
 _lprod = client.post("/products", headers=fin_hdr, json={
-    "name": "Code Lookup Widget", "price": 80, "total_inventory": 20, "sku": "CL-SKU-1"}).json()
+    "name": "Code Lookup Widget", "pricing": {"purchase_price": 40, "selling_price": 80}, "total_inventory": 20, "sku": "CL-SKU-1"}).json()
 _lquote = client.post("/quotations", headers=fin_hdr, json={
     "customer_id": _lcust["id"],
     "items": [{"product_id": _lprod["id"], "quantity": 1, "unit_price": 80}]}).json()
@@ -2026,7 +2026,7 @@ check("staff cannot read the overview -> 403",
 
 print("\n== HSN codes and payment allocation ==")
 hsn_prod = client.post("/products", headers=fin_hdr, json={
-    "name": "HSN Test Pipe", "price": 500, "hsn_code": "7306", "total_inventory": 50}).json()
+    "name": "HSN Test Pipe", "pricing": {"purchase_price": 300, "selling_price": 500}, "hsn_code": "7306", "total_inventory": 50}).json()
 check("product stores hsn_code", hsn_prod.get("hsn_code") == "7306", hsn_prod.get("hsn_code"))
 hsn_cust = client.post("/customers", headers=fin_hdr, json={
     "name": "HSN Traders", "phone": "9800000123"}).json()
@@ -2802,7 +2802,7 @@ def _roles_scoping_and_dashboard_checks():
         "customer_id": sunil_cust["id"],
         "items": [{"product_id": None, "product_name": "Water 20L", "quantity": 2, "unit_price": 60}]})
     if my_order.status_code != 201:
-        prod = client.post("/products", headers=abc_hdr, json={"name": "Water 20L", "price": 60,
+        prod = client.post("/products", headers=abc_hdr, json={"name": "Water 20L", "pricing": {"purchase_price": 40, "selling_price": 60},
                                                                "total_inventory": 500}).json()
         my_order = client.post("/orders", headers=s_hdr, json={
             "customer_id": sunil_cust["id"],
@@ -2908,10 +2908,10 @@ def _roles_scoping_and_dashboard_checks():
 
     # Stock watch
     low = client.post("/products", headers=abc_hdr, json={
-        "name": "Sparkling Water 750ml", "price": 40, "total_inventory": 9,
+        "name": "Sparkling Water 750ml", "pricing": {"purchase_price": 20, "selling_price": 40}, "total_inventory": 9,
         "minimum_stock_level": 25}).json()
     client.post("/products", headers=abc_hdr, json={
-        "name": "Out Of Stock Item", "price": 10, "total_inventory": 0, "minimum_stock_level": 5})
+        "name": "Out Of Stock Item", "pricing": {"purchase_price": 5, "selling_price": 10}, "total_inventory": 0, "minimum_stock_level": 5})
     watch = client.get("/dashboard/admin", headers=abc_hdr).json()["stock_watch"]
     check("stock watch flags low stock with a percentage of the minimum",
           any(w["product_id"] == low["id"] and w["status"] == "low_stock"
@@ -3053,7 +3053,7 @@ def _staff_detail_checks():
         "address_information": {"city": "New Delhi"},
         "sales_crm_information": {"territory": "Karol Bagh"}}).json()
     prod = client.post("/products", headers=ah, json={
-        "name": "Water 20L", "price": 60, "total_inventory": 500}).json()
+        "name": "Water 20L", "pricing": {"purchase_price": 40, "selling_price": 60}, "total_inventory": 500}).json()
     order = client.post("/orders", headers=sales_hdr, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 60}]}).json()
@@ -3374,7 +3374,7 @@ def _phase0_checks():
 
     print("\n== 4. Stock: on hand, reserved, available ==")
     prod = client.post("/products", headers=ah, json={
-        "name": "Sparkling Water 750ml", "price": 40, "total_inventory": 100,
+        "name": "Sparkling Water 750ml", "pricing": {"purchase_price": 20, "selling_price": 40}, "total_inventory": 100,
         "minimum_stock_level": 25, "tax_rate": 5}).json()
     check("a product can carry its own tax_rate", prod["tax_rate"] == 5, prod.get("tax_rate"))
     rows = client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]}).json()
@@ -3546,9 +3546,9 @@ def _phase1a_checks():
     abc, ah = firm("QuoteCo")
     xyz, oh = firm("OtherQ")
     prod = client.post("/products", headers=ah, json={
-        "name": "Water 20L", "price": 100, "total_inventory": 200, "tax_rate": 12}).json()
+        "name": "Water 20L", "pricing": {"purchase_price": 80, "selling_price": 100}, "total_inventory": 200, "tax_rate": 12}).json()
     prod2 = client.post("/products", headers=ah, json={
-        "name": "Bottle 1L", "price": 25, "total_inventory": 50}).json()
+        "name": "Bottle 1L", "pricing": {"purchase_price": 15, "selling_price": 25}, "total_inventory": 50}).json()
     cust = client.post("/customers", headers=ah, json={
         "basic_information": {"customer_name": "Fitness First Gym"},
         "address_information": {"billing_address": "12 MG Road"}}).json()
@@ -3723,7 +3723,7 @@ def _phase1cf_checks():
         "email": dp_email, "password": "Dp@123456"}).json()["tokens"]["access_token"])
 
     prod = client.post("/products", headers=ah, json={
-        "name": "Water 20L", "price": 100, "total_inventory": 100, "tax_rate": 5}).json()
+        "name": "Water 20L", "pricing": {"purchase_price": 80, "selling_price": 100}, "total_inventory": 100, "tax_rate": 5}).json()
     cust = client.post("/customers", headers=ah, json={
         "basic_information": {"customer_name": "Metro Stores"},
         "address_information": {"shipping_address": "Opp. Cyber Towers"}}).json()
@@ -4018,7 +4018,7 @@ def _phase1ij_checks():
         "vehicle_number": "DL 01 AB 9999", "vehicle_type": "Tempo", "capacity_kg": 1000}).json()
 
     prod = client.post("/products", headers=ah, json={
-        "name": "Can 20L", "price": 100, "total_inventory": 200,
+        "name": "Can 20L", "pricing": {"purchase_price": 80, "selling_price": 100}, "total_inventory": 200,
         "tax_rate": 5, "hsn_code": "22011010"}).json()
     cust = client.post("/customers", headers=ah, json={
         "basic_information": {"customer_name": "Sharma Traders", "phone": "9812345678"},
@@ -4342,10 +4342,10 @@ def _phase1kn_checks():
     other, oh = firm("OtherCounter")
 
     prod = client.post("/products", headers=ah, json={
-        "name": "Bottle 1L", "price": 100, "total_inventory": 60,
+        "name": "Bottle 1L", "pricing": {"purchase_price": 80, "selling_price": 100}, "total_inventory": 60,
         "tax_rate": 18, "hsn_code": "22011010"}).json()
     plainprod = client.post("/products", headers=ah, json={
-        "name": "Crate", "price": 50, "total_inventory": 20}).json()
+        "name": "Crate", "pricing": {"purchase_price": 30, "selling_price": 50}, "total_inventory": 20}).json()
     cust = client.post("/customers", headers=ah, json={
         "basic_information": {"customer_name": "Gupta Kirana", "phone": "9800011122"},
         "address_information": {"billing_address": "5 Station Road"},
@@ -4706,7 +4706,7 @@ def _phase1op_checks():
     other, oh = firm("OtherReturn")
 
     prod = client.post("/products", headers=ah, json={
-        "name": "Bottle 1L", "price": 100, "total_inventory": 100, "tax_rate": 0,
+        "name": "Bottle 1L", "pricing": {"purchase_price": 80, "selling_price": 100}, "total_inventory": 100, "tax_rate": 0,
         "barcode": "8901234567890"}).json()
     cust = client.post("/customers", headers=ah, json={
         "basic_information": {"customer_name": "Mehta Stores"},
@@ -4875,7 +4875,7 @@ def _phase1op_checks():
 
     print("\n== 7. Goods received in batches (Phase 1P) ==")
     batched = client.post("/products", headers=ah, json={
-        "name": "Milk 500ml", "price": 30, "total_inventory": 0,
+        "name": "Milk 500ml", "pricing": {"purchase_price": 20, "selling_price": 30}, "total_inventory": 0,
         "batch_tracking": True, "expiry_tracking": True, "barcode": "8909998887776"}).json()
     r = client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
         "product_id": batched["id"], "quantity": 50, "movement_type": "purchase_in",
@@ -4952,7 +4952,7 @@ def _phase1op_checks():
 
     print("\n== 10. Serial-tracked units ==")
     serialed = client.post("/products", headers=ah, json={
-        "name": "Water Purifier", "price": 8000, "total_inventory": 0,
+        "name": "Water Purifier", "pricing": {"purchase_price": 6000, "selling_price": 8000}, "total_inventory": 0,
         "serial_number_tracking": True}).json()
     r = client.post(f"/warehouses/{warehouse_id}/stock/adjust", headers=ah, json={
         "product_id": serialed["id"], "quantity": 3, "movement_type": "purchase_in",
@@ -5039,7 +5039,7 @@ def _phase1op_checks():
     check("the product code route still resolves a barcode",
           client.get(f"/products/8901234567890", headers=ah).json()["id"] == prod["id"])
     variant_product = client.post("/products", headers=ah, json={
-        "name": "Juice", "price": 60,
+        "name": "Juice", "pricing": {"purchase_price": 40, "selling_price": 60},
         "variations": [{"name": "1L", "price": 60, "barcode": "7771112223334"}]}).json()
     check("scanning a variant's barcode finds its product",
           [p["id"] for p in client.get("/products", headers=ah, params={
@@ -5074,7 +5074,7 @@ def _staff_overview_fleet_checks():
     veh = client.post("/vehicles", headers=ah, json={
         "vehicle_number": "MH 12 KL 9087", "vehicle_type": "Tempo", "capacity_kg": 1200}).json()
     prod = client.post("/products", headers=ah, json={
-        "name": "Jar 20L", "price": 60, "total_inventory": 50}).json()
+        "name": "Jar 20L", "pricing": {"purchase_price": 40, "selling_price": 60}, "total_inventory": 50}).json()
     cust = client.post("/customers", headers=ah, json={
         "basic_information": {"customer_name": "Corner Cafe"}}).json()
 
@@ -5226,7 +5226,7 @@ sec_acc = client.post("/users", headers=sec_admin_hdr, json={
 
 # Create Customer and Product
 sec_cust = client.post("/customers", headers=sec_admin_hdr, json={"name": "Sec Customer"}).json()
-sec_prod = client.post("/products", headers=sec_admin_hdr, json={"name": "Sec Widget", "price": 100, "total_inventory": 500}).json()
+sec_prod = client.post("/products", headers=sec_admin_hdr, json={"name": "Sec Widget", "pricing": {"purchase_price": 60, "selling_price": 100}, "total_inventory": 500}).json()
 
 # TEST 4: Sales Officer create without salesperson_id -> auto salesperson_id = current_user.id
 order_a_res = client.post("/orders", headers=so_a_hdr, json={
@@ -5405,7 +5405,7 @@ cust = client.post("/customers", headers=del_admin_hdr, json={
 
 # Create Product
 prod = client.post("/products", headers=del_admin_hdr, json={
-    "name": "Industrial Widget", "price": 250.0, "total_inventory": 100
+    "name": "Industrial Widget", "pricing": {"purchase_price": 150.0, "selling_price": 250.0}, "total_inventory": 100
 }).json()
 
 # Create Order
@@ -5620,6 +5620,251 @@ check("Unassigned delivery partner is null (no 500 error)", unassigned_dlv["deli
 check("Unassigned vehicle is null (no 500 error)", unassigned_dlv["vehicle"] is None)
 check("GET /deliveries/by-id/{id} for unassigned delivery -> 200",
       client.get(f"/deliveries/by-id/{unassigned_dlv['id']}", headers=del_admin_hdr).status_code == 200)
+print("\n== Product Pricing Information Object ==")
+# 1. Setup isolated organization for pricing tests
+prc_org = client.post("/auth/register", json={
+    "organization_name": "Pricing Master Org", "admin_name": "Price Admin",
+    "email": f"price_admin_{uuid.uuid4().hex[:6]}@prc.com", "password": "Secret@123"
+}).json()
+prc_hdr = {"Authorization": f"Bearer {prc_org['tokens']['access_token']}"}
+
+# 1.1 Creation with valid pricing -> success
+p_valid = client.post("/products", headers=prc_hdr, json={
+    "name": "Standard Widget",
+    "pricing": {
+        "purchase_price": 100.0,
+        "selling_price": 150.0
+    }
+})
+check("1.1 Product with valid pricing -> 201", p_valid.status_code == 201, p_valid.text)
+p_valid_data = p_valid.json()
+check("1.1 Response has pricing object", "pricing" in p_valid_data and p_valid_data["pricing"] is not None)
+check("1.1 Pricing purchase_price matches", p_valid_data["pricing"]["purchase_price"] == 100.0)
+check("1.1 Pricing selling_price matches", p_valid_data["pricing"]["selling_price"] == 150.0)
+check("1.1 Default currency matches INR (org currency fallback)", p_valid_data["pricing"]["currency"] == "INR")
+check("1.1 Default tax_inclusive is False", p_valid_data["pricing"]["tax_inclusive"] is False)
+
+# 1.2 Missing purchase_price -> accepted (defaults to 0.0)
+p_no_purch = client.post("/products", headers=prc_hdr, json={
+    "name": "No Purchase Price Widget",
+    "pricing": {
+        "selling_price": 150.0
+    }
+})
+check("1.2 Missing purchase_price -> 201", p_no_purch.status_code == 201, p_no_purch.text)
+check("1.2 purchase_price defaults to 0.0", p_no_purch.json()["pricing"]["purchase_price"] == 0.0)
+
+# 1.3 Missing selling_price -> accepted (defaults to 0.0)
+p_no_sell = client.post("/products", headers=prc_hdr, json={
+    "name": "No Selling Price Widget",
+    "pricing": {
+        "purchase_price": 100.0
+    }
+})
+check("1.3 Missing selling_price -> 201", p_no_sell.status_code == 201, p_no_sell.text)
+check("1.3 selling_price defaults to 0.0", p_no_sell.json()["pricing"]["selling_price"] == 0.0)
+
+# 1.4 purchase_price = 0 -> accepted (backend does not reject 0)
+p_zero_purch = client.post("/products", headers=prc_hdr, json={
+    "name": "Zero Purchase Price Widget",
+    "pricing": {
+        "purchase_price": 0.0,
+        "selling_price": 150.0
+    }
+})
+check("1.4 purchase_price = 0 -> 201", p_zero_purch.status_code == 201, p_zero_purch.text)
+check("1.4 purchase_price is 0.0", p_zero_purch.json()["pricing"]["purchase_price"] == 0.0)
+
+# 1.5 selling_price = 0 -> accepted (backend does not reject 0)
+p_zero_sell = client.post("/products", headers=prc_hdr, json={
+    "name": "Zero Selling Price Widget",
+    "pricing": {
+        "purchase_price": 100.0,
+        "selling_price": 0.0
+    }
+})
+check("1.5 selling_price = 0 -> 201", p_zero_sell.status_code == 201, p_zero_sell.text)
+check("1.5 selling_price is 0.0", p_zero_sell.json()["pricing"]["selling_price"] == 0.0)
+
+# 1.6 Negative purchase_price -> accepted (backend does not reject negative)
+p_neg_purch = client.post("/products", headers=prc_hdr, json={
+    "name": "Negative Purchase Price Widget",
+    "pricing": {
+        "purchase_price": -50.0,
+        "selling_price": 150.0
+    }
+})
+check("1.6 Negative purchase_price -> 201", p_neg_purch.status_code == 201, p_neg_purch.text)
+check("1.6 purchase_price is -50.0", p_neg_purch.json()["pricing"]["purchase_price"] == -50.0)
+
+# 1.7 Negative selling_price -> accepted (backend does not reject negative)
+p_neg_sell = client.post("/products", headers=prc_hdr, json={
+    "name": "Negative Selling Price Widget",
+    "pricing": {
+        "purchase_price": 100.0,
+        "selling_price": -150.0
+    }
+})
+check("1.7 Negative selling_price -> 201", p_neg_sell.status_code == 201, p_neg_sell.text)
+check("1.7 selling_price is -150.0", p_neg_sell.json()["pricing"]["selling_price"] == -150.0)
+
+# 1.8 Optional pricing fields omitted -> success
+p_opt_omit = client.post("/products", headers=prc_hdr, json={
+    "name": "Minimal Pricing Widget",
+    "pricing": {
+        "purchase_price": 45.0,
+        "selling_price": 75.0
+    }
+})
+check("1.8 Optional pricing fields omitted -> 201", p_opt_omit.status_code == 201, p_opt_omit.text)
+opt_data = p_opt_omit.json()["pricing"]
+check("1.8 mrp is None", opt_data["mrp"] is None)
+check("1.8 wholesale_price is None", opt_data["wholesale_price"] is None)
+check("1.8 dealer_price is None", opt_data["dealer_price"] is None)
+check("1.8 discount_percent is None", opt_data["discount_percent"] is None)
+
+# 1.9 Full pricing object -> success
+p_full = client.post("/products", headers=prc_hdr, json={
+    "name": "Full Pricing Widget",
+    "total_inventory": 100,
+    "pricing": {
+        "purchase_price": 100.00,
+        "selling_price": 150.00,
+        "mrp": 180.00,
+        "wholesale_price": 135.00,
+        "dealer_price": 125.00,
+        "discount_percent": 5.00,
+        "tax_inclusive": True,
+        "currency": "USD"
+    }
+})
+check("1.9 Full pricing object -> 201", p_full.status_code == 201, p_full.text)
+full_data = p_full.json()
+full_prc = full_data["pricing"]
+check("1.9 full pricing purchase_price", full_prc["purchase_price"] == 100.0)
+check("1.9 full pricing selling_price", full_prc["selling_price"] == 150.0)
+check("1.9 full pricing mrp", full_prc["mrp"] == 180.0)
+check("1.9 full pricing wholesale_price", full_prc["wholesale_price"] == 135.0)
+check("1.9 full pricing dealer_price", full_prc["dealer_price"] == 125.0)
+check("1.9 full pricing discount_percent", full_prc["discount_percent"] == 5.0)
+check("1.9 full pricing tax_inclusive", full_prc["tax_inclusive"] is True)
+check("1.9 full pricing currency", full_prc["currency"] == "USD")
+
+# 2. Response Structure: List and Detail responses
+p_detail = client.get(f"/products/{p_full.json()['id']}", headers=prc_hdr).json()
+check("2. Detail response contains pricing object", "pricing" in p_detail and p_detail["pricing"] is not None)
+check("2. Detail pricing mrp matches", p_detail["pricing"]["mrp"] == 180.0)
+check("2. Detail pricing wholesale matches", p_detail["pricing"]["wholesale_price"] == 135.0)
+check("2. Detail pricing dealer matches", p_detail["pricing"]["dealer_price"] == 125.0)
+check("2. Detail pricing discount_percent matches", p_detail["pricing"]["discount_percent"] == 5.0)
+
+p_list = client.get("/products", headers=prc_hdr).json()
+matched_item = next((item for item in p_list if item["id"] == p_full.json()["id"]), None)
+check("2. List response contains item", matched_item is not None)
+check("2. List response contains pricing object", "pricing" in matched_item and matched_item["pricing"] is not None)
+check("2. List pricing selling_price matches", matched_item["pricing"]["selling_price"] == 150.0)
+check("2. List pricing currency matches", matched_item["pricing"]["currency"] == "USD")
+
+# 3. Partial Update & Preservation of Omitted Pricing Fields
+patch_res = client.patch(f"/products/{p_full.json()['id']}", headers=prc_hdr, json={
+    "pricing": {
+        "selling_price": 160.0,
+        "discount_percent": 10.0
+    }
+})
+check("3. Partial pricing update -> 200", patch_res.status_code == 200, patch_res.text)
+patched_prc = patch_res.json()["pricing"]
+check("3. Updated selling_price is 160", patched_prc["selling_price"] == 160.0)
+check("3. Updated discount_percent is 10", patched_prc["discount_percent"] == 10.0)
+check("3. Preserved purchase_price is 100", patched_prc["purchase_price"] == 100.0)
+check("3. Preserved mrp is 180", patched_prc["mrp"] == 180.0)
+check("3. Preserved wholesale_price is 135", patched_prc["wholesale_price"] == 135.0)
+check("3. Preserved dealer_price is 125", patched_prc["dealer_price"] == 125.0)
+check("3. Preserved tax_inclusive is True", patched_prc["tax_inclusive"] is True)
+check("3. Preserved currency is USD", patched_prc["currency"] == "USD")
+check("3. Backward-compatible product.price updated to 160", patch_res.json()["price"] == 160.0)
+
+# 4. Update without pricing does not disturb existing pricing
+patch_no_prc = client.patch(f"/products/{p_full.json()['id']}", headers=prc_hdr, json={
+    "description": "Updated description only"
+})
+check("4. Update non-pricing field -> 200", patch_no_prc.status_code == 200)
+check("4. Pricing unchanged after non-pricing patch", patch_no_prc.json()["pricing"]["selling_price"] == 160.0)
+check("4. Pricing mrp unchanged", patch_no_prc.json()["pricing"]["mrp"] == 180.0)
+
+# 5. Backward Compatibility with Sales Orders & Quotations & Invoices
+prc_cust = client.post("/customers", headers=prc_hdr, json={"name": "Pricing Buyer"}).json()
+prc_quote = client.post("/quotations", headers=prc_hdr, json={
+    "customer_id": prc_cust["id"],
+    "items": [{"product_id": p_full.json()["id"], "quantity": 2, "unit_price": 160.0}]
+}).json()
+check("5. Quotation created with product -> 201", prc_quote.get("id") is not None)
+check("5. Quotation total matches", prc_quote["total"] == 320.0)
+
+prc_conv = client.post(f"/quotations/{prc_quote['id']}/convert-to-order", headers=prc_hdr, json={}).json()
+check("5. Quotation converted to order", prc_conv["quotation_status"] == "converted")
+prc_order_id = prc_conv["order"]["id"]
+
+client.patch("/sales-workflow-settings", headers=prc_hdr, json={"invoice_timing": "on_order"})
+prc_inv = client.post(f"/orders/{prc_order_id}/invoice", headers=prc_hdr).json()
+check("5. Invoice generated from order -> total 320", prc_inv["total"] == 320.0)
+client.patch("/sales-workflow-settings", headers=prc_hdr, json={"invoice_timing": "after_delivery"})
+
+# 6. Database Cascade Deletion & Relationship
+from app.core.database import SessionLocal as _PrcSession
+from app.models.product import Product as _PProduct, ProductPricing as _PProductPricing
+
+_pdb = _PrcSession()
+try:
+    p_db = _pdb.query(_PProduct).filter(_PProduct.id == p_valid_data["id"]).first()
+    check("6. Product relationship to ProductPricing exists in DB", p_db.pricing is not None)
+    check("6. DB pricing purchase_price matches", p_db.pricing.purchase_price == 100.0)
+    pricing_id = p_db.pricing.id
+finally:
+    _pdb.close()
+
+# Delete product and ensure ProductPricing is cascade deleted
+del_p_res = client.delete(f"/products/{p_valid_data['id']}", headers=prc_hdr)
+check("6. Delete product -> 204", del_p_res.status_code == 204)
+
+_pdb = _PrcSession()
+try:
+    p_prc_db = _pdb.query(_PProductPricing).filter(_PProductPricing.id == pricing_id).first()
+    check("6. ProductPricing record cascade deleted with Product", p_prc_db is None)
+finally:
+    _pdb.close()
+
+# 7. Test backfill_product_pricing() migration service
+from app.services.product_pricing_service import backfill_product_pricing as _backfill_pricing
+
+_pdb = _PrcSession()
+try:
+    # Create legacy product without pricing
+    legacy_p = _PProduct(
+        id=str(uuid.uuid4()),
+        organization_id=prc_org["organization"]["id"],
+        name="Legacy Unpriced Product",
+        price=88.0,
+        total_inventory=10
+    )
+    _pdb.add(legacy_p)
+    _pdb.commit()
+    legacy_pid = legacy_p.id
+finally:
+    _pdb.close()
+
+# Run backfill
+_backfill_pricing()
+
+_pdb = _PrcSession()
+try:
+    migrated_p = _pdb.query(_PProduct).filter(_PProduct.id == legacy_pid).first()
+    check("7. Legacy product migrated with ProductPricing record", migrated_p.pricing is not None)
+    check("7. Migrated selling_price matches legacy price", migrated_p.pricing.selling_price == 88.0)
+    check("7. Migrated purchase_price matches legacy price", migrated_p.pricing.purchase_price == 88.0)
+    check("7. Migrated currency matches org currency or INR", migrated_p.pricing.currency == "INR")
+finally:
+    _pdb.close()
 
 
 print("\n== auto-migration adds missing columns to an existing table ==")

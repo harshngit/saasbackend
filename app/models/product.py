@@ -154,6 +154,9 @@ class Product(Base):
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
     )
 
+    pricing: Mapped["ProductPricing | None"] = relationship(
+        back_populates="product", cascade="all, delete-orphan", uselist=False, lazy="joined"
+    )
     variations: Mapped[list["ProductVariant"]] = relationship(
         back_populates="product", cascade="all, delete-orphan", lazy="joined"
     )
@@ -170,6 +173,33 @@ class Product(Base):
         if self.variations:
             return sum(v.inventory or 0 for v in self.variations)
         return self.total_inventory or 0
+
+
+class ProductPricing(Base):
+    """Pricing information object for a product (one-to-one)."""
+
+    __tablename__ = "product_pricing"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    product_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("products.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+    )
+
+    purchase_price: Mapped[float] = mapped_column(Float, nullable=False)
+    selling_price: Mapped[float] = mapped_column(Float, nullable=False)
+    mrp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wholesale_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dealer_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tax_inclusive: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    product: Mapped["Product"] = relationship(back_populates="pricing")
 
 
 class ProductVariant(Base):
