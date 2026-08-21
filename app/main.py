@@ -101,7 +101,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "startup-survives-db-outage"
+BUILD_TAG = "variant-upsert-and-guarded-delete"
 
 
 @app.on_event("startup")

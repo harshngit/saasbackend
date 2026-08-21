@@ -335,8 +335,11 @@ def update_product(
         if product.pricing and product.pricing.selling_price is not None:
             product.price = product.pricing.selling_price
 
-    # Variants replacement/upsert behavior: None = no-op; [] or list = replace variant set
-    # (updating existing by id, creating new, and deleting omitted).
+    # Variants are UPSERTED, never replaced: a variant named by id is updated in place
+    # and keeps that id, one with no id is created, and one simply left out of the
+    # payload is left alone. Editing a product must not silently delete a variant that
+    # inventory, reservations, orders, deliveries, invoices or serial/batch records
+    # already point at -- deleting one is its own explicit, guarded action below.
     if variations is not None:
         seen_ids: set[str] = set()
         new_variants_list: list[ProductVariant] = []
@@ -363,7 +366,11 @@ def update_product(
                 variant = ProductVariant(product_id=product.id, **new_data)
                 new_variants_list.append(variant)
 
-        product.variations = new_variants_list
+        # Whatever the payload did not mention stays exactly as it was: the variants
+        # it named are in new_variants_list (updated in place, same ids), and these are
+        # the rest.
+        untouched = [v for v in product.variations if v.id not in seen_ids]
+        product.variations = untouched + new_variants_list
 
         if "has_variants" not in data:
             product.has_variants = bool(product.variations)
@@ -371,6 +378,82 @@ def update_product(
     db.commit()
     db.refresh(product)
     return product
+
+
+# What a variant id can already be referenced by. Deleting a variant those records
+# point at would orphan them -- a delivered order line whose variant no longer exists
+# can no longer say what was delivered -- so deletion is refused while any remain.
+_VARIANT_REFERENCES: list[tuple[str, str]] = [
+    ("SalesOrderItem", "an order"),
+    ("QuotationItem", "a quotation"),
+    ("DeliveryItem", "a delivery"),
+    ("InvoiceItem", "an invoice"),
+    ("PurchaseInvoiceItem", "a purchase invoice"),
+    ("ReturnItem", "a sales return"),
+    ("VehicleLoadingItem", "a vehicle loading"),
+    ("StockReservation", "a stock reservation"),
+    ("StockMovement", "a stock movement"),
+    ("StockBatch", "a batch"),
+    ("ProductSerial", "a serial number"),
+]
+
+
+def _variant_in_use(db: Session, variant_id: str) -> list[str]:
+    """Which kinds of record still point at this variant."""
+    from app import models
+
+    found = []
+    for model_name, label in _VARIANT_REFERENCES:
+        model = getattr(models, model_name, None)
+        if model is None or not hasattr(model, "variant_id"):
+            continue
+        if db.query(model).filter(model.variant_id == variant_id).first() is not None:
+            found.append(label)
+    return found
+
+
+@router.delete("/{product_id}/variants/{variant_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_product_variant(
+    product_id: str,
+    variant_id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    """Delete one variant of a product -- deliberately its own action.
+
+    Editing a product never removes a variant, however short the `variations` list is,
+    because a variant id is referenced by inventory, reservations, orders, deliveries,
+    invoices and serial/batch records. Removing one that anything still points at would
+    orphan those records, so this refuses with 409 and names what is holding it. A
+    variant that is no longer wanted but already has history belongs deactivated on the
+    product, not deleted.
+    """
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
+    variant = db.get(ProductVariant, variant_id)
+    if variant is None or variant.product_id != product.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Variant not found on this product"
+        )
+
+    used_by = _variant_in_use(db, variant.id)
+    if used_by:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This variant is already referenced by "
+                + ", ".join(sorted(set(used_by)))
+                + ". Deleting it would orphan those records."
+            ),
+        )
+
+    db.delete(variant)
+    db.flush()
+    product.has_variants = bool(
+        [v for v in product.variations if v.id != variant.id]
+    )
+    db.commit()
 
 
 @router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
