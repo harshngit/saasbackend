@@ -19,13 +19,18 @@ from app.models import (
     Delivery,
     DeliveryItem,
 )
-from app.services import delivery_service, numbering_service
+from app.services import delivery_service, notification_service, numbering_service
 from app.schemas.delivery import (
     DeliveryConfirm,
+    DeliveryCustomerBrief,
     DeliveryOut,
+    DeliveryPartnerBrief,
+    DeliveryPickBody,
     DeliveryPlanCreate,
     DeliveryPlanUpdate,
+    DeliveryRejectBody,
     DeliveryStatusUpdate,
+    VehicleBrief,
 )
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
@@ -101,10 +106,22 @@ def _delivery_out(db: Session, delivery: Delivery) -> DeliveryOut:
     out = DeliveryOut.model_validate(delivery)
     for key, value in delivery_service.sync_delivery_view(db, delivery).items():
         setattr(out, key, value)
-    out.vehicle = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
-    out.delivery_partner = (
+
+    cust = delivery.customer
+    if cust is None and delivery.customer_id:
+        cust = db.get(Customer, delivery.customer_id)
+    if cust is None and delivery.sales_order and delivery.sales_order.customer:
+        cust = delivery.sales_order.customer
+    out.customer = DeliveryCustomerBrief.model_validate(cust) if cust else None
+
+    veh = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
+    out.vehicle = VehicleBrief.model_validate(veh) if veh else None
+
+    partner = (
         db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
     )
+    out.delivery_partner = DeliveryPartnerBrief.model_validate(partner) if partner else None
+
     return out
 
 
@@ -132,14 +149,10 @@ def plan_delivery(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="order_id is not an order in your firm"
         )
-    if order.status == "cancelled":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="This order was cancelled"
-        )
-    if order.status == "awaiting_approval":
+    if order.status in ("draft", "awaiting_approval", "cancelled", "pending", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This order is still awaiting approval",
+            detail="Order must be confirmed before delivery can be planned",
         )
 
     partner = None
@@ -172,6 +185,19 @@ def plan_delivery(
             if payload.items is not None else None
         ),
     )
+    if partner is not None:
+        try:
+            notification_service.notify(
+                db,
+                user_id=partner.id,
+                title="New delivery assigned",
+                body=f"Delivery {delivery.delivery_number} needs your acceptance",
+                type="delivery",
+                link=delivery.id,
+                organization_id=org_id,
+            )
+        except Exception:
+            pass
     db.commit()
     db.refresh(delivery)
     return _delivery_out(db, delivery)
@@ -206,6 +232,81 @@ def list_deliveries(
     return [
         _delivery_out(db, d) for d in query.order_by(Delivery.created_at.desc()).all()
     ]
+
+
+@router.post("/{delivery_id}/pick", response_model=DeliveryOut)
+def pick_items(
+    delivery_id: str,
+    payload: DeliveryPickBody,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Record picked quantities for a delivery (warehouse picking). This is a
+    preparatory step: it does not move stock, only records how many units were
+    picked from shelves for each delivery item.
+    """
+    delivery = _owned_delivery(db, delivery_id, user)
+    if delivery.status != "accepted":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Delivery must be accepted before picking",
+        )
+
+    # Map items by id for quick lookup
+    items_by_id = {i.id: i for i in delivery.items}
+    any_changed = False
+    for it in payload.items:
+        di = items_by_id.get(it.delivery_item_id)
+        if di is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown delivery_item_id: {it.delivery_item_id}")
+        if it.picked_quantity < 0 or it.picked_quantity > (di.planned_quantity or 0):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid picked_quantity for item {it.delivery_item_id}")
+        if di.picked_quantity != it.picked_quantity:
+            di.picked_quantity = it.picked_quantity
+            any_changed = True
+
+    # Update picking_status
+    if any(i.picked_quantity and i.picked_quantity > 0 for i in delivery.items):
+        if all((i.picked_quantity or 0) >= (i.planned_quantity or 0) for i in delivery.items):
+            delivery.picking_status = "picked"
+        else:
+            delivery.picking_status = "picking"
+    else:
+        delivery.picking_status = "not_started"
+
+    db.commit()
+    db.refresh(delivery)
+    return _delivery_out(db, delivery)
+
+
+@router.post("/{delivery_id}/ready", response_model=DeliveryOut)
+def mark_ready(
+    delivery_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Mark a delivery as `ready` once picking is complete. This moves the
+    delivery into the `ready` lifecycle step — loading may only proceed from
+    `ready`.
+    """
+    delivery = _owned_delivery(db, delivery_id, user)
+    if delivery.status != "accepted":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Can only mark accepted deliveries as ready",
+        )
+    if delivery.picking_status != "picked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="All items must be fully picked before marking ready",
+        )
+
+    delivery.status = "ready"
+    db.commit()
+    db.refresh(delivery)
+    return _delivery_out(db, delivery)
 
 
 @router.get("/by-id/{delivery_id}", response_model=DeliveryOut)
@@ -272,15 +373,81 @@ def update_delivery(
             )
         delivery.status = "cancelled"
     elif new_status == "planned":
-        if delivery.status not in ("planned", "loaded"):
+        if delivery.status == "rejected":
+            partner_id = data.get("delivery_partner_id") or delivery.delivery_partner_id
+            if not partner_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="A new delivery partner is required to reassign a rejected delivery",
+                )
+            delivery.status = "planned"
+            new_partner = db.get(User, partner_id)
+            if new_partner:
+                try:
+                    notification_service.notify(
+                        db,
+                        user_id=new_partner.id,
+                        title="New delivery assigned",
+                        body=f"Delivery {delivery.delivery_number} has been reassigned to you",
+                        type="delivery",
+                        link=delivery.id,
+                        organization_id=org_id,
+                    )
+                except Exception:
+                    pass
+        elif delivery.status not in ("planned", "loaded"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"A '{delivery.status}' delivery cannot go back to planned",
             )
-        delivery.status = "planned"
+        else:
+            delivery.status = "planned"
 
     db.commit()
     db.refresh(delivery)
+    return _delivery_out(db, delivery)
+
+
+@router.post("/{delivery_id}/accept", response_model=DeliveryOut)
+def accept_delivery(
+    delivery_id: str,
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Accept a planned delivery. Partner-specific action that marks status as accepted."""
+    delivery = _owned_delivery(db, delivery_id, user)
+    delivery_service.accept(db, user, delivery)
+    db.commit()
+    db.refresh(delivery)
+    return _delivery_out(db, delivery)
+
+
+@router.post("/{delivery_id}/reject", response_model=DeliveryOut)
+def reject_delivery(
+    delivery_id: str,
+    payload: DeliveryRejectBody = DeliveryRejectBody(),
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryOut:
+    """Reject a planned delivery. Partner-specific action that clears partner & vehicle and notifies admins."""
+    delivery = _owned_delivery(db, delivery_id, user)
+    delivery_service.reject(db, user, delivery, reason=payload.reason if payload else None)
+    db.commit()
+    db.refresh(delivery)
+    try:
+        notification_service.notify_org_admins(
+            db,
+            organization_id=delivery.organization_id,
+            title="Delivery rejected",
+            body=f"{delivery.delivery_number} was rejected by the partner — needs reassignment",
+            type="delivery",
+            link=delivery.id,
+        )
+        db.commit()
+    except Exception:
+        pass
     return _delivery_out(db, delivery)
 
 

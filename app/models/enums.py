@@ -76,3 +76,13 @@ class BillingCycle(str, enum.Enum):
 
 # Statuses where data-mutation endpoints are blocked (read-only + upgrade allowed).
 LOCKED_STATUSES = {OrganizationStatus.LOCKED, OrganizationStatus.SUSPENDED, OrganizationStatus.INACTIVE}
+
+
+class ProductStatus(str, enum.Enum):
+    """Lifecycle status of a catalog product. Kept in sync with `Product.is_active`
+    (ACTIVE -> True, anything else -> False) so existing is_active-based checks
+    (filters, order/quotation flows) keep working unchanged."""
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    DISCONTINUED = "discontinued"

@@ -9,9 +9,13 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
 from app.models import (
+    Brand,
     Category,
+    Organization,
     Product,
+    ProductPricing,
     ProductSerial,
+    ProductStatus,
     ProductVariant,
     StockBatch,
     Supplier,
@@ -73,6 +77,14 @@ def _validate_supplier(db: Session, org_id: str, supplier_id: str | None) -> Non
         )
 
 
+def _validate_brand(db: Session, org_id: str, brand_id: str | None) -> None:
+    if brand_id is None:
+        return
+    brand = db.get(Brand, brand_id)
+    if brand is None or brand.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id is not a brand in your firm")
+
+
 def _build_variants(variations: list[VariantIn]) -> list[ProductVariant]:
     return [ProductVariant(**v.model_dump()) for v in variations]
 
@@ -86,17 +98,46 @@ def create_product(
 ) -> Product:
     org_id = _org_id(user)
     _validate_category(db, org_id, payload.category_id)
+    _validate_category(db, org_id, payload.sub_category_id)
     _validate_supplier(db, org_id, payload.preferred_supplier_id)
+    _validate_brand(db, org_id, payload.brand_id)
     data = payload.model_dump()
     variations = data.pop("variations")
     has_variants = data.pop("has_variants")
+    pricing_data = data.pop("pricing", None) or {}
+    # Plain string in the DB regardless of the enum wrapper Pydantic hands back.
+    data["status"] = ProductStatus(data["status"]).value
+
+    # Default currency from organization if not provided
+    if not pricing_data.get("currency"):
+        org = db.get(Organization, org_id)
+        pricing_data["currency"] = (org.currency if org and org.currency else "INR")
+
     data.setdefault("product_id", None)
     if not data.get("product_id"):
         data["product_id"] = numbering_service.next_number(db, org_id, Product.product_id, "PROD")
+
+    # Sync price on Product model with selling_price for backward compatibility
+    selling_p = pricing_data.get("selling_price", 0.0)
+    purchase_p = pricing_data.get("purchase_price", 0.0)
+    data["price"] = selling_p
     product = Product(organization_id=org_id, **data)
     product.variations = _build_variants([VariantIn(**v) for v in variations])
     # Left unset, the toggle just follows whether variants were actually sent.
     product.has_variants = bool(variations) if has_variants is None else has_variants
+    # Keep the legacy is_active boolean in sync with the new status field.
+    product.is_active = product.status == ProductStatus.ACTIVE.value
+
+    product.pricing = ProductPricing(
+        purchase_price=purchase_p,
+        selling_price=selling_p,
+        mrp=pricing_data.get("mrp"),
+        wholesale_price=pricing_data.get("wholesale_price"),
+        dealer_price=pricing_data.get("dealer_price"),
+        discount_percent=pricing_data.get("discount_percent"),
+        tax_inclusive=pricing_data.get("tax_inclusive", False),
+        currency=pricing_data.get("currency"),
+    )
     db.add(product)
     db.commit()
     db.refresh(product)
@@ -130,8 +171,11 @@ def list_products(
         default=None, description="Exact barcode — what a scanner sends. Matches a variant's too"
     ),
     category_id: str | None = Query(default=None),
+    sub_category_id: str | None = Query(default=None),
+    brand_id: str | None = Query(default=None),
     preferred_supplier_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status", description="active | inactive | discontinued"),
     db: Session = Depends(get_db),
 ) -> list[Product]:
     org_id = _org_id(user)
@@ -162,10 +206,16 @@ def list_products(
         )
     if category_id is not None:
         query = query.filter(Product.category_id == category_id)
+    if sub_category_id is not None:
+        query = query.filter(Product.sub_category_id == sub_category_id)
+    if brand_id is not None:
+        query = query.filter(Product.brand_id == brand_id)
     if preferred_supplier_id is not None:
         query = query.filter(Product.preferred_supplier_id == preferred_supplier_id)
     if is_active is not None:
         query = query.filter(Product.is_active == is_active)
+    if status_filter is not None:
+        query = query.filter(Product.status == status_filter)
     return query.order_by(Product.created_at.desc()).all()
 
 
@@ -239,17 +289,85 @@ def update_product(
     data = payload.model_dump(exclude_unset=True)
     if "category_id" in data:
         _validate_category(db, org_id, data["category_id"])
+    if "sub_category_id" in data:
+        _validate_category(db, org_id, data["sub_category_id"])
     if "preferred_supplier_id" in data:
         _validate_supplier(db, org_id, data["preferred_supplier_id"])
+    if "brand_id" in data:
+        _validate_brand(db, org_id, data["brand_id"])
     variations = data.pop("variations", None)
+    pricing_data = data.pop("pricing", None)
     if data.get("has_variants") is None:
         data.pop("has_variants", None)  # NOT NULL column — never write a null into it
+    if "status" in data:
+        data["status"] = ProductStatus(data["status"]).value
     for field, value in data.items():
         setattr(product, field, value)
-    if variations is not None:  # full replace of the variant set
-        product.variations = _build_variants([VariantIn(**v) for v in variations])
+
+    # Keep is_active and status in sync when only one of the two was supplied.
+    if "status" in data and "is_active" not in data:
+        product.is_active = product.status == ProductStatus.ACTIVE.value
+    elif "is_active" in data and "status" not in data:
+        product.status = ProductStatus.ACTIVE.value if product.is_active else ProductStatus.INACTIVE.value
+
+    if pricing_data is not None:
+        if product.pricing is None:
+            p_price = pricing_data.get("purchase_price", 0.0) if pricing_data.get("purchase_price") is not None else 0.0
+            s_price = pricing_data.get("selling_price", 0.0) if pricing_data.get("selling_price") is not None else product.price or 0.0
+            if not pricing_data.get("currency"):
+                org = db.get(Organization, org_id)
+                pricing_data["currency"] = (org.currency if org and org.currency else "INR")
+            product.pricing = ProductPricing(
+                product_id=product.id,
+                purchase_price=p_price,
+                selling_price=s_price,
+                mrp=pricing_data.get("mrp"),
+                wholesale_price=pricing_data.get("wholesale_price"),
+                dealer_price=pricing_data.get("dealer_price"),
+                discount_percent=pricing_data.get("discount_percent"),
+                tax_inclusive=pricing_data.get("tax_inclusive", False),
+                currency=pricing_data.get("currency"),
+            )
+        else:
+            for p_field, p_value in pricing_data.items():
+                if p_value is not None:
+                    setattr(product.pricing, p_field, p_value)
+        if product.pricing and product.pricing.selling_price is not None:
+            product.price = product.pricing.selling_price
+
+    # Variants replacement/upsert behavior: None = no-op; [] or list = replace variant set
+    # (updating existing by id, creating new, and deleting omitted).
+    if variations is not None:
+        seen_ids: set[str] = set()
+        new_variants_list: list[ProductVariant] = []
+        for v in variations:
+            # Validate payload shape using VariantIn
+            vobj = VariantIn(**v)
+            vid = vobj.id
+            if vid:
+                if vid in seen_ids:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="duplicate variant id in payload")
+                seen_ids.add(vid)
+                variant = db.get(ProductVariant, vid)
+                if variant is None or variant.product_id != product.id:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="variant id not found or does not belong to this product")
+                # Update only fields provided in the incoming dict
+                for key, val in v.items():
+                    if key == "id":
+                        continue
+                    setattr(variant, key, val)
+                new_variants_list.append(variant)
+            else:
+                # Create new variant and attach to the product
+                new_data = {k: val for k, val in v.items() if k != "id"}
+                variant = ProductVariant(product_id=product.id, **new_data)
+                new_variants_list.append(variant)
+
+        product.variations = new_variants_list
+
         if "has_variants" not in data:
-            product.has_variants = bool(variations)
+            product.has_variants = bool(product.variations)
+
     db.commit()
     db.refresh(product)
     return product

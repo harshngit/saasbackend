@@ -41,12 +41,29 @@ class VehicleLoadingItemOut(BaseModel):
     delivered_qty: int
 
 
+class VehiclePartnerBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+
+
+class VehicleBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    vehicle_number: str
+    vehicle_type: str | None = None
+    capacity_kg: float | None = None
+
+
 class VehicleLoadingOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     organization_id: str
     delivery_partner_id: str
+    delivery_partner: VehiclePartnerBrief | None = None
+    vehicle_id: str | None = None
+    vehicle: VehicleBrief | None = None
     date: datetime
     status: str
     items: list[VehicleLoadingItemOut]

@@ -21,6 +21,10 @@ class DeliveryStatusUpdate(BaseModel):
         return self
 
 
+class DeliveryRejectBody(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class DeliveryItemBase(BaseModel):
     product_id: str | None = None
     variant_id: str | None = None
@@ -56,12 +60,18 @@ class DeliveryCustomerBrief(BaseModel):
     id: str
     name: str
     business_name: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    delivery_address: str | None = None
 
 
 class DeliveryOrderBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     order_number: str
+    status: str | None = None
+    fulfilment_status: str | None = None
+    total: float | None = None
 
 
 class DeliveryNoteOut(DeliveryNoteBase):
@@ -113,6 +123,15 @@ class DeliveryPlanCreate(BaseModel):
     items: list[DeliveryPlanItem] | None = None
 
 
+class DeliveryPickItem(BaseModel):
+    delivery_item_id: str
+    picked_quantity: float = Field(gt=0)
+
+
+class DeliveryPickBody(BaseModel):
+    items: list[DeliveryPickItem]
+
+
 class DeliveryPlanUpdate(BaseModel):
     """Re-plan or dispatch a delivery. Only the fields you send change.
 
@@ -141,21 +160,30 @@ class DeliveryLineOut(BaseModel):
     variant_id: str | None = None
     product_name: str
     planned_quantity: float = 0
+    picked_quantity: float = 0
     loaded_quantity: float = 0
     delivered_quantity: float = 0
     pending_quantity: float = 0
+    batch_number: str | None = None
+    expiry_date: datetime | None = None
+    serial_numbers: list | None = None
 
 
 class DeliveryPartnerBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     name: str
+    phone: str | None = None
+    email: str | None = None
+    employee_id: str | None = None
 
 
 class VehicleBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     vehicle_number: str
+    vehicle_type: str | None = None
+    capacity_kg: float | None = None
 
 
 class DeliveryPod(BaseModel):
@@ -173,6 +201,10 @@ class DeliveryOut(BaseModel):
     delivery_number: str = Field(description="Human code, DLV-… / DN-…")
     order_id: str | None = None
     order_number: str | None = None
+    order_status: str | None = None
+    order_total: float | None = None
+    fulfilment_status: str | None = None
+    order: DeliveryOrderBrief | None = None
     customer_id: str | None = None
     customer: DeliveryCustomerBrief | None = None
     delivery_partner_id: str | None = None
@@ -185,6 +217,7 @@ class DeliveryOut(BaseModel):
     status: str = Field(
         description="planned | loaded | in_transit | partially_delivered | delivered | "
                     "failed | cancelled")
+    picking_status: str = "not_started"
     dispatched_at: datetime | None = None
     dispatched_by_id: str | None = None
     confirmed_at: datetime | None = None

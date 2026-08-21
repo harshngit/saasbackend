@@ -15,6 +15,7 @@ class LedgerSummary(BaseModel):
         default=0, description="Credit limit less what is outstanding, never below zero"
     )
     overdue_amount: float = Field(default=0, description="Of the outstanding, what is past its due date")
+    overdue: float = Field(default=0, description="Same as overdue_amount")
 
 
 class LedgerAgeing(BaseModel):
@@ -36,6 +37,7 @@ class LedgerTransaction(BaseModel):
     """One line of the account. A debit is what the customer owes, a credit what they
     have settled — an invoice debits, a payment or a credit note credits."""
 
+    id: str | None = None
     type: str = Field(description="invoice | payment | credit_note | opening_balance")
     reference_id: str | None = None
     reference_number: str | None = None
@@ -44,6 +46,7 @@ class LedgerTransaction(BaseModel):
     debit: float = 0
     credit: float = 0
     balance: float = Field(default=0, description="The running balance after this line")
+    balance_after: float = Field(default=0, description="The running balance after this line (synonym for balance)")
     due_date: datetime | None = None
     status: str | None = None
 

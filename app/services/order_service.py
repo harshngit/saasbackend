@@ -91,8 +91,13 @@ def place_order(
     order_level_tax: float = 0,
     notes: str | None = None,
     order_status_label: str | None = None,
+    create_as_draft: bool = False,
 ) -> tuple[SalesOrder, list[str]]:
     """Validate, price, reserve and place. Returns the order and any warnings.
+
+    If `create_as_draft` is True this creates a draft order: products and prices
+    are validated and snapshot, but no stock shortage check or reservation is
+    performed, no credit warnings generated and no admin notification sent.
 
     Does not commit — the caller owns the transaction, so converting a quotation can
     mark it converted in the same one.
@@ -118,9 +123,9 @@ def place_order(
         order_date=order_date or datetime.now(timezone.utc),
         salesperson_id=salesperson_id,
         order_status=order_status_label or "Draft",
-        # Placed straight away — an Admin is not a step in every sale. A firm that
-        # turns order_requires_approval on gets the awaiting-approval gate.
-        status="awaiting_approval" if settings["order_requires_approval"] else "placed",
+        # If creating as a draft, set the lifecycle to draft and do not reserve.
+        # Otherwise preserve existing behaviour: placed or awaiting_approval.
+        status="draft" if create_as_draft else ("awaiting_approval" if settings["order_requires_approval"] else "placed"),
         fulfilment_status="not_started",
         warehouse_id=warehouse.id,
         quotation_id=quotation_id,
@@ -185,9 +190,9 @@ def place_order(
             }
         )
 
-    # Can the warehouse actually cover it? `available` is on-hand less what other
-    # orders already hold, so this is the check that stops overselling.
-    if not settings["allow_backorder"]:
+    # Can the warehouse actually cover it? When creating a draft we skip this
+    # check; it will run at confirm time.
+    if not create_as_draft and not settings["allow_backorder"]:
         short = stock_service.shortages(db, warehouse.id, wanted)
         if short:
             raise HTTPException(
@@ -202,24 +207,106 @@ def place_order(
     order.total = round(order.subtotal - order_level_discount + order.tax, 2)
 
     warnings = []
-    credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
-    if credit:
-        warnings.append(credit)
+    # Credit warnings are deferred for drafts until confirm time.
+    if not create_as_draft:
+        credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
+        if credit:
+            warnings.append(credit)
 
     db.add(order)
     db.flush()
 
-    # Hold the stock. Nothing physical moves — on-hand only drops when a vehicle is
-    # loaded, so cancelling this order is a release, not an invented stock-in.
-    if settings["reserve_stock_on_order"]:
+    # Hold the stock. For drafts we skip reservation until confirm time.
+    if not create_as_draft and settings["reserve_stock_on_order"]:
         for reservation in stock_service.reserve_for_order(db, order, warehouse.id):
             item = db.get(SalesOrderItem, reservation.order_item_id)
             if item is not None:
                 item.reserved_quantity = reservation.reserved_quantity
         order.fulfilment_status = "reserved"
 
+    # Notify admins only for actual placed/awaiting orders, not drafts.
+    if not create_as_draft:
+        notification_service.notify_org_admins(
+            db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
+            type="order", link=order.id,
+        )
+    return order, warnings
+
+
+def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrder, list[str]]:
+    """Confirm a previously-created draft order: validate, check shortages,
+    reserve stock, set lifecycle status and generate warnings.
+
+    Does not commit.
+    """
+    org_id = order.organization_id
+    settings = workflow.sales_settings(user.organization)
+    if order.status != "draft":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only a draft order may be confirmed (this is '{order.status}')"
+        )
+
+    # Re-validate customer
+    customer = db.get(Customer, order.customer_id) if order.customer_id else None
+    if customer is None or customer.organization_id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Order's customer not found in your firm"
+        )
+
+    # Re-validate products/variants and build wanted list
+    wanted: list[dict] = []
+    for item in order.items:
+        product = db.get(Product, item.product_id)
+        if product is None or product.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="An item's product is not in your firm"
+            )
+        if item.variant_id:
+            variant = db.get(ProductVariant, item.variant_id)
+            if variant is None or variant.product_id != product.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="An item's variant is invalid"
+                )
+        wanted.append({
+            "product_id": item.product_id,
+            "variant_id": item.variant_id,
+            "quantity": item.quantity,
+            "product_name": product.name,
+        })
+
+    # Stock shortages
+    if not settings["allow_backorder"]:
+        short = stock_service.shortages(db, order.warehouse_id, wanted)
+        if short:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "INSUFFICIENT_STOCK", "shortages": short}
+            )
+
+    # Reserve
+    if settings["reserve_stock_on_order"]:
+        for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
+            item = db.get(SalesOrderItem, reservation.order_item_id)
+            if item is not None:
+                item.reserved_quantity = reservation.reserved_quantity
+        order.fulfilment_status = "reserved"
+
+    # Lifecycle status
+    order.status = "awaiting_approval" if settings["order_requires_approval"] else "placed"
+
+    # Credit warnings
+    warnings: list[str] = []
+    credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
+    if credit:
+        warnings.append(credit)
+
+    # Notify admins
     notification_service.notify_org_admins(
-        db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
+        db, org_id, "Sales order confirmed", f"{order.order_number} — Rs {order.total:,.2f}",
         type="order", link=order.id,
     )
     return order, warnings

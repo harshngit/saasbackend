@@ -4,6 +4,7 @@ from app.models.enums import (
     LOCKED_STATUSES,
     OrganizationStatus,
     PlanTier,
+    ProductStatus,
     STAFF_ROLE_NAME,
     STAFF_ROLES,
     SystemRole,
@@ -13,6 +14,7 @@ from app.models.enums import (
 )
 from app.models.activity_log import ActivityLog
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
+from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer, CustomerDocument, CustomerPayment
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense
@@ -29,7 +31,7 @@ from app.models.purchase_invoice import (
 from app.models.sales_order import ORDER_STATUSES, SalesOrder, SalesOrderItem
 from app.models.password_reset_token import PasswordResetToken
 from app.models.plan import Plan
-from app.models.product import Product, ProductVariant
+from app.models.product import Product, ProductPricing, ProductVariant
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role
 from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
@@ -65,7 +67,10 @@ __all__ = [
     "Customer",
     "CustomerDocument",
     "Category",
+    "Brand",
     "Product",
+    "ProductPricing",
+    "ProductStatus",
     "ProductVariant",
     "ProductSerial",
     "StockBatch",

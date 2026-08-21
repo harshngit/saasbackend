@@ -72,7 +72,6 @@ SALES_WORKFLOW_DEFAULTS: dict[str, object] = {
     "allow_partial_delivery": True,
     # Refuse to place an order the warehouse cannot cover.
     "allow_backorder": False,
-    "invoice_timing": "after_delivery",        # after_delivery | on_order
     "allow_direct_invoice": True,
     # What to do when an order would take a customer past their credit limit.
     "credit_limit_action": "warn",             # warn | block | ignore
@@ -81,8 +80,12 @@ SALES_WORKFLOW_DEFAULTS: dict[str, object] = {
     "partial_delivery_invoice_mode": "per_delivery",  # per_delivery | after_full_order
 }
 
+# When True, `POST /orders` creates a `draft` order that does not reserve stock.
+# A separate `POST /orders/{id}/confirm` call performs stock checks and reservation.
+# Default False for backward compatibility.
+SALES_WORKFLOW_DEFAULTS["draft_orders_enabled"] = False
+
 SALES_WORKFLOW_CHOICES: dict[str, tuple[str, ...]] = {
-    "invoice_timing": ("after_delivery", "on_order"),
     "credit_limit_action": ("warn", "block", "ignore"),
     "partial_delivery_invoice_mode": ("per_delivery", "after_full_order"),
 }
@@ -151,6 +154,9 @@ def invoice_settings(org) -> dict:  # noqa: ANN001
 # is the identifier every delivery endpoint takes. Its status tracks the goods:
 DELIVERY_STATUSES = (
     "planned",              # partner and vehicle named, quantities planned
+    "accepted",             # accepted by assigned partner
+    "rejected",             # rejected by assigned partner
+    "ready",                # picked and ready for loading
     "loaded",               # goods physically on the vehicle
     "in_transit",           # dispatched — only now is it live for the partner
     "partially_delivered",
@@ -162,6 +168,9 @@ DELIVERY_STATUSES = (
 # The order's fulfilment_status each delivery status implies, so the two never drift.
 ORDER_FULFILMENT_FOR_DELIVERY = {
     "planned": "planned",
+    "accepted": "planned",
+    "rejected": "planned",
+    "ready": "planned",
     "loaded": "loaded",
     "in_transit": "in_transit",
     "partially_delivered": "partially_delivered",
@@ -170,7 +179,7 @@ ORDER_FULFILMENT_FOR_DELIVERY = {
 }
 
 # Deliveries whose goods are still out with the partner.
-OPEN_DELIVERY_STATUSES = ("planned", "loaded", "in_transit", "partially_delivered")
+OPEN_DELIVERY_STATUSES = ("planned", "accepted", "ready", "loaded", "in_transit", "partially_delivered")
 
 
 # ------------------------------ sales returns ------------------------------

@@ -161,6 +161,46 @@ def plan(
     return delivery
 
 
+def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
+    """Partner accepts a planned delivery. Does not commit."""
+    if delivery.status != "planned":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only planned deliveries can be accepted (this delivery is '{delivery.status}')",
+        )
+    if delivery.delivery_partner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This delivery is not assigned to you",
+        )
+    delivery.status = "accepted"
+    return delivery
+
+
+def reject(db: Session, user: User, delivery: Delivery, reason: str | None = None) -> Delivery:
+    """Partner rejects a planned delivery. Clears partner + vehicle. Does not commit."""
+    if delivery.status != "planned":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only planned deliveries can be rejected (this delivery is '{delivery.status}')",
+        )
+    if delivery.delivery_partner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This delivery is not assigned to you",
+        )
+    delivery.status = "rejected"
+    reason_str = reason.strip() if reason and reason.strip() else "no reason given"
+    note_text = f"Rejected by partner: {reason_str}"
+    if delivery.notes:
+        delivery.notes = f"{delivery.notes}\n{note_text}"
+    else:
+        delivery.notes = note_text
+    delivery.delivery_partner_id = None
+    delivery.vehicle_id = None
+    return delivery
+
+
 def _open_loading(db: Session, org_id: str, partner_id: str) -> VehicleLoading | None:
     return (
         db.query(VehicleLoading)
@@ -211,16 +251,26 @@ def load(
     it never deducts the same units twice.
     """
     org_id = delivery.organization_id
-    if delivery.status == "cancelled":
+    if delivery.status not in ("ready", "loaded"):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery was cancelled"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Delivery must be ready before vehicle loading",
         )
     if not delivery.delivery_partner_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Name a delivery partner before loading — the stock goes onto their vehicle",
         )
-    warehouse = stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
+    if not delivery.vehicle_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Assign a vehicle before loading — vehicle is required for loading",
+        )
+    warehouse = (
+        stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
+        if delivery.warehouse_id
+        else None
+    )
     if warehouse is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery has no valid warehouse"
@@ -247,11 +297,20 @@ def load(
         loading = VehicleLoading(
             organization_id=org_id,
             delivery_partner_id=delivery.delivery_partner_id,
+            vehicle_id=delivery.vehicle_id,
             date=datetime.now(timezone.utc),
             status="active",
         )
         db.add(loading)
         db.flush()
+    else:
+        if loading.vehicle_id is None and delivery.vehicle_id:
+            loading.vehicle_id = delivery.vehicle_id
+        elif loading.vehicle_id and delivery.vehicle_id and loading.vehicle_id != delivery.vehicle_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The active vehicle loading session for this delivery partner belongs to a different vehicle",
+            )
 
     results = []
     for line in lines:
@@ -349,7 +408,7 @@ def load(
 
 def dispatch(db: Session, user: User, delivery: Delivery) -> None:
     """Send it out. Only now is the delivery live for the partner."""
-    if delivery.status not in ("loaded", "planned"):
+    if delivery.status != "loaded":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"A '{delivery.status}' delivery cannot be dispatched",
@@ -391,10 +450,10 @@ def confirm(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"This delivery is already {delivery.status}",
         )
-    if delivery.status == "planned":
+    if delivery.status not in ("in_transit", "partially_delivered"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Load and dispatch the delivery before confirming an outcome",
+            detail="Delivery must be in transit before confirmation",
         )
 
     delivery.pod_photo_file_ids = list(pod_photo_file_ids or [])
@@ -485,6 +544,16 @@ def sync_delivery_view(db: Session, delivery: Delivery) -> dict:
     return {
         # `delivery_number` and `order_id` come off the model as properties.
         "order_number": order.order_number if order is not None else None,
+        "order_status": order.status if order is not None else None,
+        "order_total": order.total if order is not None else None,
+        "fulfilment_status": order.fulfilment_status if order is not None else None,
+        "order": {
+            "id": order.id,
+            "order_number": order.order_number,
+            "status": order.status,
+            "fulfilment_status": order.fulfilment_status,
+            "total": order.total,
+        } if order is not None else None,
         "amount_due": amount_due(db, delivery),
         "pod": {
             "photo_file_ids": list(delivery.pod_photo_file_ids or []),

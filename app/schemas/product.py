@@ -4,8 +4,11 @@ from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
+from app.models.enums import ProductStatus
+
 
 class VariantIn(BaseModel):
+    id: str | None = None
     name: str = Field(min_length=1, max_length=150)
     sku: str | None = Field(default=None, max_length=100)
     barcode: str | None = Field(default=None, max_length=100)
@@ -65,6 +68,41 @@ class ProductFileField(str, Enum):
     warranty_document = "warranty_document"
 
 
+class ProductPricingIn(BaseModel):
+    purchase_price: float = 0.0
+    selling_price: float = 0.0
+    mrp: float | None = None
+    wholesale_price: float | None = None
+    dealer_price: float | None = None
+    discount_percent: float | None = None
+    tax_inclusive: bool = False
+    currency: str | None = Field(default=None, max_length=10)
+
+
+class ProductPricingOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    purchase_price: float = 0.0
+    selling_price: float = 0.0
+    mrp: float | None = None
+    wholesale_price: float | None = None
+    dealer_price: float | None = None
+    discount_percent: float | None = None
+    tax_inclusive: bool = False
+    currency: str | None = None
+
+
+class ProductPricingUpdate(BaseModel):
+    purchase_price: float | None = None
+    selling_price: float | None = None
+    mrp: float | None = None
+    wholesale_price: float | None = None
+    dealer_price: float | None = None
+    discount_percent: float | None = None
+    tax_inclusive: bool | None = None
+    currency: str | None = Field(default=None, max_length=10)
+
+
 class ProductProfileIn(BaseModel):
     """The Product Profile block — shared by create and update so both accept
     exactly the same fields. Everything here is optional; toggles default to a
@@ -80,24 +118,25 @@ class ProductProfileIn(BaseModel):
     barcode: str | None = Field(default=None, max_length=100)
     short_name: str | None = Field(default=None, max_length=100)
     sub_category: str | None = Field(default=None, max_length=150)
+    sub_category_id: str | None = Field(
+        default=None, description="References another Category row (a child of category_id)"
+    )
+    brand_id: str | None = Field(default=None, description="References a Brand row")
     manufacturer: str | None = Field(default=None, max_length=150)
     model_number: str | None = Field(default=None, max_length=100)
+    status: ProductStatus = Field(
+        default=ProductStatus.ACTIVE,
+        description="Kept in sync with is_active: only 'active' maps to is_active=True",
+    )
 
     # 2. Images & media — pass a URL / data: URL, or upload via /files/{field}
     product_video: str | None = None
     product_catalog_brochure: str | None = None
     product_manual: str | None = None
 
-    # 3. Pricing
-    msrp_mrp: float | None = Field(default=None, ge=0)
-    wholesale_price: float | None = Field(default=None, ge=0)
-    dealer_price: float | None = Field(default=None, ge=0)
-    discount: float | None = Field(default=None, ge=0, le=100, description="percent")
-    tax_inclusive_price: bool = False
-    currency: str | None = Field(default=None, max_length=10)
-
-    # 4. Inventory
+    # 3. Inventory
     inventory_tracking: bool = True
+    uom: str | None = Field(default=None, max_length=50, description='Base unit of measure, e.g. "piece", "kg"')
     opening_stock: int | None = Field(default=None, ge=0)
     minimum_stock_level: int | None = Field(default=None, ge=0)
     maximum_stock_level: int | None = Field(default=None, ge=0)
@@ -108,7 +147,7 @@ class ProductProfileIn(BaseModel):
     serial_number_tracking: bool = False
     expiry_tracking: bool = False
 
-    # 5. Tax
+    # 4. Tax
     hsn_code: str | None = Field(
         default=None, max_length=20, description="HSN (goods) / SAC (services) code for GST invoices"
     )
@@ -116,23 +155,23 @@ class ProductProfileIn(BaseModel):
         default=None, ge=0, le=100,
         description="Tax %, snapshotted onto order and invoice lines")
     tax_category: str | None = Field(default=None, max_length=100)
-    tax_inclusive: bool = False
 
-    # 6. Purchase
+    # 5. Purchase
     preferred_supplier_id: str | None = None
     supplier_product_code: str | None = Field(default=None, max_length=100)
     lead_time: str | None = Field(default=None, max_length=50, description='free text, e.g. "7 days"')
     minimum_order_quantity: int | None = Field(default=None, ge=0)
     purchase_unit: str | None = Field(default=None, max_length=50)
 
-    # 7. Sales
+    # 6. Sales
     sales_unit: str | None = Field(default=None, max_length=50)
     commission_eligible: bool = False
     commission: float | None = Field(default=None, ge=0, le=100, description="percent")
     default_discount: float | None = Field(default=None, ge=0, le=100, description="percent")
 
-    # 8. Physical specifications
+    # 7. Physical specifications
     weight: float | None = Field(default=None, ge=0)
+    weight_unit: str | None = Field(default=None, max_length=20, description='e.g. "kg", "lb"')
     length: float | None = Field(default=None, ge=0)
     width: float | None = Field(default=None, ge=0)
     height: float | None = Field(default=None, ge=0)
@@ -145,7 +184,7 @@ class ProductProfileIn(BaseModel):
         description='Physical size band (S/M/L). Not the variant "size" (250ml/1L) — that stays on the variant.',
     )
 
-    # 9. Variants & attributes
+    # 8. Variants & attributes
     has_variants: bool | None = Field(
         default=None, description="Defaults to whether the product has variants"
     )
@@ -153,29 +192,31 @@ class ProductProfileIn(BaseModel):
         default=None, description='Attribute types the variants vary by, e.g. ["Color", "Size"]'
     )
 
-    # 10. Digital product
+    # 9. Digital product
     downloadable_product: bool = False
     download_file: str | None = None
     license_key_required: bool = False
     download_limit: int | None = Field(default=None, ge=0)
 
-    # 11. Additional information
+    # 10. Additional information
     warranty_period: str | None = Field(default=None, max_length=50)
+    warranty_period_unit: str | None = Field(default=None, max_length=20, description='e.g. "years", "months"')
     shelf_life: str | None = Field(default=None, max_length=50)
+    shelf_life_unit: str | None = Field(default=None, max_length=20, description='e.g. "months", "days"')
     country_of_origin: str | None = Field(default=None, max_length=100)
     launch_date: datetime | None = None
     end_of_life_date: datetime | None = None
     product_tags: list[str] | None = None
     notes: str | None = None
 
-    # 12. Documents
+    # 11. Documents
     product_datasheet: str | None = None
     compliance_certificate: str | None = None
     warranty_document: str | None = None
 
-    @field_validator("preferred_supplier_id", mode="before")
+    @field_validator("preferred_supplier_id", "sub_category_id", "brand_id", mode="before")
     @classmethod
-    def _blank_supplier_to_none(cls, v: object) -> object:
+    def _blank_ref_to_none(cls, v: object) -> object:
         return None if v == "" else v
 
 
@@ -198,6 +239,7 @@ class ProductOut(ProductProfileIn):
     name: str
     description: str | None
     price: float
+    pricing: ProductPricingOut | None = None
     cover_image: str | None
     images: StringList = Field(default_factory=list)
     product_type: str | None
@@ -209,8 +251,10 @@ class ProductOut(ProductProfileIn):
     total_stock: int
     is_active: bool
     variations: list[VariantOut]
-    # Resolved from category_id / preferred_supplier_id.
+    # Resolved from category_id / sub_category_id / brand_id / preferred_supplier_id.
     category: NamedRef | None = None
+    subcategory: NamedRef | None = None
+    brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
     created_at: datetime
     updated_at: datetime
@@ -235,6 +279,7 @@ class ProductListItem(BaseModel):
     name: str
     description: str | None
     price: float
+    pricing: ProductPricingOut | None = None
     cover_image: str | None
     product_type: str | None
     vendor: str | None
@@ -246,6 +291,8 @@ class ProductListItem(BaseModel):
     is_active: bool
     variations: list[VariantOut]
     category: NamedRef | None = None
+    subcategory: NamedRef | None = None
+    brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
     created_at: datetime
 
@@ -254,13 +301,12 @@ class ProductListItem(BaseModel):
     barcode: str | None = None
     short_name: str | None = None
     sub_category: str | None = None
+    sub_category_id: str | None = None
+    brand_id: str | None = None
     manufacturer: str | None = None
     model_number: str | None = None
-    msrp_mrp: float | None = None
-    wholesale_price: float | None = None
-    dealer_price: float | None = None
-    discount: float | None = None
-    currency: str | None = None
+    status: ProductStatus = ProductStatus.ACTIVE
+    uom: str | None = None
     inventory_tracking: bool = True
     minimum_stock_level: int | None = None
     reorder_level: int | None = None
@@ -268,7 +314,6 @@ class ProductListItem(BaseModel):
     hsn_code: str | None = None
     tax_rate: float | None = None
     tax_category: str | None = None
-    tax_inclusive: bool = False
     preferred_supplier_id: str | None = None
     sales_unit: str | None = None
     has_variants: bool = False
@@ -280,7 +325,7 @@ class ProductListItem(BaseModel):
 class ProductCreate(ProductProfileIn):
     name: str = Field(min_length=1, max_length=200)
     description: str | None = None
-    price: float = Field(default=0, ge=0)
+    pricing: ProductPricingIn = Field(default_factory=ProductPricingIn, description="Pricing information object")
     cover_image: str | None = None
     images: list[str] = Field(default_factory=list)
     product_type: str | None = Field(default=None, max_length=100)
@@ -302,7 +347,7 @@ class ProductUpdate(ProductProfileIn):
 
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
-    price: float | None = Field(default=None, ge=0)
+    pricing: ProductPricingUpdate | None = None
     cover_image: str | None = None
     images: list[str] | None = None
     product_type: str | None = Field(default=None, max_length=100)

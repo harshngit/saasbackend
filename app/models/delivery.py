@@ -49,6 +49,8 @@ class Delivery(Base):
     scheduled_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # planned | loaded | in_transit | partially_delivered | delivered | failed | cancelled
     status: Mapped[str] = mapped_column(String(30), default="planned", nullable=False, index=True)
+    # Picking status for the new picking workflow: not_started | picking | picked
+    picking_status: Mapped[str] = mapped_column(String(20), default="not_started", nullable=False)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dispatched_by_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -118,6 +120,9 @@ class DeliveryItem(Base):
     planned_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     loaded_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     delivered_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    # How many units were picked during the picking stage (prep only). Does not
+    # represent movement of stock; loading still moves stock.
+    picked_quantity: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     # Which lot and which units this line was for. Written when the goods actually
     # move, so a bill or a challan can be traced to the batch that left the shelf.
     batch_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
