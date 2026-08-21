@@ -4,6 +4,7 @@ from app.models.enums import (
     LOCKED_STATUSES,
     OrganizationStatus,
     PlanTier,
+    ProductStatus,
     STAFF_ROLE_NAME,
     STAFF_ROLES,
     SystemRole,
@@ -13,6 +14,7 @@ from app.models.enums import (
 )
 from app.models.activity_log import ActivityLog
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
+from app.models.brand import Brand
 from app.models.category import Category
 from app.models.customer import Customer, CustomerDocument, CustomerPayment
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense
@@ -65,8 +67,10 @@ __all__ = [
     "Customer",
     "CustomerDocument",
     "Category",
+    "Brand",
     "Product",
     "ProductPricing",
+    "ProductStatus",
     "ProductVariant",
     "ProductSerial",
     "StockBatch",

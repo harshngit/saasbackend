@@ -4,6 +4,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
+from app.models.enums import ProductStatus
+
 
 class VariantIn(BaseModel):
     id: str | None = None
@@ -116,8 +118,16 @@ class ProductProfileIn(BaseModel):
     barcode: str | None = Field(default=None, max_length=100)
     short_name: str | None = Field(default=None, max_length=100)
     sub_category: str | None = Field(default=None, max_length=150)
+    sub_category_id: str | None = Field(
+        default=None, description="References another Category row (a child of category_id)"
+    )
+    brand_id: str | None = Field(default=None, description="References a Brand row")
     manufacturer: str | None = Field(default=None, max_length=150)
     model_number: str | None = Field(default=None, max_length=100)
+    status: ProductStatus = Field(
+        default=ProductStatus.ACTIVE,
+        description="Kept in sync with is_active: only 'active' maps to is_active=True",
+    )
 
     # 2. Images & media — pass a URL / data: URL, or upload via /files/{field}
     product_video: str | None = None
@@ -126,6 +136,7 @@ class ProductProfileIn(BaseModel):
 
     # 3. Inventory
     inventory_tracking: bool = True
+    uom: str | None = Field(default=None, max_length=50, description='Base unit of measure, e.g. "piece", "kg"')
     opening_stock: int | None = Field(default=None, ge=0)
     minimum_stock_level: int | None = Field(default=None, ge=0)
     maximum_stock_level: int | None = Field(default=None, ge=0)
@@ -160,6 +171,7 @@ class ProductProfileIn(BaseModel):
 
     # 7. Physical specifications
     weight: float | None = Field(default=None, ge=0)
+    weight_unit: str | None = Field(default=None, max_length=20, description='e.g. "kg", "lb"')
     length: float | None = Field(default=None, ge=0)
     width: float | None = Field(default=None, ge=0)
     height: float | None = Field(default=None, ge=0)
@@ -188,7 +200,9 @@ class ProductProfileIn(BaseModel):
 
     # 10. Additional information
     warranty_period: str | None = Field(default=None, max_length=50)
+    warranty_period_unit: str | None = Field(default=None, max_length=20, description='e.g. "years", "months"')
     shelf_life: str | None = Field(default=None, max_length=50)
+    shelf_life_unit: str | None = Field(default=None, max_length=20, description='e.g. "months", "days"')
     country_of_origin: str | None = Field(default=None, max_length=100)
     launch_date: datetime | None = None
     end_of_life_date: datetime | None = None
@@ -200,9 +214,9 @@ class ProductProfileIn(BaseModel):
     compliance_certificate: str | None = None
     warranty_document: str | None = None
 
-    @field_validator("preferred_supplier_id", mode="before")
+    @field_validator("preferred_supplier_id", "sub_category_id", "brand_id", mode="before")
     @classmethod
-    def _blank_supplier_to_none(cls, v: object) -> object:
+    def _blank_ref_to_none(cls, v: object) -> object:
         return None if v == "" else v
 
 
@@ -237,8 +251,10 @@ class ProductOut(ProductProfileIn):
     total_stock: int
     is_active: bool
     variations: list[VariantOut]
-    # Resolved from category_id / preferred_supplier_id.
+    # Resolved from category_id / sub_category_id / brand_id / preferred_supplier_id.
     category: NamedRef | None = None
+    subcategory: NamedRef | None = None
+    brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
     created_at: datetime
     updated_at: datetime
@@ -275,6 +291,8 @@ class ProductListItem(BaseModel):
     is_active: bool
     variations: list[VariantOut]
     category: NamedRef | None = None
+    subcategory: NamedRef | None = None
+    brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
     created_at: datetime
 
@@ -283,8 +301,12 @@ class ProductListItem(BaseModel):
     barcode: str | None = None
     short_name: str | None = None
     sub_category: str | None = None
+    sub_category_id: str | None = None
+    brand_id: str | None = None
     manufacturer: str | None = None
     model_number: str | None = None
+    status: ProductStatus = ProductStatus.ACTIVE
+    uom: str | None = None
     inventory_tracking: bool = True
     minimum_stock_level: int | None = None
     reorder_level: int | None = None

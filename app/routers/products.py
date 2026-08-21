@@ -9,11 +9,13 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
 from app.models import (
+    Brand,
     Category,
     Organization,
     Product,
     ProductPricing,
     ProductSerial,
+    ProductStatus,
     ProductVariant,
     StockBatch,
     Supplier,
@@ -75,6 +77,14 @@ def _validate_supplier(db: Session, org_id: str, supplier_id: str | None) -> Non
         )
 
 
+def _validate_brand(db: Session, org_id: str, brand_id: str | None) -> None:
+    if brand_id is None:
+        return
+    brand = db.get(Brand, brand_id)
+    if brand is None or brand.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id is not a brand in your firm")
+
+
 def _build_variants(variations: list[VariantIn]) -> list[ProductVariant]:
     return [ProductVariant(**v.model_dump()) for v in variations]
 
@@ -88,11 +98,15 @@ def create_product(
 ) -> Product:
     org_id = _org_id(user)
     _validate_category(db, org_id, payload.category_id)
+    _validate_category(db, org_id, payload.sub_category_id)
     _validate_supplier(db, org_id, payload.preferred_supplier_id)
+    _validate_brand(db, org_id, payload.brand_id)
     data = payload.model_dump()
     variations = data.pop("variations")
     has_variants = data.pop("has_variants")
     pricing_data = data.pop("pricing", None) or {}
+    # Plain string in the DB regardless of the enum wrapper Pydantic hands back.
+    data["status"] = ProductStatus(data["status"]).value
 
     # Default currency from organization if not provided
     if not pricing_data.get("currency"):
@@ -111,6 +125,8 @@ def create_product(
     product.variations = _build_variants([VariantIn(**v) for v in variations])
     # Left unset, the toggle just follows whether variants were actually sent.
     product.has_variants = bool(variations) if has_variants is None else has_variants
+    # Keep the legacy is_active boolean in sync with the new status field.
+    product.is_active = product.status == ProductStatus.ACTIVE.value
 
     product.pricing = ProductPricing(
         purchase_price=purchase_p,
@@ -155,8 +171,11 @@ def list_products(
         default=None, description="Exact barcode — what a scanner sends. Matches a variant's too"
     ),
     category_id: str | None = Query(default=None),
+    sub_category_id: str | None = Query(default=None),
+    brand_id: str | None = Query(default=None),
     preferred_supplier_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status", description="active | inactive | discontinued"),
     db: Session = Depends(get_db),
 ) -> list[Product]:
     org_id = _org_id(user)
@@ -187,10 +206,16 @@ def list_products(
         )
     if category_id is not None:
         query = query.filter(Product.category_id == category_id)
+    if sub_category_id is not None:
+        query = query.filter(Product.sub_category_id == sub_category_id)
+    if brand_id is not None:
+        query = query.filter(Product.brand_id == brand_id)
     if preferred_supplier_id is not None:
         query = query.filter(Product.preferred_supplier_id == preferred_supplier_id)
     if is_active is not None:
         query = query.filter(Product.is_active == is_active)
+    if status_filter is not None:
+        query = query.filter(Product.status == status_filter)
     return query.order_by(Product.created_at.desc()).all()
 
 
@@ -264,14 +289,26 @@ def update_product(
     data = payload.model_dump(exclude_unset=True)
     if "category_id" in data:
         _validate_category(db, org_id, data["category_id"])
+    if "sub_category_id" in data:
+        _validate_category(db, org_id, data["sub_category_id"])
     if "preferred_supplier_id" in data:
         _validate_supplier(db, org_id, data["preferred_supplier_id"])
+    if "brand_id" in data:
+        _validate_brand(db, org_id, data["brand_id"])
     variations = data.pop("variations", None)
     pricing_data = data.pop("pricing", None)
     if data.get("has_variants") is None:
         data.pop("has_variants", None)  # NOT NULL column — never write a null into it
+    if "status" in data:
+        data["status"] = ProductStatus(data["status"]).value
     for field, value in data.items():
         setattr(product, field, value)
+
+    # Keep is_active and status in sync when only one of the two was supplied.
+    if "status" in data and "is_active" not in data:
+        product.is_active = product.status == ProductStatus.ACTIVE.value
+    elif "is_active" in data and "status" not in data:
+        product.status = ProductStatus.ACTIVE.value if product.is_active else ProductStatus.INACTIVE.value
 
     if pricing_data is not None:
         if product.pricing is None:

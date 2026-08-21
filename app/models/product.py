@@ -40,6 +40,18 @@ class Product(Base):
     category_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Points at another Category row (a child of category_id) — distinct from the
+    # legacy free-text `sub_category` column below, kept for backward compatibility.
+    sub_category_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Distinct from the legacy free-text `brand` column below, kept for backward compatibility.
+    brand_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("brands.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Lifecycle status (active/inactive/discontinued). Kept in sync with `is_active`
+    # (see app/routers/products.py) so existing is_active-based checks keep working.
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
 
     # Used only when the product has no variants; otherwise stock is per-variant.
     total_inventory: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -73,6 +85,9 @@ class Product(Base):
 
     # 4. Inventory (these overlap the Inventory module — this is the catalog's copy)
     inventory_tracking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Base unit of measure (e.g. "piece", "kg", "litre") — distinct from purchase_unit
+    # / sales_unit below, which may differ from the base unit (e.g. buy by the "box").
+    uom: Mapped[str | None] = mapped_column(String(50), nullable=True)
     opening_stock: Mapped[int | None] = mapped_column(Integer, nullable=True)
     minimum_stock_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
     maximum_stock_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -110,6 +125,7 @@ class Product(Base):
 
     # 8. Physical specifications
     weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    weight_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)  # e.g. "kg", "lb"
     length: Mapped[float | None] = mapped_column(Float, nullable=True)
     width: Mapped[float | None] = mapped_column(Float, nullable=True)
     height: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -132,8 +148,10 @@ class Product(Base):
     download_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # 11. Additional information
-    warranty_period: Mapped[str | None] = mapped_column(String(50), nullable=True)  # e.g. "1 year"
-    shelf_life: Mapped[str | None] = mapped_column(String(50), nullable=True)       # e.g. "6 months"
+    warranty_period: Mapped[str | None] = mapped_column(String(50), nullable=True)  # e.g. "1", "12"
+    warranty_period_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)  # e.g. "years", "months"
+    shelf_life: Mapped[str | None] = mapped_column(String(50), nullable=True)       # e.g. "6"
+    shelf_life_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)  # e.g. "months", "days"
     country_of_origin: Mapped[str | None] = mapped_column(String(100), nullable=True)
     launch_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     end_of_life_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -162,10 +180,12 @@ class Product(Base):
     )
     # Loaded with the product so responses can resolve the ids into names without
     # the caller making a second call.
-    category: Mapped["Category | None"] = relationship(lazy="joined")  # noqa: F821
+    category: Mapped["Category | None"] = relationship(foreign_keys=[category_id], lazy="joined")  # noqa: F821
+    subcategory: Mapped["Category | None"] = relationship(foreign_keys=[sub_category_id], lazy="joined")  # noqa: F821
     supplier: Mapped["Supplier | None"] = relationship(
         foreign_keys=[preferred_supplier_id], lazy="joined"
     )
+    brand_ref: Mapped["Brand | None"] = relationship(foreign_keys=[brand_id], lazy="joined")  # noqa: F821
 
     @property
     def total_stock(self) -> int:

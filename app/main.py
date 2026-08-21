@@ -15,6 +15,7 @@ from app.core.database import (
 from app.models import (  # noqa: F401  (register mappers)
     ActivityLog,
     Attendance,
+    Brand,
     Category,
     Customer,
     Notification,
@@ -47,6 +48,7 @@ from app.services.stock_service import migrate_order_statuses
 from app.routers import (
     attendance,
     auth,
+    brands,
     categories,
     customers,
     dashboard,
@@ -150,6 +152,7 @@ app.include_router(users.router)
 app.include_router(roles.router)
 app.include_router(customers.router)
 app.include_router(categories.router)
+app.include_router(brands.router)
 app.include_router(products.router)
 app.include_router(inventory.router)
 app.include_router(warehouses.router)
