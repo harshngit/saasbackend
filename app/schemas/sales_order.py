@@ -67,6 +67,10 @@ class OrderOut(BaseModel):
     quotation_id: str | None = None
     delivery_date: datetime | None = None
     fulfilment_method: str | None = None
+    pickup_status: str | None = None
+    collected_by: str | None = None
+    collected_at: datetime | None = None
+    pickup_notes: str | None = None
     payment_type: str | None = None
     payment_terms_days: int | None = None
     source: str
@@ -145,3 +149,14 @@ class AssignDeliveryBody(BaseModel):
 
 class CancelBody(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
+
+
+class PickupItemConfirm(BaseModel):
+    order_item_id: str
+    collected_quantity: float = Field(gt=0)
+
+
+class PickupConfirmRequest(BaseModel):
+    items: list[PickupItemConfirm] | None = None
+    collected_by: str | None = Field(default=None, max_length=150)
+    notes: str | None = Field(default=None, max_length=500)

@@ -216,16 +216,16 @@ def generate_from_order(
             )
 
         mode = settings.get("partial_delivery_invoice_mode", "per_delivery")
-        if mode == "per_delivery":
+        if mode == "per_delivery" and order.fulfilment_method != "pickup":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This organization bills per delivery. Please specify delivery_id.",
             )
-        elif mode == "after_full_order":
+        elif mode == "after_full_order" or order.fulfilment_method == "pickup":
             if order.fulfilment_status != "delivered":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Order still has pending delivery quantity",
+                    detail="Order still has pending delivery quantity" if order.fulfilment_method != "pickup" else "Pickup order must be collected before invoicing",
                 )
             # Aggregate delivered qty across order items, subtract already invoiced qty
             agg_lines: list[dict] = []

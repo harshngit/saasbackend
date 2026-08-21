@@ -157,6 +157,8 @@ def seed_testing_paid_user(db: Session) -> None:
 
 def main() -> None:
     Base.metadata.create_all(bind=engine)
+    from app.core.database import auto_add_missing_columns
+    auto_add_missing_columns()
     db = SessionLocal()
     try:
         default_plan = seed_plans(db)

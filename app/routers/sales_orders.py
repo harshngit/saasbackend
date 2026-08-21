@@ -6,12 +6,13 @@ from sqlalchemy.orm import Session
 from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, Delivery, Role, SalesOrder, User, UserRole
+from app.models import Customer, Delivery, Role, SalesOrder, StockReservation, User, UserRole
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
     OrderCreate,
     OrderOut,
+    PickupConfirmRequest,
     RejectBody,
 )
 from app.services import delivery_service, lookup_service, order_service, stock_service
@@ -307,6 +308,11 @@ def assign_delivery_partner(
     """
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id, user)
+    if order.fulfilment_method == "pickup":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot assign delivery partner to a pickup order",
+        )
     if order.status == "cancelled" or order.fulfilment_status == "delivered":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -391,6 +397,156 @@ def cancel_order(
     order.fulfilment_status = "not_started"
     if payload.reason:
         order.reject_reason = payload.reason
+    db.commit()
+    db.refresh(order)
+    return _order_out(db, order)
+
+
+@router.post("/{order_id}/pickup/pick", response_model=OrderOut)
+def pick_order_for_pickup(
+    order_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Transition a confirmed pickup order from not_started -> picking.
+
+    No stock movement happens at this stage.
+    """
+    org_id = _org_id(user)
+    order = _owned(db, order_id, org_id, user)
+    if order.status in ("draft", "cancelled", "rejected", "awaiting_approval"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot start picking a '{order.status}' order. Confirm the order first.",
+        )
+    if order.fulfilment_status == "delivered" or order.pickup_status == "collected":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Order has already been collected",
+        )
+    order.fulfilment_method = "pickup"
+    order.pickup_status = "picking"
+    order.status = "processing"
+    db.commit()
+    db.refresh(order)
+    return _order_out(db, order)
+
+
+@router.post("/{order_id}/pickup/ready", response_model=OrderOut)
+def ready_order_for_pickup(
+    order_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Transition a pickup order from picking -> ready for customer collection.
+
+    No stock movement happens at this stage.
+    """
+    org_id = _org_id(user)
+    order = _owned(db, order_id, org_id, user)
+    if order.status in ("draft", "cancelled", "rejected", "awaiting_approval"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot mark a '{order.status}' order ready for pickup. Confirm the order first.",
+        )
+    if order.fulfilment_status == "delivered" or order.pickup_status == "collected":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Order has already been collected",
+        )
+    order.fulfilment_method = "pickup"
+    order.pickup_status = "ready"
+    order.status = "processing"
+    db.commit()
+    db.refresh(order)
+    return _order_out(db, order)
+
+
+@router.post("/{order_id}/pickup/confirm", response_model=OrderOut)
+def confirm_order_pickup(
+    order_id: str,
+    payload: PickupConfirmRequest | None = None,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Customer collects the pickup order.
+
+    Deducts warehouse physical stock and consumes outstanding reservations.
+    Updates delivered/fulfilled quantity so subsequent invoicing bills the collected items.
+    No vehicle stock or delivery movements are created.
+    """
+    org_id = _org_id(user)
+    order = _owned(db, order_id, org_id, user)
+    if order.status in ("draft", "cancelled", "rejected", "awaiting_approval"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot confirm pickup for a '{order.status}' order. Confirm the order first.",
+        )
+    if order.fulfilment_status == "delivered" or order.pickup_status == "collected":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pickup for this order has already been confirmed",
+        )
+
+    order.fulfilment_method = "pickup"
+
+    # Process items
+    if payload and payload.items:
+        items_map = {item.id: item for item in order.items}
+        for item_in in payload.items:
+            item = items_map.get(item_in.order_item_id)
+            if item is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Item {item_in.order_item_id} does not belong to this order",
+                )
+            qty = float(item_in.collected_quantity)
+            if qty > 0 and item.product_id and order.warehouse_id:
+                stock_service.adjust_on_hand(
+                    db, org_id, order.warehouse_id, item.product_id, item.variant_id,
+                    -qty, "sale", note=f"Pickup for order {order.order_number}", created_by=user.id,
+                )
+                res = (
+                    db.query(StockReservation)
+                    .filter(StockReservation.order_item_id == item.id, StockReservation.status == "active")
+                    .first()
+                )
+                if res:
+                    stock_service.consume_reservation(db, res, qty)
+                item.delivered_quantity = round((item.delivered_quantity or 0) + qty, 3)
+                item.reserved_quantity = max(0.0, round((item.reserved_quantity or 0) - qty, 3))
+    else:
+        for item in order.items:
+            qty = float(item.quantity or 0)
+            if qty > 0 and item.product_id and order.warehouse_id:
+                stock_service.adjust_on_hand(
+                    db, org_id, order.warehouse_id, item.product_id, item.variant_id,
+                    -qty, "sale", note=f"Pickup for order {order.order_number}", created_by=user.id,
+                )
+                res = (
+                    db.query(StockReservation)
+                    .filter(StockReservation.order_item_id == item.id, StockReservation.status == "active")
+                    .first()
+                )
+                if res:
+                    stock_service.consume_reservation(db, res, qty)
+                item.delivered_quantity = qty
+                item.reserved_quantity = 0.0
+
+    order.pickup_status = "collected"
+    order.fulfilment_status = "delivered"
+    order.status = "completed"
+    if payload:
+        if payload.collected_by:
+            order.collected_by = payload.collected_by
+        if payload.notes:
+            order.pickup_notes = payload.notes
+    order.collected_at = datetime.now(timezone.utc)
+    order.stock_deducted = True
+
     db.commit()
     db.refresh(order)
     return _order_out(db, order)

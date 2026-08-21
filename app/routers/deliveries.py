@@ -154,6 +154,11 @@ def plan_delivery(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Order must be confirmed before delivery can be planned",
         )
+    if order.fulfilment_method == "pickup":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot plan delivery for a pickup order",
+        )
 
     partner = None
     if payload.delivery_partner_id:

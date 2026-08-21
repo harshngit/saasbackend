@@ -63,6 +63,10 @@ class SalesOrder(Base):
     )
     delivery_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fulfilment_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    pickup_status: Mapped[str | None] = mapped_column(String(30), default="not_started", nullable=True)
+    collected_by: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pickup_notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
     payment_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     payment_terms_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quotation_id: Mapped[str | None] = mapped_column(
