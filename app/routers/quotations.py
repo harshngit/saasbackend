@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core import scoping
+from app.core import scoping, workflow
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import (
     Customer,
@@ -228,13 +228,17 @@ def convert_to_order(
     fulfilment terms the order needs — warehouse, delivery date, fulfilment method,
     payment type and terms — come in the body.
 
-    The order is placed through exactly the same path as POST /orders, so its stock is
-    reserved and its status is `placed` (or `awaiting_approval` if the firm asks for
-    approval). The quotation becomes `converted` and is frozen; converting twice is
-    refused, and both records point at each other.
+    The order is placed through exactly the same path as POST /orders: if the firm's
+    `draft_orders_enabled` is off, its stock is reserved and its status is `placed`
+    (or `awaiting_approval` if the firm asks for approval). If `draft_orders_enabled`
+    is on, the order lands as `draft` — no stock check, no reservation — until
+    POST /orders/{id}/confirm reserves it. The quotation becomes `converted` and is
+    frozen either way; converting twice is refused, and both records point at each
+    other.
 
     A shortage refuses the conversion with `INSUFFICIENT_STOCK` and leaves the
-    quotation untouched — the same rule as placing an order by hand.
+    quotation untouched — the same rule as placing an order by hand. A draft
+    conversion skips that check, same as POST /orders does for a draft.
     """
     org_id = _org_id(user)
     quotation = _owned(db, id, org_id, user)
@@ -258,6 +262,7 @@ def convert_to_order(
             detail="This quotation has no customer to raise an order for",
         )
 
+    settings = workflow.sales_settings(user.organization)
     order, warnings = order_service.place_order(
         db, user, customer,
         lines=[
@@ -278,6 +283,9 @@ def convert_to_order(
         salesperson_id=quotation.salesperson_id,
         quotation_id=quotation.id,
         notes=quotation.notes,
+        # Same shared path POST /orders uses: a draft-enabled firm gets an
+        # unreserved draft here too, confirmed later via POST /orders/{id}/confirm.
+        create_as_draft=settings["draft_orders_enabled"],
     )
     _ = warnings  # surfaced on the order itself via GET /orders/{id}
 
