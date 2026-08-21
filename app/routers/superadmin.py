@@ -236,6 +236,43 @@ def deactivate_plan(plan_id: str, db: Session = Depends(get_db)) -> Plan:
     return plan
 
 
+@router.delete("/plans/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_plan(plan_id: str, db: Session = Depends(get_db)) -> None:
+    """Permanently remove an unused subscription plan from the catalog.
+
+    Refused if the plan is currently assigned to any organization (plan_id) or has
+    pending/historical upgrade requests referencing it (requested_plan_id) — deactivate
+    the plan via PATCH /plans/{id}/status instead so existing subscribers keep functioning.
+    Default plans cannot be deleted.
+    """
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+
+    if plan.is_default:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The default plan cannot be deleted. Set another plan as default first.",
+        )
+
+    used_count = db.query(Organization).filter(Organization.plan_id == plan.id).count()
+    if used_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete plan: {used_count} organization(s) are currently on this plan. Deactivate it instead.",
+        )
+
+    requested_count = db.query(Organization).filter(Organization.requested_plan_id == plan.id).count()
+    if requested_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete plan: {requested_count} organization(s) have requested this plan. Deactivate it instead.",
+        )
+
+    db.delete(plan)
+    db.commit()
+
+
 @router.get("/organizations/{org_id}", response_model=OrganizationOut)
 def get_organization(org_id: str, db: Session = Depends(get_db)) -> Organization:
     return _get_org(db, org_id)
