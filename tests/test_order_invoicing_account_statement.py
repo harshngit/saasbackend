@@ -241,17 +241,35 @@ def run_tests():
     inv1_dup = client.post(f"/orders/{so1_id}/invoice", json={}, headers=auth1)
     assert_eq(inv1_dup.status_code, 409, "Duplicate full order invoice returns HTTP 409 Conflict")
 
-    # TEST F: GET /invoices?order_id={id} filter
+    # TEST F: GET /invoices?order_id={id} filter & delivery_id exposure
     inv_list_res = client.get(f"/invoices?order_id={so1_id}", headers=auth1)
     assert_eq(inv_list_res.status_code, 200, "GET /invoices?order_id={id} returns 200")
     inv_list = inv_list_res.json()
     assert_eq(len(inv_list), 1, "GET /invoices?order_id={id} returns exactly 1 invoice for this order")
     assert_eq(inv_list[0]["id"], inv1_id, "Matching invoice returned")
+    assert_eq(inv_list[0]["order_id"], so1_id, "Full-order invoice exposes order_id")
+    assert_eq(inv_list[0]["delivery_id"], None, "Full-order invoice exposes delivery_id as null")
+
+    # Delivery Filter: GET /deliveries?order_id={id}
+    del_list_res = client.get(f"/deliveries?order_id={so1_id}", headers=auth1)
+    assert_eq(del_list_res.status_code, 200, "GET /deliveries?order_id={id} returns 200")
+    del_list = del_list_res.json()
+    assert_eq(len(del_list), 2, "GET /deliveries?order_id={id} returns both deliveries for SO1")
+    for dlv in del_list:
+        assert_eq(dlv["order_id"], so1_id, "Delivery response contains order_id matching requested order")
+        assert "id" in dlv, "Delivery response exposes id"
+        assert "delivery_number" in dlv, "Delivery response exposes delivery_number"
+        assert "status" in dlv, "Delivery response exposes status"
+        assert "planned_total" in dlv, "Delivery response exposes planned_total"
+        assert "delivered_total" in dlv, "Delivery response exposes delivered_total"
+        assert "items" in dlv, "Delivery response exposes items"
 
     # Query non-matching order_id
     dummy_order_id = str(uuid.uuid4())
     inv_empty_res = client.get(f"/invoices?order_id={dummy_order_id}", headers=auth1)
     assert_eq(len(inv_empty_res.json()), 0, "GET /invoices?order_id={dummy} returns empty list")
+    del_empty_res = client.get(f"/deliveries?order_id={dummy_order_id}", headers=auth1)
+    assert_eq(len(del_empty_res.json()), 0, "GET /deliveries?order_id={dummy} returns empty list")
 
     # TEST C: per_delivery Partial Delivery Invoicing Mode
     print("\n--- TEST C: PER-DELIVERY INVOICING MODE ---")
@@ -335,6 +353,10 @@ def run_tests():
     # Verify both invoices appear in GET /invoices?order_id={so2_id}
     so2_invoices = client.get(f"/invoices?order_id={so2_id}", headers=auth1).json()
     assert_eq(len(so2_invoices), 2, "Both per-delivery invoices listed under GET /invoices?order_id={id}")
+    deliv_ids_in_invoices = {inv.get("delivery_id") for inv in so2_invoices}
+    assert_eq(deliv_ids_in_invoices, {deliv1_id, deliv2_id}, "Every per-delivery invoice exposes its delivery_id")
+    for inv in so2_invoices:
+        assert_eq(inv["order_id"], so2_id, "Per-delivery invoice exposes order_id")
 
     # TEST 7: Direct Invoice / Quick Billing remains untouched
     print("\n--- DIRECT INVOICE / QUICK BILLING ---")
@@ -417,17 +439,86 @@ def run_tests():
     assert_eq(len(future_stmt["transactions"]), 0, "Future date_from returns 0 transactions in window")
     assert_eq(future_stmt["summary"]["opening_balance"], 268.0, "Future date_from accumulates all previous transactions into opening_balance (268.0)")
 
-    print("\n--- PART 4: TENANT ISOLATION ---")
+    print("\n--- PART 4: DELIVERY PLANNING BACKEND GUARDS (SCENARIO F) ---")
+    # Order in 'draft' status
+    draft_order_res = client.post("/orders", json={
+        "customer_id": cust1_id,
+        "warehouse_id": wh1_id,
+        "items": [{"product_id": prod1_id, "quantity": 5, "unit_price": 30.0}],
+    }, headers=auth1)
+    draft_order_id = draft_order_res.json()["id"]
+    db_session = SessionLocal()
+    draft_db = db_session.get(SalesOrder, draft_order_id)
+    draft_db.status = "draft"
+    db_session.commit()
+    db_session.close()
 
-    # Org 2 cannot access Org 1's invoices, orders, customers, or statements
+    draft_plan_res = client.post("/deliveries", json={
+        "order_id": draft_order_id,
+        "warehouse_id": wh1_id,
+    }, headers=auth1)
+    assert_eq(draft_plan_res.status_code, 400, "Planning delivery for draft order returns HTTP 400")
+    assert_eq(draft_plan_res.json().get("detail"), "Order must be confirmed before delivery can be planned", "Draft error detail matches requirement")
+
+    # Order in 'awaiting_approval' status
+    db_session = SessionLocal()
+    draft_db = db_session.get(SalesOrder, draft_order_id)
+    draft_db.status = "awaiting_approval"
+    db_session.commit()
+    db_session.close()
+
+    awaiting_plan_res = client.post("/deliveries", json={
+        "order_id": draft_order_id,
+        "warehouse_id": wh1_id,
+    }, headers=auth1)
+    assert_eq(awaiting_plan_res.status_code, 400, "Planning delivery for awaiting_approval order returns HTTP 400")
+    assert_eq(awaiting_plan_res.json().get("detail"), "Order must be confirmed before delivery can be planned", "Awaiting approval error detail matches requirement")
+
+    # Order in 'cancelled' status
+    db_session = SessionLocal()
+    draft_db = db_session.get(SalesOrder, draft_order_id)
+    draft_db.status = "cancelled"
+    db_session.commit()
+    db_session.close()
+
+    cancel_plan_res = client.post("/deliveries", json={
+        "order_id": draft_order_id,
+        "warehouse_id": wh1_id,
+    }, headers=auth1)
+    assert_eq(cancel_plan_res.status_code, 400, "Planning delivery for cancelled order returns HTTP 400")
+    assert_eq(cancel_plan_res.json().get("detail"), "Order must be confirmed before delivery can be planned", "Cancelled error detail matches requirement")
+
+    print("\n--- PART 5: TENANT ISOLATION (SCENARIO G) ---")
+
+    # Org 2 cannot access Org 1's orders via customer_id filter
+    cross_cust_orders = client.get(f"/orders?customer_id={cust1_id}", headers=auth2)
+    assert_eq(cross_cust_orders.status_code, 200, "Org 2 GET /orders?customer_id={cust1_id} returns 200")
+    assert_eq(len(cross_cust_orders.json()), 0, "Org 2 cannot retrieve Org 1's orders by customer_id (returns empty list)")
+
+    # Org 2 cannot access Org 1's deliveries via order_id filter
+    cross_deliv = client.get(f"/deliveries?order_id={so1_id}", headers=auth2)
+    assert_eq(cross_deliv.status_code, 200, "Org 2 GET /deliveries?order_id={so1_id} returns 200")
+    assert_eq(len(cross_deliv.json()), 0, "Org 2 cannot retrieve Org 1's deliveries by order_id (returns empty list)")
+
+    # Org 2 cannot access Org 1's invoices via order_id filter
     cross_inv = client.get(f"/invoices?order_id={so1_id}", headers=auth2)
-    assert_eq(len(cross_inv.json()), 0, "Org 2 GET /invoices?order_id={so1_id} returns 0 invoices (isolated)")
+    assert_eq(cross_inv.status_code, 200, "Org 2 GET /invoices?order_id={so1_id} returns 200")
+    assert_eq(len(cross_inv.json()), 0, "Org 2 cannot retrieve Org 1's invoices by order_id (returns empty list)")
 
+    # Org 2 cannot access Org 1's customer account statement
     cross_stmt = client.get(f"/customers/{cust1_id}/account-statement", headers=auth2)
     assert_eq(cross_stmt.status_code, 404, "Org 2 accessing Org 1 customer account statement returns 404 Not Found")
 
+    # Org 2 cannot invoice Org 1's order
     cross_order_inv = client.post(f"/orders/{so1_id}/invoice", json={}, headers=auth2)
     assert_eq(cross_order_inv.status_code, 404, "Org 2 invoicing Org 1 order returns 404 Not Found")
+
+    # Org 2 cannot create deliveries against Org 1's order
+    cross_plan = client.post("/deliveries", json={
+        "order_id": so1_id,
+        "warehouse_id": wh1_id,
+    }, headers=auth2)
+    assert_eq(cross_plan.status_code, 400, "Org 2 creating delivery against Org 1 order returns HTTP 400")
 
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")

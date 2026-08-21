@@ -335,10 +335,11 @@ def update_product(
         if product.pricing and product.pricing.selling_price is not None:
             product.price = product.pricing.selling_price
 
-    # Variants upsert behavior: None = no-op; [] = explicit no-op (do not delete);
-    # non-empty list = perform in-place updates for supplied ids and create for new ones.
-    if variations is not None and len(variations) > 0:
+    # Variants replacement/upsert behavior: None = no-op; [] or list = replace variant set
+    # (updating existing by id, creating new, and deleting omitted).
+    if variations is not None:
         seen_ids: set[str] = set()
+        new_variants_list: list[ProductVariant] = []
         for v in variations:
             # Validate payload shape using VariantIn
             vobj = VariantIn(**v)
@@ -355,15 +356,17 @@ def update_product(
                     if key == "id":
                         continue
                     setattr(variant, key, val)
+                new_variants_list.append(variant)
             else:
                 # Create new variant and attach to the product
                 new_data = {k: val for k, val in v.items() if k != "id"}
                 variant = ProductVariant(product_id=product.id, **new_data)
-                product.variations.append(variant)
+                new_variants_list.append(variant)
 
-        # Only set has_variants to True when client provided a non-empty variations list
+        product.variations = new_variants_list
+
         if "has_variants" not in data:
-            product.has_variants = True
+            product.has_variants = bool(product.variations)
 
     db.commit()
     db.refresh(product)

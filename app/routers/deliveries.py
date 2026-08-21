@@ -149,20 +149,10 @@ def plan_delivery(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="order_id is not an order in your firm"
         )
-    if order.status == "cancelled":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="This order was cancelled"
-        )
-    if order.status == "awaiting_approval":
+    if order.status in ("draft", "awaiting_approval", "cancelled", "pending", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This order is still awaiting approval",
-        )
-
-    if order.status == "draft":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot plan delivery for a draft order. Please confirm the order first.",
+            detail="Order must be confirmed before delivery can be planned",
         )
 
     partner = None
