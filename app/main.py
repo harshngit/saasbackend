@@ -101,7 +101,7 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "variant-upsert-and-guarded-delete"
+BUILD_TAG = "health-names-the-database-host"
 
 
 @app.on_event("startup")
@@ -147,6 +147,23 @@ def on_startup() -> None:
     _log.info("CRM API startup complete — build: %s", BUILD_TAG)
 
 
+def _database_target() -> str:
+    """Which server and database this instance is configured to talk to.
+
+    Host, port and database name only -- never the user or the password, so this is
+    safe to return from an unauthenticated endpoint. Without it, a dead database looks
+    like "some host does not resolve"; with it, the host can be compared against the
+    one in the platform dashboard.
+    """
+    try:
+        url = engine.url
+        if url.get_backend_name() == "sqlite":
+            return f"sqlite:{url.database}"
+        return f"{url.host or '?'}:{url.port or 5432}/{url.database or '?'}"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _database_state() -> tuple[str, str | None]:
     """Whether the database answers, and what went wrong when it does not."""
     try:
@@ -169,6 +186,7 @@ def health() -> dict[str, str | None]:
     state, detail = _database_state()
     body: dict[str, str | None] = {"status": "ok", "build": BUILD_TAG, "database": state}
     if detail:
+        body["database_target"] = _database_target()
         body["database_error"] = detail
     return body
 
