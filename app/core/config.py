@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # the URL is derived from the request that uploaded the file.
     public_base_url: str = ""
 
-    cors_origins: str = "http://localhost,http://localhost:3000,http://localhost:8080"
+    cors_origins: str = "*"
 
     # --- Password reset ---
     reset_token_expire_minutes: int = 30

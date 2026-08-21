@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from sqlalchemy import text as sa_text
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
@@ -100,20 +101,25 @@ import logging
 _log = logging.getLogger("crm.startup")
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "staff-overview-period-and-nested-refs"
+BUILD_TAG = "health-names-the-database-host"
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     _log.info("Starting CRM API — build: %s", BUILD_TAG)
 
-    # For local dev we auto-create tables. In production, use Alembic migrations instead.
-    Base.metadata.create_all(bind=engine)
+    # Every startup step is isolated, including creating the tables: a database that
+    # is unreachable at boot must not kill the process. An exception raised here fails
+    # the ASGI lifespan, uvicorn exits, the platform restarts it, and the service sits
+    # in a crash loop answering nothing at all -- so an outage in the database becomes
+    # a total outage with no way to see why. Booting anyway keeps /health answering,
+    # and it says which half is broken.
+    def _create_tables() -> None:
+        # For local dev we auto-create tables. In production, use Alembic migrations.
+        Base.metadata.create_all(bind=engine)
 
-    # Each migration step is isolated: a failure is logged but must NOT crash the
-    # app (a crash loop makes Render revert to the previous deploy). SQLite dev is
-    # unaffected; these mainly matter for the live Postgres.
     for label, step in (
+        ("create_all", _create_tables),
         ("extend_pg_enum_types", extend_pg_enum_types),
         ("drop_legacy_columns", drop_legacy_columns),
         ("relax_not_null_columns", relax_not_null_columns),
@@ -141,9 +147,48 @@ def on_startup() -> None:
     _log.info("CRM API startup complete — build: %s", BUILD_TAG)
 
 
+def _database_target() -> str:
+    """Which server and database this instance is configured to talk to.
+
+    Host, port and database name only -- never the user or the password, so this is
+    safe to return from an unauthenticated endpoint. Without it, a dead database looks
+    like "some host does not resolve"; with it, the host can be compared against the
+    one in the platform dashboard.
+    """
+    try:
+        url = engine.url
+        if url.get_backend_name() == "sqlite":
+            return f"sqlite:{url.database}"
+        return f"{url.host or '?'}:{url.port or 5432}/{url.database or '?'}"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _database_state() -> tuple[str, str | None]:
+    """Whether the database answers, and what went wrong when it does not."""
+    try:
+        with engine.connect() as connection:
+            connection.execute(sa_text("SELECT 1"))
+        return "ok", None
+    except Exception as exc:  # noqa: BLE001 -- reported, never raised
+        return "unreachable", f"{type(exc).__name__}: {exc}"[:300]
+
+
 @app.get("/health", tags=["health"])
-def health() -> dict[str, str]:
-    return {"status": "ok", "build": BUILD_TAG}
+def health() -> dict[str, str | None]:
+    """Liveness, plus whether the database behind it is actually reachable.
+
+    Deliberately still 200 when the database is down: this is what the platform
+    restarts the instance on, and restarting cannot fix a database outage -- it only
+    produces a crash loop that answers nothing. `database` carries the truth, so an
+    outage is visible from outside without needing the platform logs.
+    """
+    state, detail = _database_state()
+    body: dict[str, str | None] = {"status": "ok", "build": BUILD_TAG, "database": state}
+    if detail:
+        body["database_target"] = _database_target()
+        body["database_error"] = detail
+    return body
 
 
 app.include_router(files.router)

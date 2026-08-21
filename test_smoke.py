@@ -655,9 +655,31 @@ check("detail has images field", "images" in client.get(f"/products/{prod_id}", 
 check("search product by brand", any(p["id"] == prod_id for p in client.get("/products", headers=cp_hdr, params={"search": "Coca"}).json()))
 check("filter by category", all(p["category_id"] == cat_id for p in client.get("/products", headers=cp_hdr, params={"category_id": cat_id}).json()))
 
-# update product: replace variants
+# update product: variants are upserted, never replaced. A variant already referenced
+# by inventory, an order or an invoice must not vanish because it was left out of an
+# edit, so PATCH adds and updates but never deletes.
+before_variants = client.get(f"/products/{prod_id}", headers=cp_hdr).json()["variations"]
 r = client.patch(f"/products/{prod_id}", headers=cp_hdr, json={"price": 45, "variations": [{"name": "2L", "price": 120, "inventory": 10}]})
-check("update replaces variants -> 1 variant", r.status_code == 200 and len(r.json()["variations"]) == 1 and r.json()["total_stock"] == 10, r.text)
+check("PATCH with a new variant -> 200", r.status_code == 200, r.text[:300])
+after_variants = r.json()["variations"]
+check("the omitted variants are kept, the new one is added",
+      len(after_variants) == len(before_variants) + 1, [v["name"] for v in after_variants])
+check("and the existing ids are unchanged",
+      {v["id"] for v in before_variants} <= {v["id"] for v in after_variants},
+      [v["id"] for v in after_variants])
+kept = next(v for v in after_variants if v["name"] == "2L")
+r = client.patch(f"/products/{prod_id}", headers=cp_hdr, json={
+    "variations": [{"id": kept["id"], "name": "2L", "price": 150, "inventory": 10}]})
+check("naming a variant by id updates it in place and keeps the id",
+      r.status_code == 200
+      and next(v["price"] for v in r.json()["variations"] if v["id"] == kept["id"]) == 150
+      and len(r.json()["variations"]) == len(after_variants), r.text[:300])
+check("DELETE /products/{id}/variants/{variant_id} removes an unused one -> 204",
+      client.delete(f"/products/{prod_id}/variants/{kept['id']}", headers=cp_hdr).status_code == 204)
+check("and it is gone",
+      kept["id"] not in {v["id"] for v in client.get(f"/products/{prod_id}", headers=cp_hdr).json()["variations"]})
+check("a variant from another product -> 404",
+      client.delete(f"/products/{prod_id}/variants/{uuid.uuid4()}", headers=cp_hdr).status_code == 404)
 check("invalid category_id on product -> 400",
       client.patch(f"/products/{prod_id}", headers=cp_hdr, json={"category_id": "nope"}).status_code == 400)
 
@@ -5191,6 +5213,40 @@ def _staff_overview_fleet_checks():
 
 
 _staff_overview_fleet_checks()
+
+def _startup_survives_a_dead_database():
+    """A database outage must not take the whole service down with it.
+
+    Creating the tables used to run outside the guarded startup steps, so an
+    unreachable database raised inside the ASGI lifespan, uvicorn exited (status 3)
+    and the platform restarted it into a crash loop that answered nothing at all --
+    not even /health, which is the one thing that could have said why.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import os, sys; sys.path.insert(0, os.getcwd());"
+        "os.environ['DATABASE_URL'] = 'postgresql://nobody:nobody@127.0.0.1:59999/nothing';"
+        "from fastapi.testclient import TestClient;"
+        "import app.main as m;"
+        "c = TestClient(m.app);"
+        "c.__enter__();"
+        "r = c.get('/health');"
+        "print('RESULT', r.status_code, r.json().get('database'))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=180
+    )
+    line = next((x for x in proc.stdout.splitlines() if x.startswith("RESULT")), "")
+    check("the app still starts when the database is unreachable",
+          "RESULT 200" in line, (proc.returncode, proc.stdout[-300:], proc.stderr[-300:]))
+    check("and /health says which half is broken",
+          line.strip().endswith("unreachable"), line)
+
+
+_startup_survives_a_dead_database()
+
 
 print("\n== every model column made nullable is relaxed on Postgres too ==")
 # SQLite ignores a NOT NULL that Postgres enforces, so a column made nullable in the
