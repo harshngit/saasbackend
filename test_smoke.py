@@ -5107,6 +5107,40 @@ def _staff_overview_fleet_checks():
 
 _staff_overview_fleet_checks()
 
+def _startup_survives_a_dead_database():
+    """A database outage must not take the whole service down with it.
+
+    Creating the tables used to run outside the guarded startup steps, so an
+    unreachable database raised inside the ASGI lifespan, uvicorn exited (status 3)
+    and the platform restarted it into a crash loop that answered nothing at all --
+    not even /health, which is the one thing that could have said why.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import os, sys; sys.path.insert(0, os.getcwd());"
+        "os.environ['DATABASE_URL'] = 'postgresql://nobody:nobody@127.0.0.1:59999/nothing';"
+        "from fastapi.testclient import TestClient;"
+        "import app.main as m;"
+        "c = TestClient(m.app);"
+        "c.__enter__();"
+        "r = c.get('/health');"
+        "print('RESULT', r.status_code, r.json().get('database'))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=180
+    )
+    line = next((x for x in proc.stdout.splitlines() if x.startswith("RESULT")), "")
+    check("the app still starts when the database is unreachable",
+          "RESULT 200" in line, (proc.returncode, proc.stdout[-300:], proc.stderr[-300:]))
+    check("and /health says which half is broken",
+          line.strip().endswith("unreachable"), line)
+
+
+_startup_survives_a_dead_database()
+
+
 print("\n== every model column made nullable is relaxed on Postgres too ==")
 # SQLite ignores a NOT NULL that Postgres enforces, so a column made nullable in the
 # model looks fine locally and 500s in production. Anything nullable in the model that
