@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -25,6 +26,7 @@ from app.schemas.delivery import (
     DeliveryCustomerBrief,
     DeliveryOut,
     DeliveryPartnerBrief,
+    DeliveryPartnerOption,
     DeliveryPickBody,
     DeliveryPlanCreate,
     DeliveryPlanUpdate,
@@ -80,6 +82,26 @@ def list_assigned_deliveries(
         )
     )
     return q.order_by(SalesOrder.created_at.desc()).all()
+
+
+@router.get("/partners", response_model=list[DeliveryPartnerOption])
+def list_delivery_partners(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[DeliveryPartnerOption]:
+    """List active delivery partners in the current organization for assignment dropdowns."""
+    org_id = _org_id(user)
+    users = (
+        db.query(User)
+        .filter(
+            User.organization_id == org_id,
+            User.is_active.is_(True),
+            or_(User.status == "active", User.status.is_(None)),
+        )
+        .all()
+    )
+    partners = [u for u in users if delivery_service.is_delivery_partner(db, u)]
+    return [DeliveryPartnerOption(id=u.id, name=u.name) for u in partners]
 
 
 _create = require_permission("deliveries", "create")

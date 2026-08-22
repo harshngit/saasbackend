@@ -169,6 +169,13 @@ class DeliveryLineOut(BaseModel):
     serial_numbers: list | None = None
 
 
+class DeliveryPartnerOption(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+
+
 class DeliveryPartnerBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
