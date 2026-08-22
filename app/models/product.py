@@ -240,5 +240,6 @@ class ProductVariant(Base):
     weight: Mapped[float | None] = mapped_column(Float, nullable=True)
     price: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     inventory: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     product: Mapped["Product"] = relationship(back_populates="variations")

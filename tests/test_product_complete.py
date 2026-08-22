@@ -327,6 +327,7 @@ def run_tests():
     vprod = vp.json()
     assert_eq(vprod["has_variants"], True, "has_variants auto-set True when variants sent")
     assert_eq(len(vprod["variations"]), 1, "Variant present in response")
+    assert_eq(vprod["variations"][0]["image_url"], None, "Variant without image_url has image_url=None")
     variant_id = vprod["variations"][0]["id"]
 
     # NOTE: the existing variant upsert path validates each entry as a full VariantIn
@@ -337,6 +338,68 @@ def run_tests():
     assert_eq(vpatch.status_code, 200, "Variant in-place update via PATCH succeeds")
     assert_eq(vpatch.json()["variations"][0]["price"], 120, "Variant price updated")
     assert_eq(vpatch.json()["variations"][0]["sku"], vprod["variations"][0]["sku"], "Variant SKU unaffected by unrelated field update")
+    assert_eq(vpatch.json()["variations"][0]["image_url"], None, "Variant image_url remains None when omitted in update")
+
+    # ---------------- Variant image_url support ----------------
+    # TEST 1: Create variant with image_url
+    img_url_1 = "https://example.com/variant-red-l.jpg"
+    vp_img = client.post("/products", json={
+        "name": "Variant Image Product", "sku": f"VIP-{uuid.uuid4().hex[:6]}",
+        "variations": [
+            {"name": "Red / L", "sku": f"VIP-RL-{uuid.uuid4().hex[:4]}", "price": 100, "inventory": 10, "image_url": img_url_1},
+            {"name": "Blue / M", "sku": f"VIP-BM-{uuid.uuid4().hex[:4]}", "price": 90, "inventory": 5},
+        ],
+    }, headers=h1)
+    assert_eq(vp_img.status_code, 201, "Product with variant image created")
+    vip_data = vp_img.json()
+    assert_eq(len(vip_data["variations"]), 2, "Both variants created")
+    v1 = next(v for v in vip_data["variations"] if v["name"] == "Red / L")
+    v2 = next(v for v in vip_data["variations"] if v["name"] == "Blue / M")
+    assert_eq(v1["image_url"], img_url_1, "Variant 1 image_url returned on create")
+    assert_eq(v2["image_url"], None, "Variant 2 image_url is null when omitted on create")
+
+    # TEST 2: GET variant image_url
+    vip_get = client.get(f"/products/{vip_data['id']}", headers=h1)
+    assert_eq(vip_get.status_code, 200, "GET product with variant images succeeds")
+    vip_get_data = vip_get.json()
+    v1_get = next(v for v in vip_get_data["variations"] if v["id"] == v1["id"])
+    v2_get = next(v for v in vip_get_data["variations"] if v["id"] == v2["id"])
+    assert_eq(v1_get["image_url"], img_url_1, "GET returns variant 1 image_url accurately")
+    assert_eq(v2_get["image_url"], None, "GET returns variant 2 image_url as null")
+
+    # TEST 3: Update existing variant image_url
+    img_url_updated = "https://example.com/variant-red-l-new.jpg"
+    vip_patch1 = client.patch(f"/products/{vip_data['id']}", json={
+        "variations": [
+            {"id": v1["id"], "name": "Red / L", "price": 110, "image_url": img_url_updated},
+        ],
+    }, headers=h1)
+    assert_eq(vip_patch1.status_code, 200, "PATCH existing variant image_url succeeds")
+    v1_patched = next(v for v in vip_patch1.json()["variations"] if v["id"] == v1["id"])
+    assert_eq(v1_patched["image_url"], img_url_updated, "Existing variant image_url updated")
+    assert_eq(v1_patched["price"], 110, "Existing variant price updated")
+    assert_eq(v1_patched["sku"], v1["sku"], "Existing variant SKU preserved")
+
+    # TEST 4: Create new variant with image_url during update
+    img_url_new_var = "https://example.com/variant-green-s.jpg"
+    vip_patch2 = client.patch(f"/products/{vip_data['id']}", json={
+        "variations": [
+            {"name": "Green / S", "sku": f"VIP-GS-{uuid.uuid4().hex[:4]}", "price": 80, "inventory": 15, "image_url": img_url_new_var},
+        ],
+    }, headers=h1)
+    assert_eq(vip_patch2.status_code, 200, "PATCH adding new variant with image_url succeeds")
+    vip_patch2_data = vip_patch2.json()
+    assert_eq(len(vip_patch2_data["variations"]), 3, "New variant added alongside existing untouched variants")
+    v3_new = next(v for v in vip_patch2_data["variations"] if v["name"] == "Green / S")
+    assert_eq(v3_new["image_url"], img_url_new_var, "New variant created during update has image_url persisted")
+    assert_eq(v3_new["inventory"], 15, "New variant inventory persisted")
+
+    # TEST 5: Null image_url explicitly and GET check
+    vip_get_final = client.get(f"/products/{vip_data['id']}", headers=h1)
+    assert_eq(vip_get_final.status_code, 200, "GET product detail after variant updates succeeds")
+    for var in vip_get_final.json()["variations"]:
+        if var["name"] == "Blue / M":
+            assert_eq(var["image_url"], None, "image_url is null for variant created without it")
 
     # ---------------- Organization isolation ----------------
     iso_get = client.get(f"/products/{pid}", headers=h2)

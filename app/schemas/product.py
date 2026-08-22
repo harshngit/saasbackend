@@ -18,6 +18,7 @@ class VariantIn(BaseModel):
     weight: float | None = None
     price: float = Field(default=0, ge=0)
     inventory: int = Field(default=0, ge=0)
+    image_url: str | None = None
 
 
 class VariantOut(BaseModel):
@@ -33,6 +34,7 @@ class VariantOut(BaseModel):
     weight: float | None
     price: float
     inventory: int
+    image_url: str | None = None
 
 
 class NamedRef(BaseModel):
