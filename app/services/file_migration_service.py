@@ -31,8 +31,14 @@ TARGETS: list[tuple[str, list[str], list[str]]] = [
         "cover_image", "product_video", "product_catalog_brochure", "product_manual",
         "download_file", "product_datasheet", "compliance_certificate", "warranty_document",
     ], ["other_attachments", "images"]),
-    ("Expense", ["receipt_url"], []),
-    ("PurchaseInvoice", ["attachment_url"], []),
+    ("Category", ["image"], []),
+    ("Customer", ["doc_gst_url", "doc_pan_url"], ["documents"]),
+    ("Vehicle", ["rc_document_url", "insurance_document_url", "fitness_document_url", "puc_document_url"], []),
+    ("Expense", ["receipt_url", "vendor_invoice_url"], ["supporting_documents"]),
+    ("PurchaseInvoice", [
+        "attachment_url", "supplier_quotation_url", "purchase_order_url",
+        "supplier_invoice_url", "delivery_challan_url",
+    ], ["supporting_documents"]),
 ]
 
 _EXTENSIONS = {
