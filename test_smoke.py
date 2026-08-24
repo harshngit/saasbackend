@@ -2142,8 +2142,9 @@ check("GET /leads list -> 200", r.status_code == 200 and len(r.json()) >= 1, r.t
 r = client.get(f"/leads/{lead_obj['id']}", headers=fin_hdr)
 check("GET /leads/{id} detail -> 200", r.status_code == 200, r.text)
 
-r = client.put(f"/leads/{lead_obj['id']}", headers=fin_hdr, json={"lead_status": "contacted"})
-check("PUT /leads/{id} edit -> 200", r.status_code == 200 and r.json()["lead_status"] == "contacted", r.text)
+r = client.patch(f"/leads/{lead_obj['id']}", headers=fin_hdr, json={"lead_status": "contacted"})
+check("PATCH /leads/{id} edit -> 200", r.status_code == 200 and r.json()["lead_status"] == "contacted", r.text)
+check("PUT /leads/{id} -> 405 Method Not Allowed", client.put(f"/leads/{lead_obj['id']}", headers=fin_hdr, json={"lead_status": "contacted"}).status_code == 405)
 
 r = client.delete(f"/leads/{lead_obj['id']}", headers=fin_hdr)
 check("DELETE /leads/{id} -> 204", r.status_code == 204)

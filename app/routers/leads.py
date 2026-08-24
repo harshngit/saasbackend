@@ -113,7 +113,6 @@ def get_lead_detail(
 
 
 @router.patch("/{id}", response_model=LeadOut)
-@router.put("/{id}", response_model=LeadOut)
 def update_lead(
     id: str,
     payload: LeadUpdate,
