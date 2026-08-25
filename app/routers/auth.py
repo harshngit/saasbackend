@@ -1,5 +1,7 @@
 import jwt
+from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -13,8 +15,10 @@ from app.schemas.auth import (
     CheckEmailRequest,
     CheckEmailResponse,
     DirectResetRequest,
+    ExchangeTicketRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
+    GoogleAuthRequest,
     LoginRequest,
     LogoutRequest,
     MessageResponse,
@@ -25,8 +29,9 @@ from app.schemas.auth import (
     TokenPair,
 )
 from app.schemas.user import UserOut
-from app.services import auth_service, org_service, password_service, role_service
+from app.services import auth_service, google_auth_service, org_service, password_service, role_service
 from app.services.email_service import send_password_reset
+from app.services.google_auth_service import GoogleAuthError
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -86,6 +91,134 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
 
     tokens = auth_service.issue_tokens(db, user)
     return auth_service.build_auth_response(user, tokens)
+
+
+@router.get("/google", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+def google_oauth_redirect() -> RedirectResponse:
+    """Initiate Google OAuth 2.0 Authorization Code redirect flow with signed state."""
+    try:
+        state = google_auth_service.generate_oauth_state()
+        auth_url = google_auth_service.build_google_authorization_url(state)
+    except GoogleAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return RedirectResponse(url=auth_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+@router.get("/google/callback", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+def google_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    """Handle Google OAuth2 callback: validate state, exchange code, link user, issue exchange ticket."""
+    if error:
+        err_msg = error_description or error
+        target = f"{settings.frontend_url}/auth/callback?error={quote(err_msg)}"
+        return RedirectResponse(url=target, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+    if not code or not state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing OAuth code or state parameter",
+        )
+
+    try:
+        google_auth_service.verify_oauth_state(state)
+        google_data = google_auth_service.exchange_authorization_code(code)
+    except GoogleAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    google_sub = google_data["sub"]
+    google_email = google_data["email"]
+
+    # 1. Look up by existing linked Google ID
+    user = db.query(User).filter(User.google_id == google_sub).first()
+
+    # 2. If not found by google_id, look up by verified email and link the account
+    if user is None:
+        user = db.query(User).filter(User.email == google_email).first()
+        if user is not None:
+            user.google_id = google_sub
+            db.commit()
+            db.refresh(user)
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No CRM account found for this Google account. Please contact your organization administrator or register your organization.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+
+    # Generate short-lived single-use exchange ticket
+    exchange_code = auth_service.create_exchange_ticket(db, user.id)
+
+    redirect_url = f"{settings.frontend_url}/auth/callback?exchange_code={quote(exchange_code)}"
+    return RedirectResponse(url=redirect_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+@router.post("/exchange", response_model=AuthResponse)
+def exchange_oauth_ticket(payload: ExchangeTicketRequest, db: Session = Depends(get_db)) -> AuthResponse:
+    """Exchange a short-lived, single-use OAuth ticket for full CRM access & refresh tokens."""
+    user = auth_service.consume_exchange_ticket(db, payload.code)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid, expired, or already used exchange ticket",
+        )
+
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+
+    org_service.apply_trial_expiry(db, user.organization)
+    tokens = auth_service.issue_tokens(db, user)
+    return auth_service.build_auth_response(user, tokens)
+
+
+@router.post("/google", response_model=AuthResponse)
+def google_sign_in(payload: GoogleAuthRequest, db: Session = Depends(get_db)) -> AuthResponse:
+    """Authenticate with a verified Google OAuth2 ID token (Direct ID-Token flow).
+
+    Validates the cryptographic token signature and claims with Google, links or locates
+    the matching active CRM user, and issues standard CRM access and refresh JWT tokens.
+    """
+    try:
+        google_data = google_auth_service.verify_google_id_token(payload.credential)
+    except GoogleAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    google_sub = google_data["sub"]
+    google_email = google_data["email"]
+
+    # 1. Look up by existing linked Google ID
+    user = db.query(User).filter(User.google_id == google_sub).first()
+
+    # 2. If not found by google_id, look up by verified email and link the account
+    if user is None:
+        user = db.query(User).filter(User.email == google_email).first()
+        if user is not None:
+            user.google_id = google_sub
+            db.commit()
+            db.refresh(user)
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No CRM account found for this Google account. Please contact your organization administrator or register your organization.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+
+    # Lazily lock the org if its trial has expired
+    org_service.apply_trial_expiry(db, user.organization)
+
+    tokens = auth_service.issue_tokens(db, user)
+    return auth_service.build_auth_response(user, tokens)
+
 
 
 @router.post("/refresh", response_model=TokenPair)

@@ -134,6 +134,7 @@ class UserOut(BaseModel):
     role_id: str | None
     role_detail: RoleBrief | None      # the staff member's role + permissions
     role: UserRole | None              # legacy fixed-role enum (kept for backward-compat)
+    google_id: str | None = None
     is_active: bool
     created_at: datetime
 

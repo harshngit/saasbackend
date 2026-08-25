@@ -21,6 +21,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Customer,
     Notification,
     NumberSequence,
+    OAuthExchangeTicket,
     Organization,
     StoredFile,
     Plan,

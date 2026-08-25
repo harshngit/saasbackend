@@ -42,6 +42,18 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class GoogleAuthRequest(BaseModel):
+    """Payload for POST /auth/google containing the Google ID token/credential."""
+
+    credential: str = Field(min_length=1, description="Google OAuth2 ID token from Google Sign-In")
+
+
+class ExchangeTicketRequest(BaseModel):
+    """Payload for POST /auth/exchange containing the short-lived single-use exchange ticket."""
+
+    code: str = Field(min_length=1, description="Single-use OAuth exchange ticket")
+
+
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str

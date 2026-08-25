@@ -37,6 +37,8 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(50), nullable=True, unique=True, index=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Google OAuth subject identifier (sub claim). Nullable for password-only users.
+    google_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
 
     # Top-level role for routing/access control (super_admin / admin / staff).
     system_role: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)

@@ -30,6 +30,7 @@ from app.models.purchase_invoice import (
 )
 from app.models.sales_order import ORDER_STATUSES, SalesOrder, SalesOrderItem
 from app.models.password_reset_token import PasswordResetToken
+from app.models.oauth_exchange_ticket import OAuthExchangeTicket
 from app.models.plan import Plan
 from app.models.product import Product, ProductPricing, ProductVariant
 from app.models.refresh_token import RefreshToken
@@ -100,6 +101,7 @@ __all__ = [
     "User",
     "RefreshToken",
     "PasswordResetToken",
+    "OAuthExchangeTicket",
     "UserRole",
     "SystemRole",
     "STAFF_ROLES",

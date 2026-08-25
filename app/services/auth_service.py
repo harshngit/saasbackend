@@ -1,15 +1,16 @@
 import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import create_access_token, create_refresh_token
-from app.models import RefreshToken, User
+from app.models import OAuthExchangeTicket, RefreshToken, User
 from app.schemas.auth import AuthResponse, TokenPair
 
 
-def _hash_refresh(token: str) -> str:
+def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
@@ -21,7 +22,7 @@ def issue_tokens(db: Session, user: User) -> TokenPair:
     db.add(
         RefreshToken(
             user_id=user.id,
-            token_hash=_hash_refresh(refresh),
+            token_hash=_hash_token(refresh),
             expires_at=datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days),
         )
     )
@@ -31,7 +32,7 @@ def issue_tokens(db: Session, user: User) -> TokenPair:
 
 def get_active_refresh(db: Session, token: str) -> RefreshToken | None:
     """Return the stored refresh-token record if it exists, is unrevoked, and unexpired."""
-    record = db.query(RefreshToken).filter(RefreshToken.token_hash == _hash_refresh(token)).first()
+    record = db.query(RefreshToken).filter(RefreshToken.token_hash == _hash_token(token)).first()
     if record is None or record.revoked:
         return None
     if record.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
@@ -40,7 +41,7 @@ def get_active_refresh(db: Session, token: str) -> RefreshToken | None:
 
 
 def revoke_refresh(db: Session, token: str) -> bool:
-    record = db.query(RefreshToken).filter(RefreshToken.token_hash == _hash_refresh(token)).first()
+    record = db.query(RefreshToken).filter(RefreshToken.token_hash == _hash_token(token)).first()
     if record is None or record.revoked:
         return False
     record.revoked = True
@@ -48,5 +49,38 @@ def revoke_refresh(db: Session, token: str) -> bool:
     return True
 
 
+def create_exchange_ticket(db: Session, user_id: str) -> str:
+    """Generate a short-lived (60s), single-use exchange ticket for OAuth redirect token hand-off."""
+    raw_ticket = secrets.token_urlsafe(32)
+    ticket_hash = _hash_token(raw_ticket)
+    ticket = OAuthExchangeTicket(
+        user_id=user_id,
+        ticket_hash=ticket_hash,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        used=False,
+    )
+    db.add(ticket)
+    db.commit()
+    return raw_ticket
+
+
+def consume_exchange_ticket(db: Session, code: str) -> User | None:
+    """Validate, expire, and atomically consume an OAuth exchange ticket. Returns User if valid."""
+    ticket_hash = _hash_token(code)
+    ticket = (
+        db.query(OAuthExchangeTicket)
+        .filter(OAuthExchangeTicket.ticket_hash == ticket_hash)
+        .first()
+    )
+    if ticket is None or ticket.used:
+        return None
+    if ticket.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        return None
+    ticket.used = True
+    db.commit()
+    return db.get(User, ticket.user_id)
+
+
 def build_auth_response(user: User, tokens: TokenPair) -> AuthResponse:
     return AuthResponse(user=user, organization=user.organization, tokens=tokens)
+

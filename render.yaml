@@ -55,3 +55,12 @@ services:
         value: "CRM SaaS <no-reply@crm-saas.local>"
       - key: FRONTEND_RESET_URL
         sync: false
+      # --- Google Sign-In & OAuth 2.0 Redirect ---
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: "https://crm-saas-backend-9nom.onrender.com/auth/google/callback"
+      - key: FRONTEND_URL
+        value: "https://crm-saas.asynk.in"

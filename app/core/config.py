@@ -22,6 +22,12 @@ class Settings(BaseSettings):
 
     cors_origins: str = "*"
 
+    # --- Google Sign-In & OAuth 2.0 Redirect ---
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+    frontend_url: str = "http://localhost:5173"
+
     # --- Password reset ---
     reset_token_expire_minutes: int = 30
     # Front-end page that receives the ?token=... link from the reset email.
