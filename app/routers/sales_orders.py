@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, Delivery, Role, SalesOrder, StockReservation, User, UserRole
+from app.models import Customer, Delivery, Invoice, Role, SalesOrder, StockReservation, User, UserRole
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
@@ -70,6 +70,38 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             )
         out.stock_summary = summary
     out.warnings = warnings or []
+
+    # Ensure delivery and invoice references are populated
+    if not out.delivery_id:
+        latest_del = (
+            db.query(Delivery)
+            .filter(
+                Delivery.sales_order_id == order.id,
+                Delivery.organization_id == order.organization_id,
+                Delivery.status != "cancelled",
+            )
+            .order_by(Delivery.created_at.desc())
+            .first()
+        )
+        if latest_del:
+            out.delivery_id = latest_del.id
+            out.delivery_number = latest_del.delivery_note_number
+
+    if not out.invoice_id:
+        latest_inv = (
+            db.query(Invoice)
+            .filter(
+                Invoice.order_id == order.id,
+                Invoice.organization_id == order.organization_id,
+                Invoice.is_credit_note.is_(False),
+            )
+            .order_by(Invoice.created_at.desc())
+            .first()
+        )
+        if latest_inv:
+            out.invoice_id = latest_inv.id
+            out.invoice_number = latest_inv.invoice_number
+
     return out
 
 
@@ -175,8 +207,15 @@ def create_order(
         db, user, customer,
         lines=[
             order_service.OrderLine(
-                product_id=it.product_id, variant_id=it.variant_id, quantity=it.quantity,
-                unit_price=it.unit_price, discount=it.discount, tax_rate=it.tax_rate,
+                product_id=it.product_id,
+                variant_id=it.variant_id,
+                quantity=it.quantity,
+                unit_price=it.unit_price,
+                discount=it.discount,
+                discount_percent=it.discount_percent,
+                tax_rate=it.tax_rate,
+                uom=it.uom,
+                cost_price=it.cost_price,
             )
             for it in payload.items
         ],
@@ -194,6 +233,12 @@ def create_order(
         notes=payload.notes,
         order_status_label=payload.order_status,
         create_as_draft=settings["draft_orders_enabled"],
+        billing_address=payload.billing_address or customer.billing_address,
+        shipping_address=payload.shipping_address or payload.delivery_address or customer.delivery_address,
+        delivery_address=payload.delivery_address or payload.shipping_address or customer.delivery_address,
+        payment_terms=payload.payment_terms,
+        delivery_terms=payload.delivery_terms,
+        currency=payload.currency or "INR",
     )
     db.commit()
     db.refresh(order)

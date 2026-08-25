@@ -134,7 +134,12 @@ def _delivery_out(db: Session, delivery: Delivery) -> DeliveryOut:
         cust = db.get(Customer, delivery.customer_id)
     if cust is None and delivery.sales_order and delivery.sales_order.customer:
         cust = delivery.sales_order.customer
-    out.customer = DeliveryCustomerBrief.model_validate(cust) if cust else None
+    if cust:
+        cust_brief = DeliveryCustomerBrief.model_validate(cust)
+        cust_brief.previous_pending_balance = out.previous_pending_balance
+        out.customer = cust_brief
+    else:
+        out.customer = None
 
     veh = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
     out.vehicle = VehicleBrief.model_validate(veh) if veh else None

@@ -33,6 +33,9 @@ MODULES: list[str] = [
     "gst",
     "users",
     "settings",
+    "visits",
+    "follow_ups",
+    "leaves",
 ]
 
 # Friendlier names callers may send for a module, mapped to its canonical key. The
@@ -56,6 +59,12 @@ MODULE_ALIASES: dict[str, str] = {
     "stock": "inventory",
     "staff": "users",
     "roles": "users",
+    "visit": "visits",
+    "followup": "follow_ups",
+    "follow_up": "follow_ups",
+    "tasks": "follow_ups",
+    "task": "follow_ups",
+    "leave": "leaves",
 }
 
 # Actions available per module.
@@ -84,6 +93,9 @@ MODULE_LABELS: dict[str, str] = {
     "gst": "GST",
     "users": "Users & Roles",
     "settings": "Settings",
+    "visits": "Visits",
+    "follow_ups": "Follow-ups",
+    "leaves": "Leaves",
 }
 ACTION_LABELS: dict[str, str] = {
     "view": "View",
@@ -156,6 +168,9 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "attendance": _full(),
             "products": _view_only(),
             "inventory": _view_only(),
+            "visits": _full(),
+            "follow_ups": _full(),
+            "leaves": _perm(view=True, create=True, edit=True, delete=True),
         },
         "Delivery Partner": {
             "dashboard": _view_only(),
@@ -165,6 +180,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "customers": _create_only(),
             "sales_orders": _create_only(),
             "products": _view_only(),
+            "leaves": _perm(view=True, create=True, edit=True, delete=True),
         },
         "Accountant": {
             "dashboard": _view_only(),
@@ -178,6 +194,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "customers": _view_only(),
             "suppliers": _view_only(),
             "inventory": _view_only(),
+            "leaves": _perm(view=True, create=True, edit=True, delete=True),
         },
     }
 

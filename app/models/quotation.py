@@ -100,11 +100,16 @@ class QuotationItem(Base):
     # Quoted terms per line, carried through to the order on conversion so the
     # customer is billed what they were quoted.
     discount: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
+    discount_percent: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
     tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     @property
     def line_total(self) -> float:
-        return round((self.quantity or 0) * (self.unit_price or 0) - (self.discount or 0), 2)
+        gross = (self.quantity or 0) * (self.unit_price or 0)
+        disc = self.discount or 0
+        if disc == 0 and (self.discount_percent or 0) > 0:
+            disc = round(gross * (self.discount_percent or 0) / 100, 2)
+        return round(gross - disc, 2)
 
     @property
     def tax_amount(self) -> float:

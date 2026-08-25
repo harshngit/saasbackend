@@ -30,6 +30,8 @@ from app.schemas.customer import (
     CustomerPaymentOut,
     CustomerUpdate,
 )
+from app.schemas.visit import VisitOut
+from app.schemas.follow_up import FollowUpOut
 
 router = APIRouter(prefix="/customers", tags=["customers"])
 
@@ -480,3 +482,26 @@ def delete_customer_document(
     customer = _owned_customer(db, customer_id, user)
     db.delete(_owned_document(db, customer, document_id))
     db.commit()
+
+
+@router.get("/{customer_id}/visits", response_model=list[VisitOut])
+def list_customer_visits(
+    customer_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+):
+    customer = _owned_customer(db, customer_id, user)
+    from app.services import visit_service
+    return visit_service.list_visits(db, _org_id(user), user, customer_id=customer.id)
+
+
+@router.get("/{customer_id}/follow-ups", response_model=list[FollowUpOut])
+def list_customer_follow_ups(
+    customer_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+):
+    customer = _owned_customer(db, customer_id, user)
+    from app.services import follow_up_service
+    return follow_up_service.list_follow_ups(db, _org_id(user), user, customer_id=customer.id)
+

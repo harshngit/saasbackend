@@ -86,6 +86,12 @@ class SalesOrder(Base):
     total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    shipping_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payment_terms: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    delivery_terms: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(10), default="INR", nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # Whether stock has been deducted (on approval) — so cancel can restore it exactly once.
     stock_deducted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -100,6 +106,44 @@ class SalesOrder(Base):
         back_populates="order", cascade="all, delete-orphan", lazy="joined"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined")  # noqa: F821
+    deliveries: Mapped[list["Delivery"]] = relationship(  # noqa: F821
+        lazy="select", primaryjoin="SalesOrder.id == Delivery.sales_order_id", overlaps="sales_order"
+    )
+    invoices: Mapped[list["Invoice"]] = relationship(  # noqa: F821
+        lazy="select", primaryjoin="SalesOrder.id == Invoice.order_id", overlaps="order"
+    )
+
+    @property
+    def delivery_id(self) -> str | None:
+        if self.deliveries:
+            active = [d for d in self.deliveries if d.status != "cancelled"]
+            if active:
+                return active[-1].id
+        return None
+
+    @property
+    def delivery_number(self) -> str | None:
+        if self.deliveries:
+            active = [d for d in self.deliveries if d.status != "cancelled"]
+            if active:
+                return active[-1].delivery_note_number
+        return None
+
+    @property
+    def invoice_id(self) -> str | None:
+        if self.invoices:
+            valid = [i for i in self.invoices if not i.is_credit_note]
+            if valid:
+                return valid[-1].id
+        return None
+
+    @property
+    def invoice_number(self) -> str | None:
+        if self.invoices:
+            valid = [i for i in self.invoices if not i.is_credit_note]
+            if valid:
+                return valid[-1].invoice_number
+        return None
 
 
 class SalesOrderItem(Base):
@@ -119,6 +163,8 @@ class SalesOrderItem(Base):
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)  # line-level
+    discount_percent: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
+    cost_price: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
     # Snapshot of the tax the line was sold at, so an invoice raised later bills the
@@ -131,6 +177,12 @@ class SalesOrderItem(Base):
     # The lot and the units the customer asked for, if they asked for particular ones.
     # A request, not a hold: which lot actually goes out is settled at loading.
     batch_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
-    serial_numbers: Mapped[list | None] = mapped_column(JSON, nullable=True)
-
     order: Mapped["SalesOrder"] = relationship(back_populates="items")
+
+    @property
+    def ordered_quantity(self) -> int:
+        return self.quantity
+
+    @property
+    def remaining_quantity(self) -> float:
+        return round(max((self.quantity or 0) - (self.delivered_quantity or 0), 0), 3)

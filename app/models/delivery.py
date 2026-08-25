@@ -133,5 +133,10 @@ class DeliveryItem(Base):
 
     @property
     def pending_quantity(self) -> float:
-        """Still to deliver out of what was planned."""
+        """Still to deliver out of what was planned on this delivery."""
         return round(max((self.planned_quantity or 0) - (self.delivered_quantity or 0), 0), 3)
+
+    @property
+    def remaining_quantity(self) -> float:
+        """Alias for pending_quantity: remaining unfulfilled quantity on this delivery."""
+        return self.pending_quantity

@@ -36,6 +36,7 @@ class QuotationItemBase(BaseModel):
     uom: str | None = None
     unit_price: float = Field(ge=0)
     discount: float = Field(default=0, ge=0, description="Per line")
+    discount_percent: float | None = Field(default=0, ge=0, le=100, description="Per line discount %")
     tax_rate: float | None = Field(
         default=None, ge=0, le=100,
         description="Per-line tax %. Falls back to the product's own rate; carried "
@@ -101,6 +102,11 @@ class ConvertToOrder(BaseModel):
     fulfilment_method: str | None = Field(default=None, max_length=30, description="delivery | pickup")
     payment_type: str | None = Field(default=None, max_length=20, description="cash | credit | upi | …")
     payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    billing_address: str | None = None
+    shipping_address: str | None = None
+    delivery_address: str | None = None
+    payment_terms: str | None = None
+    delivery_terms: str | None = None
 
 
 class ConvertedOrderBrief(BaseModel):
@@ -111,6 +117,12 @@ class ConvertedOrderBrief(BaseModel):
     status: str
     fulfilment_status: str | None = None
     total: float = 0
+    billing_address: str | None = None
+    shipping_address: str | None = None
+    delivery_address: str | None = None
+    payment_terms: str | None = None
+    delivery_terms: str | None = None
+    currency: str | None = None
 
 
 class ConversionOut(BaseModel):

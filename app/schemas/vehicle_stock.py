@@ -39,6 +39,18 @@ class VehicleLoadingItemOut(BaseModel):
     extra_qty: int
     returned_qty: int
     delivered_qty: int
+    remaining_qty: int = 0
+    expected_closing_qty: int = 0
+
+    @model_validator(mode="after")
+    def _compute_quantities(self) -> "VehicleLoadingItemOut":
+        l_qty = self.loaded_qty or 0
+        e_qty = self.extra_qty or 0
+        d_qty = self.delivered_qty or 0
+        r_qty = self.returned_qty or 0
+        self.remaining_qty = max((l_qty + e_qty) - d_qty, 0)
+        self.expected_closing_qty = max((l_qty + e_qty) - d_qty - r_qty, 0)
+        return self
 
 
 class VehiclePartnerBrief(BaseModel):
@@ -146,3 +158,54 @@ class EndOfDayItem(BaseModel):
 
 class EndOfDayBody(BaseModel):
     items: list[EndOfDayItem] = Field(min_length=1)
+
+
+class ReconcileItemIn(BaseModel):
+    product_id: str | None = None
+    variant_id: str | None = None
+    loading_item_id: str | None = None
+    physical_qty: int = Field(ge=0, description="Actual physical count counted on vehicle")
+    notes: str | None = Field(default=None, max_length=300)
+
+    @field_validator("variant_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        return None if v == "" else v
+
+
+class ReconcileBody(BaseModel):
+    items: list[ReconcileItemIn] = Field(min_length=1)
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class VehicleReconciliationItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    loading_item_id: str | None = None
+    product_id: str | None = None
+    variant_id: str | None = None
+    product_name: str
+    loaded_qty: int
+    extra_qty: int
+    delivered_qty: int
+    returned_qty: int
+    expected_closing_qty: int
+    physical_qty: int
+    variance_qty: int
+    notes: str | None = None
+
+
+class VehicleReconciliationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    organization_id: str
+    loading_id: str
+    reconciled_by_id: str
+    status: str
+    notes: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    items: list[VehicleReconciliationItemOut] = Field(default_factory=list)
+

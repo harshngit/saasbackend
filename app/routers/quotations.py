@@ -79,6 +79,7 @@ def _build_items(db: Session, org_id: str, lines) -> list[QuotationItem]:  # noq
                 uom=item.uom,
                 unit_price=item.unit_price,
                 discount=item.discount,
+                discount_percent=item.discount_percent,
                 # The line's own rate, else the product's — never a hardcoded figure.
                 tax_rate=item.tax_rate if item.tax_rate is not None else product.tax_rate,
             )
@@ -263,13 +264,29 @@ def convert_to_order(
         )
 
     settings = workflow.sales_settings(user.organization)
+    resolved_billing = payload.billing_address or quotation.billing_address or customer.billing_address
+    resolved_shipping = (
+        payload.shipping_address
+        or payload.delivery_address
+        or quotation.shipping_address
+        or customer.delivery_address
+    )
+    resolved_payment_terms = payload.payment_terms or quotation.payment_terms
+    resolved_delivery_terms = payload.delivery_terms or quotation.delivery_terms
+    resolved_currency = quotation.currency or "INR"
+
     order, warnings = order_service.place_order(
         db, user, customer,
         lines=[
             order_service.OrderLine(
-                product_id=item.product_id, variant_id=item.variant_id,
-                quantity=item.quantity, unit_price=item.unit_price,
-                discount=item.discount or 0, tax_rate=item.tax_rate,
+                product_id=item.product_id,
+                variant_id=item.variant_id,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                discount=item.discount or 0,
+                discount_percent=item.discount_percent or 0,
+                tax_rate=item.tax_rate,
+                uom=item.uom,
             )
             for item in quotation.items
             if item.product_id
@@ -286,6 +303,12 @@ def convert_to_order(
         # Same shared path POST /orders uses: a draft-enabled firm gets an
         # unreserved draft here too, confirmed later via POST /orders/{id}/confirm.
         create_as_draft=settings["draft_orders_enabled"],
+        billing_address=resolved_billing,
+        shipping_address=resolved_shipping,
+        delivery_address=resolved_shipping,
+        payment_terms=resolved_payment_terms,
+        delivery_terms=resolved_delivery_terms,
+        currency=resolved_currency,
     )
     _ = warnings  # surfaced on the order itself via GET /orders/{id}
 

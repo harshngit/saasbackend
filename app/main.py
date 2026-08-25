@@ -36,10 +36,10 @@ from app.models import (  # noqa: F401  (register mappers)
     StockBatch,
     StockMovement,
     StockReservation,
-    Supplier,
-    SupplierPayment,
-    User,
     Vehicle,
+    Visit,
+    FollowUp,
+    Leave,
     Warehouse,
     WarehouseStock,
 )
@@ -57,8 +57,10 @@ from app.routers import (
     deliveries,
     expenses,
     files,
+    follow_ups,
     inventory,
     invoices,
+    leaves,
     notifications,
     organizations,
     plans,
@@ -73,6 +75,7 @@ from app.routers import (
     users,
     vehicle_stock,
     vehicles,
+    visits,
     warehouses,
     leads,
     quotations,
@@ -224,4 +227,9 @@ app.include_router(leads.router)
 app.include_router(quotations.router)
 app.include_router(payment_receipts.router)
 app.include_router(sales_returns.router)
+app.include_router(visits.router)
+app.include_router(follow_ups.router)
+app.include_router(leaves.router)
+
+
 

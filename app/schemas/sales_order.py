@@ -8,13 +8,16 @@ class OrderItemIn(BaseModel):
     variant_id: str | None = None
     quantity: int = Field(gt=0)
     unit_price: float | None = Field(default=None, ge=0)  # defaults to product/variant price
-    discount: float = Field(default=0, ge=0)              # per-line
+    discount: float = Field(default=0, ge=0)              # per-line flat discount
+    discount_percent: float | None = Field(default=0, ge=0, le=100, description="Per-line discount %")
     tax_rate: float | None = Field(
         default=None, ge=0, le=100,
         description="Per-line tax %. Falls back to the product's own rate — never a "
                     "hardcoded figure. Snapshotted on the line so an invoice raised "
                     "later bills the agreed rate.",
     )
+    uom: str | None = None
+    cost_price: float | None = None
 
     @field_validator("variant_id", mode="before")
     @classmethod
@@ -33,11 +36,18 @@ class OrderItemOut(BaseModel):
     ordered_quantity: int = Field(default=0, description="Same as quantity, named as the flow does")
     reserved_quantity: float = 0
     delivered_quantity: float = 0
+    remaining_quantity: float = Field(
+        default=0,
+        description="Authoritative remaining quantity: max(ordered_quantity - delivered_quantity, 0)",
+    )
     unit_price: float
     discount: float
+    discount_percent: float | None = 0
+    cost_price: float | None = None
     tax_rate: float | None = None
     tax_amount: float = 0
     line_total: float
+    uom: str | None = None
 
 
 class CustomerBrief(BaseModel):
@@ -45,7 +55,12 @@ class CustomerBrief(BaseModel):
 
     id: str
     name: str
-    business_name: str | None
+    business_name: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    delivery_address: str | None = None
+    billing_address: str | None = None
+    gst_number: str | None = None
 
 
 class OrderOut(BaseModel):
@@ -73,6 +88,12 @@ class OrderOut(BaseModel):
     pickup_notes: str | None = None
     payment_type: str | None = None
     payment_terms_days: int | None = None
+    payment_terms: str | None = None
+    delivery_terms: str | None = None
+    currency: str | None = "INR"
+    billing_address: str | None = None
+    shipping_address: str | None = None
+    delivery_address: str | None = None
     source: str
     assigned_delivery_partner_id: str | None
     created_by: str | None
@@ -93,6 +114,12 @@ class OrderOut(BaseModel):
     salesperson_id: str | None = None
     order_status: str | None = None
 
+    # Delivery & Invoice references
+    delivery_id: str | None = None
+    delivery_number: str | None = None
+    invoice_id: str | None = None
+    invoice_number: str | None = None
+
     # What the warehouse holds for this order, reported so the sales screen can show
     # the effect of placing it without a second call.
     stock_summary: list[dict] = Field(default_factory=list)
@@ -102,11 +129,14 @@ class OrderOut(BaseModel):
 
     @model_validator(mode="after")
     def _mirror_quantities(self) -> "OrderOut":
-        """`ordered_quantity` is the flow's name for `quantity` — fill it in rather
-        than making every client know both."""
+        """`ordered_quantity` is the flow's name for `quantity` and `remaining_quantity` is
+        max(ordered_quantity - delivered_quantity, 0)."""
         for item in self.items:
             if not item.ordered_quantity:
                 item.ordered_quantity = item.quantity
+            ordered = float(item.ordered_quantity or item.quantity or 0)
+            delivered = float(item.delivered_quantity or 0)
+            item.remaining_quantity = round(max(ordered - delivered, 0.0), 3)
         return self
 
 
@@ -120,6 +150,12 @@ class OrderCreate(BaseModel):
         default=None, max_length=30, description="delivery | pickup")
     payment_type: str | None = Field(default=None, max_length=20, description="cash | credit | upi | …")
     payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    payment_terms: str | None = None
+    delivery_terms: str | None = None
+    currency: str | None = "INR"
+    billing_address: str | None = None
+    shipping_address: str | None = None
+    delivery_address: str | None = None
     source: str = Field(default="office", description="office | delivery_vehicle")
     discount: float = Field(default=0, ge=0)  # order-level
     tax: float = Field(default=0, ge=0)

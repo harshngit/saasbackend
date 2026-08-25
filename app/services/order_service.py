@@ -29,7 +29,17 @@ from app.services import notification_service, numbering_service, stock_service
 class OrderLine:
     """One line to place, however the caller described it."""
 
-    __slots__ = ("product_id", "variant_id", "quantity", "unit_price", "discount", "tax_rate")
+    __slots__ = (
+        "product_id",
+        "variant_id",
+        "quantity",
+        "unit_price",
+        "discount",
+        "discount_percent",
+        "tax_rate",
+        "uom",
+        "cost_price",
+    )
 
     def __init__(
         self,
@@ -38,14 +48,20 @@ class OrderLine:
         variant_id: str | None = None,
         unit_price: float | None = None,
         discount: float = 0,
+        discount_percent: float | None = 0,
         tax_rate: float | None = None,
+        uom: str | None = None,
+        cost_price: float | None = None,
     ) -> None:
         self.product_id = product_id
         self.variant_id = variant_id
         self.quantity = quantity
         self.unit_price = unit_price
         self.discount = discount or 0
+        self.discount_percent = discount_percent or 0
         self.tax_rate = tax_rate
+        self.uom = uom
+        self.cost_price = cost_price
 
 
 def next_order_number(db: Session, org_id: str) -> str:
@@ -92,6 +108,12 @@ def place_order(
     notes: str | None = None,
     order_status_label: str | None = None,
     create_as_draft: bool = False,
+    billing_address: str | None = None,
+    shipping_address: str | None = None,
+    delivery_address: str | None = None,
+    payment_terms: str | None = None,
+    delivery_terms: str | None = None,
+    currency: str | None = "INR",
 ) -> tuple[SalesOrder, list[str]]:
     """Validate, price, reserve and place. Returns the order and any warnings.
 
@@ -113,6 +135,7 @@ def place_order(
         )
 
     number = next_order_number(db, org_id)
+    resolved_shipping = shipping_address or delivery_address
     order = SalesOrder(
         organization_id=org_id,
         order_number=number,
@@ -137,6 +160,12 @@ def place_order(
         created_by=user.id,
         discount=order_level_discount,
         notes=notes,
+        billing_address=billing_address,
+        shipping_address=resolved_shipping,
+        delivery_address=resolved_shipping,
+        payment_terms=payment_terms,
+        delivery_terms=delivery_terms,
+        currency=currency or "INR",
     )
 
     subtotal = 0.0
@@ -161,13 +190,24 @@ def place_order(
             if line.unit_price is not None
             else (variant.price if variant else product.price)
         )
-        line_total = round(unit_price * line.quantity - line.discount, 2)
+        gross = unit_price * line.quantity
+        disc_amount = line.discount or 0
+        disc_pct = getattr(line, "discount_percent", None) or 0
+        if disc_amount == 0 and disc_pct > 0:
+            disc_amount = round(gross * disc_pct / 100, 2)
+        line_total = round(gross - disc_amount, 2)
         # The line's own rate, else the product's. Never a hardcoded figure — an
         # invoice raised later bills this snapshot.
         rate = line.tax_rate if line.tax_rate is not None else product.tax_rate
         tax_amount = round(line_total * (rate or 0) / 100, 2)
         subtotal += line_total
         line_tax += tax_amount
+        cost_price = (
+            line.cost_price
+            if getattr(line, "cost_price", None) is not None
+            else (product.pricing.purchase_price if product.pricing else 0.0)
+        )
+        uom = getattr(line, "uom", None) or product.uom
         order.items.append(
             SalesOrderItem(
                 product_id=product.id,
@@ -175,7 +215,10 @@ def place_order(
                 product_name=product.name if not variant else f"{product.name} ({variant.name})",
                 quantity=line.quantity,
                 unit_price=unit_price,
-                discount=line.discount,
+                discount=disc_amount,
+                discount_percent=disc_pct,
+                cost_price=cost_price,
+                uom=uom,
                 tax_rate=rate,
                 tax_amount=tax_amount,
                 line_total=line_total,

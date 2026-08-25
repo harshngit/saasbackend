@@ -179,8 +179,21 @@ class CustomerPayment(Base):
     received_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
+    # Snapshot foundation columns
+    order_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    previous_pending: Mapped[float | None] = mapped_column(Float, nullable=True)
+    remaining_receivable: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Loaded with the payment so history rows carry the invoice number, not just its id.
     invoice: Mapped["Invoice | None"] = relationship(lazy="joined")  # noqa: F821
+
+    @property
+    def amount_collected(self) -> float:
+        return self.amount
+
+    @property
+    def payment_method(self) -> str:
+        return self.payment_mode
 
 
 class CustomerDocument(Base):

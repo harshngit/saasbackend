@@ -38,23 +38,35 @@ def payment_receipt_pdf(org, customer, payment) -> bytes:
     pdf.cell(0, 6, _s(f"Date: {payment.received_on.date().isoformat()}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
 
-    pdf.cell(0, 6, _s(f"Received from: {customer.name}"
-             + (f" ({customer.business_name})" if customer.business_name else "")),
+    cust_name = customer.name if customer else "Customer"
+    cust_biz = f" ({customer.business_name})" if customer and customer.business_name else ""
+    pdf.cell(0, 6, _s(f"Received from: {cust_name}{cust_biz}"),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
 
+    pdf.set_font("Helvetica", size=10)
+    if payment.order_amount is not None:
+        pdf.cell(60, 7, "Order Amount", border=1)
+        pdf.cell(60, 7, _s(f"Rs {payment.order_amount:,.2f}"), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    if payment.previous_pending is not None:
+        pdf.cell(60, 7, "Previous Pending", border=1)
+        pdf.cell(60, 7, _s(f"Rs {payment.previous_pending:,.2f}"), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
     pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(60, 8, "Amount Received", border=1)
+    pdf.cell(60, 8, "Amount Collected", border=1)
     pdf.set_font("Helvetica", size=11)
     pdf.cell(60, 8, _s(f"Rs {payment.amount:,.2f}"), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(60, 7, "Payment Mode", border=1)
+    pdf.cell(60, 7, "Payment Method", border=1)
     pdf.cell(60, 7, _s(payment.payment_mode), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if payment.reference:
         pdf.cell(60, 7, "Reference", border=1)
         pdf.cell(60, 7, _s(payment.reference), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(60, 7, "Outstanding After", border=1)
-    pdf.cell(60, 7, _s(f"Rs {(customer.outstanding_balance or 0):,.2f}"), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    rem_bal = payment.remaining_receivable if payment.remaining_receivable is not None else ((customer.outstanding_balance or 0) if customer else 0)
+    pdf.cell(60, 7, "Remaining Receivable", border=1)
+    pdf.cell(60, 7, _s(f"Rs {rem_bal:,.2f}"), border=1, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.ln(8)
     pdf.set_font("Helvetica", "I", 8)

@@ -13,7 +13,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -21,11 +21,13 @@ from app.models import (
     Customer,
     CustomerPayment,
     Delivery,
+    FollowUp,
     Invoice,
     SalesOrder,
     User,
     Vehicle,
     VehicleLoading,
+    Visit,
 )
 from app.schemas.staff_overview import (
     DELIVERY,
@@ -378,15 +380,59 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
         )
     feed += _attendance_activity(db, staff, df, dt)
 
+    # Real visits count for this salesperson in the period
+    visits_count = (
+        db.query(func.count(Visit.id))
+        .filter(
+            Visit.organization_id == staff.organization_id,
+            Visit.user_id == staff.id,
+            Visit.visit_date >= df,
+            Visit.visit_date <= dt,
+        )
+        .scalar()
+        or 0
+    )
+
+    # Real pending follow-ups assigned to this salesperson
+    pending_followups_count = (
+        db.query(func.count(FollowUp.id))
+        .filter(
+            FollowUp.organization_id == staff.organization_id,
+            FollowUp.assigned_to_id == staff.id,
+            FollowUp.status == "pending",
+        )
+        .scalar()
+        or 0
+    )
+
+    # Last visit date per customer
+    last_visits = (
+        db.query(Visit.customer_id, func.max(Visit.visit_date))
+        .filter(Visit.organization_id == staff.organization_id)
+        .group_by(Visit.customer_id)
+        .all()
+    )
+    last_visit_map = {row[0]: row[1] for row in last_visits if row[0] and row[1]}
+
+    # Next upcoming pending follow-up date per customer
+    next_followups = (
+        db.query(FollowUp.customer_id, func.min(FollowUp.due_date))
+        .filter(
+            FollowUp.organization_id == staff.organization_id,
+            FollowUp.status == "pending",
+        )
+        .group_by(FollowUp.customer_id)
+        .all()
+    )
+    next_followup_map = {row[0]: row[1] for row in next_followups if row[0] and row[1]}
+
     return {
         "summary": SalesSummary(
             sales_amount=round(sum(o.total or 0 for o in in_period), 2),
             orders=len(in_period),
             assigned_customers=assigned_total,
-            # Real data only: there is no visits or follow-ups module yet, so these
-            # stay null rather than reporting a zero the page would draw as a figure.
-            visits=None,
-            pending_followups=None,
+            visits=visits_count,
+            pending_followups=pending_followups_count,
         ),
         "performance": [
             SalesPerformancePoint(
@@ -418,8 +464,12 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
                 last_order_date=(
                     last_order[customer.id].isoformat() if customer.id in last_order else None
                 ),
-                last_visit=None,
-                next_followup=None,
+                last_visit=(
+                    last_visit_map[customer.id].isoformat() if customer.id in last_visit_map else None
+                ),
+                next_followup=(
+                    next_followup_map[customer.id].isoformat() if customer.id in next_followup_map else None
+                ),
             )
             for customer in customers.limit(ASSIGNED_ROWS).all()
         ],

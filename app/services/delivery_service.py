@@ -19,6 +19,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.models import (
+    Customer,
     Delivery,
     DeliveryItem,
     Invoice,
@@ -77,16 +78,73 @@ def amount_due(db: Session, delivery: Delivery) -> float:
     return round(max((order.total or 0) - paid, 0), 2)
 
 
+def previous_pending_balance(db: Session, delivery: Delivery) -> float:
+    """The customer's receivable/pending balance immediately before the current order/delivery financial impact.
+
+    outstanding = opening_balance + total_billed - total_received.
+    When invoices have already been issued for this delivery or for its parent sales order,
+    their uncollected portion has already increased customer.outstanding_balance.
+    To report the balance prior to this transaction, we subtract any billed-but-unpaid
+    amount of invoices associated with this delivery or its parent sales order.
+    """
+    cust = delivery.customer
+    if cust is None and delivery.customer_id:
+        cust = db.get(Customer, delivery.customer_id)
+    if cust is None and delivery.sales_order and delivery.sales_order.customer:
+        cust = delivery.sales_order.customer
+
+    if cust is None:
+        return 0.0
+
+    current_outstanding = float(cust.outstanding_balance or 0.0)
+
+    # Invoices associated with this delivery or its parent sales order in the same tenant org
+    invoices_current = []
+    if delivery.id:
+        invoices_current.extend(
+            db.query(Invoice).filter(
+                Invoice.delivery_id == delivery.id,
+                Invoice.organization_id == delivery.organization_id,
+                Invoice.is_credit_note.is_(False),
+            ).all()
+        )
+    if delivery.sales_order_id:
+        order_invoices = (
+            db.query(Invoice).filter(
+                Invoice.order_id == delivery.sales_order_id,
+                Invoice.organization_id == delivery.organization_id,
+                Invoice.is_credit_note.is_(False),
+            ).all()
+        )
+        for inv in order_invoices:
+            if inv not in invoices_current:
+                invoices_current.append(inv)
+
+    current_unpaid_invoiced = sum(
+        max((inv.total or 0.0) - (inv.amount_paid or 0.0), 0.0)
+        for inv in invoices_current
+    )
+
+    return round(max(current_outstanding - current_unpaid_invoiced, 0.0), 2)
+
+
 def outstanding_for_order_item(db: Session, item: SalesOrderItem) -> float:
     """How much of an order line no delivery has planned yet, so two deliveries
     cannot promise the same units."""
-    planned = sum(
-        (line.planned_quantity or 0)
-        for line in db.query(DeliveryItem)
-            .join(Delivery, DeliveryItem.delivery_id == Delivery.id)
-            .filter(DeliveryItem.order_item_id == item.id, Delivery.status != "cancelled")
+    lines = (
+        db.query(DeliveryItem, Delivery.status)
+        .join(Delivery, DeliveryItem.delivery_id == Delivery.id)
+        .filter(DeliveryItem.order_item_id == item.id, Delivery.status != "cancelled")
+        .all()
     )
-    return round(max((item.quantity or 0) - planned, 0), 3)
+    in_flight_statuses = {"planned", "accepted", "ready", "loaded", "in_transit"}
+    consumed = 0.0
+    for line, delivery_status in lines:
+        if delivery_status in in_flight_statuses:
+            consumed += float(line.planned_quantity or 0.0)
+        else:
+            consumed += float(line.delivered_quantity or 0.0)
+    return round(max((item.quantity or 0) - consumed, 0.0), 3)
 
 
 def plan(
@@ -578,6 +636,7 @@ def sync_delivery_view(db: Session, delivery: Delivery) -> dict:
             "total": order.total,
         } if order is not None else None,
         "amount_due": amount_due(db, delivery),
+        "previous_pending_balance": previous_pending_balance(db, delivery),
         "pod": {
             "photo_file_ids": list(delivery.pod_photo_file_ids or []),
             "signature_file_id": delivery.pod_signature_file_id,

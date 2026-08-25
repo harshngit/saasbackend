@@ -20,6 +20,7 @@ from app.schemas.choices import CustomerStatus, CustomerType
 # API field name -> column name, for the handful that differ.
 ALIASES = {
     "customer_name": "name",
+    "legal_business_name": "business_name",
     "customer_category": "category",
     "mobile_number": "phone",
     "email_address": "email",

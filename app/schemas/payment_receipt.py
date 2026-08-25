@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ReceiptCustomerBrief(BaseModel):
@@ -65,8 +65,9 @@ class PaymentReceiptOut(BaseModel):
     receipt_date: datetime
     customer_id: str | None
     invoice_reference_id: str | None
-    invoice_id: str | None = Field(description="Same as invoice_reference_id")
+    invoice_id: str | None = Field(default=None, description="Same as invoice_reference_id")
     amount_received: float
+    amount_collected: float | None = None
     payment_method: str | None
     transaction_reference: str | None
     note: str | None = None
@@ -79,6 +80,17 @@ class PaymentReceiptOut(BaseModel):
         default=None, description="The invoice's status after this payment: unpaid | partial | paid"
     )
 
+    # Snapshot foundation fields
+    order_amount: float | None = None
+    previous_pending: float | None = None
+    remaining_receivable: float | None = None
+
     created_at: datetime
     customer: ReceiptCustomerBrief | None = None
     invoice: ReceiptInvoiceBrief | None = None
+
+    @model_validator(mode="after")
+    def _populate_aliases(self) -> "PaymentReceiptOut":
+        if self.amount_collected is None:
+            self.amount_collected = self.amount_received
+        return self

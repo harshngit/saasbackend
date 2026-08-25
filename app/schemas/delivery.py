@@ -63,6 +63,8 @@ class DeliveryCustomerBrief(BaseModel):
     phone: str | None = None
     email: str | None = None
     delivery_address: str | None = None
+    outstanding_balance: float | None = None
+    previous_pending_balance: float | None = None
 
 
 class DeliveryOrderBrief(BaseModel):
@@ -164,9 +166,18 @@ class DeliveryLineOut(BaseModel):
     loaded_quantity: float = 0
     delivered_quantity: float = 0
     pending_quantity: float = 0
+    remaining_quantity: float = 0
     batch_number: str | None = None
     expiry_date: datetime | None = None
     serial_numbers: list | None = None
+
+    @model_validator(mode="after")
+    def _fill_remaining(self) -> "DeliveryLineOut":
+        if self.remaining_quantity == 0 and self.pending_quantity > 0:
+            self.remaining_quantity = self.pending_quantity
+        elif self.pending_quantity == 0 and self.remaining_quantity > 0:
+            self.pending_quantity = self.remaining_quantity
+        return self
 
 
 class DeliveryPartnerOption(BaseModel):
@@ -237,6 +248,9 @@ class DeliveryOut(BaseModel):
     pod: DeliveryPod = Field(default_factory=DeliveryPod)
     amount_due: float = Field(
         default=0, description="Order total less what has been received against it")
+    previous_pending_balance: float | None = Field(
+        default=None, description="Customer previous pending balance prior to current order"
+    )
     created_at: datetime
     updated_at: datetime
 

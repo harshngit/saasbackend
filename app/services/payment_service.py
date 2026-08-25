@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import Customer, CustomerPayment, Invoice
+from app.models import Customer, CustomerPayment, Invoice, SalesOrder
 from app.services import numbering_service
 
 
@@ -100,17 +100,30 @@ def record(
                 "with no invoice_id."
             )
 
+    # 1. Capture customer receivable balance BEFORE this payment is recorded
+    previous_pending = float(customer.outstanding_balance or 0.0) if customer is not None else 0.0
+
+    # 2. Determine order_id and order_amount if linked to an order or invoice with order
+    resolved_order_id = order_id or (invoice.order_id if invoice else None)
+    resolved_order_amount = None
+    if resolved_order_id:
+        order = db.get(SalesOrder, resolved_order_id)
+        if order is not None and order.organization_id == org_id:
+            resolved_order_amount = float(order.total)
+
     payment = CustomerPayment(
         organization_id=org_id,
         customer_id=customer.id if customer is not None else None,
         invoice_id=invoice.id if invoice is not None else None,
-        order_id=order_id,
+        order_id=resolved_order_id,
         receipt_number=receipt_number or next_receipt_number(db, org_id),
         amount=round(amount, 2),
         payment_mode=payment_mode or "cash",
         reference=reference,
         note=note,
         received_on=received_on or _now(),
+        order_amount=resolved_order_amount,
+        previous_pending=previous_pending,
     )
     db.add(payment)
 
@@ -119,6 +132,11 @@ def record(
     if customer is not None:
         customer.total_received = round((customer.total_received or 0) + payment.amount, 2)
         customer.recompute_outstanding()
+        # 3. Capture authoritative remaining receivable AFTER payment is applied
+        payment.remaining_receivable = float(customer.outstanding_balance or 0.0)
+    else:
+        payment.remaining_receivable = 0.0
+
     return payment
 
 

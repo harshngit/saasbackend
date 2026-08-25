@@ -13,6 +13,8 @@ from app.models import (
     User,
     VehicleLoading,
     VehicleLoadingItem,
+    VehicleReconciliationItem,
+    VehicleStockReconciliation,
 )
 from app.services import delivery_service
 from app.schemas.vehicle_stock import (
@@ -20,8 +22,10 @@ from app.schemas.vehicle_stock import (
     EndOfDayBody,
     ExtraLoadBody,
     LoadedLineOut,
+    ReconcileBody,
     VehicleLoadingCreate,
     VehicleLoadingOut,
+    VehicleReconciliationOut,
 )
 
 router = APIRouter(prefix="/vehicle-stock", tags=["vehicle_stock"])
@@ -325,7 +329,17 @@ def record_returns(
         if not match:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Item not found in this loading session.",
+                detail="Item not found in this loading session.",
+            )
+
+        available_stock = (match.loaded_qty or 0) + (match.extra_qty or 0) - (match.delivered_qty or 0)
+        if it.returned_qty > available_stock:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Returned quantity ({it.returned_qty}) cannot exceed available vehicle stock ({available_stock}) "
+                    f"for {match.product_name}."
+                ),
             )
 
         match.returned_qty = it.returned_qty
@@ -361,6 +375,102 @@ def record_returns(
     return loading
 
 
+@router.post("/{id}/reconcile", response_model=VehicleReconciliationOut, status_code=status.HTTP_201_CREATED)
+def reconcile_vehicle_stock(
+    id: str,
+    payload: ReconcileBody,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> VehicleStockReconciliation:
+    """Record physical stock count and calculate variance against expected vehicle closing stock.
+
+    Authoritative formulas:
+        expected_closing_qty = loaded_qty + extra_qty - delivered_qty - returned_qty
+        variance_qty = physical_qty - expected_closing_qty
+
+    Variance interpretation:
+        0: Reconciled exactly
+        < 0: Physical shortage (missing items)
+        > 0: Physical surplus (extra items)
+    """
+    org_id = _org_id(user)
+    loading = _owned(db, id, org_id)
+
+    reconciliation = VehicleStockReconciliation(
+        organization_id=org_id,
+        loading_id=loading.id,
+        reconciled_by_id=user.id,
+        status="reconciled",
+        notes=payload.notes,
+    )
+
+    for it in payload.items:
+        match = None
+        if it.loading_item_id:
+            match = next((x for x in loading.items if x.id == it.loading_item_id), None)
+        if not match and it.product_id:
+            match = next(
+                (x for x in loading.items if x.product_id == it.product_id and x.variant_id == it.variant_id),
+                None,
+            )
+
+        if not match:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Item not found in this loading session for reconciliation.",
+            )
+
+        l_qty = match.loaded_qty or 0
+        e_qty = match.extra_qty or 0
+        d_qty = match.delivered_qty or 0
+        r_qty = match.returned_qty or 0
+        expected_closing = max((l_qty + e_qty) - d_qty - r_qty, 0)
+        variance = it.physical_qty - expected_closing
+
+        reconciliation.items.append(
+            VehicleReconciliationItem(
+                loading_item_id=match.id,
+                product_id=match.product_id,
+                variant_id=match.variant_id,
+                product_name=match.product_name,
+                loaded_qty=l_qty,
+                extra_qty=e_qty,
+                delivered_qty=d_qty,
+                returned_qty=r_qty,
+                expected_closing_qty=expected_closing,
+                physical_qty=it.physical_qty,
+                variance_qty=variance,
+                notes=it.notes,
+            )
+        )
+
+    db.add(reconciliation)
+    db.commit()
+    db.refresh(reconciliation)
+    return reconciliation
+
+
+@router.get("/{id}/reconciliations", response_model=list[VehicleReconciliationOut])
+def get_session_reconciliations(
+    id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[VehicleStockReconciliation]:
+    """List historical stock reconciliation records for a vehicle loading session."""
+    org_id = _org_id(user)
+    loading = _owned(db, id, org_id)
+    return (
+        db.query(VehicleStockReconciliation)
+        .filter(
+            VehicleStockReconciliation.loading_id == loading.id,
+            VehicleStockReconciliation.organization_id == org_id,
+        )
+        .order_by(VehicleStockReconciliation.created_at.desc())
+        .all()
+    )
+
+
 @router.get("", response_model=list[VehicleLoadingOut])
 def list_all_loadings(
     user: User = Depends(_view),
@@ -376,3 +486,4 @@ def list_all_loadings(
     if status_filter:
         q = q.filter(VehicleLoading.status == status_filter)
     return q.order_by(VehicleLoading.date.desc()).all()
+

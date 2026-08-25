@@ -41,7 +41,12 @@ from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
 from app.models.vehicle import Vehicle
-from app.models.vehicle_stock import VehicleLoading, VehicleLoadingItem
+from app.models.vehicle_stock import (
+    VehicleLoading,
+    VehicleLoadingItem,
+    VehicleReconciliationItem,
+    VehicleStockReconciliation,
+)
 from app.models.warehouse import (
     RESERVATION_STATUSES,
     StockReservation,
@@ -52,8 +57,18 @@ from app.models.lead import Lead
 from app.models.quotation import Quotation, QuotationItem
 from app.models.delivery import Delivery, DeliveryItem
 from app.models.sales_return import SalesReturn, ReturnItem
+from app.models.visit import Visit
+from app.models.follow_up import FollowUp
+from app.models.leave import LEAVE_STATUSES, LEAVE_TYPES, Leave
 
 __all__ = [
+    "Leave",
+    "LEAVE_STATUSES",
+    "LEAVE_TYPES",
+    "Visit",
+    "FollowUp",
+    "VehicleStockReconciliation",
+    "VehicleReconciliationItem",
     "ActivityLog",
     "Vehicle",
     "Warehouse",

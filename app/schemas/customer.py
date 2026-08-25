@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from app.schemas.choices import CustomerStatus
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class AssigneeBrief(BaseModel):
@@ -112,10 +112,23 @@ class CustomerPaymentOut(BaseModel):
     invoice: PaymentInvoiceBrief | None = None
     amount: float
     payment_mode: str
+    amount_collected: float | None = None
+    payment_method: str | None = None
     reference: str | None
     note: str | None
     received_on: datetime
     created_at: datetime
+    order_amount: float | None = None
+    previous_pending: float | None = None
+    remaining_receivable: float | None = None
+
+    @model_validator(mode="after")
+    def _populate_aliases(self) -> "CustomerPaymentOut":
+        if self.amount_collected is None:
+            self.amount_collected = self.amount
+        if self.payment_method is None:
+            self.payment_method = self.payment_mode
+        return self
 
 
 class CustomerUpdate(BaseModel):
