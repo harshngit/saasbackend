@@ -9,6 +9,8 @@ from app.core.database import (
     auto_add_missing_columns,
     drop_legacy_columns,
     engine,
+    enforce_unique_email,
+    enforce_unique_google_id,
     extend_pg_enum_types,
     relax_not_null_columns,
     widen_columns_to_text,
@@ -22,6 +24,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Notification,
     NumberSequence,
     OAuthExchangeTicket,
+    OAuthRegistrationTicket,
     Organization,
     StoredFile,
     Plan,
@@ -130,6 +133,11 @@ def on_startup() -> None:
         ("widen_columns_to_text", widen_columns_to_text),
         ("add_columns_with_default", add_columns_with_default),
         ("auto_add_missing_columns", auto_add_missing_columns),
+        # Constraint-level migrations run last, after every table/column exists,
+        # and are self-auditing: each skips (with a logged warning) instead of
+        # failing startup if it finds data that isn't safe to constrain yet.
+        ("enforce_unique_email", enforce_unique_email),
+        ("enforce_unique_google_id", enforce_unique_google_id),
         ("backfill_missing_numbers", backfill_missing_numbers),
         ("migrate_order_statuses", migrate_order_statuses),
         ("convert_inline_uploads", convert_inline_uploads),

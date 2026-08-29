@@ -309,3 +309,99 @@ def drop_legacy_columns() -> None:
             with engine.begin() as conn:
                 conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN IF EXISTS "{column}"'))
             logger.info("Auto-migrated: dropped legacy column %s.%s", table, column)
+
+
+def enforce_unique_email() -> None:
+    """Business rule: one email belongs to only one CRM user, platform-wide
+    (the existing `uq_user_org_email` constraint only scoped this per
+    organization, which allowed the same email in two different firms).
+
+    This is intentionally self-auditing rather than a blind ALTER: it runs the
+    same read-only duplicate check documented in the Google auth architecture
+    notes (`SELECT LOWER(email), COUNT(*) ... HAVING COUNT(*) > 1`) and ONLY
+    creates the index when that comes back clean. It never merges, renames, or
+    deletes any row. If duplicates exist — or the CREATE INDEX itself still
+    fails, e.g. against a database this audit didn't see — this logs a clear
+    warning and leaves the schema untouched; startup continues either way,
+    exactly like every other helper in this module.
+
+    The index is case-insensitive (`LOWER(email)`) so a case-variant address
+    (`User@x.com` vs `user@x.com`) cannot create a second account either —
+    matching how Google-verified emails are already lowercased before lookup.
+    """
+    if not inspect(engine).has_table("users"):
+        return
+    try:
+        with engine.connect() as conn:
+            duplicates = conn.execute(
+                text(
+                    "SELECT LOWER(email) AS e, COUNT(*) AS c FROM users "
+                    "GROUP BY LOWER(email) HAVING COUNT(*) > 1"
+                )
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not run the duplicate-email audit — skipping unique-email migration")
+        return
+
+    if duplicates:
+        logger.warning(
+            "Skipping platform-wide email uniqueness: %d duplicate email group(s) found "
+            "(case-insensitive). Resolve them manually (merge/rename/deactivate) before this "
+            "constraint can be added. First few: %s",
+            len(duplicates),
+            [row[0] for row in duplicates[:10]],
+        )
+        return
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text('CREATE UNIQUE INDEX IF NOT EXISTS "ux_users_email_ci" ON "users" (LOWER("email"))')
+            )
+        logger.info("Auto-migrated: enforced platform-wide case-insensitive email uniqueness")
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not create the platform-wide unique email index (a duplicate the audit above "
+            "did not catch likely exists) — schema left unchanged"
+        )
+
+
+def enforce_unique_google_id() -> None:
+    """One Google identity (`sub`) should never be linked to more than one CRM
+    user. Same audit-then-create, never-destructive pattern as
+    enforce_unique_email — NULLs (password-only users) are unaffected, since a
+    plain unique index treats every NULL as distinct from every other NULL.
+    """
+    if not inspect(engine).has_table("users"):
+        return
+    try:
+        with engine.connect() as conn:
+            duplicates = conn.execute(
+                text(
+                    "SELECT google_id, COUNT(*) AS c FROM users "
+                    "WHERE google_id IS NOT NULL GROUP BY google_id HAVING COUNT(*) > 1"
+                )
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not run the duplicate-google_id audit — skipping unique-google_id migration")
+        return
+
+    if duplicates:
+        logger.warning(
+            "Skipping unique google_id index: %d duplicate google_id group(s) found. Resolve "
+            "them manually before this constraint can be added.",
+            len(duplicates),
+        )
+        return
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text('CREATE UNIQUE INDEX IF NOT EXISTS "ux_users_google_id" ON "users" ("google_id")')
+            )
+        logger.info("Auto-migrated: enforced unique google_id")
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not create the unique google_id index (a duplicate the audit above did not "
+            "catch likely exists) — schema left unchanged"
+        )

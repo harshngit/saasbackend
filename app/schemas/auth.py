@@ -6,11 +6,13 @@ from app.schemas.role import RoleBriefOut
 from app.schemas.user import UserOut
 
 
-class RegisterOrganization(BaseModel):
-    """Admin self-registration: creates a firm and its owner (Admin) account.
-
-    Only Admins self-register. Staff (accountant / sales_officer / delivery_partner)
-    are created afterwards by the Admin via POST /users — so `role` is always admin.
+class OrganizationRegistrationFields(BaseModel):
+    """The firm + owner-account fields shared by every self-registration entry
+    point (password-based and Google-based). Kept as one base class so the two
+    request schemas can never drift apart — RegisterOrganization only adds
+    `email`/`role` on top; GoogleCompleteRegistrationRequest deliberately adds
+    neither (its email comes from the verified registration ticket, and its
+    role is always Admin, exactly like RegisterOrganization enforces below).
     """
 
     # --- Company / firm profile ---
@@ -20,13 +22,22 @@ class RegisterOrganization(BaseModel):
     pan_number: str | None = Field(default=None, max_length=20)
     address: str | None = Field(default=None, max_length=500)
     phone: str | None = Field(default=None, max_length=20)
-    email: EmailStr
     financial_year: str | None = Field(default=None, max_length=20, examples=["2025-2026"])
     logo_url: str | None = Field(default=None, max_length=500)
 
     # --- Owner (Admin) account ---
     admin_name: str = Field(min_length=1, max_length=150)
     password: str = Field(min_length=8, max_length=128)
+
+
+class RegisterOrganization(OrganizationRegistrationFields):
+    """Admin self-registration: creates a firm and its owner (Admin) account.
+
+    Only Admins self-register. Staff (accountant / sales_officer / delivery_partner)
+    are created afterwards by the Admin via POST /users — so `role` is always admin.
+    """
+
+    email: EmailStr
     role: UserRole = Field(default=UserRole.ADMIN, description="Always 'admin' for self-registration")
 
     @field_validator("role")
@@ -52,6 +63,46 @@ class ExchangeTicketRequest(BaseModel):
     """Payload for POST /auth/exchange containing the short-lived single-use exchange ticket."""
 
     code: str = Field(min_length=1, description="Single-use OAuth exchange ticket")
+
+
+class GoogleRegistrationRequired(BaseModel):
+    """Returned by POST /auth/google when the verified Google identity has no
+    matching CRM account yet. The SPA should route to the Complete
+    Registration page with this code — no account exists, no tokens are
+    issued, nothing was created."""
+
+    status: str = "registration_required"
+    registration_code: str
+
+
+class GoogleRegistrationInfoRequest(BaseModel):
+    """Payload for POST /auth/google/registration-info: read (not consume) a
+    pending registration ticket, to prefill the Complete Registration form."""
+
+    registration_code: str = Field(min_length=1)
+
+
+class GoogleRegistrationInfoResponse(BaseModel):
+    """Prefill data for the Complete Registration form. `email` is rendered
+    read-only in the UI — it is never accepted back from the client."""
+
+    email: EmailStr
+    name: str | None = None
+
+
+class GoogleCompleteRegistrationRequest(OrganizationRegistrationFields):
+    """Payload for POST /auth/google/complete-registration.
+
+    Inherits the exact same organization/admin/password fields and validation
+    as RegisterOrganization (via OrganizationRegistrationFields), so the two
+    contracts cannot drift apart. Deliberately carries NO `email` field: the
+    new account's email always comes from the verified Google identity bound
+    to `registration_code`, never from the client. `role` is not accepted
+    either — Google self-registration always creates an Admin, exactly like
+    password self-registration.
+    """
+
+    registration_code: str = Field(min_length=1)
 
 
 class TokenPair(BaseModel):

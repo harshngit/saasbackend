@@ -281,19 +281,35 @@ def test_inactive_user_blocked_from_google_login():
         assert "Account is deactivated" in res.json()["detail"]
 
 
-def test_unregistered_google_user_returns_404():
-    """18, 20. Google user with no existing CRM account returns 404."""
+def test_unregistered_google_user_returns_registration_required():
+    """18, 20. Google user with no existing CRM account gets a registration_code,
+    NOT an auto-created account and NOT the old bare 404."""
+    email = f"unknown_{uuid.uuid4().hex[:6]}@example.com"
     fake_claims = {
         "iss": "accounts.google.com",
         "sub": f"gid_nonexistent_{uuid.uuid4().hex[:8]}",
-        "email": f"unknown_{uuid.uuid4().hex[:6]}@example.com",
+        "email": email,
         "email_verified": True,
         "name": "Unknown User",
     }
+    db = SessionLocal()
+    users_before = db.query(User).count()
+    db.close()
+
     with patch("google.oauth2.id_token.verify_oauth2_token", return_value=fake_claims):
         res = client.post("/auth/google", json={"credential": "valid.google.token"})
-        assert res.status_code == 404
-        assert "No CRM account found" in res.json()["detail"]
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "registration_required"
+        assert isinstance(data["registration_code"], str) and len(data["registration_code"]) > 20
+
+    # No CRM account was created merely by verifying the Google identity.
+    db = SessionLocal()
+    try:
+        assert db.query(User).count() == users_before
+        assert db.query(User).filter(User.email == email).first() is None
+    finally:
+        db.close()
 
 
 def test_google_auth_multi_tenant_isolation():
@@ -369,8 +385,8 @@ if __name__ == "__main__":
     print("  PASS  test_existing_password_login_still_works")
     test_inactive_user_blocked_from_google_login()
     print("  PASS  test_inactive_user_blocked_from_google_login")
-    test_unregistered_google_user_returns_404()
-    print("  PASS  test_unregistered_google_user_returns_404")
+    test_unregistered_google_user_returns_registration_required()
+    print("  PASS  test_unregistered_google_user_returns_registration_required")
     test_google_auth_multi_tenant_isolation()
     print("  PASS  test_google_auth_multi_tenant_isolation")
     print("\nAll Google Auth tests passed successfully!")

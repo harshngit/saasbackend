@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.config import settings
 from app.core.security import REFRESH_TOKEN, create_access_token, decode_token, hash_password, verify_password
-from app.models import Organization, User, UserRole
+from app.models import User
 from app.schemas.auth import (
     AuthResponse,
     ChangePasswordRequest,
@@ -19,6 +19,10 @@ from app.schemas.auth import (
     ForgotPasswordRequest,
     ForgotPasswordResponse,
     GoogleAuthRequest,
+    GoogleCompleteRegistrationRequest,
+    GoogleRegistrationInfoRequest,
+    GoogleRegistrationInfoResponse,
+    GoogleRegistrationRequired,
     LoginRequest,
     LogoutRequest,
     MessageResponse,
@@ -36,43 +40,71 @@ from app.services.google_auth_service import GoogleAuthError
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+class GoogleIdentityConflict(Exception):
+    """Raised when a verified Google email matches an existing CRM user whose
+    `google_id` is already linked to a DIFFERENT Google account.
+
+    This is deliberately NOT the same as "no user found" — the CRM account
+    exists, it is just linked to a different Google identity. The existing
+    link must never be silently overwritten (see Scenario C of the Google
+    auth architecture): the caller must reject the attempt outright, with no
+    linking, no login, no exchange ticket, and no registration ticket.
+    """
+
+
+def _resolve_google_identity(db: Session, google_sub: str, google_email: str) -> User | None:
+    """Resolve a verified Google identity to an existing CRM user.
+
+    Priority: (1) exact `google_id` match, (2) `email` match — auto-linking
+    `google_id` only when the matched user has none set yet. Raises
+    GoogleIdentityConflict instead of linking when the matched user's
+    `google_id` is already set to a *different* sub than the one just
+    verified. Returns None when no user matches by either key (new user).
+    """
+    user = db.query(User).filter(User.google_id == google_sub).first()
+    if user is not None:
+        return user
+
+    user = db.query(User).filter(User.email == google_email).first()
+    if user is None:
+        return None
+
+    if user.google_id is not None and user.google_id != google_sub:
+        raise GoogleIdentityConflict()
+
+    if user.google_id is None:
+        user.google_id = google_sub
+        db.commit()
+        db.refresh(user)
+    return user
+
+
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 def register_organization(payload: RegisterOrganization, db: Session = Depends(get_db)) -> AuthResponse:
-    """Admin self-registration. Creates a new firm and its owner (Admin) account."""
-    existing = db.query(User).filter(User.email == payload.email).first()
-    if existing is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+    """Admin self-registration. Creates a new firm and its owner (Admin) account.
 
-    org = Organization(
-        name=payload.organization_name,
-        business_type=payload.business_type,
-        gst_number=payload.gst_number,
-        pan_number=payload.pan_number,
-        address=payload.address,
-        email=payload.email,
-        phone=payload.phone,
-        financial_year=payload.financial_year,
-        logo_url=payload.logo_url,
-    )
-    org_service.start_trial(db, org)  # status=trial, default plan, trial_ends_at=now+7d
-    db.add(org)
-    db.flush()  # assign org.id before creating the user
-
-    admin = User(
-        organization_id=org.id,
-        name=payload.admin_name,
-        email=payload.email,
-        phone=payload.phone,
-        password_hash=hash_password(payload.password),
-        role=UserRole.ADMIN,
-        system_role="admin",
-    )
-    db.add(admin)
-    db.commit()
-    db.refresh(admin)
-
-    # Auto-seed the 3 default roles (Sales Officer / Delivery Partner / Accountant).
-    role_service.seed_default_roles(db, org.id)
+    Delegates the actual org/admin/trial/role creation to
+    auth_service.register_organization, the same function
+    POST /auth/google/complete-registration uses — so the two entry points can
+    never implement that business logic differently.
+    """
+    try:
+        admin = auth_service.register_organization(
+            db,
+            email=str(payload.email),
+            organization_name=payload.organization_name,
+            admin_name=payload.admin_name,
+            password=payload.password,
+            business_type=payload.business_type,
+            gst_number=payload.gst_number,
+            pan_number=payload.pan_number,
+            address=payload.address,
+            phone=payload.phone,
+            financial_year=payload.financial_year,
+            logo_url=payload.logo_url,
+        )
+    except auth_service.RegistrationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     tokens = auth_service.issue_tokens(db, admin)
     return auth_service.build_auth_response(admin, tokens)
@@ -133,22 +165,24 @@ def google_oauth_callback(
     google_sub = google_data["sub"]
     google_email = google_data["email"]
 
-    # 1. Look up by existing linked Google ID
-    user = db.query(User).filter(User.google_id == google_sub).first()
-
-    # 2. If not found by google_id, look up by verified email and link the account
-    if user is None:
-        user = db.query(User).filter(User.email == google_email).first()
-        if user is not None:
-            user.google_id = google_sub
-            db.commit()
-            db.refresh(user)
+    try:
+        user = _resolve_google_identity(db, google_sub, google_email)
+    except GoogleIdentityConflict:
+        # Same email, different Google account already linked elsewhere. Do NOT
+        # overwrite, link, log in, or start a new registration — send the user
+        # back to the frontend with a distinct, actionable error indicator.
+        target = f"{settings.frontend_url}/auth/callback?error={quote('google_identity_conflict')}"
+        return RedirectResponse(url=target, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No CRM account found for this Google account. Please contact your organization administrator or register your organization.",
+        # No CRM account for this Google identity yet — verified, but not
+        # auto-created. Hand off to the frontend's Complete Registration page
+        # with a short-lived registration ticket instead of the old raw 404.
+        registration_code = auth_service.create_registration_ticket(
+            db, google_sub=google_sub, google_email=google_email, google_name=google_data["name"]
         )
+        redirect_url = f"{settings.frontend_url}/auth/register/google?registration_code={quote(registration_code)}"
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
@@ -178,12 +212,86 @@ def exchange_oauth_ticket(payload: ExchangeTicketRequest, db: Session = Depends(
     return auth_service.build_auth_response(user, tokens)
 
 
-@router.post("/google", response_model=AuthResponse)
-def google_sign_in(payload: GoogleAuthRequest, db: Session = Depends(get_db)) -> AuthResponse:
+@router.post("/google/registration-info", response_model=GoogleRegistrationInfoResponse)
+def google_registration_info(
+    payload: GoogleRegistrationInfoRequest, db: Session = Depends(get_db)
+) -> GoogleRegistrationInfoResponse:
+    """Prefill data for the Complete Registration form.
+
+    Reads the registration ticket WITHOUT consuming it, so the frontend can
+    safely call this repeatedly (e.g. on a page reload) within the ticket's
+    validity window. Never returns tokens or credentials of any kind.
+    """
+    ticket = auth_service.peek_registration_ticket(db, payload.registration_code)
+    if ticket is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid, expired, or already used registration code",
+        )
+    return GoogleRegistrationInfoResponse(email=ticket.google_email, name=ticket.google_name)
+
+
+@router.post(
+    "/google/complete-registration", response_model=AuthResponse, status_code=status.HTTP_201_CREATED
+)
+def google_complete_registration(
+    payload: GoogleCompleteRegistrationRequest, db: Session = Depends(get_db)
+) -> AuthResponse:
+    """Complete a Google-originated registration.
+
+    Consumes the single-use registration_code and creates Organization + Admin
+    + 7-day Trial + default roles via the exact same auth_service.register_organization
+    call POST /auth/register uses. The new account's email comes ONLY from the
+    verified ticket (`ticket.google_email`) — this request's schema has no
+    email field, so a client cannot influence it. The new Admin's `google_id`
+    is set from the ticket's verified Google sub, so subsequent Google logins
+    resolve immediately via the fast google_id lookup.
+    """
+    ticket = auth_service.consume_registration_ticket(db, payload.registration_code)
+    if ticket is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid, expired, or already used registration code",
+        )
+
+    try:
+        admin = auth_service.register_organization(
+            db,
+            email=ticket.google_email,
+            organization_name=payload.organization_name,
+            admin_name=payload.admin_name,
+            password=payload.password,
+            business_type=payload.business_type,
+            gst_number=payload.gst_number,
+            pan_number=payload.pan_number,
+            address=payload.address,
+            phone=payload.phone,
+            financial_year=payload.financial_year,
+            logo_url=payload.logo_url,
+            google_id=ticket.google_sub,
+        )
+    except auth_service.RegistrationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    tokens = auth_service.issue_tokens(db, admin)
+    return auth_service.build_auth_response(admin, tokens)
+
+
+@router.post("/google", response_model=AuthResponse | GoogleRegistrationRequired)
+def google_sign_in(
+    payload: GoogleAuthRequest, db: Session = Depends(get_db)
+) -> AuthResponse | GoogleRegistrationRequired:
     """Authenticate with a verified Google OAuth2 ID token (Direct ID-Token flow).
 
-    Validates the cryptographic token signature and claims with Google, links or locates
-    the matching active CRM user, and issues standard CRM access and refresh JWT tokens.
+    Validates the cryptographic token signature and claims with Google, then:
+    - an existing CRM user (matched/linked by google_id or email) gets standard
+      CRM access and refresh JWT tokens, exactly as before;
+    - an unrecognized Google identity gets a `registration_required` response
+      carrying a `registration_code` instead of the old bare 404 — no account
+      is created here;
+    - a Google identity whose email matches a CRM user already linked to a
+      *different* google_id is rejected with 409, and nothing is linked,
+      logged in, or ticketed.
     """
     try:
         google_data = google_auth_service.verify_google_id_token(payload.credential)
@@ -193,22 +301,22 @@ def google_sign_in(payload: GoogleAuthRequest, db: Session = Depends(get_db)) ->
     google_sub = google_data["sub"]
     google_email = google_data["email"]
 
-    # 1. Look up by existing linked Google ID
-    user = db.query(User).filter(User.google_id == google_sub).first()
-
-    # 2. If not found by google_id, look up by verified email and link the account
-    if user is None:
-        user = db.query(User).filter(User.email == google_email).first()
-        if user is not None:
-            user.google_id = google_sub
-            db.commit()
-            db.refresh(user)
-
-    if user is None:
+    try:
+        user = _resolve_google_identity(db, google_sub, google_email)
+    except GoogleIdentityConflict:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No CRM account found for this Google account. Please contact your organization administrator or register your organization.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "google_identity_conflict",
+                "message": "This account is already linked to a different Google identity.",
+            },
         )
+
+    if user is None:
+        registration_code = auth_service.create_registration_ticket(
+            db, google_sub=google_sub, google_email=google_email, google_name=google_data["name"]
+        )
+        return GoogleRegistrationRequired(registration_code=registration_code)
 
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
