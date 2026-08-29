@@ -254,10 +254,94 @@ def run_all_tests():
     log_test("Org 2 customer's last order/visit is isolated from Org 1", 
              customers_org2[0]["last_order_date"] is None and customers_org2[0]["last_visit_date"] is None)
 
+    # ----------------------------------------------------
+    # TEST 5: Delivery Partner RBAC Permissions
+    # ----------------------------------------------------
+    print("\n--- TEST 5: Delivery Partner RBAC Permissions ---")
+    
+    # 1. Fetch default roles
+    roles = {r["name"]: r for r in client.get("/roles", headers=auth1).json()}
+    dp_role = roles["Delivery Partner"]
+    so_role = roles["Sales Officer"]
+    
+    # 2. Create a Delivery Partner staff user in Org 1
+    dp_email = f"dp_{uuid.uuid4().hex[:6]}@firm.com"
+    dp_username = f"dp_{uuid.uuid4().hex[:6]}"
+    dp_res = client.post(
+        "/users",
+        json={
+            "name": "Driver Dave",
+            "email": dp_email,
+            "username": dp_username,
+            "password": "Password123!",
+            "role_id": dp_role["id"],
+        },
+        headers=auth1,
+    )
+    assert dp_res.status_code == 201, dp_res.text
+    
+    # Authenticate as Delivery Partner
+    dp_login_res = client.post(
+        "/auth/login",
+        json={"email": dp_email, "password": "Password123!"}
+    )
+    assert dp_login_res.status_code == 200, dp_login_res.text
+    dp_auth = {"Authorization": f"Bearer {dp_login_res.json()['tokens']['access_token']}"}
+    
+    # 3. Verify Delivery Partner CANNOT create a customer (HTTP 403)
+    dp_create_res = client.post(
+        "/customers",
+        json={"name": "Driver Customer"},
+        headers=dp_auth,
+    )
+    log_test("Delivery Partner CANNOT create a customer (HTTP 403)", dp_create_res.status_code == 403)
+    
+    # 4. Verify Delivery Partner CAN view/list customers (HTTP 200)
+    dp_list_res = client.get("/customers", headers=dp_auth)
+    log_test("Delivery Partner CAN view/list customers (HTTP 200)", dp_list_res.status_code == 200)
+    
+    # 5. Create a Sales Officer staff user in Org 1
+    so_email = f"so_{uuid.uuid4().hex[:6]}@firm.com"
+    so_username = f"so_{uuid.uuid4().hex[:6]}"
+    so_res = client.post(
+        "/users",
+        json={
+            "name": "Sales Officer Sam",
+            "email": so_email,
+            "username": so_username,
+            "password": "Password123!",
+            "role_id": so_role["id"],
+        },
+        headers=auth1,
+    )
+    assert so_res.status_code == 201, so_res.text
+    
+    # Authenticate as Sales Officer
+    so_login_res = client.post(
+        "/auth/login",
+        json={"email": so_email, "password": "Password123!"}
+    )
+    assert so_login_res.status_code == 200, so_login_res.text
+    so_auth = {"Authorization": f"Bearer {so_login_res.json()['tokens']['access_token']}"}
+    
+    # 6. Verify Sales Officer CAN create a customer (HTTP 201)
+    so_create_res = client.post(
+        "/customers",
+        json={"name": "Sales Customer"},
+        headers=so_auth,
+    )
+    log_test("Sales Officer CAN create a customer (HTTP 201)", so_create_res.status_code == 201)
+    so_cust_id = so_create_res.json()["id"] if so_create_res.status_code == 201 else None
+
     # Clean up test DB data
-    db.query(SalesOrder).filter(SalesOrder.customer_id.in_([cust1_id, cust2_id, cust_org2_id])).delete(synchronize_session=False)
-    db.query(Visit).filter(Visit.customer_id.in_([cust1_id, cust2_id, cust_org2_id])).delete(synchronize_session=False)
-    db.query(Customer).filter(Customer.id.in_([cust1_id, cust2_id, cust_org2_id])).delete(synchronize_session=False)
+    clean_cust_ids = [cust1_id, cust2_id, cust_org2_id]
+    if so_cust_id:
+        clean_cust_ids.append(so_cust_id)
+        
+    db.query(SalesOrder).filter(SalesOrder.customer_id.in_(clean_cust_ids)).delete(synchronize_session=False)
+    db.query(Visit).filter(Visit.customer_id.in_(clean_cust_ids)).delete(synchronize_session=False)
+    db.query(Customer).filter(Customer.id.in_(clean_cust_ids)).delete(synchronize_session=False)
+    db.query(User).filter(User.email.in_([dp_email, so_email])).delete(synchronize_session=False)
     db.commit()
 
     print("\n=======================================================")

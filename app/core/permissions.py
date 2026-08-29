@@ -177,7 +177,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "deliveries": _full(),
             "vehicle_stock": _full(),
             "attendance": _full(),
-            "customers": _create_only(),
+            "customers": _view_only(),
             "sales_orders": _create_only(),
             "products": _view_only(),
             "leaves": _perm(view=True, create=True, edit=True, delete=True),

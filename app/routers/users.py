@@ -5,7 +5,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_system_role, require_unlocked_org
+from app.core.deps import get_current_user, require_permission, require_system_role, require_unlocked_org
 from app.core.security import hash_password
 from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, User, VehicleLoading
 from app.schemas.auth import MessageResponse
@@ -15,6 +15,7 @@ from app.schemas.user import (
     COLLECTION_COLUMN,
     AccountStatus,
     AdminResetPassword,
+    AssignableStaffOut,
     EmployeeDocumentCollection,
     EmployeeStatus,
     EmploymentType,
@@ -31,6 +32,9 @@ from app.services import (
 router = APIRouter(prefix="/users", tags=["users"])
 
 _ADMIN = require_system_role(SystemRole.ADMIN)
+# Same gate as actually creating a follow-up (POST /follow-ups, POST
+# /visits/{id}/follow-ups) — whoever may create one may see who it can go to.
+_ASSIGNABLE = require_permission("follow_ups", "create")
 
 # Used when a firm has not set its own employee_id_prefix in Company Settings.
 DEFAULT_EMPLOYEE_ID_PREFIX = "EMP-"
@@ -277,6 +281,47 @@ def list_staff(
     if reporting_manager_id is not None:
         query = query.filter(User.reporting_manager_id == reporting_manager_id)
     return query.order_by(User.created_at.desc()).all()
+
+
+def _assignee_role_label(user: User) -> str:
+    """A short role string for the assignee picker: the legacy enum value for
+    admins and the 3 default-seeded staff roles (matches what those roles have
+    always been called — "admin", "sales_officer", …), else the firm's own
+    name for a custom role, else a generic fallback."""
+    if user.effective_system_role in ("admin", "super_admin"):
+        return user.effective_system_role
+    if user.role is not None:
+        return user.role.value
+    if user.role_detail is not None:
+        return user.role_detail.name
+    return "staff"
+
+
+@router.get("/assignable", response_model=list[AssignableStaffOut])
+def list_assignable_staff(
+    user: User = Depends(_ASSIGNABLE),
+    db: Session = Depends(get_db),
+) -> list[AssignableStaffOut]:
+    """Minimal staff picker for the Follow-up Task assignee dropdown.
+
+    Unlike GET /users (admin-only, full employee profile), this is reachable
+    by anyone who may create a follow-up — the same `follow_ups:create`
+    permission gate as POST /follow-ups and POST /visits/{id}/follow-ups —
+    and returns only active users in the caller's own organization whose
+    role actually has some access to the follow_ups module (so the list never
+    offers a role that could never see or act on the task once assigned).
+    """
+    candidates = (
+        db.query(User)
+        .filter(User.organization_id == user.organization_id, User.is_active.is_(True))
+        .order_by(User.name)
+        .all()
+    )
+    assignable = [
+        u for u in candidates
+        if any(role_service.effective_permissions(db, u).get("follow_ups", {}).values())
+    ]
+    return [AssignableStaffOut(id=u.id, name=u.name, role=_assignee_role_label(u)) for u in assignable]
 
 
 @router.post("/me/location", response_model=LocationPingOut)

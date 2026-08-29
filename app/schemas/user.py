@@ -214,3 +214,18 @@ class UserOut(BaseModel):
 
 class AdminResetPassword(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
+
+
+class AssignableStaffOut(BaseModel):
+    """One row in the minimal assignee picker (GET /users/assignable).
+
+    Deliberately narrow — no email, permissions, or profile data — since this
+    is served to non-admin roles (e.g. Sales Officer) for a task-assignee
+    dropdown, unlike the full GET /users (admin-only) listing.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    role: str
