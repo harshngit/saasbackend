@@ -172,7 +172,50 @@ def list_customers(
     if assigned_sales_officer_id is not None:
         query = query.filter(Customer.assigned_sales_officer_id == assigned_sales_officer_id)
     query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
-    return query.order_by(Customer.created_at.desc()).all()
+    customers = query.order_by(Customer.created_at.desc()).all()
+
+    if customers:
+        customer_ids = [c.id for c in customers]
+        from sqlalchemy import func
+        from app.models import SalesOrder, Visit
+        from app.services.report_service import SALE_STATUSES
+
+        # Bulk fetch last order date per customer (placed, processing, completed)
+        last_orders = (
+            db.query(
+                SalesOrder.customer_id,
+                func.max(func.coalesce(SalesOrder.order_date, SalesOrder.created_at)).label("last_order_date")
+            )
+            .filter(
+                SalesOrder.organization_id == org_id,
+                SalesOrder.customer_id.in_(customer_ids),
+                SalesOrder.status.in_(SALE_STATUSES)
+            )
+            .group_by(SalesOrder.customer_id)
+            .all()
+        )
+        last_order_map = {row.customer_id: row.last_order_date for row in last_orders if row.customer_id}
+
+        # Bulk fetch last visit date per customer
+        last_visits = (
+            db.query(
+                Visit.customer_id,
+                func.max(Visit.visit_date).label("last_visit_date")
+            )
+            .filter(
+                Visit.organization_id == org_id,
+                Visit.customer_id.in_(customer_ids)
+            )
+            .group_by(Visit.customer_id)
+            .all()
+        )
+        last_visit_map = {row.customer_id: row.last_visit_date for row in last_visits if row.customer_id}
+
+        for customer in customers:
+            customer.last_order_date = last_order_map.get(customer.id)
+            customer.last_visit_date = last_visit_map.get(customer.id)
+
+    return customers
 
 
 @router.get("/{customer_id}", response_model=CustomerProfileOut)

@@ -3122,8 +3122,8 @@ def _staff_detail_checks():
     check("today's sale counted", d["summary"]["sales_amount"] == 180
           and d["summary"]["orders"] == 1, d["summary"])
     check("assigned customers counted", d["summary"]["assigned_customers"] == 1, d["summary"])
-    check("visits / follow-ups are null until those modules exist",
-          d["summary"]["visits"] is None and d["summary"]["pending_followups"] is None, d["summary"])
+    check("visits / follow-ups are 0 when those modules exist but have no entries",
+          d["summary"]["visits"] == 0 and d["summary"]["pending_followups"] == 0, d["summary"])
     check("performance is a per-day series, one point for today",
           len(d["performance"]) == 1
           and all(set(p) == {"date", "sales_amount", "orders"} for p in d["performance"]),

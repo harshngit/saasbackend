@@ -43,6 +43,10 @@ class CustomerOut(BaseModel):
     maps_latitude: float | None = None
     maps_longitude: float | None = None
 
+    city: str | None = None
+    last_order_date: datetime | None = None
+    last_visit_date: datetime | None = None
+
     created_at: datetime
     updated_at: datetime
 
