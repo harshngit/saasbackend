@@ -39,6 +39,7 @@ class CustomerOut(BaseModel):
     customer_id: str | None = None
     customer_since: datetime | None = None
     status: str | None = None
+    customer_type: str | None = None
     primary_contact_person: str | None = None
     maps_latitude: float | None = None
     maps_longitude: float | None = None

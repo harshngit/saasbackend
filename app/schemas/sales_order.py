@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.workflow import public_order_status
+
 
 class OrderItemIn(BaseModel):
     product_id: str
@@ -72,7 +74,9 @@ class OrderOut(BaseModel):
     customer_id: str | None
     customer: CustomerBrief | None
     status: str = Field(
-        description="draft | placed | awaiting_approval | processing | completed | cancelled")
+        description="Client-facing Order status: placed | confirmed | completed | cancelled. "
+                    "(Internally the order may be draft/awaiting_approval/placed/processing/"
+                    "completed/cancelled — see app.core.workflow.public_order_status.)")
     fulfilment_status: str = Field(
         default="not_started",
         description="not_started | reserved | planned | loaded | in_transit | "
@@ -126,6 +130,14 @@ class OrderOut(BaseModel):
     # Non-blocking notices, e.g. the order taking a customer past their credit limit
     # while the firm's credit_limit_action is "warn".
     warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _public_status(cls, v: str) -> str:
+        """Normalize the internal `status` to the client-facing value at the API
+        boundary — the stored value on the order is never touched. Applies to
+        every endpoint that returns OrderOut (list, detail, create, update)."""
+        return public_order_status(v)
 
     @model_validator(mode="after")
     def _mirror_quantities(self) -> "OrderOut":

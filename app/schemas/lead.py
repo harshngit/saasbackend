@@ -119,6 +119,11 @@ class LeadConvertToCustomerIn(BaseModel):
     category: str | None = None
     notes: str | None = None
     primary_contact_person: str | None = None
+    customer_type: str | None = None
+    customer_since: datetime | None = None
+    status: str | None = None
+    maps_latitude: float | None = None
+    maps_longitude: float | None = None
 
 
 class LeadConvertResponse(BaseModel):

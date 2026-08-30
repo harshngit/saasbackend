@@ -249,7 +249,8 @@ def run_all_tests():
     log_test("After D1: delivered_quantity = 30", ord1_after["items"][0]["delivered_quantity"] == 30.0)
     log_test("After D1: remaining_quantity = 70", ord1_after["items"][0]["remaining_quantity"] == 70.0)
     log_test("After D1: fulfilment_status = 'partially_delivered'", ord1_after["fulfilment_status"] == "partially_delivered")
-    log_test("After D1: order status = 'processing'", ord1_after["status"] == "processing")
+    # Public Order status contract: internal 'processing' -> public 'confirmed'.
+    log_test("After D1: order status = 'confirmed'", ord1_after["status"] == "confirmed")
 
     # ----------------------------------------------------
     # TEST 3: Delivery 2 - Plan 20 Units (Partial Delivery 2)

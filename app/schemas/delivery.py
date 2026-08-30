@@ -1,6 +1,8 @@
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.workflow import public_delivery_status, public_order_status
+
 
 class DeliveryStatusUpdate(BaseModel):
     status: str = Field(description="Delivered | Partial | Failed | Rescheduled")
@@ -74,6 +76,13 @@ class DeliveryOrderBrief(BaseModel):
     status: str | None = None
     fulfilment_status: str | None = None
     total: float | None = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _public_order_status(cls, v: str | None) -> str | None:
+        """This is a Sales Order status embedded in a Delivery response — same
+        public Order mapping as OrderOut.status, so it can never disagree."""
+        return public_order_status(v)
 
 
 class DeliveryNoteOut(DeliveryNoteBase):
@@ -233,8 +242,10 @@ class DeliveryOut(BaseModel):
     delivery_address: str | None = None
     scheduled_date: datetime | None = None
     status: str = Field(
-        description="planned | loaded | in_transit | partially_delivered | delivered | "
-                    "failed | cancelled")
+        description="Client-facing Delivery status: pending | accepted | in_transit | "
+                    "partially_delivered | delivered | returned | cancelled. (Internally "
+                    "planned/accepted/rejected/ready/loaded/in_transit/partially_delivered/"
+                    "delivered/failed/cancelled — see app.core.workflow.public_delivery_status.)")
     picking_status: str = "not_started"
     dispatched_at: datetime | None = None
     dispatched_by_id: str | None = None
@@ -253,6 +264,22 @@ class DeliveryOut(BaseModel):
     )
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _public_status(cls, v: str) -> str:
+        """Normalize the internal Delivery `status` to the client-facing value at
+        the API boundary — the stored value is never touched. Applies to every
+        endpoint that returns DeliveryOut (list, detail, plan/update/accept/
+        reject/load/confirm)."""
+        return public_delivery_status(v)
+
+    @field_validator("order_status", mode="before")
+    @classmethod
+    def _public_order_status(cls, v: str | None) -> str | None:
+        """This is the parent Sales Order's status, carried at the top level of
+        the Delivery response — same public Order mapping as OrderOut.status."""
+        return public_order_status(v)
 
 
 class DeliveryConfirmItem(BaseModel):

@@ -678,7 +678,7 @@ def get_delivery_details(
         "id": order.id,
         "organization_id": order.organization_id,
         "order_number": order.order_number,
-        "status": order.status,
+        "status": workflow.public_order_status(order.status),
         "source": order.source,
         "subtotal": order.subtotal,
         "discount": order.discount,
@@ -810,7 +810,7 @@ def update_delivery_status(
     db.refresh(order)
     return {
         "status": "success",
-        "order_status": order.status,
+        "order_status": workflow.public_order_status(order.status),
         "fulfilment_status": order.fulfilment_status,
         "reject_reason": order.reject_reason,
     }

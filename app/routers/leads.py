@@ -212,6 +212,11 @@ def convert_lead_to_customer(
         notes=cust_notes,
         primary_contact_person=cust_contact,
         lead_source=lead.lead_source,
+        customer_type=data.get("customer_type"),
+        customer_since=data.get("customer_since"),
+        status=data.get("status"),
+        maps_latitude=data.get("maps_latitude"),
+        maps_longitude=data.get("maps_longitude"),
     )
     customer.recompute_outstanding()
     db.add(customer)

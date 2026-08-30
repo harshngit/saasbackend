@@ -221,7 +221,8 @@ def run_tests():
     assert_eq(so_create_res.status_code, 201, "Created pickup sales order")
     so = so_create_res.json()
     order_id = so["id"]
-    assert_eq(so["status"], "draft", "Order is in draft status")
+    # Public Order status contract: internal 'draft' -> public 'placed'.
+    assert_eq(so["status"], "placed", "Order is in draft status (public: 'placed')")
     assert_eq(so["fulfilment_method"], "pickup", "Fulfilment method is 'pickup'")
     assert_eq(so["pickup_status"], "not_started", "Pickup status is 'not_started'")
 
@@ -250,7 +251,8 @@ def run_tests():
     assert_eq(pick_res.status_code, 200, "POST /orders/{id}/pickup/pick succeeded")
     so_pick = pick_res.json()
     assert_eq(so_pick["pickup_status"], "picking", "Pickup status transitioned to 'picking'")
-    assert_eq(so_pick["status"], "processing", "Order status transitioned to 'processing'")
+    # Public Order status contract: internal 'processing' -> public 'confirmed'.
+    assert_eq(so_pick["status"], "confirmed", "Order status transitioned to 'processing' (public: 'confirmed')")
 
     # After Pick: Physical = 100, Reserved = 20, Available = 80 (No stock movement)
     stock_pick = so_pick["stock_summary"][0]

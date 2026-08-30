@@ -26,7 +26,7 @@ class VisitLeadBrief(BaseModel):
 
 
 class VisitBase(BaseModel):
-    customer_id: str
+    customer_id: str | None = None
     lead_id: str | None = None
     user_id: str | None = None
     salesperson_id: str | None = None
@@ -47,6 +47,12 @@ class VisitBase(BaseModel):
             if "sales_officer_id" in data and "user_id" not in data:
                 data["user_id"] = data["sales_officer_id"]
         return data
+
+    @model_validator(mode="after")
+    def _validate_ids(self) -> "VisitBase":
+        if not self.customer_id and not self.lead_id:
+            raise ValueError("At least one of customer_id or lead_id must be provided")
+        return self
 
 
 class VisitCreate(VisitBase):
@@ -82,7 +88,7 @@ class VisitOut(BaseModel):
 
     id: str
     organization_id: str
-    customer_id: str
+    customer_id: str | None = None
     lead_id: str | None = None
     user_id: str | None = None
     visit_date: datetime

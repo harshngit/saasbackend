@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.workflow import public_order_status
 from app.models import (
     Customer,
     Delivery,
@@ -620,18 +621,26 @@ def _settle_order_fulfilment(db: Session, order: SalesOrder) -> None:
 
 
 def sync_delivery_view(db: Session, delivery: Delivery) -> dict:
-    """The extra fields the response carries beyond the columns."""
+    """The extra fields the response carries beyond the columns.
+
+    Built as plain dicts merged onto DeliveryOut via setattr() (see
+    routers/deliveries.py::_delivery_out), which bypasses Pydantic field
+    validation — so the Order status embedded here must already be the
+    public value; DeliveryOut/DeliveryOrderBrief's own validators only
+    protect callers that construct them the normal (model_validate) way.
+    """
     order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
+    order_public_status = public_order_status(order.status) if order is not None else None
     return {
         # `delivery_number` and `order_id` come off the model as properties.
         "order_number": order.order_number if order is not None else None,
-        "order_status": order.status if order is not None else None,
+        "order_status": order_public_status,
         "order_total": order.total if order is not None else None,
         "fulfilment_status": order.fulfilment_status if order is not None else None,
         "order": {
             "id": order.id,
             "order_number": order.order_number,
-            "status": order.status,
+            "status": order_public_status,
             "fulfilment_status": order.fulfilment_status,
             "total": order.total,
         } if order is not None else None,

@@ -55,6 +55,36 @@ LEGACY_ORDER_STATUS = {
 # An order past this point counts as a realised sale for reporting.
 SALE_ORDER_STATUSES = ("placed", "processing", "completed")
 
+# ------------------------- public (client-facing) Order status -------------------------
+# The internal lifecycle above (draft / awaiting_approval / processing / …) is richer
+# than what the client should ever see — draft/awaiting_approval/placed all mean "not
+# yet confirmed" to a customer, and "processing" must never leak out as anything but
+# "confirmed". This maps ONLY at the API response boundary: the stored `status` value,
+# every transition above and every internal comparison against it are unaffected.
+# Centralized here — the one place every Order response (list/detail/create/update)
+# reads from — so no router or schema keeps its own copy that could drift.
+PUBLIC_ORDER_STATUS: dict[str, str] = {
+    "draft": "placed",
+    "awaiting_approval": "placed",
+    "placed": "placed",
+    "processing": "confirmed",
+    "completed": "completed",
+    "cancelled": "cancelled",
+}
+
+
+def public_order_status(value: str | None) -> str | None:
+    """The client-facing Order status for an internal `SalesOrder.status` value.
+
+    Never touches the stored value. An internal status this map does not recognise
+    (should not happen — migrate_order_statuses backfills any row still on the old
+    vocabulary) is passed through unchanged rather than raising, so a stray value
+    never turns into a 500.
+    """
+    if value is None:
+        return None
+    return PUBLIC_ORDER_STATUS.get(value, value)
+
 # Fulfilment states where goods have physically left the warehouse, so a plain
 # cancel is no longer the right move — the return-to-warehouse flow is.
 DISPATCHED_FULFILMENT = ("loaded", "in_transit", "partially_delivered", "delivered")
@@ -180,6 +210,36 @@ ORDER_FULFILMENT_FOR_DELIVERY = {
 
 # Deliveries whose goods are still out with the partner.
 OPEN_DELIVERY_STATUSES = ("planned", "accepted", "ready", "loaded", "in_transit", "partially_delivered")
+
+# ------------------------- public (client-facing) Delivery status -------------------------
+# Same boundary-only mapping as PUBLIC_ORDER_STATUS above, for the Delivery's own
+# `status` column. `ready`/`loaded` are internal warehouse steps within "accepted";
+# `rejected` reads as still-`pending` reassignment; `failed` is reported as `returned`
+# (nothing was handed over, so the goods effectively came back). None of the internal
+# values are removed — the workflow above keeps using them exactly as before.
+PUBLIC_DELIVERY_STATUS: dict[str, str] = {
+    "planned": "pending",
+    "rejected": "pending",
+    "accepted": "accepted",
+    "ready": "accepted",
+    "loaded": "accepted",
+    "in_transit": "in_transit",
+    "partially_delivered": "partially_delivered",
+    "delivered": "delivered",
+    "failed": "returned",
+    "cancelled": "cancelled",
+}
+
+
+def public_delivery_status(value: str | None) -> str | None:
+    """The client-facing Delivery status for an internal `Delivery.status` value.
+
+    Same non-destructive, defensive behaviour as public_order_status: the stored
+    value is untouched, and an unrecognised value passes through unchanged.
+    """
+    if value is None:
+        return None
+    return PUBLIC_DELIVERY_STATUS.get(value, value)
 
 
 # ------------------------------ sales returns ------------------------------

@@ -933,7 +933,8 @@ dp = client.post("/users", headers=so_hdr, json={"name": "DP", "email": dp_email
 r = client.patch(f"/orders/{order_id}/assign-delivery-partner", headers=so_hdr, json={"delivery_partner_id": dp["id"]})
 check("assigning a partner plans the delivery, it does not dispatch it",
       r.status_code == 200 and r.json()["fulfilment_status"] == "planned"
-      and r.json()["status"] == "processing"
+      # Public Order status contract: internal 'processing' -> public 'confirmed'.
+      and r.json()["status"] == "confirmed"
       and r.json()["assigned_delivery_partner_id"] == dp["id"], r.text)
 
 # cancel releases the hold; physical stock never moved, so there is nothing to restore
@@ -3520,7 +3521,8 @@ def _phase0_checks():
         "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]})
     appr = r.json()
     check("with approval on, the order awaits approval",
-          appr["status"] == "awaiting_approval", appr["status"])
+          # Public Order status contract: internal 'awaiting_approval' -> public 'placed'.
+          appr["status"] == "placed", appr["status"])
     check("its stock is still held while it waits", appr["fulfilment_status"] == "reserved", appr)
     r = client.patch(f"/orders/{appr['id']}/approve", headers=ah)
     check("approve -> placed, and still no stock movement",
@@ -3806,7 +3808,8 @@ def _phase1cf_checks():
                                           "amount_due", "items")}, indent=2))
     check("it has its own id and human code",
           dlv["id"] and dlv["delivery_number"].startswith("DLV-"), dlv)
-    check("status is planned, NOT out for delivery", dlv["status"] == "planned", dlv["status"])
+    # Public Delivery status contract: internal 'planned' -> public 'pending'.
+    check("status is planned, NOT out for delivery", dlv["status"] == "pending", dlv["status"])
     check("the line tracks planned / loaded / delivered / pending",
           dlv["items"][0]["planned_quantity"] == 20 and dlv["items"][0]["loaded_quantity"] == 0
           and dlv["items"][0]["delivered_quantity"] == 0
@@ -3820,7 +3823,8 @@ def _phase1cf_checks():
     check("amount_due is the order's unpaid total", dlv["amount_due"] == order["total"], dlv["amount_due"])
     after = client.get(f"/orders/{order['id']}", headers=ah).json()
     check("planning moves the order to processing / planned",
-          after["status"] == "processing" and after["fulfilment_status"] == "planned", after)
+          # Public Order status contract: internal 'processing' -> public 'confirmed'.
+          after["status"] == "confirmed" and after["fulfilment_status"] == "planned", after)
     check("planning did NOT touch physical stock",
           client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
           .json()[0]["on_hand"] == 100)
@@ -4002,7 +4006,8 @@ def _phase1cf_checks():
     r = client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr, json={
         "failed": True, "failure_reason": "Customer unavailable"})
     check("a failed delivery records the reason",
-          r.status_code == 200 and r.json()["status"] == "failed"
+          # Public Delivery status contract: internal 'failed' -> public 'returned'.
+          r.status_code == 200 and r.json()["status"] == "returned"
           and r.json()["failure_reason"] == "Customer unavailable", r.text[:300])
     check("failure without a reason -> 422",
           client.post(f"/deliveries/{d2['id']}/confirm", headers=dp_hdr,
@@ -5398,7 +5403,8 @@ order_b_approval = client.post("/orders", headers=so_b_hdr, json={
     "customer_id": sec_cust["id"],
     "items": [{"product_id": sec_prod["id"], "quantity": 1}]
 }).json()
-check("Order created awaiting approval", order_b_approval["status"] == "awaiting_approval")
+# Public Order status contract: internal 'awaiting_approval' -> public 'placed'.
+check("Order created awaiting approval", order_b_approval["status"] == "placed")
 check("TEST 9: SO A without approve permission cannot approve -> 403",
       client.patch(f"/orders/{order_b_approval['id']}/approve", headers=so_a_hdr).status_code == 403)
 check("TEST 9: SO A without approve permission cannot reject -> 403",
@@ -5432,7 +5438,8 @@ check("TEST 12: Valid delivery partner assignment -> 200", valid_assign.status_c
 va_json = valid_assign.json()
 check("TEST 12: assigned_delivery_partner_id updated", va_json["assigned_delivery_partner_id"] == sec_dp["id"])
 check("TEST 12: fulfilment_status moved to planned", va_json["fulfilment_status"] == "planned")
-check("TEST 12: status moved to processing", va_json["status"] == "processing")
+# Public Order status contract: internal 'processing' -> public 'confirmed'.
+check("TEST 12: status moved to processing", va_json["status"] == "confirmed")
 
 # TEST 13: Existing normal order flow
 norm_order = client.post("/orders", headers=sec_admin_hdr, json={
@@ -5450,7 +5457,8 @@ draft_order = client.post("/orders", headers=sec_admin_hdr, json={
     "customer_id": sec_cust["id"],
     "items": [{"product_id": sec_prod["id"], "quantity": 4, "unit_price": 100}]
 }).json()
-check("TEST 14: Order created as draft", draft_order["status"] == "draft" and draft_order["fulfilment_status"] == "not_started")
+# Public Order status contract: internal 'draft' -> public 'placed'.
+check("TEST 14: Order created as draft", draft_order["status"] == "placed" and draft_order["fulfilment_status"] == "not_started")
 confirm_res = client.post(f"/orders/{draft_order['id']}/confirm", headers=sec_admin_hdr)
 check("TEST 14: Draft confirmed -> 200", confirm_res.status_code == 200, confirm_res.text)
 check("TEST 14: Confirmed order status placed and reserved",
@@ -5545,7 +5553,8 @@ check("TEST A4: Warehouse reservation unchanged during pick", stock_during_pick[
 # TEST B2: Ready after picked -> 200
 ready_res = client.post(f"/deliveries/{dlv_data['id']}/ready", headers=del_admin_hdr)
 check("TEST B2: Ready after picked -> 200", ready_res.status_code == 200, ready_res.text)
-check("TEST B2: Status is ready", ready_res.json()["status"] == "ready")
+# Public Delivery status contract: internal 'ready' -> public 'accepted'.
+check("TEST B2: Status is ready", ready_res.json()["status"] == "accepted")
 check("TEST B2: Picking status is picked", ready_res.json()["picking_status"] == "picked")
 
 # TEST C1 & C2: Loading guard checks
@@ -5562,7 +5571,8 @@ check("TEST D1: Confirm before in_transit -> 400", confirm_fail.status_code == 4
 # TEST C3: Load vehicle -> 200
 load_res = client.post(f"/deliveries/{dlv_data['id']}/load", headers=del_admin_hdr)
 check("TEST C3: Load delivery -> 200", load_res.status_code == 200, load_res.text)
-check("TEST C3: Status is loaded", load_res.json()["status"] == "loaded")
+# Public Delivery status contract: internal 'loaded' -> public 'accepted'.
+check("TEST C3: Status is loaded", load_res.json()["status"] == "accepted")
 
 # Verify inventory moved on load
 stock_after_load = client.get(f"/warehouses/stock?product_id={prod['id']}", headers=del_admin_hdr).json()[0]
@@ -5606,7 +5616,8 @@ check("order_number present", dlv["order_number"] == order["order_number"])
 check("order object present", dlv["order"] is not None and isinstance(dlv["order"], dict))
 check("order.id matches", dlv["order"]["id"] == order["id"])
 check("order.order_number matches", dlv["order"]["order_number"] == order["order_number"])
-check("order.status matches", dlv["order"]["status"] in ("completed", "processing"), dlv["order"])
+# Public Order status contract: internal 'processing' -> public 'confirmed'.
+check("order.status matches", dlv["order"]["status"] in ("completed", "confirmed"), dlv["order"])
 check("order.fulfilment_status matches", dlv["order"]["fulfilment_status"] == "delivered", dlv["order"])
 check("order.total matches", dlv["order"]["total"] == order["total"], dlv["order"])
 check("top-level order_total matches", dlv["order_total"] == order["total"])
@@ -5670,7 +5681,8 @@ dlv_rej = client.post("/deliveries", headers=del_admin_hdr, json={
 # Reject by partner 1
 rej_res = client.post(f"/deliveries/{dlv_rej['id']}/reject", headers=dp_hdr, json={"reason": "Vehicle broke down"})
 check("Partner rejects delivery -> 200", rej_res.status_code == 200)
-check("Rejected status is rejected", rej_res.json()["status"] == "rejected")
+# Public Delivery status contract: internal 'rejected' -> public 'pending'.
+check("Rejected status is rejected", rej_res.json()["status"] == "pending")
 check("Rejected clears delivery_partner", rej_res.json()["delivery_partner"] is None)
 check("Rejected clears vehicle", rej_res.json()["vehicle"] is None)
 
@@ -5686,7 +5698,8 @@ reassign_res = client.patch(f"/deliveries/by-id/{dlv_rej['id']}", headers=del_ad
 })
 check("Reassign rejected delivery to new partner -> 200", reassign_res.status_code == 200, reassign_res.text)
 reassigned_dlv = reassign_res.json()
-check("Reassigned delivery status is planned", reassigned_dlv["status"] == "planned")
+# Public Delivery status contract: internal 'planned' -> public 'pending'.
+check("Reassigned delivery status is planned", reassigned_dlv["status"] == "pending")
 check("Reassigned delivery has partner 2", reassigned_dlv["delivery_partner"]["id"] == dp2_user["id"])
 check("Reassigned delivery has vehicle", reassigned_dlv["vehicle"]["id"] == veh["id"])
 

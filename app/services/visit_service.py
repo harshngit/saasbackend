@@ -13,12 +13,20 @@ def _now() -> datetime:
 
 
 def create_visit(db: Session, org_id: str, user: User, payload: VisitCreate) -> Visit:
-    # 1. Validate customer
-    cust = db.get(Customer, payload.customer_id)
-    if cust is None or cust.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+    # Ensure at least one of customer_id or lead_id is provided
+    if not payload.customer_id and not payload.lead_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one of customer_id or lead_id must be provided"
+        )
 
-    # 2. Validate optional lead
+    # 1. Validate customer if provided
+    if payload.customer_id:
+        cust = db.get(Customer, payload.customer_id)
+        if cust is None or cust.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+
+    # 2. Validate optional lead if provided
     if payload.lead_id:
         lead = db.get(Lead, payload.lead_id)
         if lead is None or lead.organization_id != org_id:
@@ -104,6 +112,15 @@ def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: V
 
     valid_statuses = {"planned", "completed", "cancelled"}
     data = payload.model_dump(exclude_unset=True)
+
+    # Ensure at least one of customer_id or lead_id remains
+    new_customer_id = data.get("customer_id", visit.customer_id) if "customer_id" in data else visit.customer_id
+    new_lead_id = data.get("lead_id", visit.lead_id) if "lead_id" in data else visit.lead_id
+    if not new_customer_id and not new_lead_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one of customer_id or lead_id must be provided"
+        )
 
     if "customer_id" in data and data["customer_id"]:
         cust = db.get(Customer, data["customer_id"])

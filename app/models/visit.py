@@ -29,8 +29,8 @@ class Visit(Base):
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    customer_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True
+    customer_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=True, index=True
     )
     lead_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("leads.id", ondelete="SET NULL"), nullable=True, index=True

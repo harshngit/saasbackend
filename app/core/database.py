@@ -229,6 +229,7 @@ _RELAX_NOT_NULL = [
     # be mandatory no longer is. Making a column nullable in the model is invisible to
     # an existing Postgres database — the constraint has to be dropped here too.
     ("customer_payments", "customer_id"),
+    ("visits", "customer_id"),
 ]
 
 
