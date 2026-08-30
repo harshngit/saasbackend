@@ -176,6 +176,14 @@ class CustomerPayment(Base):
     payment_mode: Mapped[str] = mapped_column(String(30), default="cash", nullable=False)
     reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Method-specific details. All optional — which ones apply depends on
+    # payment_mode; cash carries none of them. Never the full card number or CVV,
+    # only enough to identify the card on a statement.
+    upi_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    card_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    card_last_four: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    collection_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 

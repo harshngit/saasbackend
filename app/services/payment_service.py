@@ -70,6 +70,10 @@ def record(
     received_on: datetime | None = None,
     order_id: str | None = None,
     receipt_number: str | None = None,
+    upi_id: str | None = None,
+    card_type: str | None = None,
+    card_last_four: str | None = None,
+    collection_instructions: str | None = None,
 ) -> CustomerPayment:
     """Record one payment. Raises `ValueError` with a message fit to show a user.
 
@@ -124,6 +128,10 @@ def record(
         received_on=received_on or _now(),
         order_amount=resolved_order_amount,
         previous_pending=previous_pending,
+        upi_id=upi_id,
+        card_type=card_type,
+        card_last_four=card_last_four,
+        collection_instructions=collection_instructions,
     )
     db.add(payment)
 

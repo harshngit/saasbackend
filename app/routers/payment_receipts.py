@@ -59,6 +59,10 @@ def _out(db: Session, payment: CustomerPayment) -> PaymentReceiptOut:
         payment_method=payment.payment_mode,
         transaction_reference=payment.reference,
         note=payment.note,
+        upi_id=payment.upi_id,
+        card_type=payment.card_type,
+        card_last_four=payment.card_last_four,
+        collection_instructions=payment.collection_instructions,
         invoice_total=invoice.total if invoice is not None else None,
         total_paid=invoice.amount_paid if invoice is not None else None,
         outstanding_amount=payment_service.outstanding(invoice) if invoice is not None else None,
@@ -149,6 +153,10 @@ def create_receipt(
             note=payload.note,
             received_on=payload.receipt_date,
             receipt_number=payload.receipt_number,
+            upi_id=payload.upi_id,
+            card_type=payload.card_type,
+            card_last_four=payload.card_last_four,
+            collection_instructions=payload.collection_instructions,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -225,6 +233,10 @@ def update_receipt(
         "receipt_date": "received_on",
         "receipt_number": "receipt_number",
         "note": "note",
+        "upi_id": "upi_id",
+        "card_type": "card_type",
+        "card_last_four": "card_last_four",
+        "collection_instructions": "collection_instructions",
     }
     for field, column in columns.items():
         if field in data:

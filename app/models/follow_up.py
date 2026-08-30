@@ -30,8 +30,10 @@ class FollowUp(Base):
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    customer_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False, index=True
+    # Nullable: a follow-up on a lead-only Visit (no converted Customer yet) has no
+    # customer to point at — its parent chain is FollowUp -> Visit -> Lead instead.
+    customer_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=True, index=True
     )
     visit_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("visits.id", ondelete="SET NULL"), nullable=True, index=True
@@ -52,6 +54,6 @@ class FollowUp(Base):
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
     )
 
-    customer: Mapped["Customer"] = relationship(lazy="joined", foreign_keys=[customer_id])  # noqa: F821
+    customer: Mapped["Customer | None"] = relationship(lazy="joined", foreign_keys=[customer_id])  # noqa: F821
     visit: Mapped["Visit | None"] = relationship(back_populates="follow_ups", lazy="joined", foreign_keys=[visit_id])  # noqa: F821
     assigned_to: Mapped["User | None"] = relationship(lazy="joined", foreign_keys=[assigned_to_id])  # noqa: F821

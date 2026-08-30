@@ -4,7 +4,7 @@ from sqlalchemy import asc, desc
 from sqlalchemy.orm import Session
 
 from app.core import scoping
-from app.models import Customer, FollowUp, User, Visit
+from app.models import Customer, FollowUp, Lead, User, Visit
 from app.schemas.follow_up import FollowUpCreate, FollowUpUpdate
 
 
@@ -31,19 +31,32 @@ def create_follow_up(
     if not customer_id and visit is not None:
         customer_id = visit.customer_id
 
-    if not customer_id:
+    # A follow-up needs a valid parent: a customer, or — for a lead-only Visit that
+    # has not converted yet — the lead reached via FollowUp -> Visit -> Lead.
+    lead_id = visit.lead_id if visit is not None else None
+    if not customer_id and not lead_id:
+        if visit is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Visit must be linked to a customer or lead",
+            )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id is required")
 
-    cust = db.get(Customer, customer_id)
-    if cust is None or cust.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
-
-    # If both visit and customer are specified, check they match
-    if visit is not None and visit.customer_id != customer_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="visit_id belongs to a different customer than customer_id",
-        )
+    if customer_id:
+        cust = db.get(Customer, customer_id)
+        if cust is None or cust.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+        # If both visit and customer are specified, check they match — but a
+        # lead-only visit (visit.customer_id is None) has nothing to conflict with.
+        if visit is not None and visit.customer_id and visit.customer_id != customer_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="visit_id belongs to a different customer than customer_id",
+            )
+    elif lead_id:
+        lead = db.get(Lead, lead_id)
+        if lead is None or lead.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
 
     # Validate assigned_to_id
     assigned_to_id = payload.assigned_to_id or user.id

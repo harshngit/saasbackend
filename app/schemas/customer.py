@@ -91,6 +91,26 @@ class CustomerPaymentCreate(BaseModel):
     )
     received_on: datetime | None = None
 
+    # Method-specific details — which ones are relevant depends on payment_mode
+    # (cash uses none of them). Never send the full card number or CVV.
+    upi_id: str | None = Field(default=None, max_length=100, description="Payer's UPI id, for payment_mode='upi'")
+    card_type: str | None = Field(default=None, max_length=30, description="e.g. Visa, Mastercard — for payment_mode='card'")
+    card_last_four: str | None = Field(
+        default=None, max_length=4, description="Last 4 digits only — never the full card number"
+    )
+    collection_instructions: str | None = Field(
+        default=None, description="For payment_mode='cod' — where/how to collect"
+    )
+
+    @field_validator("card_last_four")
+    @classmethod
+    def _valid_card_last_four(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not (v.isdigit() and len(v) == 4):
+            raise ValueError("card_last_four must be exactly 4 digits")
+        return v
+
 
 class PaymentInvoiceBrief(BaseModel):
     """The invoice a payment settled, resolved from invoice_id."""
@@ -126,6 +146,12 @@ class CustomerPaymentOut(BaseModel):
     order_amount: float | None = None
     previous_pending: float | None = None
     remaining_receivable: float | None = None
+
+    # Method-specific details, persisted alongside the payment.
+    upi_id: str | None = None
+    card_type: str | None = None
+    card_last_four: str | None = None
+    collection_instructions: str | None = None
 
     @model_validator(mode="after")
     def _populate_aliases(self) -> "CustomerPaymentOut":

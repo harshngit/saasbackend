@@ -230,6 +230,8 @@ _RELAX_NOT_NULL = [
     # an existing Postgres database — the constraint has to be dropped here too.
     ("customer_payments", "customer_id"),
     ("visits", "customer_id"),
+    # A follow-up on a lead-only Visit has no Customer yet (FollowUp -> Visit -> Lead).
+    ("follow_ups", "customer_id"),
 ]
 
 

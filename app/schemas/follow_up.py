@@ -57,7 +57,9 @@ class FollowUpOut(BaseModel):
 
     id: str
     organization_id: str
-    customer_id: str
+    # Null for a follow-up on a lead-only Visit (no converted Customer yet) —
+    # its parent chain is FollowUp -> Visit -> Lead instead.
+    customer_id: str | None = None
     visit_id: str | None = None
     assigned_to_id: str | None = None
     title: str
