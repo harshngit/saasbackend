@@ -195,6 +195,10 @@ class CustomerPayment(Base):
     # Loaded with the payment so history rows carry the invoice number, not just its id.
     invoice: Mapped["Invoice | None"] = relationship(lazy="joined")  # noqa: F821
 
+    splits: Mapped[list["PaymentSplit"]] = relationship(
+        back_populates="payment", cascade="all, delete-orphan", lazy="joined"
+    )
+
     @property
     def amount_collected(self) -> float:
         return self.amount
@@ -202,6 +206,32 @@ class CustomerPayment(Base):
     @property
     def payment_method(self) -> str:
         return self.payment_mode
+
+
+class PaymentSplit(Base):
+    """One tender / split component of a CustomerPayment (e.g. cash, UPI, card, bank_transfer)."""
+
+    __tablename__ = "payment_splits"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    payment_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("customer_payments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    payment_mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
+
+    # Method-specific details for this split (never full card number or CVV)
+    upi_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    card_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    card_last_four: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    collection_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    payment: Mapped["CustomerPayment"] = relationship(back_populates="splits")
 
 
 class CustomerDocument(Base):

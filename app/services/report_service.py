@@ -106,11 +106,18 @@ def _payment_collection(db, org_id, df, dt):
 
 def _cash_collection(db, org_id, df, dt):
     names = _customer_names(db, org_id)
-    q = _between(db.query(CustomerPayment).filter(CustomerPayment.organization_id == org_id, CustomerPayment.payment_mode == "cash"),
+    q = _between(db.query(CustomerPayment).filter(CustomerPayment.organization_id == org_id),
                  CustomerPayment.received_on, df, dt).order_by(CustomerPayment.received_on)
-    pays = q.all()
-    rows = [{"date": p.received_on.date().isoformat(), "customer": names.get(p.customer_id), "amount": p.amount} for p in pays]
-    return {"summary": {"total_cash": round(sum(p.amount for p in pays), 2), "payments": len(pays)}, "rows": rows}
+    all_pays = q.all()
+    rows = []
+    for p in all_pays:
+        if p.payment_mode == "cash":
+            rows.append({"date": p.received_on.date().isoformat(), "customer": names.get(p.customer_id), "amount": p.amount})
+        elif p.payment_mode == "split" and p.splits:
+            for s in p.splits:
+                if s.payment_mode == "cash":
+                    rows.append({"date": p.received_on.date().isoformat(), "customer": names.get(p.customer_id), "amount": s.amount})
+    return {"summary": {"total_cash": round(sum(r["amount"] for r in rows), 2), "payments": len(rows)}, "rows": rows}
 
 
 def _expense(db, org_id, df, dt):

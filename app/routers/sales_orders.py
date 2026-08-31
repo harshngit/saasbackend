@@ -12,6 +12,7 @@ from app.schemas.sales_order import (
     CancelBody,
     OrderCreate,
     OrderOut,
+    OrderUpdate,
     PickupConfirmRequest,
     RejectBody,
 )
@@ -240,6 +241,23 @@ def create_order(
         delivery_terms=payload.delivery_terms,
         currency=payload.currency or "INR",
     )
+    db.commit()
+    db.refresh(order)
+    return _order_out(db, order, warnings)
+
+
+@router.patch("/{order_id}", response_model=OrderOut)
+def update_order(
+    order_id: str,
+    payload: OrderUpdate,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Edit a sales order before fulfillment/dispatch."""
+    org_id = _org_id(user)
+    order = _owned(db, order_id, org_id, user)
+    order, warnings = order_service.update_order(db, user, order, payload)
     db.commit()
     db.refresh(order)
     return _order_out(db, order, warnings)

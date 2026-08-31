@@ -187,6 +187,45 @@ class OrderCreate(BaseModel):
     order_status: str | None = Field(default=None, max_length=30, description="Draft, Confirmed, Processing, Completed, Cancelled")
 
 
+class OrderUpdate(BaseModel):
+    customer_id: str | None = None
+    warehouse_id: str | None = Field(
+        default=None, description="Which warehouse to reserve from."
+    )
+    quotation_id: str | None = None
+    delivery_date: datetime | None = None
+    fulfilment_method: str | None = Field(
+        default=None, max_length=30, description="delivery | pickup"
+    )
+    payment_type: str | None = Field(
+        default=None, max_length=20, description="cash | credit | upi | …"
+    )
+    payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    payment_terms: str | None = None
+    delivery_terms: str | None = None
+    currency: str | None = None
+    billing_address: str | None = None
+    shipping_address: str | None = None
+    delivery_address: str | None = None
+    source: str | None = Field(default=None, description="office | delivery_vehicle")
+    discount: float | None = Field(default=None, ge=0)
+    tax: float | None = Field(default=None, ge=0)
+    notes: str | None = None
+    items: list[OrderItemIn] | None = None
+    order_date: datetime | None = None
+    salesperson_id: str | None = Field(default=None, description="Assigned salesperson")
+    order_status: str | None = Field(
+        default=None, max_length=30, description="Draft, Confirmed, Processing, Completed, Cancelled"
+    )
+
+    @field_validator("source")
+    @classmethod
+    def _valid_source(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("office", "delivery_vehicle"):
+            raise ValueError("source must be 'office' or 'delivery_vehicle'")
+        return v
+
+
 class RejectBody(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 

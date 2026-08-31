@@ -79,6 +79,9 @@ class CustomerCreate(BaseModel):
     maps_longitude: float | None = Field(default=None, ge=-180, le=180)
 
 
+from app.schemas.payment_receipt import PaymentSplitIn, PaymentSplitOut
+
+
 class CustomerPaymentCreate(BaseModel):
     amount: float = Field(gt=0)
     payment_mode: str = Field(default="cash", max_length=30)
@@ -90,6 +93,11 @@ class CustomerPaymentCreate(BaseModel):
         description="Settle this invoice. Omit for an advance / on-account payment.",
     )
     received_on: datetime | None = None
+
+    # Optional split payments breakdown
+    splits: list[PaymentSplitIn] | None = Field(
+        default=None, description="Optional multi-tender split payment breakdown"
+    )
 
     # Method-specific details — which ones are relevant depends on payment_mode
     # (cash uses none of them). Never send the full card number or CVV.
@@ -152,6 +160,7 @@ class CustomerPaymentOut(BaseModel):
     card_type: str | None = None
     card_last_four: str | None = None
     collection_instructions: str | None = None
+    splits: list[PaymentSplitOut] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _populate_aliases(self) -> "CustomerPaymentOut":

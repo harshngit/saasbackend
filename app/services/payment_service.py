@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import Customer, CustomerPayment, Invoice, SalesOrder
+from app.models import Customer, CustomerPayment, Invoice, PaymentSplit, SalesOrder
 from app.services import numbering_service
 
 
@@ -74,6 +74,7 @@ def record(
     card_type: str | None = None,
     card_last_four: str | None = None,
     collection_instructions: str | None = None,
+    splits: list | None = None,
 ) -> CustomerPayment:
     """Record one payment. Raises `ValueError` with a message fit to show a user.
 
@@ -87,6 +88,23 @@ def record(
     """
     if amount is None or amount <= 0:
         raise ValueError("A payment must be more than zero")
+
+    if splits is not None:
+        if len(splits) == 0:
+            raise ValueError("Payment splits list cannot be empty")
+        split_sum = 0.0
+        for s in splits:
+            s_amt = getattr(s, "amount", None) if hasattr(s, "amount") else (s.get("amount") if isinstance(s, dict) else None)
+            s_mode = getattr(s, "payment_mode", None) or (s.get("payment_mode") if isinstance(s, dict) else None)
+            if s_amt is None or s_amt <= 0:
+                raise ValueError("Each split amount must be greater than zero")
+            if not s_mode:
+                raise ValueError("Each split must specify a payment_mode")
+            split_sum += float(s_amt)
+        if round(split_sum, 2) != round(amount, 2):
+            raise ValueError(
+                f"Sum of payment splits ({split_sum:.2f}) does not match total payment amount ({amount:.2f})"
+            )
 
     if invoice is not None:
         if invoice.is_credit_note:
@@ -115,6 +133,8 @@ def record(
         if order is not None and order.organization_id == org_id:
             resolved_order_amount = float(order.total)
 
+    effective_payment_mode = "split" if splits else (payment_mode or "cash")
+
     payment = CustomerPayment(
         organization_id=org_id,
         customer_id=customer.id if customer is not None else None,
@@ -122,7 +142,7 @@ def record(
         order_id=resolved_order_id,
         receipt_number=receipt_number or next_receipt_number(db, org_id),
         amount=round(amount, 2),
-        payment_mode=payment_mode or "cash",
+        payment_mode=effective_payment_mode,
         reference=reference,
         note=note,
         received_on=received_on or _now(),
@@ -134,6 +154,31 @@ def record(
         collection_instructions=collection_instructions,
     )
     db.add(payment)
+    db.flush()
+
+    # Persist child splits if provided
+    if splits:
+        for s in splits:
+            s_mode = getattr(s, "payment_mode", None) or (s.get("payment_mode") if isinstance(s, dict) else None)
+            s_amt = getattr(s, "amount", None) if hasattr(s, "amount") else (s.get("amount") if isinstance(s, dict) else None)
+            s_ref = getattr(s, "reference", None) if hasattr(s, "reference") else (s.get("reference") if isinstance(s, dict) else None)
+            s_upi = getattr(s, "upi_id", None) if hasattr(s, "upi_id") else (s.get("upi_id") if isinstance(s, dict) else None)
+            s_ctype = getattr(s, "card_type", None) if hasattr(s, "card_type") else (s.get("card_type") if isinstance(s, dict) else None)
+            s_clast4 = getattr(s, "card_last_four", None) if hasattr(s, "card_last_four") else (s.get("card_last_four") if isinstance(s, dict) else None)
+            s_cinst = getattr(s, "collection_instructions", None) if hasattr(s, "collection_instructions") else (s.get("collection_instructions") if isinstance(s, dict) else None)
+            split_row = PaymentSplit(
+                organization_id=org_id,
+                payment_id=payment.id,
+                payment_mode=str(s_mode),
+                amount=round(float(s_amt), 2),
+                reference=s_ref,
+                upi_id=s_upi,
+                card_type=s_ctype,
+                card_last_four=s_clast4,
+                collection_instructions=s_cinst,
+            )
+            db.add(split_row)
+        db.flush()
 
     if invoice is not None:
         apply_to_invoice(invoice, payment.amount)

@@ -195,6 +195,11 @@ def plan_delivery(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="delivery_partner_id is not an employee in your firm",
             )
+        if not delivery_service.is_delivery_partner(db, partner):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected user is not a delivery partner",
+            )
     if payload.vehicle_id:
         vehicle = db.get(Vehicle, payload.vehicle_id)
         if vehicle is None or vehicle.organization_id != org_id:

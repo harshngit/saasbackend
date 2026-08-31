@@ -48,13 +48,6 @@ def is_delivery_partner(db: Session, partner: User) -> bool:
                 return True
             if role.name and role.name.strip().lower().replace("_", " ").replace("-", " ") == "delivery partner":
                 return True
-            perms = role.permissions or {}
-            if (
-                perms.get("deliveries", {}).get("view")
-                or perms.get("deliveries", {}).get("create")
-                or perms.get("deliveries", {}).get("edit")
-            ):
-                return True
     return False
 
 

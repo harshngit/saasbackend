@@ -16,7 +16,7 @@ from app.models.activity_log import ActivityLog
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.brand import Brand
 from app.models.category import Category
-from app.models.customer import Customer, CustomerDocument, CustomerPayment
+from app.models.customer import Customer, CustomerDocument, CustomerPayment, PaymentSplit
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense, ExpenseItem
 from app.models.notification import Notification
 from app.models.number_sequence import NumberSequence
@@ -101,6 +101,7 @@ __all__ = [
     "Attendance",
     "ATTENDANCE_TYPES",
     "CustomerPayment",
+    "PaymentSplit",
     "PurchaseInvoice",
     "PurchaseInvoiceItem",
     "PURCHASE_STATUSES",

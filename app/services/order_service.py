@@ -21,8 +21,9 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.core import workflow
-from app.models import Customer, Product, ProductVariant, SalesOrder, SalesOrderItem, User
+from app.core import scoping, workflow
+from app.models import Customer, Delivery, Invoice, Product, ProductVariant, SalesOrder, SalesOrderItem, User
+from app.schemas.sales_order import OrderUpdate
 from app.services import notification_service, numbering_service, stock_service
 
 
@@ -235,6 +236,9 @@ def place_order(
 
     # Can the warehouse actually cover it? When creating a draft we skip this
     # check; it will run at confirm time.
+    if not create_as_draft and warehouse.id and wanted:
+        stock_service.lock_stock_items(db, org_id, warehouse.id, wanted)
+
     if not create_as_draft and not settings["allow_backorder"]:
         short = stock_service.shortages(db, warehouse.id, wanted)
         if short:
@@ -321,6 +325,10 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
             "product_name": product.name,
         })
 
+    # Acquire deterministic row-level locks before checking shortages/reserving
+    if order.warehouse_id and wanted:
+        stock_service.lock_stock_items(db, org_id, order.warehouse_id, wanted)
+
     # Stock shortages
     if not settings["allow_backorder"]:
         short = stock_service.shortages(db, order.warehouse_id, wanted)
@@ -352,4 +360,300 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
         db, org_id, "Sales order confirmed", f"{order.order_number} — Rs {order.total:,.2f}",
         type="order", link=order.id,
     )
+    return order, warnings
+
+
+def update_order(
+    db: Session, user: User, order: SalesOrder, payload: OrderUpdate
+) -> tuple[SalesOrder, list[str]]:
+    """Update a sales order before fulfillment/dispatch.
+
+    Does not commit — caller owns the transaction.
+    """
+    org_id = order.organization_id
+    settings = workflow.sales_settings(user.organization)
+
+    # 1. Status / workflow restrictions
+    if order.status in ("completed", "cancelled", "rejected"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot edit an order with status '{order.status}'",
+        )
+    if order.fulfilment_status in workflow.DISPATCHED_FULFILMENT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot edit order when fulfilment status is '{order.fulfilment_status}'",
+        )
+    if order.stock_deducted:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot edit order after stock has been deducted",
+        )
+
+    # Check if an invoice has already been issued for this order
+    inv = (
+        db.query(Invoice)
+        .filter(
+            Invoice.order_id == order.id,
+            Invoice.organization_id == org_id,
+            Invoice.is_credit_note.is_(False),
+        )
+        .first()
+    )
+    if inv:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot edit order because invoice {inv.invoice_number} has already been issued",
+        )
+
+    # If updating line items, check that active deliveries don't exist
+    if payload.items is not None:
+        active_deliveries = (
+            db.query(Delivery)
+            .filter(
+                Delivery.sales_order_id == order.id,
+                Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES),
+            )
+            .all()
+        )
+        if active_deliveries:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot edit line items while open deliveries exist for this order. Please cancel or update deliveries first.",
+            )
+
+    # 2. Update customer if provided
+    if payload.customer_id is not None and payload.customer_id != order.customer_id:
+        customer = db.get(Customer, payload.customer_id)
+        if customer is None or customer.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="customer_id is not a customer in your firm",
+            )
+        order.customer_id = customer.id
+    else:
+        customer = db.get(Customer, order.customer_id) if order.customer_id else None
+
+    # 3. Update warehouse if provided
+    warehouse_changed = False
+    if payload.warehouse_id is not None and payload.warehouse_id != order.warehouse_id:
+        wh = stock_service.owned_warehouse(db, payload.warehouse_id, org_id)
+        if wh is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="warehouse_id is not a warehouse in your firm",
+            )
+        order.warehouse_id = wh.id
+        warehouse_changed = True
+
+    # 4. Update header fields if provided
+    if payload.quotation_id is not None:
+        order.quotation_id = payload.quotation_id or None
+    if payload.delivery_date is not None:
+        order.delivery_date = payload.delivery_date
+    if payload.order_date is not None:
+        order.order_date = payload.order_date
+    if payload.fulfilment_method is not None:
+        order.fulfilment_method = payload.fulfilment_method
+    if payload.payment_type is not None:
+        order.payment_type = payload.payment_type
+    if payload.payment_terms_days is not None:
+        order.payment_terms_days = payload.payment_terms_days
+    if payload.payment_terms is not None:
+        order.payment_terms = payload.payment_terms
+    if payload.delivery_terms is not None:
+        order.delivery_terms = payload.delivery_terms
+    if payload.currency is not None:
+        order.currency = payload.currency
+    if payload.billing_address is not None:
+        order.billing_address = payload.billing_address
+    if payload.shipping_address is not None or payload.delivery_address is not None:
+        resolved_shipping = payload.shipping_address or payload.delivery_address
+        order.shipping_address = resolved_shipping
+        order.delivery_address = resolved_shipping
+    if payload.source is not None:
+        order.source = payload.source
+    if payload.notes is not None:
+        order.notes = payload.notes
+    if payload.order_status is not None:
+        order.order_status = payload.order_status
+
+    # Salesperson handling (enforcing own-scope)
+    if scoping.scope_to_own(db, user):
+        order.salesperson_id = user.id
+    elif payload.salesperson_id is not None:
+        if payload.salesperson_id:
+            sp = db.get(User, payload.salesperson_id)
+            if sp is None or sp.organization_id != org_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="salesperson_id is not a user in your firm",
+                )
+            order.salesperson_id = sp.id
+        else:
+            order.salesperson_id = None
+
+    # 5. Line items update (if provided)
+    if payload.items is not None:
+        if len(payload.items) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Order must contain at least one item",
+            )
+
+        # Acquire deterministic row-level locks on all affected items (both old and new)
+        if order.status != "draft" and order.warehouse_id:
+            all_affected_items = [
+                (it.product_id, it.variant_id) for it in order.items if it.product_id
+            ] + [
+                (line.product_id, line.variant_id) for line in payload.items if line.product_id
+            ]
+            stock_service.lock_stock_items(db, org_id, order.warehouse_id, all_affected_items)
+
+        # Release existing reservations before item changes
+        if order.status != "draft":
+            stock_service.release_for_order(db, order.id)
+
+        order.items.clear()
+        db.flush()
+
+        subtotal = 0.0
+        line_tax = 0.0
+        wanted: list[dict] = []
+        for line in payload.items:
+            product = db.get(Product, line.product_id)
+            if product is None or product.organization_id != org_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="An item's product is not in your firm",
+                )
+            variant = None
+            if line.variant_id:
+                variant = db.get(ProductVariant, line.variant_id)
+                if variant is None or variant.product_id != product.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="An item's variant is invalid",
+                    )
+            unit_price = (
+                line.unit_price
+                if line.unit_price is not None
+                else (variant.price if variant else product.price)
+            )
+            gross = unit_price * line.quantity
+            disc_amount = line.discount or 0
+            disc_pct = getattr(line, "discount_percent", None) or 0
+            if disc_amount == 0 and disc_pct > 0:
+                disc_amount = round(gross * disc_pct / 100, 2)
+            line_total = round(gross - disc_amount, 2)
+            rate = line.tax_rate if line.tax_rate is not None else product.tax_rate
+            tax_amount = round(line_total * (rate or 0) / 100, 2)
+            subtotal += line_total
+            line_tax += tax_amount
+            cost_price = (
+                line.cost_price
+                if getattr(line, "cost_price", None) is not None
+                else (product.pricing.purchase_price if product.pricing else 0.0)
+            )
+            uom = getattr(line, "uom", None) or product.uom
+            order.items.append(
+                SalesOrderItem(
+                    product_id=product.id,
+                    variant_id=line.variant_id,
+                    product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                    quantity=line.quantity,
+                    unit_price=unit_price,
+                    discount=disc_amount,
+                    discount_percent=disc_pct,
+                    cost_price=cost_price,
+                    uom=uom,
+                    tax_rate=rate,
+                    tax_amount=tax_amount,
+                    line_total=line_total,
+                )
+            )
+            wanted.append(
+                {
+                    "product_id": product.id,
+                    "variant_id": line.variant_id,
+                    "quantity": line.quantity,
+                    "product_name": product.name,
+                }
+            )
+
+        # Check stock shortages if order is already active (not draft) and no backorders
+        if order.status != "draft" and not settings["allow_backorder"] and order.warehouse_id:
+            short = stock_service.shortages(db, order.warehouse_id, wanted)
+            if short:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": "INSUFFICIENT_STOCK", "shortages": short},
+                )
+
+        order.subtotal = round(subtotal, 2)
+        if payload.discount is not None:
+            order.discount = payload.discount
+        if payload.tax is not None:
+            order.tax = payload.tax
+        else:
+            order.tax = round(line_tax, 2)
+        order.total = round(order.subtotal - order.discount + order.tax, 2)
+
+        db.flush()
+
+        # Re-reserve stock if order is active
+        if order.status != "draft" and settings["reserve_stock_on_order"] and order.warehouse_id:
+            for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
+                item = db.get(SalesOrderItem, reservation.order_item_id)
+                if item is not None:
+                    item.reserved_quantity = reservation.reserved_quantity
+            order.fulfilment_status = "reserved"
+
+    else:
+        # Items were not replaced, but discount / tax or warehouse might have changed
+        recalculate = False
+        if payload.discount is not None:
+            order.discount = payload.discount
+            recalculate = True
+        if payload.tax is not None:
+            order.tax = payload.tax
+            recalculate = True
+        if recalculate:
+            order.total = round(order.subtotal - order.discount + order.tax, 2)
+
+        if warehouse_changed and order.status != "draft" and order.warehouse_id:
+            wanted = [
+                {
+                    "product_id": it.product_id,
+                    "variant_id": it.variant_id,
+                    "quantity": it.quantity,
+                    "product_name": it.product_name,
+                }
+                for it in order.items
+                if it.product_id
+            ]
+            stock_service.lock_stock_items(db, org_id, order.warehouse_id, wanted)
+            stock_service.release_for_order(db, order.id)
+            if not settings["allow_backorder"]:
+                short = stock_service.shortages(db, order.warehouse_id, wanted)
+                if short:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={"error": "INSUFFICIENT_STOCK", "shortages": short},
+                    )
+            if settings["reserve_stock_on_order"]:
+                for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
+                    item = db.get(SalesOrderItem, reservation.order_item_id)
+                    if item is not None:
+                        item.reserved_quantity = reservation.reserved_quantity
+                order.fulfilment_status = "reserved"
+
+    order.updated_at = datetime.now(timezone.utc)
+
+    warnings = []
+    if order.status != "draft" and customer:
+        credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
+        if credit:
+            warnings.append(credit)
+
     return order, warnings

@@ -287,6 +287,7 @@ def record_customer_payment(
             card_type=payload.card_type,
             card_last_four=payload.card_last_four,
             collection_instructions=payload.collection_instructions,
+            splits=payload.splits,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

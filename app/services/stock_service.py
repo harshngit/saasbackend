@@ -133,6 +133,58 @@ def _row(
     return row
 
 
+def lock_stock_items(
+    db: Session,
+    org_id: str,
+    warehouse_id: str,
+    items: list[dict | tuple[str, str | None]],
+) -> list[WarehouseStock]:
+    """Acquire pessimistic row-level locks on warehouse stock rows in a deterministic order.
+
+    Deduplicates items, ensures each WarehouseStock row exists physically, sorts
+    deterministically by (warehouse_id, product_id, variant_id or "") to eliminate
+    PostgreSQL deadlocks across concurrent multi-item transactions, and locks each row
+    using .with_for_update(nowait=False).
+    """
+    if not warehouse_id or not items:
+        return []
+
+    # Extract unique (product_id, variant_id)
+    unique_pairs: set[tuple[str, str | None]] = set()
+    for item in items:
+        if isinstance(item, dict):
+            pid = item.get("product_id")
+            vid = item.get("variant_id")
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            pid, vid = item[0], item[1]
+        elif hasattr(item, "product_id"):
+            pid = item.product_id
+            vid = getattr(item, "variant_id", None)
+        else:
+            continue
+        if pid:
+            unique_pairs.add((pid, vid))
+
+    # Deterministic sorting to prevent cyclic lock dependency deadlocks
+    sorted_pairs = sorted(unique_pairs, key=lambda p: (warehouse_id, p[0], p[1] or ""))
+
+    locked_rows: list[WarehouseStock] = []
+    for pid, vid in sorted_pairs:
+        # Ensure row exists in DB
+        _row(db, org_id, warehouse_id, pid, vid)
+        # Lock row with SELECT ... FOR UPDATE
+        query = db.query(WarehouseStock).filter(
+            WarehouseStock.warehouse_id == warehouse_id,
+            WarehouseStock.product_id == pid,
+            WarehouseStock.variant_id == vid,
+        ).with_for_update(nowait=False)
+        row = query.first()
+        if row is not None:
+            locked_rows.append(row)
+
+    return locked_rows
+
+
 def _untracked_catalog_stock(
     db: Session, org_id: str, product_id: str, variant_id: str | None
 ) -> float:
@@ -266,7 +318,19 @@ def move_tracked(
     snapshot on its line, so an invoice or a challan can say which lot went out and
     which units — which is the whole point of tracking them.
     """
-    row = _row(db, org_id, warehouse_id, product_id, variant_id)
+    _row(db, org_id, warehouse_id, product_id, variant_id)
+    row = (
+        db.query(WarehouseStock)
+        .filter(
+            WarehouseStock.warehouse_id == warehouse_id,
+            WarehouseStock.product_id == product_id,
+            WarehouseStock.variant_id == variant_id,
+        )
+        .with_for_update(nowait=False)
+        .first()
+    )
+    if row is None:
+        row = _row(db, org_id, warehouse_id, product_id, variant_id)
     row.on_hand_quantity = round((row.on_hand_quantity or 0) + delta, 3)
     # This session runs with autoflush off, so the new figure has to be written
     # before the sum below can see it — otherwise the catalog counter is set from

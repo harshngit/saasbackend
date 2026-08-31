@@ -474,6 +474,7 @@ def create_direct_invoice(
          "product_name": line["product"].name}
         for line in lines
     ]
+    stock_service.lock_stock_items(db, org_id, warehouse.id, wanted)
     short = stock_service.shortages(db, warehouse.id, wanted)
     if short:
         detail = "; ".join(

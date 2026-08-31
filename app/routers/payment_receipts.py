@@ -16,6 +16,7 @@ from app.schemas.payment_receipt import (
     PaymentReceiptCreate,
     PaymentReceiptOut,
     PaymentReceiptUpdate,
+    PaymentSplitOut,
 )
 from app.services import payment_service
 
@@ -73,6 +74,7 @@ def _out(db: Session, payment: CustomerPayment) -> PaymentReceiptOut:
         created_at=payment.created_at,
         customer=customer,
         invoice=invoice,
+        splits=[PaymentSplitOut.model_validate(s) for s in payment.splits] if payment.splits else [],
     )
 
 
@@ -157,6 +159,7 @@ def create_receipt(
             card_type=payload.card_type,
             card_last_four=payload.card_last_four,
             collection_instructions=payload.collection_instructions,
+            splits=payload.splits,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

@@ -17,6 +17,41 @@ class ReceiptInvoiceBrief(BaseModel):
     total: float
 
 
+class PaymentSplitIn(BaseModel):
+    payment_mode: str = Field(max_length=30, description="cash | upi | card | bank_transfer | cod | …")
+    amount: float = Field(gt=0)
+    reference: str | None = Field(default=None, max_length=150, description="UTR, UPI ref, cheque no")
+    upi_id: str | None = Field(default=None, max_length=100, description="Payer's UPI id")
+    card_type: str | None = Field(default=None, max_length=30, description="e.g. Visa, Mastercard")
+    card_last_four: str | None = Field(
+        default=None, max_length=4, description="Last 4 digits only — never full card number"
+    )
+    collection_instructions: str | None = Field(default=None, description="Where/how to collect")
+
+    @field_validator("card_last_four")
+    @classmethod
+    def _valid_card_last_four(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not (v.isdigit() and len(v) == 4):
+            raise ValueError("card_last_four must be exactly 4 digits")
+        return v
+
+
+class PaymentSplitOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    payment_mode: str
+    amount: float
+    reference: str | None = None
+    upi_id: str | None = None
+    card_type: str | None = None
+    card_last_four: str | None = None
+    collection_instructions: str | None = None
+    created_at: datetime | None = None
+
+
 class PaymentReceiptCreate(BaseModel):
     """Record money received.
 
@@ -42,6 +77,11 @@ class PaymentReceiptCreate(BaseModel):
     receipt_date: datetime | None = None
     receipt_number: str | None = Field(default=None, description="Auto-generated when omitted")
     note: str | None = None
+
+    # Optional split payments breakdown
+    splits: list[PaymentSplitIn] | None = Field(
+        default=None, description="Optional multi-tender split payment breakdown"
+    )
 
     # Method-specific details — which ones are relevant depends on payment_method
     # (cash uses none of them). Never send the full card number or CVV.
@@ -127,6 +167,7 @@ class PaymentReceiptOut(BaseModel):
     created_at: datetime
     customer: ReceiptCustomerBrief | None = None
     invoice: ReceiptInvoiceBrief | None = None
+    splits: list[PaymentSplitOut] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _populate_aliases(self) -> "PaymentReceiptOut":
