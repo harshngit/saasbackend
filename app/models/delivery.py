@@ -56,6 +56,10 @@ class Delivery(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Who physically accepted the goods, captured at confirm time alongside the
+    # signature/photos. Free text (not a User/Customer reference) since the actual
+    # receiver at the door is often not a system user.
+    receiver_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Proof of delivery, captured on confirm. File ids from POST /files/upload.

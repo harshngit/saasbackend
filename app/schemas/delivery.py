@@ -243,14 +243,16 @@ class DeliveryOut(BaseModel):
     scheduled_date: datetime | None = None
     status: str = Field(
         description="Client-facing Delivery status: pending | accepted | in_transit | "
-                    "partially_delivered | delivered | returned | cancelled. (Internally "
-                    "planned/accepted/rejected/ready/loaded/in_transit/partially_delivered/"
-                    "delivered/failed/cancelled — see app.core.workflow.public_delivery_status.)")
+                    "partially_delivered | delivered | returned | rejected | cancelled. "
+                    "(Internally planned/accepted/rejected/ready/loaded/in_transit/"
+                    "partially_delivered/delivered/failed/cancelled — see "
+                    "app.core.workflow.public_delivery_status.)")
     picking_status: str = "not_started"
     dispatched_at: datetime | None = None
     dispatched_by_id: str | None = None
     confirmed_at: datetime | None = None
     failure_reason: str | None = None
+    receiver_name: str | None = Field(default=None, description="Who physically accepted the goods")
     notes: str | None = None
     items: list[DeliveryLineOut]
     planned_total: float = 0
@@ -299,6 +301,9 @@ class DeliveryConfirm(BaseModel):
     pod_photo_file_ids: list[str] = Field(
         default_factory=list, description="file_ids from POST /files/upload")
     signature_file_id: str | None = None
+    receiver_name: str | None = Field(
+        default=None, max_length=150, description="Who physically accepted the goods"
+    )
     notes: str | None = Field(default=None, max_length=1000)
     failed: bool = Field(
         default=False,

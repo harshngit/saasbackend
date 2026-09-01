@@ -151,10 +151,10 @@ def run_all_tests():
 
     delivery_cases = [
         ("planned", "pending"),
-        ("rejected", "pending"),
+        ("rejected", "rejected"),
         ("accepted", "accepted"),
         ("ready", "accepted"),
-        ("loaded", "accepted"),
+        ("loaded", "in_transit"),
         ("in_transit", "in_transit"),
         ("partially_delivered", "partially_delivered"),
         ("delivered", "delivered"),
@@ -166,10 +166,13 @@ def run_all_tests():
             f"Delivery internal '{internal}' -> public '{expected}'",
             public_delivery_status(internal) == expected,
         )
-    leaked_internal = {"planned", "ready", "loaded", "failed", "rejected"} & {
+    # "rejected" is a legitimate public value now (Case: rejection genuinely
+    # happened and is not terminal — see PUBLIC_DELIVERY_STATUS's docstring), so
+    # it is intentionally excluded from this internal-leak check.
+    leaked_internal = {"planned", "ready", "loaded", "failed"} & {
         public_delivery_status(i) for i, _ in delivery_cases
     }
-    log_test("public_delivery_status never returns planned/ready/loaded/failed/rejected", not leaked_internal)
+    log_test("public_delivery_status never returns planned/ready/loaded/failed", not leaked_internal)
 
     # ------------------------------------------------------------------
     # PART B: end-to-end API — Order list/detail consistency + DB untouched
@@ -228,7 +231,7 @@ def run_all_tests():
         log_test(f"DB status still internal '{internal}' after GET (not rewritten)", reloaded.status == internal)
 
     all_delivery_rows = client.get("/deliveries", headers=auth).json()
-    for banned in ("planned", "ready", "loaded", "failed", "rejected"):
+    for banned in ("planned", "ready", "loaded", "failed"):
         log_test(
             f"No Delivery API response ever contains internal '{banned}'",
             all(d["status"] != banned for d in all_delivery_rows),

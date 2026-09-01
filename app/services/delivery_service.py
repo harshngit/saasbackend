@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.core.workflow import public_order_status
+from app.core.workflow import DeliveryTransitionError, public_order_status, validate_delivery_transition
 from app.models import (
     Customer,
     Delivery,
@@ -35,6 +35,15 @@ from app.models import (
 )
 from app.services.tracking_service import TrackingError
 from app.services import numbering_service, stock_service
+
+
+def _require_transition(current: str, new: str) -> None:
+    """validate_delivery_transition, translated to the HTTPException every caller
+    in this module already raises on an invalid change."""
+    try:
+        validate_delivery_transition(current, new)
+    except DeliveryTransitionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message) from exc
 
 
 def is_delivery_partner(db: Session, partner: User) -> bool:
@@ -238,11 +247,7 @@ def plan(
 
 def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
     """Partner accepts a planned delivery. Does not commit."""
-    if delivery.status != "planned":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Only planned deliveries can be accepted (this delivery is '{delivery.status}')",
-        )
+    _require_transition(delivery.status, "accepted")
     if delivery.delivery_partner_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -254,11 +259,7 @@ def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
 
 def reject(db: Session, user: User, delivery: Delivery, reason: str | None = None) -> Delivery:
     """Partner rejects a planned delivery. Clears partner + vehicle. Does not commit."""
-    if delivery.status != "planned":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Only planned deliveries can be rejected (this delivery is '{delivery.status}')",
-        )
+    _require_transition(delivery.status, "rejected")
     if delivery.delivery_partner_id != user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -326,11 +327,7 @@ def load(
     it never deducts the same units twice.
     """
     org_id = delivery.organization_id
-    if delivery.status not in ("ready", "loaded"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Delivery must be ready before vehicle loading",
-        )
+    _require_transition(delivery.status, "loaded")
     if not delivery.delivery_partner_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -483,11 +480,7 @@ def load(
 
 def dispatch(db: Session, user: User, delivery: Delivery) -> None:
     """Send it out. Only now is the delivery live for the partner."""
-    if delivery.status != "loaded":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"A '{delivery.status}' delivery cannot be dispatched",
-        )
+    _require_transition(delivery.status, "in_transit")
     if delivery.loaded_total <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -513,6 +506,7 @@ def confirm(
     notes: str | None,
     failed: bool,
     failure_reason: str | None,
+    receiver_name: str | None = None,
 ) -> None:
     """Record what was actually handed over. Does not commit.
 
@@ -520,21 +514,19 @@ def confirm(
     handed over stays on the vehicle until a re-attempt or the end-of-day return — it
     is never silently put back into the warehouse.
     """
-    if delivery.status in ("delivered", "cancelled"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"This delivery is already {delivery.status}",
-        )
-    if delivery.status not in ("in_transit", "partially_delivered"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Delivery must be in transit before confirmation",
-        )
+    # "delivered" is checked as the representative target: in this workflow the
+    # states that may reach "delivered" (in_transit, partially_delivered) are
+    # exactly the states that may reach "partially_delivered" too, so validating
+    # against either representative target correctly gates the real outcome,
+    # which is computed further down once the delivered quantity is known.
+    _require_transition(delivery.status, "failed" if failed else "delivered")
 
     delivery.pod_photo_file_ids = list(pod_photo_file_ids or [])
     delivery.pod_signature_file_id = signature_file_id
     if notes:
         delivery.notes = notes
+    if receiver_name:
+        delivery.receiver_name = receiver_name
     delivery.confirmed_at = datetime.now(timezone.utc)
 
     if failed:

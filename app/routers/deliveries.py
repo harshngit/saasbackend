@@ -48,6 +48,15 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
+def _require_delivery_transition(current: str, new: str) -> None:
+    """workflow.validate_delivery_transition, translated to an HTTPException —
+    the same centralized rules delivery_service.py's own functions validate against."""
+    try:
+        workflow.validate_delivery_transition(current, new)
+    except workflow.DeliveryTransitionError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message) from exc
+
+
 def _owned_order(db: Session, id: str, user: User) -> SalesOrder:
     order = db.get(SalesOrder, id)
     if order is None or order.organization_id != _org_id(user):
@@ -402,6 +411,7 @@ def update_delivery(
     if new_status == "in_transit":
         delivery_service.dispatch(db, user, delivery)
     elif new_status == "cancelled":
+        _require_delivery_transition(delivery.status, "cancelled")
         if delivery.loaded_total > 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -410,6 +420,10 @@ def update_delivery(
             )
         delivery.status = "cancelled"
     elif new_status == "planned":
+        # In this workflow only a rejected delivery can go back to planned — to be
+        # reassigned to a new partner. (A loaded delivery cannot: physical stock has
+        # already left the warehouse, so its status must not silently claim otherwise.)
+        _require_delivery_transition(delivery.status, "planned")
         if delivery.status == "rejected":
             partner_id = data.get("delivery_partner_id") or delivery.delivery_partner_id
             if not partner_id:
@@ -417,7 +431,6 @@ def update_delivery(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="A new delivery partner is required to reassign a rejected delivery",
                 )
-            delivery.status = "planned"
             new_partner = db.get(User, partner_id)
             if new_partner:
                 try:
@@ -432,13 +445,7 @@ def update_delivery(
                     )
                 except Exception:
                     pass
-        elif delivery.status not in ("planned", "loaded"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"A '{delivery.status}' delivery cannot go back to planned",
-            )
-        else:
-            delivery.status = "planned"
+        delivery.status = "planned"
 
     db.commit()
     db.refresh(delivery)
@@ -548,6 +555,7 @@ def confirm_delivery(
         notes=payload.notes,
         failed=payload.failed,
         failure_reason=payload.failure_reason,
+        receiver_name=payload.receiver_name,
     )
     db.commit()
     db.refresh(delivery)
@@ -709,11 +717,21 @@ def get_delivery_details(
 def update_delivery_status(
     id: str,
     payload: DeliveryStatusUpdate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(_edit),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Update delivery outcome. Syncs with delivery partner's vehicle stock if source is vehicle."""
+    """Update delivery outcome. Syncs with delivery partner's vehicle stock if source is vehicle.
+
+    Legacy route, kept for backward compatibility — it serves a distinct, already
+    simplified flow (field/vehicle-stock sales completing a delivery in one step,
+    without the plan -> accept -> pick -> ready -> load -> dispatch -> confirm
+    sequence a warehouse delivery goes through). New integrations should use the
+    Delivery-id based endpoints above, which enforce the full transition rules.
+    This route now requires `deliveries:edit` (previously any authenticated user
+    could call it) — organization/ownership scoping was already enforced via
+    `_owned_order`.
+    """
     org_id = _org_id(user)
     order = _owned_order(db, id, user)
 

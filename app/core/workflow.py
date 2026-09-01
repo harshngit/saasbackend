@@ -212,17 +212,34 @@ ORDER_FULFILMENT_FOR_DELIVERY = {
 OPEN_DELIVERY_STATUSES = ("planned", "accepted", "ready", "loaded", "in_transit", "partially_delivered")
 
 # ------------------------- public (client-facing) Delivery status -------------------------
-# Same boundary-only mapping as PUBLIC_ORDER_STATUS above, for the Delivery's own
-# `status` column. `ready`/`loaded` are internal warehouse steps within "accepted";
-# `rejected` reads as still-`pending` reassignment; `failed` is reported as `returned`
-# (nothing was handed over, so the goods effectively came back). None of the internal
-# values are removed — the workflow above keeps using them exactly as before.
+# Boundary-only mapping for the Delivery's own `status` column — the internal
+# warehouse vocabulary above is unchanged; this only shapes what a client sees.
+#
+# `planned` has no partner-acceptance guarantee yet (a delivery can be planned with
+# no partner named), so it reads as `pending`, not `accepted`/`assigned` — matching
+# the canonical public lifecycle's first state.
+#
+# `ready` is still prep (nothing has moved) so it stays folded into `accepted`.
+# `loaded` means physical stock has already left the warehouse onto the vehicle —
+# that is the transport phase, so it is reported as `in_transit`, not `accepted`,
+# even though the formal `dispatch()` stamp (and the partner's own visibility) only
+# happens one step later. A client should never be told less progress has been made
+# than actually has.
+#
+# `rejected` is its own public value, not folded into `pending`: a client should be
+# able to see that a rejection genuinely happened. It is not terminal in this
+# architecture (a rejected delivery can be reassigned to a new partner, see
+# DELIVERY_TRANSITIONS below), so it is not folded into `cancelled` either — that
+# would misrepresent it as dead when the firm is actively re-routing it.
+#
+# `failed` means nothing was handed over on an attempt — goods are still on the
+# vehicle, not back in the warehouse — reported as `returned`.
 PUBLIC_DELIVERY_STATUS: dict[str, str] = {
     "planned": "pending",
-    "rejected": "pending",
+    "rejected": "rejected",
     "accepted": "accepted",
     "ready": "accepted",
-    "loaded": "accepted",
+    "loaded": "in_transit",
     "in_transit": "in_transit",
     "partially_delivered": "partially_delivered",
     "delivered": "delivered",
@@ -240,6 +257,53 @@ def public_delivery_status(value: str | None) -> str | None:
     if value is None:
         return None
     return PUBLIC_DELIVERY_STATUS.get(value, value)
+
+
+# --------------------- centralized Delivery transition validation ---------------------
+# The exact set of `Delivery.status` transitions the existing workflow already
+# enforces — extracted from delivery_service.py's own guard clauses (accept/reject/
+# load/dispatch/confirm) and the reassignment/cancel branches in
+# routers/deliveries.py::update_delivery — collected into one table so every caller
+# validates against the same rules instead of each keeping its own ad-hoc check.
+#
+# `rejected -> planned` is the existing reassign-to-a-new-partner flow.
+# `rejected -> cancelled` and `planned/accepted/ready -> cancelled` are allowed only
+# while nothing has been loaded yet (loaded_total == 0) — callers check that
+# separately, since it is a quantity check, not a status-transition rule.
+# `X -> X` (no-op) is always allowed and is not listed explicitly.
+DELIVERY_TRANSITIONS: dict[str, set[str]] = {
+    "planned": {"accepted", "rejected", "cancelled"},
+    "rejected": {"planned", "cancelled"},
+    "accepted": {"ready", "cancelled"},
+    "ready": {"loaded", "cancelled"},
+    "loaded": {"in_transit"},
+    "in_transit": {"partially_delivered", "delivered", "failed"},
+    "partially_delivered": {"partially_delivered", "delivered", "failed"},
+    "delivered": set(),           # terminal
+    "failed": set(),              # terminal (goods stay on the vehicle; handled by the return-to-warehouse flow)
+    "cancelled": set(),           # terminal
+}
+
+
+class DeliveryTransitionError(Exception):
+    """Raised by validate_delivery_transition for a disallowed status change."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def validate_delivery_transition(current: str, new: str) -> None:
+    """Raise DeliveryTransitionError unless `current -> new` is an allowed Delivery
+    status transition. The single source of truth for delivery workflow rules —
+    every service function or router that changes `Delivery.status` calls this
+    instead of duplicating its own inline check.
+    """
+    if new == current:
+        return
+    allowed = DELIVERY_TRANSITIONS.get(current, set())
+    if new not in allowed:
+        raise DeliveryTransitionError(f"Cannot move a delivery from '{current}' to '{new}'")
 
 
 # ------------------------------ sales returns ------------------------------

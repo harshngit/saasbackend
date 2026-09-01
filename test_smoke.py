@@ -5571,8 +5571,9 @@ check("TEST D1: Confirm before in_transit -> 400", confirm_fail.status_code == 4
 # TEST C3: Load vehicle -> 200
 load_res = client.post(f"/deliveries/{dlv_data['id']}/load", headers=del_admin_hdr)
 check("TEST C3: Load delivery -> 200", load_res.status_code == 200, load_res.text)
-# Public Delivery status contract: internal 'loaded' -> public 'accepted'.
-check("TEST C3: Status is loaded", load_res.json()["status"] == "accepted")
+# Public Delivery status contract: internal 'loaded' -> public 'in_transit'
+# (physical stock has already left the warehouse — that is the transport phase).
+check("TEST C3: Status is loaded", load_res.json()["status"] == "in_transit")
 
 # Verify inventory moved on load
 stock_after_load = client.get(f"/warehouses/stock?product_id={prod['id']}", headers=del_admin_hdr).json()[0]
@@ -5681,8 +5682,9 @@ dlv_rej = client.post("/deliveries", headers=del_admin_hdr, json={
 # Reject by partner 1
 rej_res = client.post(f"/deliveries/{dlv_rej['id']}/reject", headers=dp_hdr, json={"reason": "Vehicle broke down"})
 check("Partner rejects delivery -> 200", rej_res.status_code == 200)
-# Public Delivery status contract: internal 'rejected' -> public 'pending'.
-check("Rejected status is rejected", rej_res.json()["status"] == "pending")
+# Public Delivery status contract: internal 'rejected' -> public 'rejected'
+# (a genuine rejection happened — it must not be reported as merely 'pending').
+check("Rejected status is rejected", rej_res.json()["status"] == "rejected")
 check("Rejected clears delivery_partner", rej_res.json()["delivery_partner"] is None)
 check("Rejected clears vehicle", rej_res.json()["vehicle"] is None)
 
