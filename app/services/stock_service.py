@@ -15,7 +15,7 @@ report endpoint keeps reporting the same figure it always did.
 """
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.models import (
     Product,
@@ -172,12 +172,21 @@ def lock_stock_items(
     for pid, vid in sorted_pairs:
         # Ensure row exists in DB
         _row(db, org_id, warehouse_id, pid, vid)
-        # Lock row with SELECT ... FOR UPDATE
-        query = db.query(WarehouseStock).filter(
-            WarehouseStock.warehouse_id == warehouse_id,
-            WarehouseStock.product_id == pid,
-            WarehouseStock.variant_id == vid,
-        ).with_for_update(nowait=False)
+        # Lock row with SELECT ... FOR UPDATE. `WarehouseStock.warehouse` is
+        # lazy="joined" at the mapper level, which would otherwise pull a LEFT
+        # OUTER JOIN into this statement — Postgres refuses FOR UPDATE on the
+        # nullable side of an outer join. lazyload() suppresses just that
+        # default for this one query so the lock targets warehouse_stock alone.
+        query = (
+            db.query(WarehouseStock)
+            .filter(
+                WarehouseStock.warehouse_id == warehouse_id,
+                WarehouseStock.product_id == pid,
+                WarehouseStock.variant_id == vid,
+            )
+            .options(lazyload(WarehouseStock.warehouse))
+            .with_for_update(nowait=False)
+        )
         row = query.first()
         if row is not None:
             locked_rows.append(row)
@@ -319,6 +328,9 @@ def move_tracked(
     which units — which is the whole point of tracking them.
     """
     _row(db, org_id, warehouse_id, product_id, variant_id)
+    # See lock_stock_items() above: lazyload() keeps the eager-joined `warehouse`
+    # relationship out of this FOR UPDATE statement so Postgres doesn't see it
+    # as locking the nullable side of a LEFT OUTER JOIN.
     row = (
         db.query(WarehouseStock)
         .filter(
@@ -326,6 +338,7 @@ def move_tracked(
             WarehouseStock.product_id == product_id,
             WarehouseStock.variant_id == variant_id,
         )
+        .options(lazyload(WarehouseStock.warehouse))
         .with_for_update(nowait=False)
         .first()
     )
