@@ -14,6 +14,8 @@ import re
 from datetime import datetime, timezone
 
 from sqlalchemy import func
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("crm.numbering")
@@ -57,36 +59,81 @@ def next_number(db: Session, org_id: str, column, series: str, year: int | None 
     moves forward — deleting a record never frees its number for reuse.
 
     The counter is keyed on the series, not the rendered prefix, so renaming the
-    prefix continues the same run instead of restarting it."""
+    prefix continues the same run instead of restarting it.
+
+    Safe under real concurrency on both Postgres and SQLite. Two things make
+    that true:
+
+    1. Creating the row the first time is done inside a SAVEPOINT. Two
+       concurrent first-ever callers for this (org, series, year) can both see
+       no row and both attempt to create it; the unique constraint rejects the
+       loser. Catching that inside a SAVEPOINT unwinds only this nested attempt
+       — never anything the caller already flushed earlier in its own
+       transaction (e.g. stock reservations already held) — and SQLite can
+       also report the same conflict as a locking `OperationalError` rather
+       than an `IntegrityError`, so both are caught.
+    2. The actual increment is one atomic `UPDATE ... SET last_number =
+       last_number + 1`, expressed as a database-side relative expression
+       rather than a Python-side read-modify-write. This is what makes it
+       race-free: `SELECT ... FOR UPDATE` genuinely blocks a second
+       transaction on Postgres, but SQLite has no row-level locking — a second
+       connection's SELECT is not blocked by it — so a "read last_number, add
+       one in Python, write it back" pattern can lose an update on SQLite even
+       with FOR UPDATE. A relative SQL-level increment cannot lose an update:
+       the database serializes the two UPDATE statements, and whichever runs
+       second is computed from the first's already-applied result, not from a
+       stale Python value. `RETURNING` hands back the exact number this call
+       obtained without a separate (potentially stale) re-read.
+    """
     from app.models.number_sequence import NumberSequence
 
     year = year or _year()
     prefix = prefix_for(db, org_id, series)
     stem = f"{prefix}-{year}-"
-
-    sequence = (
-        db.query(NumberSequence)
-        .filter(
-            NumberSequence.organization_id == org_id,
-            NumberSequence.series == series,
-            NumberSequence.year == year,
-        )
-        .with_for_update(nowait=False)
-        .first()
+    _match = (
+        NumberSequence.organization_id == org_id,
+        NumberSequence.series == series,
+        NumberSequence.year == year,
     )
-    if sequence is None:
-        sequence = NumberSequence(
-            organization_id=org_id,
-            series=series,
-            year=year,
-            last_number=_highest_issued(db, org_id, column, stem),
-        )
-        db.add(sequence)
-        db.flush()
 
-    sequence.last_number += 1
+    exists = db.query(NumberSequence.id).filter(*_match).first()
+    if exists is None:
+        try:
+            with db.begin_nested():
+                db.add(
+                    NumberSequence(
+                        organization_id=org_id,
+                        series=series,
+                        year=year,
+                        last_number=_highest_issued(db, org_id, column, stem),
+                    )
+                )
+                db.flush()
+        except (IntegrityError, OperationalError):
+            # A concurrent request won the race and created this row first (or
+            # SQLite's coarser file-level lock rejected our attempt while
+            # theirs held it) — the row exists either way now, so proceed to
+            # the atomic increment below regardless of who created it.
+            pass
+
+    result = db.execute(
+        sa_update(NumberSequence)
+        .where(*_match)
+        .values(last_number=NumberSequence.last_number + 1)
+        .returning(NumberSequence.last_number)
+    )
+    row = result.first()
     db.flush()
-    return f"{stem}{sequence.last_number}"
+    if row is None:
+        # Should be unreachable — the block above guarantees the row
+        # exists — but never leave the caller with an unexplained 500 if
+        # it somehow is.
+        logger.error(
+            "Number sequence for org=%s series=%s year=%s was not found "
+            "for the increment despite ensuring it exists", org_id, series, year,
+        )
+        raise RuntimeError(f"Could not allocate a number for series '{series}'")
+    return f"{stem}{row[0]}"
 
 
 # Every auto-numbered column, with the prefix its series uses.

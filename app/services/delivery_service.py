@@ -16,6 +16,7 @@ event.
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
 from app.core.workflow import DeliveryTransitionError, public_order_status, validate_delivery_transition
@@ -325,8 +326,36 @@ def load(
     Idempotent by quantity: each delivery line can only ever be loaded up to its
     planned quantity, so calling this twice loads the remainder and then nothing —
     it never deducts the same units twice.
+
+    Locks the delivery before reading it or its items. Without this, two
+    concurrent /load calls on the same delivery each read the same pre-load
+    `loaded_quantity`, each independently compute the same "remaining room",
+    and each deduct it from the warehouse — the delivery's own bookkeeping
+    still looks like a single load happened, but stock silently leaves the
+    warehouse twice.
+
+    This locks with a real `UPDATE`, not `SELECT ... FOR UPDATE`. Postgres
+    would genuinely block a second transaction's `SELECT ... FOR UPDATE` on
+    this row — the pattern stock_service already uses for warehouse rows —
+    but SQLite does not: it accepts the clause without error and silently
+    does not enforce it, so a second connection's plain `SELECT` sails
+    straight through while the first transaction is still mid-load. An
+    `UPDATE` takes a lock on both engines: the row lock on Postgres, and on
+    SQLite — which has no row-level locking at all — the file-level write
+    lock that actually forces a concurrent second /load call to wait for
+    this one to commit. The assignment is a no-op (`status` set to its own
+    current value); its only purpose is to be a write.
     """
     org_id = delivery.organization_id
+    db.execute(sa_update(Delivery).where(Delivery.id == delivery.id).values(status=Delivery.status))
+    db.refresh(delivery)
+    locked_items = (
+        db.query(DeliveryItem)
+        .filter(DeliveryItem.delivery_id == delivery.id)
+        .with_for_update(nowait=False)
+        .populate_existing()
+        .all()
+    )
     _require_transition(delivery.status, "loaded")
     if not delivery.delivery_partner_id:
         raise HTTPException(
@@ -348,12 +377,12 @@ def load(
             status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery has no valid warehouse"
         )
 
-    by_id = {item.id: item for item in delivery.items}
+    by_id = {item.id: item for item in locked_items}
     if wanted is None:
         lines = [
             {"delivery_item_id": item.id,
              "loaded_quantity": round((item.planned_quantity or 0) - (item.loaded_quantity or 0), 3)}
-            for item in delivery.items
+            for item in locked_items
         ]
         lines = [line for line in lines if line["loaded_quantity"] > 0]
         if not lines:

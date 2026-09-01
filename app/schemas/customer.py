@@ -43,6 +43,7 @@ class CustomerOut(BaseModel):
     primary_contact_person: str | None = None
     maps_latitude: float | None = None
     maps_longitude: float | None = None
+    profile_image_id: str | None = None
 
     city: str | None = None
     last_order_date: datetime | None = None
