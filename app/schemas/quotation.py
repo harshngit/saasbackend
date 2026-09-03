@@ -3,8 +3,13 @@ from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
-# A quotation's life. `converted` is set by the conversion endpoint, never sent in.
-QUOTATION_STATUSES = ("draft", "sent", "accepted", "rejected", "expired", "converted")
+from app.core.workflow import QUOTATION_STATUSES
+
+# A quotation's life: draft | sent | accepted | rejected | converted. `converted`
+# is set by the conversion endpoint, never sent in. `expired` is NOT one of
+# these — it is a read-time projection of `sent` + a passed `valid_until` (see
+# QuotationOut.effective_status / app.core.workflow.quotation_effective_status),
+# never a value a client can PATCH in.
 
 
 def _lower(value: object) -> object:
@@ -90,8 +95,9 @@ class QuotationBase(BaseModel):
     terms_conditions: str | None = None
     status: QuotationStatus | None = Field(
         default=None,
-        description="draft | sent | accepted | rejected | expired. `converted` is set "
-                    "by POST /quotations/{id}/convert-to-order, not sent in.",
+        description="draft | sent | accepted | rejected. `converted` is set by "
+                    "POST /quotations/{id}/convert-to-order, not sent in. `expired` is "
+                    "never a stored value — see effective_status on the response.",
     )
 
 
@@ -169,6 +175,7 @@ class QuotationOut(QuotationBase):
     item_count: int = 0
     converted_order_id: str | None = None
     converted_at: datetime | None = None
+    effective_status: str = "draft"
 
 
 class QuotationListItem(BaseModel):
@@ -184,6 +191,7 @@ class QuotationListItem(BaseModel):
     valid_until: datetime | None = None
     currency: str | None = None
     status: str | None = None
+    effective_status: str = "draft"
     customer: QuotationCustomerBrief | None = None
     lead: QuotationLeadBrief | None = None
     salesperson: QuotationSalespersonBrief | None = None

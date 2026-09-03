@@ -237,15 +237,40 @@ def run_party_validation_tests():
     r_lead = client.post("/quotations", json={"lead_id": lead_id, "items": items}, headers=auth)
     check("lead_id only -> 201", r_lead.status_code == 201, r_lead.text)
 
-    # Update-time: switching to "both" or "neither" must also be rejected cleanly.
-    quote_id = r_cust.json()["id"]
-    r_patch_both = client.patch(f"/quotations/{quote_id}", json={"lead_id": lead_id}, headers=auth)
-    check("PATCH adding lead_id onto a Customer quotation -> clean 4xx (would result in both)",
-          400 <= r_patch_both.status_code < 500, r_patch_both.text)
+    # Update-time: setting BOTH to new truthy values in the SAME request is
+    # still rejected (this is the "create-shaped" ambiguity Phase 2 blocked).
+    r_none2 = client.post("/quotations", json={"customer_id": cust_id, "items": items}, headers=auth)
+    quote_id_fresh = r_none2.json()["id"]
+    r_patch_both_same_request = client.patch(
+        f"/quotations/{quote_id_fresh}", json={"lead_id": lead_id, "customer_id": cust_id}, headers=auth
+    )
+    check("PATCH setting customer_id AND lead_id together in one request -> clean 4xx",
+          400 <= r_patch_both_same_request.status_code < 500, r_patch_both_same_request.text)
 
-    r_patch_none = client.patch(f"/quotations/{quote_id}", json={"customer_id": None}, headers=auth)
+    # Clearing the only party set (on a quotation with just ONE party) -> neither -> rejected.
+    r_patch_none = client.patch(f"/quotations/{quote_id_fresh}", json={"customer_id": None}, headers=auth)
     check("PATCH clearing the only party to null -> clean 4xx (would result in neither)",
           400 <= r_patch_none.status_code < 500, r_patch_none.text)
+
+    # Phase 3 (Lead -> Customer conversion history): adding lead_id onto an
+    # already customer_id-having quotation via a single-field PATCH is now
+    # ALLOWED -- a quotation legitimately ends up with both set (see
+    # lead_service.convert_lead_to_customer's automatic linking, which
+    # preserves lead_id while adding customer_id the same way, just system-
+    # driven instead of a manual PATCH). Only setting both from scratch in one
+    # request (tested above) remains blocked.
+    quote_id = r_cust.json()["id"]
+    r_patch_add_lead = client.patch(f"/quotations/{quote_id}", json={"lead_id": lead_id}, headers=auth)
+    check("PATCH adding lead_id onto a Customer quotation -> now allowed (both may coexist)",
+          r_patch_add_lead.status_code == 200, r_patch_add_lead.text)
+    check("Resulting quotation carries both customer_id and lead_id",
+          r_patch_add_lead.json()["customer_id"] == cust_id and r_patch_add_lead.json()["lead_id"] == lead_id,
+          r_patch_add_lead.text)
+
+    # Clearing customer_id on that now-both-set quotation succeeds, since lead_id remains.
+    r_patch_clear_customer = client.patch(f"/quotations/{quote_id}", json={"customer_id": None}, headers=auth)
+    check("PATCH clearing customer_id while lead_id remains -> 200 (still has a party)",
+          r_patch_clear_customer.status_code == 200, r_patch_clear_customer.text)
 
     # Switching parties in one PATCH (old cleared, new set) is a valid resulting state.
     quote_id2 = r_lead.json()["id"]

@@ -5,6 +5,7 @@ from sqlalchemy import DateTime, Float, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.workflow import quotation_effective_status
 
 
 def _uuid() -> str:
@@ -88,6 +89,13 @@ class Quotation(Base):
     @property
     def item_count(self) -> int:
         return len(self.items)
+
+    @property
+    def effective_status(self) -> str:
+        """`status`, except a still-`sent` quotation past `valid_until` reads as
+        "expired" — computed at read time, never stored. See
+        app.core.workflow.quotation_effective_status."""
+        return quotation_effective_status(self.status, self.valid_until)
 
 
 class QuotationItem(Base):

@@ -337,6 +337,24 @@ def convert_lead_to_customer(
     lead.lead_status = "won"
     lead.converted_at = datetime.now(timezone.utc)
 
+    # 5. Carry this Lead's quotations over to the new Customer, same
+    # transaction — the relationship must survive a page refresh or a
+    # different device from the moment conversion succeeds, not depend on a
+    # follow-up PATCH the frontend might never send. lead_id is deliberately
+    # preserved rather than cleared: it is the quotation's history of where it
+    # came from, and Quotation.lead_id/.customer_id are only mutually
+    # exclusive at the point a *new* quotation is created or a user actively
+    # re-targets one via PATCH (see quotation_service._validate_party_for_*) —
+    # not for this system-driven "the Lead behind it just became a real
+    # Customer" transition. Only quotations not already linked to some other
+    # Customer are touched, so a quotation a user already manually re-pointed
+    # elsewhere is left alone.
+    db.query(Quotation).filter(
+        Quotation.organization_id == org_id,
+        Quotation.lead_id == lead.id,
+        Quotation.customer_id.is_(None),
+    ).update({"customer_id": customer.id})
+
     db.commit()
     db.refresh(customer)
     db.refresh(lead)

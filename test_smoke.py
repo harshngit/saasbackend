@@ -3664,6 +3664,10 @@ def _phase1a_checks():
           client.patch(f"/quotations/{q['id']}", headers=ah, json={"items": []}).status_code == 400)
     check("another firm's quotation -> 404",
           client.patch(f"/quotations/{q['id']}", headers=oh, json={"status": "sent"}).status_code == 404)
+    # The content edits above (payment_terms/valid_until/items) reset status
+    # back to 'draft' -- a meaningful edit to a 'sent' quotation always does
+    # (Phase 3 workflow rule). Re-send it before accepting.
+    client.patch(f"/quotations/{q['id']}", headers=ah, json={"status": "sent"})
     client.patch(f"/quotations/{q['id']}", headers=ah, json={"status": "accepted"})
 
     print("\n== 3. GET /quotations/{id}/pdf ==")
@@ -3721,13 +3725,20 @@ def _phase1a_checks():
 
     print("\n-- conversion guards --")
     rej = client.post("/quotations", headers=ah, json={
-        "customer_id": cust["id"], "status": "rejected",
+        "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 10}]}).json()
+    # A quotation is always created as 'draft' regardless of any status sent
+    # in the payload (Phase 3: the backend owns the initial workflow state) --
+    # advance it through the real workflow to reach 'rejected'.
+    client.patch(f"/quotations/{rej['id']}", headers=ah, json={"status": "sent"})
+    client.patch(f"/quotations/{rej['id']}", headers=ah, json={"status": "rejected"})
     check("a rejected quotation cannot be converted",
           client.post(f"/quotations/{rej['id']}/convert-to-order", headers=ah, json={}).status_code == 400)
     big = client.post("/quotations", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod2["id"], "quantity": 9999, "unit_price": 25}]}).json()
+    client.patch(f"/quotations/{big['id']}", headers=ah, json={"status": "sent"})
+    client.patch(f"/quotations/{big['id']}", headers=ah, json={"status": "accepted"})
     r = client.post(f"/quotations/{big['id']}/convert-to-order", headers=ah, json={})
     check("a shortage refuses the conversion",
           r.status_code == 400 and r.json()["detail"]["error"] == "INSUFFICIENT_STOCK", r.text[:250])
@@ -5910,6 +5921,8 @@ prc_quote = client.post("/quotations", headers=prc_hdr, json={
 check("5. Quotation created with product -> 201", prc_quote.get("id") is not None)
 check("5. Quotation total matches", prc_quote["total"] == 320.0)
 
+client.patch(f"/quotations/{prc_quote['id']}", headers=prc_hdr, json={"status": "sent"})
+client.patch(f"/quotations/{prc_quote['id']}", headers=prc_hdr, json={"status": "accepted"})
 prc_conv = client.post(f"/quotations/{prc_quote['id']}/convert-to-order", headers=prc_hdr, json={}).json()
 check("5. Quotation converted to order", prc_conv["quotation_status"] == "converted")
 prc_order_id = prc_conv["order"]["id"]

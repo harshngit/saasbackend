@@ -11,6 +11,8 @@ reserved and placed on creation — an Admin is for organization control and
 exceptions, not a mandatory step in every sale.
 """
 
+from datetime import datetime, timezone
+
 # ------------------------------ order statuses ------------------------------
 # Two independent axes. The order's own lifecycle:
 ORDER_STATUSES = (
@@ -381,3 +383,76 @@ def validate_lead_transition(current: str, new: str) -> None:
     allowed = LEAD_TRANSITIONS.get(current, set())
     if new not in allowed:
         raise LeadTransitionError(f"Cannot move a Lead from '{current}' to '{new}'")
+
+
+# ------------------------------- quotations -----------------------------------
+# `expired` is deliberately NOT one of these — it is never written to
+# Quotation.status. A quotation whose valid_until has passed while it is still
+# `sent` displays as "Expired" (see quotation_effective_status below); the
+# stored column stays `sent` until something actually changes it.
+QUOTATION_STATUSES = ("draft", "sent", "accepted", "rejected", "converted")
+
+# Manual (PATCH) transitions only. `converted` is deliberately absent from
+# every allowed set below — it is reachable exclusively through a successful
+# POST /quotations/{id}/convert-to-order, never by a direct status write.
+# `X -> X` (no-op) is always allowed and is not listed explicitly.
+QUOTATION_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"sent"},
+    "sent": {"accepted", "rejected", "draft"},
+    "accepted": {"converted"},   # only reachable via convert-to-order, see below
+    "rejected": {"draft"},
+    "converted": set(),          # terminal
+}
+
+
+class QuotationTransitionError(Exception):
+    """Raised by validate_quotation_transition for a disallowed status change."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def validate_quotation_transition(current: str, new: str) -> None:
+    """Raise QuotationTransitionError unless `current -> new` is an allowed
+    manual Quotation status change. The single source of truth for Quotation
+    workflow rules — every caller that changes `Quotation.status` via PATCH
+    validates against this instead of duplicating its own inline check.
+
+    `converted` is never a valid destination here on purpose: it is set only
+    by a successful conversion (see quotation_service.convert_to_order), which
+    writes `status` directly rather than going through this function.
+    """
+    if new == current:
+        return
+    if new == "converted":
+        raise QuotationTransitionError(
+            "A quotation's status cannot be set to 'converted' directly — "
+            "use POST /quotations/{id}/convert-to-order"
+        )
+    if new not in QUOTATION_STATUSES:
+        raise QuotationTransitionError(f"'{new}' is not a valid quotation status")
+    allowed = QUOTATION_TRANSITIONS.get(current, set())
+    if new not in allowed:
+        raise QuotationTransitionError(f"Cannot move a quotation from '{current}' to '{new}'")
+
+
+def quotation_effective_status(status: str | None, valid_until: datetime | None) -> str:
+    """The status a client should *display* — `status` itself, except a
+    quotation still sitting at `sent` past its `valid_until` reads as
+    "expired". Nothing else reads as expired: a `draft` was never sent to
+    anyone to expire on, and `accepted` / `rejected` / `converted` already
+    reached a real outcome before (or regardless of) the deadline.
+
+    Purely a read-time projection — never written back to the database. The
+    stored `status` and QUOTATION_TRANSITIONS both stay in the 5-value
+    vocabulary; this is the one place "expired" is computed from `valid_until`
+    for API responses and for the edit-resets-to-draft rule in
+    quotation_service.update_quotation.
+    """
+    if status == "sent" and valid_until is not None:
+        now = datetime.now(timezone.utc)
+        compare_at = valid_until if valid_until.tzinfo is not None else valid_until.replace(tzinfo=timezone.utc)
+        if compare_at < now:
+            return "expired"
+    return status or "draft"

@@ -115,6 +115,7 @@ def test_1_billing_address_propagation():
     assert_eq(q_res.status_code, 201, "Quotation created")
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to order")
@@ -136,6 +137,7 @@ def test_2_shipping_delivery_address_propagation():
     assert_eq(q_res.status_code, 201, "Quotation created with shipping_address")
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to order")
@@ -157,6 +159,7 @@ def test_3_payment_terms_propagation():
     }, headers=auth)
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={
         "warehouse_id": wh_id,
@@ -181,6 +184,7 @@ def test_4_delivery_terms_propagation():
     }, headers=auth)
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to order")
@@ -201,6 +205,7 @@ def test_5_currency_propagation():
     }, headers=auth)
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to order")
@@ -235,6 +240,7 @@ def test_6_all_commercial_fields_simultaneous_propagation():
     assert_eq(q_res.status_code, 201, "Quotation with all commercial fields created")
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={
         "warehouse_id": wh_id,
@@ -276,6 +282,7 @@ def test_7_item_level_propagation_intact():
     }, headers=auth)
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to order")
@@ -302,6 +309,7 @@ def test_8_legacy_quotation_fallback_conversion():
     }, headers=auth)
     q_id = q_res.json()["id"]
 
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Legacy quotation converts successfully")
@@ -324,6 +332,7 @@ def test_9_duplicate_and_rejected_conversion_protection():
         "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 250.0}],
     }, headers=auth)
     q_id = q_res.json()["id"]
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv1 = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv1.status_code, 201, "First conversion succeeds")
@@ -353,6 +362,7 @@ def test_10_stock_reservation_integrity_on_conversion():
         "items": [{"product_id": prod_id, "quantity": 25, "unit_price": 250.0}],
     }, headers=auth)
     q_id = q_res.json()["id"]
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
 
     stock_before = client.get(f"/products/{prod_id}", headers=auth).json()

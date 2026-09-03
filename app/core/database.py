@@ -1,3 +1,40 @@
+"""Engine/session setup, plus this project's pre-Alembic schema-compatibility
+helpers.
+
+MIGRATION POLICY (as of the Alembic adoption in alembic/):
+
+  Alembic (see alembic/, `alembic upgrade head`) is now the official
+  mechanism for every *new* schema change: new tables, new columns, foreign
+  keys, indexes, unique/check constraints, type changes, nullable changes,
+  renames, and data migrations. New schema work belongs in a new revision
+  under alembic/versions/ — not as a new entry in the functions below.
+
+  Everything below this docstring — auto_add_missing_columns,
+  extend_pg_enum_types, relax_not_null_columns, widen_columns_to_text,
+  add_columns_with_default, drop_legacy_columns, enforce_unique_email,
+  enforce_unique_google_id — predates Alembic and is now a FROZEN
+  compatibility layer, kept only so:
+    1. an already-deployed database that hasn't run the new Alembic
+       migrations yet still boots correctly (each step is idempotent and
+       self-auditing, exactly as before), and
+    2. local dev / the test suite, which imports the app without ever
+       running `alembic upgrade head`, keeps working unchanged.
+  They are not deleted because removing a startup step a live production
+  database has been implicitly depending on is exactly the kind of
+  unreviewed, silent schema-affecting change this policy exists to prevent.
+  Do not add new entries to these lists/functions for new work — write an
+  Alembic revision instead. See alembic/README (also referenced from
+  crm_changes.md) for the full policy write-up and the production deployment
+  flow (migrations run as an explicit release step, never implicitly on
+  every app boot).
+
+  `Base.metadata.create_all(bind=engine)`, called at application startup
+  below `app/main.py`'s on_startup(), remains in place for the same two
+  reasons — it is purely additive (creates a table only if missing, never
+  alters an existing one) and is exactly what alembic/versions' own baseline
+  revision also does, so the two never disagree.
+"""
+
 import json
 import logging
 from collections.abc import Generator
@@ -121,9 +158,11 @@ def auto_add_missing_columns() -> None:
     without that they were silently skipped, and every later SELECT of that table
     failed with "column does not exist" (which is exactly how /products broke).
 
-    This is a stopgap for early development (works on SQLite + Postgres). Once the
-    schema stabilises, switch to Alembic migrations for anything non-trivial
-    (type changes, renames, data backfills).
+    DEPRECATED as the primary migration mechanism — see this module's top
+    docstring. Frozen compatibility layer only; new columns get a proper
+    Alembic revision (alembic/versions/), not a code change here. Kept
+    running so a database that hasn't been through the new Alembic
+    migrations yet still boots correctly.
     """
     inspector = inspect(engine)
     for table in Base.metadata.sorted_tables:
