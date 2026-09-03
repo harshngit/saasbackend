@@ -54,7 +54,7 @@ from app.models.warehouse import (
     Warehouse,
     WarehouseStock,
 )
-from app.models.lead import Lead
+from app.models.lead import Lead, LeadInterestedProduct
 from app.models.quotation import Quotation, QuotationItem
 from app.models.delivery import Delivery, DeliveryItem
 from app.models.sales_return import SalesReturn, ReturnItem
@@ -132,6 +132,7 @@ __all__ = [
     "BillingCycle",
     "LOCKED_STATUSES",
     "Lead",
+    "LeadInterestedProduct",
     "Quotation",
     "QuotationItem",
     "Delivery",

@@ -340,16 +340,20 @@ LEAD_STATUSES = ("new", "contacted", "qualified", "won", "lost")
 # Manual (PATCH) transitions only. `won` is deliberately absent from every
 # allowed set below — it is reachable exclusively through a successful
 # POST /leads/{id}/convert-to-customer, never by a direct status write.
-# `lost` is treated as terminal: no product requirement defines a "reopen a
-# lost lead" flow, so the safest default (no transitions out) is chosen here
-# rather than inventing one.
+# `lost` can be reopened to `contacted` or `qualified` (approved product
+# rule) — deliberately NOT to `new`, since a lead that was already contacted
+# or qualified before being marked lost shouldn't silently lose that
+# progress. Reopening still cannot reach `won` directly: from `contacted`/
+# `qualified` the normal rules apply, and `won` still only comes from a real
+# conversion (see convert_lead_to_customer, which separately also refuses to
+# convert a Lead that is currently `lost`).
 # `X -> X` (no-op) is always allowed and is not listed explicitly.
 LEAD_TRANSITIONS: dict[str, set[str]] = {
     "new": {"contacted", "qualified", "lost"},
     "contacted": {"qualified", "lost"},
     "qualified": {"lost"},
-    "won": set(),    # terminal — only convert-to-customer may set this
-    "lost": set(),   # terminal — no reopen flow defined by product spec
+    "won": set(),                       # terminal — only convert-to-customer may set this
+    "lost": {"contacted", "qualified"}, # reopenable — approved recovery flow
 }
 
 

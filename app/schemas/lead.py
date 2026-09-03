@@ -19,6 +19,16 @@ class LeadSalespersonBrief(BaseModel):
     email: str
 
 
+class LeadProductBrief(BaseModel):
+    """Lightweight Product identity for a Lead's interested-products list —
+    same "brief" pattern as LeadCustomerBrief/QuotationCustomerBrief."""
+
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    sku: str | None = None
+
+
 class LeadBase(BaseModel):
     lead_id: str | None = None
     name: str | None = None
@@ -28,7 +38,20 @@ class LeadBase(BaseModel):
     email: str | None = None
     lead_source: str | None = None
     source: str | None = None
+    # Legacy free-text field, kept fully functional. interested_product_ids
+    # (below) is the normalized replacement — the two are independent.
     interested_product: str | None = None
+    # Frontend-defined categorization (not a fixed backend taxonomy) and
+    # commercial-size classification — separate concepts from lead_status
+    # and unrelated to Customer.customer_type.
+    lead_type: str | None = None
+    segment: str | None = None
+    interested_product_ids: list[str] | None = Field(
+        default=None,
+        description="Product IDs this Lead is interested in. On update, sending "
+                    "this replaces the entire existing set (send [] to clear it "
+                    "entirely). All IDs must belong to the caller's organization.",
+    )
     notes: str | None = None
     customer_id: str | None = None
     converted_customer_id: str | None = None
@@ -91,6 +114,14 @@ class LeadUpdate(BaseModel):
     lead_source: LeadSource | None = None
     source: str | None = None
     interested_product: str | None = None
+    lead_type: str | None = None
+    segment: str | None = None
+    interested_product_ids: list[str] | None = Field(
+        default=None,
+        description="Replaces the entire existing interested-product set when sent "
+                    "(send [] to clear it entirely). All IDs must belong to the "
+                    "caller's organization.",
+    )
     notes: str | None = None
     customer_id: str | None = None
     converted_customer_id: str | None = None
@@ -126,6 +157,7 @@ class LeadOut(LeadBase):
 
     customer: LeadCustomerBrief | None = None
     assigned_salesperson: LeadSalespersonBrief | None = None
+    interested_products: list[LeadProductBrief] = []
 
 
 class LeadConvertToCustomerIn(BaseModel):

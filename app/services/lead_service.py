@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.workflow import LEAD_STATUSES, LeadTransitionError, validate_lead_transition
-from app.models import Customer, Lead, Quotation, Role, User
+from app.models import Customer, Lead, LeadInterestedProduct, Product, Quotation, Role, User
 from app.schemas.lead import LeadConvertToCustomerIn, LeadCreate, LeadUpdate
 from app.services import lookup_service, numbering_service, role_service
 
@@ -72,6 +72,32 @@ def _validate_assignee(db: Session, org_id: str, salesperson_id: str) -> None:
         )
 
 
+def _sync_interested_products(db: Session, org_id: str, lead: Lead, product_ids: list[str]) -> None:
+    """Replace a Lead's entire interested-product set — same "clear, then
+    re-add" convention already used for QuotationUpdate.items
+    (quotation_service.update_quotation). Order-preserving de-duplication
+    keeps a repeated id from ever hitting the (lead_id, product_id) unique
+    constraint, and every id is validated to exist and belong to this
+    organization before anything is touched, mirroring
+    quotation_service._build_items' product validation exactly.
+    """
+    deduped = list(dict.fromkeys(product_ids))
+    for product_id in deduped:
+        product = db.get(Product, product_id)
+        if product is None or product.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid product_id: {product_id}",
+            )
+
+    lead.interested_product_links.clear()
+    db.flush()
+    lead.interested_product_links.extend(
+        LeadInterestedProduct(organization_id=org_id, product_id=product_id)
+        for product_id in deduped
+    )
+
+
 def get_lead(db: Session, org_id: str, lead_id: str, user: User | None = None) -> Lead:
     """Accepts the UUID or the human-facing code (lead_id)."""
     record = lookup_service.by_id_or_code(db, Lead, lead_id, org_id, Lead.lead_id)
@@ -111,11 +137,15 @@ def create_lead(db: Session, org_id: str, user: User, payload: LeadCreate) -> Le
         email=payload.email,
         lead_source=payload.lead_source,
         interested_product=payload.interested_product,
+        lead_type=payload.lead_type,
+        segment=payload.segment,
         notes=payload.notes,
         customer_id=payload.customer_id,
         assigned_salesperson_id=salesperson_id,
         lead_status="new",
     )
+    if payload.interested_product_ids:
+        _sync_interested_products(db, org_id, lead, payload.interested_product_ids)
 
     db.add(lead)
     db.commit()
@@ -207,6 +237,13 @@ def update_lead(db: Session, org_id: str, lead_id: str, user: User, payload: Lea
         if new_assignee:
             _validate_assignee(db, org_id, new_assignee)
 
+    # Popped out and handled separately: interested_product_ids has no
+    # column of its own to setattr onto (it's a read-only computed property
+    # backed by the interested_product_links relationship) — sending it
+    # replaces the whole set, same convention as QuotationUpdate.items.
+    product_ids_touched = "interested_product_ids" in data
+    new_product_ids = data.pop("interested_product_ids", None)
+
     for field, value in data.items():
         if field in ("customer_id", "converted_customer_id"):
             continue
@@ -214,6 +251,9 @@ def update_lead(db: Session, org_id: str, lead_id: str, user: User, payload: Lea
             continue
         if hasattr(lead, field):
             setattr(lead, field, value)
+
+    if product_ids_touched:
+        _sync_interested_products(db, org_id, lead, new_product_ids or [])
 
     db.commit()
     db.refresh(lead)
@@ -264,6 +304,15 @@ def convert_lead_to_customer(
     """
     db.execute(sa_update(Lead).where(Lead.id == lead.id).values(lead_status=Lead.lead_status))
     db.refresh(lead)
+
+    # 0. A lost Lead cannot be converted — the frontend hides the button for
+    # the same reason, but that's advisory only; this is the actual rule.
+    # Reopen it first (PATCH lead_status to 'contacted' or 'qualified').
+    if lead.lead_status == "lost":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Lost lead cannot be converted to customer. Reopen the lead first.",
+        )
 
     # 1. If already converted (by us or by the request we were racing),
     # return the existing customer — idempotent duplicate protection.

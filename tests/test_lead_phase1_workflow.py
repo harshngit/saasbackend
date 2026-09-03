@@ -163,11 +163,14 @@ def run_status_workflow_tests():
     r_bad = client.patch(f"/leads/{lid4}", json={"status": "banana"}, headers=auth)
     check("invalid status value rejected (400)", r_bad.status_code == 400, r_bad.text)
 
-    # lost is terminal: no transition out (documented, conservative default)
+    # lost can be reopened to contacted/qualified (approved recovery flow —
+    # see tests/test_lead_addendum_products_type_segment.py for that
+    # coverage), but NOT to new: a lead already contacted/qualified before
+    # being marked lost shouldn't silently lose that progress.
     lid5 = new_lead("9200000021")
     client.patch(f"/leads/{lid5}", json={"status": "lost"}, headers=auth)
     r_reopen = client.patch(f"/leads/{lid5}", json={"status": "new"}, headers=auth)
-    check("lost -> new rejected (terminal, no reopen flow defined)", r_reopen.status_code == 400, r_reopen.text)
+    check("lost -> new rejected (not an approved reopen target)", r_reopen.status_code == 400, r_reopen.text)
 
     # won -> anything, via a real conversion, is covered in run_converted_protection_tests()
 
