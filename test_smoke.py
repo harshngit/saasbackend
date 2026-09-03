@@ -1574,7 +1574,8 @@ check("a client-supplied quotation number is still honoured",
           "items": [{"product_id": _yprod["id"], "quantity": 1, "unit_price": 10}]}
       ).json()["quotation_number"] == "QT-MANUAL-9")
 _ylead = client.post("/leads", headers=fin_hdr,
-                     json={"customer_id": _ycust["id"], "mobile_number": "9800004444"})
+                     json={"customer_id": _ycust["id"], "mobile_number": "9800004444",
+                           "name": "Auto Ref Lead", "lead_source": "Referral"})
 check("lead gets an auto LEAD id",
       _ylead.status_code == 201 and bool(_re.fullmatch(r"LEAD-\d{4}-\d+", _ylead.json().get("lead_id") or "")),
       _ylead.text[:200])
@@ -2126,6 +2127,7 @@ check("advance payment without invoice_id still works",
 print("\n== Leads CRUD ==")
 lead_payload = {
     "lead_id": "L-12345",
+    "name": "Regular Buyer Lead",
     "lead_source": "Website",
     "customer_id": fcust["id"],
     "mobile_number": "9876543210",
@@ -2867,8 +2869,10 @@ def _roles_scoping_and_dashboard_checks():
           len(client.get("/orders", headers=abc_hdr).json()) == 2)
 
     # Leads
-    my_lead = client.post("/leads", headers=s_hdr, json={"mobile_number": "9800001111"}).json()
-    other_lead = client.post("/leads", headers=o_hdr, json={"mobile_number": "9800002222"}).json()
+    my_lead = client.post("/leads", headers=s_hdr, json={
+        "name": "My Lead", "mobile_number": "9800001111", "lead_source": "Website"}).json()
+    other_lead = client.post("/leads", headers=o_hdr, json={
+        "name": "Other Lead", "mobile_number": "9800002222", "lead_source": "Website"}).json()
     check("a lead a field role creates is assigned to them",
           my_lead["assigned_salesperson_id"] == sunil["id"], my_lead)
     check("GET /leads returns only their own",

@@ -120,7 +120,10 @@ def run_tests():
     lead_res2 = client.post("/leads", json={
         "name": "Unstructured Lead",
         "contact_person": "Bob Smith",
+        "mobile": "9222233334",
+        "source": "Referral",
     }, headers=auth1)
+    assert_eq(lead_res2.status_code, 201, "Lead created for TEST 2")
     lead_id2 = lead_res2.json()["id"]
 
     conv_res2 = client.post(f"/leads/{lead_id2}/convert-to-customer", json={}, headers=auth1)
@@ -151,7 +154,10 @@ def run_tests():
     lead_res3 = client.post("/leads", json={
         "name": "Visit-only Lead",
         "contact_person": "Charlie",
+        "mobile": "9333344445",
+        "source": "Referral",
     }, headers=auth1)
+    assert_eq(lead_res3.status_code, 201, "Lead created for TEST 4")
     lead_id3 = lead_res3.json()["id"]
 
     visit_res2 = client.post("/visits", json={

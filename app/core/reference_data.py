@@ -114,6 +114,16 @@ EXPENSE_PAYMENT_STATUSES = ["Pending", "Partially Paid", "Paid"]
 
 APPROVAL_STATUSES = ["Pending", "Approved", "Rejected"]
 
+# Closed list for Lead.lead_source. No field sheet defines this module yet, so
+# this is the standard CRM lead-source taxonomy, chosen to also cover the
+# values already exercised by existing Lead tests ("Website", "Website
+# Enquiry", "Google") rather than inventing an unrelated vocabulary.
+LEAD_SOURCES = [
+    "Website", "Website Enquiry", "Referral", "Social Media", "Google",
+    "Advertisement", "Cold Call", "Walk-in", "Exhibition", "Email Campaign",
+    "Existing Customer", "Other",
+]
+
 RETURN_TYPES = ["Refund", "Replacement", "Credit Note"]
 RETURN_STATUSES = ["Requested", "Approved", "Refunded", "Closed"]
 

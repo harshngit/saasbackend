@@ -184,8 +184,10 @@ def run_tests():
     iso_lead_res = client.post("/leads", json={
         "name": "Iso Prospect",
         "mobile": "9111111111",
+        "source": "Website",
         "interested_product": "Stock Isolation Test Product",
     }, headers=auth1)
+    assert_eq(iso_lead_res.status_code, 201, "Lead created for stock isolation test")
     iso_lead_id = iso_lead_res.json()["id"]
     client.patch(f"/leads/{iso_lead_id}", json={"status": "qualified"}, headers=auth1)
     client.post(f"/leads/{iso_lead_id}/convert-to-customer", json={}, headers=auth1)

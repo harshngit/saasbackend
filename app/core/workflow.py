@@ -330,3 +330,54 @@ SALEABLE_CONDITION = "saleable"
 def is_saleable(condition: str | None) -> bool:
     """Whether goods in this condition may re-enter sellable stock."""
     return (condition or "").strip().lower() == SALEABLE_CONDITION
+
+
+# --------------------------------- leads ------------------------------------
+LEAD_STATUSES = ("new", "contacted", "qualified", "won", "lost")
+
+# Manual (PATCH) transitions only. `won` is deliberately absent from every
+# allowed set below — it is reachable exclusively through a successful
+# POST /leads/{id}/convert-to-customer, never by a direct status write.
+# `lost` is treated as terminal: no product requirement defines a "reopen a
+# lost lead" flow, so the safest default (no transitions out) is chosen here
+# rather than inventing one.
+# `X -> X` (no-op) is always allowed and is not listed explicitly.
+LEAD_TRANSITIONS: dict[str, set[str]] = {
+    "new": {"contacted", "qualified", "lost"},
+    "contacted": {"qualified", "lost"},
+    "qualified": {"lost"},
+    "won": set(),    # terminal — only convert-to-customer may set this
+    "lost": set(),   # terminal — no reopen flow defined by product spec
+}
+
+
+class LeadTransitionError(Exception):
+    """Raised by validate_lead_transition for a disallowed status change."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def validate_lead_transition(current: str, new: str) -> None:
+    """Raise LeadTransitionError unless `current -> new` is an allowed manual
+    Lead status change. The single source of truth for Lead workflow rules —
+    every caller that changes `Lead.lead_status` via PATCH validates against
+    this instead of duplicating its own inline check.
+
+    `won` is never a valid destination here on purpose: it is set only by a
+    successful conversion (see lead_service.convert_lead_to_customer), which
+    writes `lead_status` directly rather than going through this function.
+    """
+    if new == current:
+        return
+    if new == "won":
+        raise LeadTransitionError(
+            "A Lead's status cannot be set to 'won' directly — "
+            "use POST /leads/{id}/convert-to-customer"
+        )
+    if new not in LEAD_STATUSES:
+        raise LeadTransitionError(f"'{new}' is not a valid Lead status")
+    allowed = LEAD_TRANSITIONS.get(current, set())
+    if new not in allowed:
+        raise LeadTransitionError(f"Cannot move a Lead from '{current}' to '{new}'")

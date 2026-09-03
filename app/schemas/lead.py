@@ -1,5 +1,6 @@
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.schemas.choices import LeadSource
 from app.schemas.customer import CustomerOut
 
 
@@ -55,7 +56,29 @@ class LeadBase(BaseModel):
 
 
 class LeadCreate(LeadBase):
-    pass
+    """Required to create a Lead: name, lead_source (or its alias `source`),
+    and mobile_number (or its alias `mobile`). `_unify_aliases` above (run as
+    a `mode="before"` validator, inherited from LeadBase) fills the canonical
+    field in from its alias before these are checked, so either spelling
+    satisfies the requirement.
+
+    The backend owns the initial workflow state: whatever `status`/
+    `lead_status` the client sends, a new Lead always starts as 'new' — a
+    client cannot create a Lead directly as contacted/qualified/won/lost.
+    """
+
+    name: str = Field(min_length=1)
+    mobile_number: str = Field(min_length=1)
+    lead_source: LeadSource
+
+    @model_validator(mode="after")
+    def _initial_status_is_new(self) -> "LeadCreate":
+        if self.lead_status not in (None, "new"):
+            raise ValueError(
+                "A new Lead always starts as 'new' — status cannot be set during creation"
+            )
+        self.lead_status = "new"
+        return self
 
 
 class LeadUpdate(BaseModel):
@@ -65,7 +88,7 @@ class LeadUpdate(BaseModel):
     mobile_number: str | None = None
     mobile: str | None = None
     email: str | None = None
-    lead_source: str | None = None
+    lead_source: LeadSource | None = None
     source: str | None = None
     interested_product: str | None = None
     notes: str | None = None

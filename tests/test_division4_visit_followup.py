@@ -156,6 +156,8 @@ def run_all_tests():
             "contact_person": "Alice Buyer",
             "customer_id": cust_a_id,
             "assigned_salesperson_id": sales_user_id,
+            "mobile_number": "9555566667",
+            "lead_source": "Referral",
         },
         headers=admin_auth,
     )

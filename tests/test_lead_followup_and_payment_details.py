@@ -112,7 +112,10 @@ def run_fix1_tests():
     print("\n--- TEST B: Lead-only Visit -> Follow-up ---")
     lead_res = client.post(
         "/leads",
-        json={"name": "Prospect Co", "contact_person": "Raj", "assigned_salesperson_id": so_id},
+        json={
+            "name": "Prospect Co", "contact_person": "Raj", "assigned_salesperson_id": so_id,
+            "mobile": "9444455556", "source": "Referral",
+        },
         headers=admin_auth,
     )
     assert lead_res.status_code == 201, lead_res.text

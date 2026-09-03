@@ -19,6 +19,7 @@ from app.core.reference_data import (
     EXPENSE_PAYMENT_STATUSES,
     EXPENSE_STATUSES_SHEET,
     INVOICE_PAYMENT_STATUSES,
+    LEAD_SOURCES,
     PURCHASE_PAYMENT_STATUSES,
     PURCHASE_STATUSES,
     PURCHASE_TYPES,
@@ -66,3 +67,4 @@ ExpensePaymentStatus = Annotated[str, one_of(EXPENSE_PAYMENT_STATUSES, "payment_
 ApprovalStatus = Annotated[str, one_of(APPROVAL_STATUSES, "approval_status")]
 ReturnType = Annotated[str, one_of(RETURN_TYPES, "return_type")]
 ReturnStatus = Annotated[str, one_of(RETURN_STATUSES, "return_status")]
+LeadSource = Annotated[str, one_of(LEAD_SOURCES, "lead_source")]
