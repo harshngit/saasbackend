@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.workflow import LEAD_STATUSES, LeadTransitionError, validate_lead_transition
-from app.models import Customer, Lead, Role, User
+from app.models import Customer, Lead, Quotation, Role, User
 from app.schemas.lead import LeadConvertToCustomerIn, LeadCreate, LeadUpdate
 from app.services import lookup_service, numbering_service, role_service
 
@@ -227,6 +227,16 @@ def delete_lead(db: Session, org_id: str, lead_id: str, user: User) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This Lead has been converted to a Customer and cannot be deleted",
         )
+    # Quotation.lead_id declares ON DELETE SET NULL, but that only actually
+    # exists in the database for a `quotations` table created fresh via
+    # create_all() — a table that already existed before this column shipped
+    # only ever gets the bare column from auto_add_missing_columns()'s
+    # `ALTER TABLE ... ADD COLUMN`, never the constraint (and SQLite cannot
+    # add a foreign key to an existing table via ALTER TABLE at all, so this
+    # gap cannot be closed there after the fact). Null the reference here
+    # explicitly so a Lead's quotations survive its deletion on every
+    # database this app actually runs against, not only a brand new one.
+    db.query(Quotation).filter(Quotation.lead_id == lead.id).update({"lead_id": None})
     db.delete(lead)
     db.commit()
 

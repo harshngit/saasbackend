@@ -8,6 +8,7 @@ from app.core import scoping, workflow
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import (
     Customer,
+    Lead,
     Product,
     ProductVariant,
     Quotation,
@@ -50,6 +51,30 @@ def _owned(db: Session, id: str, org_id: str, user: User | None = None) -> Quota
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Quotation not found")
     return record
+
+
+def _validate_party(customer_id: str | None, lead_id: str | None) -> None:
+    """A quotation has exactly one party: a Customer, or — before that Lead has
+    converted — a Lead directly. Neither is a database constraint (both columns
+    are individually nullable), so this is the one place that rule is enforced,
+    for both create and update."""
+    if customer_id and lead_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A quotation cannot have both customer_id and lead_id — choose one",
+        )
+    if not customer_id and not lead_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A quotation needs exactly one party: customer_id or lead_id",
+        )
+
+
+def _validate_lead(db: Session, org_id: str, lead_id: str) -> Lead:
+    lead = db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
+    return lead
 
 
 def _build_items(db: Session, org_id: str, lines) -> list[QuotationItem]:  # noqa: ANN001
@@ -96,10 +121,18 @@ def create_quotation(
 ) -> Quotation:
     org_id = _org_id(user)
 
-    # Validate customer
-    customer = db.get(Customer, payload.customer_id)
-    if customer is None or customer.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+    # A quotation is for exactly one party: an existing Customer, or a Lead that
+    # hasn't converted to one yet.
+    _validate_party(payload.customer_id, payload.lead_id)
+
+    customer = None
+    if payload.customer_id:
+        customer = db.get(Customer, payload.customer_id)
+        if customer is None or customer.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+
+    if payload.lead_id:
+        _validate_lead(db, org_id, payload.lead_id)
 
     # Validate salesperson if provided
     if payload.salesperson_id:
@@ -115,10 +148,13 @@ def create_quotation(
         quotation_date=payload.quotation_date or datetime.now(timezone.utc),
         valid_until=payload.valid_until,
         customer_id=payload.customer_id,
+        lead_id=payload.lead_id,
         # Sheet marks both addresses "Auto-filled" — default them from the
         # customer the quotation is for, rather than making the user retype them.
-        billing_address=payload.billing_address or customer.billing_address,
-        shipping_address=payload.shipping_address or customer.delivery_address,
+        # A Lead carries no address of its own, so a Lead quotation only gets
+        # what the caller explicitly sends.
+        billing_address=payload.billing_address or (customer.billing_address if customer else None),
+        shipping_address=payload.shipping_address or (customer.delivery_address if customer else None),
         # Default to the creator for a field role — see customers.create_customer.
         salesperson_id=payload.salesperson_id
         or (user.id if scoping.scope_to_own(db, user) else None),
@@ -188,10 +224,22 @@ def update_quotation(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Use POST /quotations/{id}/convert-to-order to convert a quotation",
         )
+    # Re-validate the party rule against the state that would result from this
+    # PATCH, not just the raw payload — a request that only sends lead_id must
+    # still be rejected if the quotation already has a customer_id (and vice
+    # versa), and clearing the only party set (e.g. customer_id: null with no
+    # replacement) must be rejected too.
+    if "customer_id" in data or "lead_id" in data:
+        resulting_customer_id = data["customer_id"] if "customer_id" in data else quotation.customer_id
+        resulting_lead_id = data["lead_id"] if "lead_id" in data else quotation.lead_id
+        _validate_party(resulting_customer_id, resulting_lead_id)
+
     if data.get("customer_id"):
         customer = db.get(Customer, data["customer_id"])
         if customer is None or customer.organization_id != org_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+    if data.get("lead_id"):
+        _validate_lead(db, org_id, data["lead_id"])
     if data.get("salesperson_id"):
         sales = db.get(User, data["salesperson_id"])
         if sales is None or sales.organization_id != org_id:
@@ -332,10 +380,12 @@ def quotation_pdf_download(
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> Response:
-    """The quotation as a PDF, to send to the customer."""
+    """The quotation as a PDF, to send to the customer — or, for a Lead
+    quotation, the Lead."""
     quotation = _owned(db, id, _org_id(user), user)
     customer = db.get(Customer, quotation.customer_id) if quotation.customer_id else None
-    body = quotation_pdf(user.organization, customer, quotation)
+    lead = db.get(Lead, quotation.lead_id) if quotation.lead_id else None
+    body = quotation_pdf(user.organization, customer, quotation, lead=lead)
     return Response(
         content=body,
         media_type="application/pdf",

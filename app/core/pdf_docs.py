@@ -143,10 +143,17 @@ def delivery_receipt_pdf(org, customer, order) -> bytes:
     return bytes(pdf.output())
 
 
-def quotation_pdf(org, customer, quotation) -> bytes:
+def quotation_pdf(org, customer, quotation, lead=None) -> bytes:
     """The quotation as the customer receives it: quoted lines, terms and validity.
 
     A quotation is an offer, not a bill — there is no payment or balance on it.
+
+    `customer` and `lead` are mutually exclusive in practice (a quotation has
+    exactly one party — see Quotation.customer_id / .lead_id): pass whichever
+    one the quotation actually has, and leave the other None. A Lead carries no
+    business name, GSTIN or address of its own, so the "QUOTED TO" block falls
+    back to what a Lead does have — name, contact person, mobile, email — and
+    those blank rather than showing stale/incorrect Customer-shaped fields.
     """
     pdf = FPDF()
     pdf.add_page()
@@ -163,9 +170,22 @@ def quotation_pdf(org, customer, quotation) -> bytes:
     pdf.cell(col, 5, "DETAILS:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_font("Helvetica", size=9)
+    if customer:
+        party_name = customer.business_name or customer.name
+        party_phone = f"Phone: {customer.phone}" if customer.phone else "Phone: N/A"
+        party_fourth_line = f"GSTIN: {customer.gst_number}" if customer.gst_number else ""
+    elif lead:
+        party_name = lead.name or lead.contact_person or "-"
+        party_phone = f"Phone: {lead.mobile_number}" if lead.mobile_number else "Phone: N/A"
+        party_fourth_line = f"Email: {lead.email}" if lead.email else ""
+    else:
+        party_name = "-"
+        party_phone = "Phone: N/A"
+        party_fourth_line = ""
+
     rows = [
         (
-            _s(customer.business_name or customer.name) if customer else "-",
+            _s(party_name),
             _s(f"Quotation No: {quotation.quotation_number}"),
         ),
         (
@@ -173,11 +193,11 @@ def quotation_pdf(org, customer, quotation) -> bytes:
             _s(f"Date: {quotation.quotation_date.date().isoformat() if quotation.quotation_date else '-'}"),
         ),
         (
-            _s(f"Phone: {customer.phone}" if customer and customer.phone else "Phone: N/A"),
+            _s(party_phone),
             _s(f"Valid until: {quotation.valid_until.date().isoformat() if quotation.valid_until else '-'}"),
         ),
         (
-            _s(f"GSTIN: {customer.gst_number}" if customer and customer.gst_number else ""),
+            _s(party_fourth_line),
             _s(f"Status: {(quotation.status or '').title()}"),
         ),
     ]

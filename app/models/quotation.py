@@ -28,6 +28,15 @@ class Quotation(Base):
     customer_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # A quotation is for exactly one party: a Customer, or — before that Lead has
+    # converted — a Lead directly. Both are nullable and independently optional at
+    # this layer; app/routers/quotations.py enforces "exactly one of the two" since
+    # that is a cross-field business rule, not something a column constraint can
+    # express. ON DELETE SET NULL, not CASCADE: deleting a Lead must not delete the
+    # quotations raised against it.
+    lead_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("leads.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     billing_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     salesperson_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
@@ -58,6 +67,7 @@ class Quotation(Base):
         back_populates="quotation", cascade="all, delete-orphan", lazy="joined"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined", primaryjoin="Quotation.customer_id == Customer.id")  # noqa: F821
+    lead: Mapped["Lead | None"] = relationship(lazy="joined", primaryjoin="Quotation.lead_id == Lead.id")  # noqa: F821
     salesperson: Mapped["User | None"] = relationship(lazy="joined", primaryjoin="Quotation.salesperson_id == User.id")  # noqa: F821
 
 

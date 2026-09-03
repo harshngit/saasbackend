@@ -23,6 +23,20 @@ class QuotationCustomerBrief(BaseModel):
     business_name: str | None = None
 
 
+class QuotationLeadBrief(BaseModel):
+    """Lightweight Lead identity for a Lead quotation — enough for the frontend to
+    display the party without a second round-trip, and without needing the full
+    Lead record (see LeadOut in app/schemas/lead.py for that)."""
+
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str | None = None
+    contact_person: str | None = None
+    mobile_number: str | None = None
+    email: str | None = None
+    lead_source: str | None = None
+
+
 class QuotationSalespersonBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -61,6 +75,11 @@ class QuotationBase(BaseModel):
     quotation_date: datetime | None = None
     valid_until: datetime | None = None
     customer_id: str | None = None
+    lead_id: str | None = Field(
+        default=None,
+        description="A quotation for a Lead that has not converted to a Customer yet. "
+                    "Exactly one of customer_id / lead_id is required.",
+    )
     billing_address: str | None = None
     salesperson_id: str | None = None
     currency: str | None = "INR"
@@ -142,6 +161,7 @@ class QuotationOut(QuotationBase):
 
     items: list[QuotationItemOut]
     customer: QuotationCustomerBrief | None = None
+    lead: QuotationLeadBrief | None = None
     salesperson: QuotationSalespersonBrief | None = None
     subtotal: float = 0
     tax_total: float = 0
@@ -165,6 +185,7 @@ class QuotationListItem(BaseModel):
     currency: str | None = None
     status: str | None = None
     customer: QuotationCustomerBrief | None = None
+    lead: QuotationLeadBrief | None = None
     salesperson: QuotationSalespersonBrief | None = None
     total: float = 0
     item_count: int = 0
