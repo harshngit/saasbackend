@@ -46,8 +46,13 @@ def _owned(db: Session, order_id: str, org_id: str, user: User | None = None) ->
     record = lookup_service.by_id_or_code(
         db, SalesOrder, order_id, org_id, SalesOrder.order_number, SalesOrder.sales_order_number
     )
+    # Team Scope widens only the true CRM-ownership field (salesperson_id) to
+    # teammates -- created_by/assigned_delivery_partner_id stay "this user
+    # only" concepts even under team scope, same as they always were under
+    # own scope. See app.core.scoping.owns_record's team_attributes param.
     out_of_scope = user is not None and not scoping.owns_record(
-        db, user, record, "created_by", "salesperson_id", "assigned_delivery_partner_id"
+        db, user, record, "created_by", "salesperson_id", "assigned_delivery_partner_id",
+        team_attributes=("salesperson_id",),
     ) if record is not None else False
     if record is None or out_of_scope:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
@@ -171,10 +176,13 @@ def list_orders(
         query = query.filter(SalesOrder.assigned_delivery_partner_id == assigned_delivery_partner_id)
     if search:
         query = query.filter(SalesOrder.order_number.ilike(f"%{search}%"))
-    # A field role sees the orders it raised, was recorded against, or must deliver.
+    # A field role sees the orders it raised, was recorded against, or must
+    # deliver. Team Scope widens only salesperson_id to teammates -- see
+    # app.core.scoping.owned_by's team_columns param and _owned's matching note.
     query = scoping.owned_by(
         query, db, user,
         SalesOrder.created_by, SalesOrder.salesperson_id, SalesOrder.assigned_delivery_partner_id,
+        team_columns=(SalesOrder.salesperson_id,),
     )
     return query.order_by(SalesOrder.created_at.desc()).all()
 

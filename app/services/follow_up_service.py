@@ -30,7 +30,15 @@ def create_follow_up(
     visit = None
     if visit_id:
         visit = db.get(Visit, visit_id)
-        if visit is None or visit.organization_id != org_id:
+        # Org match AND — for an "own"-scope role — that this Visit is
+        # actually theirs (Visit.user_id, the same field visit_service.get_visit
+        # already scopes direct access by), so a Sales Officer cannot link a
+        # Follow-up onto a colleague's Visit just by knowing its id.
+        if (
+            visit is None
+            or visit.organization_id != org_id
+            or not scoping.owns_record(db, user, visit, "user_id")
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid visit_id")
 
     # Determine customer_id and lead_id — explicit payload value first, else
@@ -53,7 +61,15 @@ def create_follow_up(
 
     if customer_id:
         cust = db.get(Customer, customer_id)
-        if cust is None or cust.organization_id != org_id:
+        # Org match AND — for an "own"-scope role (Sales Officer) — that this
+        # Customer is actually assigned to them (Customer.assigned_sales_officer_id),
+        # the same scoping.owns_record check customers.py::_owned_customer
+        # uses for direct Customer access.
+        if (
+            cust is None
+            or cust.organization_id != org_id
+            or not scoping.owns_record(db, user, cust, "assigned_sales_officer_id")
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
         # If both visit and customer are specified, check they match — but a
         # lead-only visit (visit.customer_id is None) has nothing to conflict with.
@@ -176,7 +192,11 @@ def update_follow_up(
 
     if "customer_id" in data and data["customer_id"]:
         cust = db.get(Customer, data["customer_id"])
-        if cust is None or cust.organization_id != org_id:
+        if (
+            cust is None
+            or cust.organization_id != org_id
+            or not scoping.owns_record(db, user, cust, "assigned_sales_officer_id")
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
 
     if "lead_id" in data and data["lead_id"]:
@@ -184,7 +204,11 @@ def update_follow_up(
 
     if "visit_id" in data and data["visit_id"]:
         visit = db.get(Visit, data["visit_id"])
-        if visit is None or visit.organization_id != org_id:
+        if (
+            visit is None
+            or visit.organization_id != org_id
+            or not scoping.owns_record(db, user, visit, "user_id")
+        ):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid visit_id")
 
     if "assigned_to_id" in data and data["assigned_to_id"]:

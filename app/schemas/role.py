@@ -31,7 +31,11 @@ DataScopeOut = Annotated[str, BeforeValidator(_scope_or_default)]
 _SCOPE_HELP = (
     "all = the role sees every record in the firm; "
     "own = list endpoints return only records assigned to or created by the "
-    "logged-in user (customers, leads, quotations, sales orders, deliveries)"
+    "logged-in user (customers, leads, quotations, sales orders, deliveries); "
+    "team = records owned by the logged-in user plus records owned by anyone "
+    "currently on the same Team (see app.core.scoping) -- applies to leads, "
+    "customers, visits, follow-ups, quotations and sales orders; a user with "
+    "no Team falls back to own-only"
 )
 
 

@@ -39,6 +39,7 @@ from app.models import (  # noqa: F401  (register mappers)
     StockBatch,
     StockMovement,
     StockReservation,
+    Team,
     Vehicle,
     Visit,
     FollowUp,
@@ -75,6 +76,7 @@ from app.routers import (
     settings as settings_router,
     suppliers,
     superadmin,
+    teams,
     users,
     vehicle_stock,
     vehicles,
@@ -207,6 +209,7 @@ app.include_router(files.router)
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(roles.router)
+app.include_router(teams.router)
 app.include_router(customers.router)
 app.include_router(categories.router)
 app.include_router(brands.router)

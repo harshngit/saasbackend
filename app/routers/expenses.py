@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
@@ -25,12 +26,25 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned(db: Session, expense_id: str, org_id: str) -> Expense:
-    """Accepts the UUID or the human-facing code (expense_number, expense_id)."""
+def _owned(db: Session, expense_id: str, org_id: str, user: User, *, enforce_scope: bool = True) -> Expense:
+    """Accepts the UUID or the human-facing code (expense_number, expense_id).
+
+    An "own"-scope user (a custom role with data_scope=="own" submitting
+    their own expenses) may only reach an Expense they submitted — the same
+    dynamic scope check every other module uses. `enforce_scope=False` is
+    used only by the reviewer actions (approve/reject/request-clarification),
+    which are gated by the separate `expenses:approve` permission and must
+    keep working across the whole organization's expenses regardless of the
+    reviewer's own data scope — an own-scoped check there would make
+    approving anyone else's expense impossible, which is not what this fixes.
+    """
     record = lookup_service.by_id_or_code(
         db, Expense, expense_id, org_id, Expense.expense_number, Expense.expense_id
     )
     if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
+    # team_attributes=(): Expenses are explicitly excluded from Team Scope.
+    if enforce_scope and not scoping.owns_record(db, user, record, "submitted_by", team_attributes=()):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Expense not found")
     return record
 
@@ -148,7 +162,7 @@ def upload_receipt(
     db: Session = Depends(get_db),
 ) -> Expense:
     """Attach a bill/receipt (image or PDF, max 10 MB) to an expense."""
-    expense = _owned(db, expense_id, _org_id(user))
+    expense = _owned(db, expense_id, _org_id(user), user)
     expense.receipt_url, _ = save_upload(db, expense.organization_id, file, request)
     db.commit()
     db.refresh(expense)
@@ -197,12 +211,17 @@ def list_expenses(
         # Check tag in JSON list
         q = q.filter(Expense.tags.contains([tag]))
 
+    # An "own"-scope user only sees expenses they submitted — same dynamic
+    # list-scoping helper as everywhere else. "all"-scope (Admin, Accountant,
+    # or any custom org-wide role) is unaffected. team_columns=(): Expenses
+    # are explicitly excluded from Team Scope.
+    q = scoping.owned_by(q, db, user, Expense.submitted_by, team_columns=())
     return q.order_by(Expense.expense_date.desc()).all()
 
 
 @router.get("/{expense_id}", response_model=ExpenseOut)
 def get_expense(expense_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> Expense:
-    return _owned(db, expense_id, _org_id(user))
+    return _owned(db, expense_id, _org_id(user), user)
 
 
 @router.patch("/{expense_id}", response_model=ExpenseOut)
@@ -214,7 +233,7 @@ def update_expense(
     db: Session = Depends(get_db),
 ) -> Expense:
     org_id = _org_id(user)
-    expense = _owned(db, expense_id, org_id)
+    expense = _owned(db, expense_id, org_id, user)
     if expense.status not in ("pending", "clarification_requested"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses can be edited")
 
@@ -279,7 +298,9 @@ def approve_expense(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Expense:
-    expense = _owned(db, expense_id, _org_id(user))
+    # Reviewer action, gated by the separate expenses:approve permission —
+    # deliberately org-wide regardless of the reviewer's own data scope.
+    expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
     if expense.status not in ("pending", "clarification_requested"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses can be approved")
     expense.status = "approved"
@@ -298,7 +319,9 @@ def reject_expense(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Expense:
-    expense = _owned(db, expense_id, _org_id(user))
+    # Reviewer action, gated by the separate expenses:approve permission —
+    # deliberately org-wide regardless of the reviewer's own data scope.
+    expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
     if expense.status != "pending":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses can be rejected")
     expense.status = "rejected"
@@ -319,7 +342,9 @@ def request_clarification(
     db: Session = Depends(get_db),
 ) -> Expense:
     """Ask the submitter for more info (keeps it out of approved/rejected)."""
-    expense = _owned(db, expense_id, _org_id(user))
+    # Reviewer action, gated by the separate expenses:approve permission —
+    # deliberately org-wide regardless of the reviewer's own data scope.
+    expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
     if expense.status not in ("pending", "clarification_requested"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses need clarification")
     expense.status = "clarification_requested"
@@ -351,6 +376,6 @@ def delete_expense(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> None:
-    expense = _owned(db, expense_id, _org_id(user))
+    expense = _owned(db, expense_id, _org_id(user), user)
     db.delete(expense)
     db.commit()

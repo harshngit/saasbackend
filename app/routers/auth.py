@@ -347,7 +347,13 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)) -> TokenPair
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User no longer active")
 
-    access = create_access_token(user.id, user.role.value, user.organization_id)
+    # Same role resolution auth_service.issue_tokens() already uses at login —
+    # user.role is None for a pure custom-role user (see User.effective_system_role),
+    # so reading .role.value here crashed with AttributeError for exactly those
+    # users. effective_system_role never returns None: it falls back to the
+    # legacy role mapping and, for a role-less custom user, to "staff" — the
+    # lowest-privilege bucket, never an escalation.
+    access = create_access_token(user.id, user.effective_system_role, user.organization_id)
     return TokenPair(access_token=access, refresh_token=payload.refresh_token)
 
 

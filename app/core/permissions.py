@@ -151,7 +151,7 @@ DEFAULT_ROLE_SETTINGS: dict[str, dict[str, str]] = {
     "Accountant": {"workspace": "accounts", "data_scope": "all"},
 }
 
-DATA_SCOPES = ("all", "own")
+DATA_SCOPES = ("all", "own", "team")
 # What a role with no scope recorded is treated as — the widest, so adding the
 # column never silently hid anyone's data.
 DEFAULT_DATA_SCOPE = "all"

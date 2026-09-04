@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_permission, require_unlocked_org
 from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
-from app.core import workflow
+from app.core import scoping, workflow
 from app.models import (
     Customer,
     Product,
@@ -63,9 +63,15 @@ def _owned_order(db: Session, id: str, user: User) -> SalesOrder:
     order = db.get(SalesOrder, id)
     if order is None or order.organization_id != _org_id(user):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery/Order not found")
-    
-    # Staff/Delivery Partner can only access their assigned deliveries
-    if user.effective_system_role == "staff" and order.assigned_delivery_partner_id != user.id:
+
+    # An "own"-scope user (Delivery Partner, or any custom role with
+    # data_scope=="own") can only reach the order/delivery assigned to them —
+    # the same dynamic scope check every other module uses, not a hardcoded
+    # role-name check. "all"-scope (Admin, or a custom org-wide role) is
+    # unaffected. team_attributes=() deliberately opts Delivery out of Team
+    # Scope widening (not one of the six confirmed CRM modules) even if a
+    # role somehow holds data_scope=="team" here -- it behaves as own-only.
+    if not scoping.owns_record(db, user, order, "assigned_delivery_partner_id", team_attributes=()):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This delivery is not assigned to you")
     return order
 
@@ -121,16 +127,20 @@ _create = require_permission("deliveries", "create")
 def _owned_delivery(db: Session, delivery_id: str, user: User) -> Delivery:
     """A delivery by **its own id** — the identifier the whole flow uses.
 
-    A field role only reaches the deliveries assigned to them; out of scope reads as
-    not found, the same rule as everywhere else.
+    An "own"-scope user (Delivery Partner, or any custom role with
+    data_scope=="own") only reaches a Delivery actually assigned to them —
+    the dynamic scope check every other module uses, not a hardcoded
+    role-name check. Deliberately requires a real assignment: an unassigned
+    Delivery (delivery_partner_id is None) is NOT visible to an own-scope
+    user just because nobody else has claimed it yet. "all"-scope (Admin, or
+    a custom org-wide role) is unaffected. Out of scope reads as not found,
+    the same rule as everywhere else.
     """
     delivery = db.get(Delivery, delivery_id)
     if delivery is None or delivery.organization_id != _org_id(user):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found")
-    if (
-        user.effective_system_role == "staff"
-        and delivery.delivery_partner_id not in (None, user.id)
-    ):
+    # team_attributes=(): Delivery is explicitly excluded from Team Scope.
+    if not scoping.owns_record(db, user, delivery, "delivery_partner_id", team_attributes=()):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found")
     return delivery
 
@@ -290,8 +300,12 @@ def list_deliveries(
         query = query.filter(Delivery.delivery_partner_id == delivery_partner_id)
     if open_only:
         query = query.filter(Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES))
-    if user.effective_system_role == "staff":
-        query = query.filter(Delivery.delivery_partner_id == user.id)
+    # Same dynamic list-scoping helper every other module's list endpoint
+    # uses — an "own"-scope user only ever sees rows where they are the
+    # delivery_partner (a plain SQL equality, so an unassigned Delivery,
+    # where the column is NULL, is never matched either). team_columns=():
+    # Delivery is explicitly excluded from Team Scope.
+    query = scoping.owned_by(query, db, user, Delivery.delivery_partner_id, team_columns=())
     return [
         _delivery_out(db, d) for d in query.order_by(Delivery.created_at.desc()).all()
     ]

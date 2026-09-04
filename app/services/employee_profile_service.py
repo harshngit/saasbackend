@@ -27,7 +27,7 @@ from app.schemas.employee_profile import (
     ProfessionalInformation,
     SystemPreferences,
 )
-from app.schemas.user import AccountStatus, RoleBrief
+from app.schemas.user import AccountStatus, RoleBrief, TeamBrief
 
 _SECTION_MODELS = {
     "basic_information": BasicInformation,
@@ -122,6 +122,8 @@ def _section(db: Session, user, name: str):
         block.role_detail = (
             RoleBrief.model_validate(user.role_detail) if user.role_detail is not None else None
         )
+        block.team_id = user.team_id
+        block.team = TeamBrief.model_validate(user.team) if user.team is not None else None
     if name == "system_preferences" and block.account_status is None:
         # Rows created before `status` existed report one derived from `is_active`,
         # so clients never have to handle a null account status.

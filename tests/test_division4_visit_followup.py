@@ -522,7 +522,9 @@ def run_visit_lifecycle_ownership_tests():
     so_b, _so_b_auth = _create_staff(org2_auth, "Officer B", "Sales Officer")
 
     cust_res = client.post(
-        "/customers", json={"name": "Lifecycle Customer", "phone": "9000000001"}, headers=admin_auth
+        "/customers",
+        json={"name": "Lifecycle Customer", "phone": "9000000001", "assigned_sales_officer_id": so_a["id"]},
+        headers=admin_auth,
     )
     assert cust_res.status_code == 201, cust_res.text
     cust_id = cust_res.json()["id"]

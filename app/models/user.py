@@ -49,6 +49,13 @@ class User(Base):
     # Legacy fixed role enum — kept (nullable) for backward-compat in responses.
     role: Mapped[UserRole | None] = mapped_column(Enum(UserRole), nullable=True)
 
+    # At most one Team (never many — see app.models.team.Team). Nullable: most
+    # users are not required to belong to a team, and "team" data-scope users
+    # with none safely fall back to "own" (see app.core.scoping).
+    team_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("teams.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     # ----------------------------- Employee Profile -----------------------------
     # All nullable: rows created before a field existed keep working, and only the
     # create endpoint enforces which of them the HR form treats as mandatory.
@@ -141,6 +148,9 @@ class User(Base):
 
     organization: Mapped["Organization | None"] = relationship(back_populates="users")  # noqa: F821
     role_detail: Mapped["Role | None"] = relationship(foreign_keys=[role_id], lazy="joined")  # noqa: F821
+    team: Mapped["Team | None"] = relationship(  # noqa: F821
+        foreign_keys=[team_id], back_populates="members", lazy="joined"
+    )
 
     @property
     def effective_system_role(self) -> str:

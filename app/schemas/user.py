@@ -107,6 +107,17 @@ class RoleBrief(BaseModel):
     permissions: dict[str, dict[str, bool]]
 
 
+class TeamBrief(BaseModel):
+    """The Team as it appears nested inside a user — just enough for a
+    frontend list/detail view; see GET /teams/{id} for the full roster."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    manager_id: str | None = None
+
+
 class EmployeeDocument(BaseModel):
     """One file in an employee's multi-file document slots."""
 
@@ -134,6 +145,8 @@ class UserOut(BaseModel):
     role_id: str | None
     role_detail: RoleBrief | None      # the staff member's role + permissions
     role: UserRole | None              # legacy fixed-role enum (kept for backward-compat)
+    team_id: str | None = None
+    team: TeamBrief | None = None      # the Team this user currently belongs to, if any
     google_id: str | None = None
     is_active: bool
     created_at: datetime

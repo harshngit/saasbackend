@@ -37,6 +37,7 @@ from app.models.product import Product, ProductPricing, ProductVariant
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role
 from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
+from app.models.team import Team
 from app.models.tracking import ProductSerial, StockBatch
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
@@ -81,6 +82,7 @@ __all__ = [
     "Organization",
     "Plan",
     "Role",
+    "Team",
     "Customer",
     "CustomerDocument",
     "Category",

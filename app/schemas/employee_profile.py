@@ -26,6 +26,7 @@ from app.schemas.user import (
     EmploymentTypeIn,
     RoleBrief,
     StringList,
+    TeamBrief,
 )
 
 # API field name -> column name, for the handful that differ.
@@ -153,6 +154,10 @@ class EmploymentInformation(BaseModel):
     role_id: OptionalRef = Field(default=None, description="One of the firm's roles (GET /roles)")
     # Read-only, resolved from role_id — the role's name and permission matrix.
     role_detail: RoleBrief | None = None
+    # Read-only. Team membership is managed exclusively through the Team API
+    # (POST/PATCH /teams) — not writable here.
+    team_id: str | None = None
+    team: TeamBrief | None = None
 
 
 class LoginSecurity(BaseModel):

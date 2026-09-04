@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import (
@@ -41,9 +42,20 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _owned(db: Session, id: str, org_id: str) -> VehicleLoading:
+def _owned(db: Session, id: str, org_id: str, user: User) -> VehicleLoading:
+    """A loading session by its own id. An "own"-scope user (Delivery Partner,
+    or any custom role with data_scope=="own") may only reach a session that
+    is actually theirs — the same dynamic scope check every other module
+    uses (see app.core.scoping), not a hardcoded role-name check. Knowing
+    another partner's session UUID does not grant access: out of scope reads
+    as not found, same as the org check above. "all"-scope (Admin, or a
+    custom org-wide role) is unaffected.
+    """
     loading = db.get(VehicleLoading, id)
     if loading is None or loading.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle loading session not found")
+    # team_attributes=(): Vehicle Stock is explicitly excluded from Team Scope.
+    if not scoping.owns_record(db, user, loading, "delivery_partner_id", team_attributes=()):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle loading session not found")
     return loading
 
@@ -77,6 +89,16 @@ def load_vehicle(
     if payload.delivery_id:
         delivery = db.get(Delivery, payload.delivery_id)
         if delivery is None or delivery.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="delivery_id is not a delivery in your firm",
+            )
+        # An "own"-scope user may only load stock onto a Delivery actually
+        # assigned to them — same dynamic scope check as everywhere else in
+        # this module. Without this, any Delivery Partner could load (and
+        # thereby deduct warehouse stock for) any delivery in the org just by
+        # knowing its id.
+        if not scoping.owns_record(db, user, delivery, "delivery_partner_id", team_attributes=()):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="delivery_id is not a delivery in your firm",
@@ -115,6 +137,13 @@ def load_vehicle(
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="delivery_partner_id is not a user in your firm")
+    # An "own"-scope user may only start a loading session for themselves —
+    # not stock a van "for" a colleague.
+    if scoping.scope_to_own(db, user) and partner.id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You may only start a vehicle loading session for yourself",
+        )
 
     # Check for active session
     active = (
@@ -204,6 +233,13 @@ def get_current_stock(
 ) -> VehicleLoading:
     """Retrieve what's currently loaded on a delivery partner's vehicle (active session)."""
     org_id = _org_id(user)
+    # An "own"-scope user may only look up their own current stock — the path
+    # param alone (any other partner's user id) must not grant access.
+    if scoping.scope_to_own(db, user) and delivery_partner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active loading session found for this delivery partner.",
+        )
     loading = (
         db.query(VehicleLoading)
         .filter(
@@ -231,7 +267,7 @@ def add_extra_load(
 ) -> VehicleLoading:
     """Add extra stock mid-day. Deducts from warehouse."""
     org_id = _org_id(user)
-    loading = _owned(db, id, org_id)
+    loading = _owned(db, id, org_id, user)
     if loading.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Loading session is not active")
 
@@ -313,7 +349,7 @@ def record_returns(
 ) -> VehicleLoading:
     """Record actual returned stock at the end of the day. Closes the loading session."""
     org_id = _org_id(user)
-    loading = _owned(db, id, org_id)
+    loading = _owned(db, id, org_id, user)
     if loading.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Loading session is not active")
 
@@ -395,7 +431,7 @@ def reconcile_vehicle_stock(
         > 0: Physical surplus (extra items)
     """
     org_id = _org_id(user)
-    loading = _owned(db, id, org_id)
+    loading = _owned(db, id, org_id, user)
 
     reconciliation = VehicleStockReconciliation(
         organization_id=org_id,
@@ -459,7 +495,7 @@ def get_session_reconciliations(
 ) -> list[VehicleStockReconciliation]:
     """List historical stock reconciliation records for a vehicle loading session."""
     org_id = _org_id(user)
-    loading = _owned(db, id, org_id)
+    loading = _owned(db, id, org_id, user)
     return (
         db.query(VehicleStockReconciliation)
         .filter(
@@ -478,12 +514,17 @@ def list_all_loadings(
     status_filter: str | None = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
 ) -> list[VehicleLoading]:
-    """Admin overview across all delivery partners and sessions."""
+    """Organization-wide overview for an "all"-scope user (Admin, or a custom
+    org-wide role); an "own"-scope user (e.g. Delivery Partner) sees only
+    their own sessions — same dynamic list-scoping helper as everywhere else.
+    """
     org_id = _org_id(user)
     q = db.query(VehicleLoading).filter(VehicleLoading.organization_id == org_id)
     if delivery_partner_id:
         q = q.filter(VehicleLoading.delivery_partner_id == delivery_partner_id)
     if status_filter:
         q = q.filter(VehicleLoading.status == status_filter)
+    # team_columns=(): Vehicle Stock is explicitly excluded from Team Scope.
+    q = scoping.owned_by(q, db, user, VehicleLoading.delivery_partner_id, team_columns=())
     return q.order_by(VehicleLoading.date.desc()).all()
 
