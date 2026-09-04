@@ -213,6 +213,52 @@ class VehicleBrief(BaseModel):
     capacity_kg: float | None = None
 
 
+class DeliveryHistoryActorBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+
+
+class DeliveryHistoryOut(BaseModel):
+    """One Delivery timeline event — see app.models.delivery.DeliveryHistory
+    and delivery_service.record_history. `actor` is built from the row's own
+    denormalized actor_id/actor_name (never a join back to `users`), so it
+    still reads correctly after the acting user has been deleted.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    event_type: str
+    previous_status: str | None = None
+    new_status: str | None = None
+    actor: DeliveryHistoryActorBrief | None = None
+    notes: str | None = None
+    event_metadata: dict | None = None
+    created_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def _build_actor(cls, data: object) -> object:
+        """Accepts either a DeliveryHistory ORM row (actor_id/actor_name
+        columns) or an already-shaped dict; only the ORM-row case needs the
+        actor object assembled."""
+        if hasattr(data, "actor_id"):
+            actor_id = getattr(data, "actor_id", None)
+            actor_name = getattr(data, "actor_name", None)
+            return {
+                "id": data.id,
+                "event_type": data.event_type,
+                "previous_status": data.previous_status,
+                "new_status": data.new_status,
+                "actor": {"id": actor_id, "name": actor_name} if actor_id else None,
+                "notes": data.notes,
+                "event_metadata": data.event_metadata,
+                "created_at": data.created_at,
+            }
+        return data
+
+
 class DeliveryPod(BaseModel):
     photo_file_ids: list[str] = Field(default_factory=list)
     signature_file_id: str | None = None
@@ -266,6 +312,12 @@ class DeliveryOut(BaseModel):
     )
     created_at: datetime
     updated_at: datetime
+
+    # Only populated on GET /deliveries/by-id/{id} (the detail endpoint) —
+    # deliberately left empty on list responses (GET /deliveries) so listing
+    # many deliveries never pulls in every one's full timeline. See
+    # routers/deliveries.py::_delivery_out's `include_timeline` parameter.
+    timeline: list["DeliveryHistoryOut"] = Field(default_factory=list)
 
     @field_validator("status", mode="before")
     @classmethod

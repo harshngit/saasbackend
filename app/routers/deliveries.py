@@ -18,12 +18,14 @@ from app.models import (
     VehicleLoading,
     VehicleLoadingItem,
     Delivery,
+    DeliveryHistory,
     DeliveryItem,
 )
 from app.services import delivery_service, notification_service, numbering_service
 from app.schemas.delivery import (
     DeliveryConfirm,
     DeliveryCustomerBrief,
+    DeliveryHistoryOut,
     DeliveryOut,
     DeliveryPartnerBrief,
     DeliveryPartnerOption,
@@ -133,7 +135,7 @@ def _owned_delivery(db: Session, delivery_id: str, user: User) -> Delivery:
     return delivery
 
 
-def _delivery_out(db: Session, delivery: Delivery) -> DeliveryOut:
+def _delivery_out(db: Session, delivery: Delivery, include_timeline: bool = False) -> DeliveryOut:
     out = DeliveryOut.model_validate(delivery)
     for key, value in delivery_service.sync_delivery_view(db, delivery).items():
         setattr(out, key, value)
@@ -157,6 +159,21 @@ def _delivery_out(db: Session, delivery: Delivery) -> DeliveryOut:
         db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
     )
     out.delivery_partner = DeliveryPartnerBrief.model_validate(partner) if partner else None
+
+    # Only the detail endpoint asks for this — see the docstring on
+    # DeliveryOut.timeline. No join to `users`: DeliveryHistory carries its
+    # own denormalized actor_id/actor_name (see DeliveryHistoryOut._build_actor).
+    if include_timeline:
+        rows = (
+            db.query(DeliveryHistory)
+            .filter(
+                DeliveryHistory.organization_id == delivery.organization_id,
+                DeliveryHistory.delivery_id == delivery.id,
+            )
+            .order_by(DeliveryHistory.created_at.asc(), DeliveryHistory.id.asc())
+            .all()
+        )
+        out.timeline = [DeliveryHistoryOut.model_validate(r) for r in rows]
 
     return out
 
@@ -313,6 +330,7 @@ def pick_items(
             any_changed = True
 
     # Update picking_status
+    previous_picking_status = delivery.picking_status
     if any(i.picked_quantity and i.picked_quantity > 0 for i in delivery.items):
         if all((i.picked_quantity or 0) >= (i.planned_quantity or 0) for i in delivery.items):
             delivery.picking_status = "picked"
@@ -320,6 +338,12 @@ def pick_items(
             delivery.picking_status = "picking"
     else:
         delivery.picking_status = "not_started"
+
+    if any_changed and delivery.picking_status != previous_picking_status:
+        if delivery.picking_status == "picking" and previous_picking_status == "not_started":
+            delivery_service.record_history(db, delivery, "picking_started", actor=user)
+        elif delivery.picking_status == "picked":
+            delivery_service.record_history(db, delivery, "picking_completed", actor=user)
 
     db.commit()
     db.refresh(delivery)
@@ -349,7 +373,11 @@ def mark_ready(
             detail="All items must be fully picked before marking ready",
         )
 
+    previous = delivery.status
     delivery.status = "ready"
+    delivery_service.record_history(
+        db, delivery, "ready", actor=user, previous_status=previous, new_status="ready"
+    )
     db.commit()
     db.refresh(delivery)
     return _delivery_out(db, delivery)
@@ -364,8 +392,11 @@ def get_delivery(
     Registered under /by-id/ because the older GET /deliveries/{id} takes a **Sales
     Order** id and is kept working for existing clients. New code should use this one
     (and the /{delivery_id}/… actions below, which are all Delivery-id based).
+
+    Includes the full `timeline` — the only Delivery response that does; list
+    responses deliberately leave it empty (see DeliveryOut.timeline).
     """
-    return _delivery_out(db, _owned_delivery(db, delivery_id, user))
+    return _delivery_out(db, _owned_delivery(db, delivery_id, user), include_timeline=True)
 
 
 @router.patch("/by-id/{delivery_id}", response_model=DeliveryOut)
@@ -396,6 +427,9 @@ def update_delivery(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="delivery_partner_id is not an employee in your firm",
             )
+        delivery_service.require_partner_available(
+            db, org_id, partner, delivery.scheduled_date or delivery.delivery_date
+        )
     if data.get("vehicle_id"):
         vehicle = db.get(Vehicle, data["vehicle_id"])
         if vehicle is None or vehicle.organization_id != org_id:
@@ -405,20 +439,23 @@ def update_delivery(
             )
 
     new_status = data.pop("status", None)
+    previous_partner_id = delivery.delivery_partner_id
     for field, value in data.items():
         setattr(delivery, field, value)
+
+    if "delivery_partner_id" in data and delivery.delivery_partner_id != previous_partner_id:
+        delivery_service.record_history(
+            db, delivery, "reassigned" if previous_partner_id else "assigned", actor=user,
+            metadata={
+                "previous_delivery_partner_id": previous_partner_id,
+                "delivery_partner_id": delivery.delivery_partner_id,
+            },
+        )
 
     if new_status == "in_transit":
         delivery_service.dispatch(db, user, delivery)
     elif new_status == "cancelled":
-        _require_delivery_transition(delivery.status, "cancelled")
-        if delivery.loaded_total > 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Goods are already on the vehicle. Bring them back with the "
-                       "end-of-day return instead of cancelling.",
-            )
-        delivery.status = "cancelled"
+        delivery_service.cancel(db, delivery, actor=user)
     elif new_status == "planned":
         # In this workflow only a rejected delivery can go back to planned — to be
         # reassigned to a new partner. (A loaded delivery cannot: physical stock has

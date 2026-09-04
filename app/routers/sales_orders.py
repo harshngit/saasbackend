@@ -16,7 +16,7 @@ from app.schemas.sales_order import (
     PickupConfirmRequest,
     RejectBody,
 )
-from app.services import delivery_service, lookup_service, order_service, stock_service
+from app.services import delivery_service, lookup_service, order_service, payment_service, stock_service
 
 router = APIRouter(prefix="/orders", tags=["sales_orders"])
 
@@ -118,8 +118,10 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
         inv = db.get(Invoice, out.invoice_id)
 
     if inv:
-        out.paid_amount = round(float(inv.paid_amount or 0.0), 2)
-        out.remaining_balance = round(float(inv.balance_due or 0.0), 2)
+        # Invoice has no `paid_amount`/`balance_due` attributes -- the real
+        # columns/helper are `amount_paid` and payment_service.outstanding().
+        out.paid_amount = round(float(inv.amount_paid or 0.0), 2)
+        out.remaining_balance = payment_service.outstanding(inv)
     else:
         out.paid_amount = 0.0
         out.remaining_balance = out.current_order_amount
@@ -398,6 +400,7 @@ def assign_delivery_partner(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="delivery_partner_id is not a user in your firm")
     if not _is_delivery_partner(db, partner):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected user is not a delivery partner")
+    delivery_service.require_partner_available(db, org_id, partner, order.delivery_date or datetime.now(timezone.utc))
     order.assigned_delivery_partner_id = partner.id
     if order.status == "placed":
         order.status = "processing"
@@ -416,7 +419,13 @@ def assign_delivery_partner(
     )
     if existing:
         for delivery in existing:
+            previous_partner_id = delivery.delivery_partner_id
             delivery.delivery_partner_id = partner.id
+            if previous_partner_id != partner.id:
+                delivery_service.record_history(
+                    db, delivery, "reassigned" if previous_partner_id else "assigned", actor=user,
+                    metadata={"previous_delivery_partner_id": previous_partner_id, "delivery_partner_id": partner.id},
+                )
     else:
         try:
             delivery_service.plan(
@@ -450,6 +459,15 @@ def cancel_order(
     Once goods have been loaded or dispatched a plain cancel is refused: those units
     are out of the warehouse, and bringing them back is the delivery-return /
     return-to-warehouse flow, not a status change.
+
+    Any Delivery still linked to this order and still in a pre-operational
+    state (planned / rejected / accepted / ready — i.e. nothing loaded onto a
+    vehicle yet) is cancelled along with the order, in the same transaction,
+    so an order never ends up cancelled while a Delivery still claims to be
+    planned for it. The DISPATCHED_FULFILMENT guard above already refuses the
+    whole operation once anything has been loaded, so nothing reachable past
+    that point should ever be an operationally active Delivery — the loop
+    below is a defensive belt-and-suspenders check, not the primary guard.
     """
     order = _owned(db, order_id, _org_id(user), user)
     if order.status == "cancelled":
@@ -467,6 +485,22 @@ def cancel_order(
     order.fulfilment_status = "not_started"
     if payload.reason:
         order.reject_reason = payload.reason
+
+    linked_deliveries = (
+        db.query(Delivery)
+        .filter(Delivery.sales_order_id == order.id, Delivery.organization_id == order.organization_id)
+        .all()
+    )
+    for delivery in linked_deliveries:
+        if delivery.status == "cancelled":
+            continue
+        if "cancelled" not in workflow.DELIVERY_TRANSITIONS.get(delivery.status, set()):
+            # Not reachable in practice given the DISPATCHED_FULFILMENT guard
+            # above, but skipped rather than raised so an edge case here can
+            # never block the order cancellation that was already approved.
+            continue
+        delivery_service.cancel(db, delivery, reason=payload.reason, actor=user)
+
     db.commit()
     db.refresh(order)
     return _order_out(db, order)

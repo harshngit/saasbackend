@@ -23,8 +23,10 @@ from app.core.workflow import DeliveryTransitionError, public_order_status, vali
 from app.models import (
     Customer,
     Delivery,
+    DeliveryHistory,
     DeliveryItem,
     Invoice,
+    Leave,
     Role,
     SalesOrder,
     SalesOrderItem,
@@ -63,6 +65,81 @@ def is_delivery_partner(db: Session, partner: User) -> bool:
 
 def next_delivery_number(db: Session, org_id: str) -> str:
     return numbering_service.next_number(db, org_id, Delivery.delivery_note_number, "DLV")
+
+
+def record_history(
+    db: Session,
+    delivery: Delivery,
+    event_type: str,
+    actor: User | None = None,
+    previous_status: str | None = None,
+    new_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict | None = None,
+) -> DeliveryHistory:
+    """Add one Delivery timeline event. Does not commit — joins whatever
+    transaction the caller is already in, so a business action and its
+    history entry always land together or not at all (same pairing
+    activity_service.record() already establishes for the org-wide activity
+    feed elsewhere in this project).
+    """
+    entry = DeliveryHistory(
+        organization_id=delivery.organization_id,
+        delivery_id=delivery.id,
+        event_type=event_type,
+        previous_status=previous_status,
+        new_status=new_status,
+        actor_id=actor.id if actor is not None else None,
+        actor_name=actor.name if actor is not None else None,
+        notes=notes,
+        event_metadata=metadata,
+    )
+    db.add(entry)
+    return entry
+
+
+def _approved_leave_on(db: Session, org_id: str, partner_id: str, on_date) -> Leave | None:
+    """The partner's approved Leave covering `on_date`, if any.
+
+    Only `status == "approved"` blocks assignment — a pending leave has not
+    been decided yet and a rejected/cancelled one never took effect, so
+    neither should stop an assignment (see app.models.leave.LEAVE_STATUSES).
+    Scoped to `org_id`, so a leave record cannot affect a partner outside its
+    own organization even if ids collided.
+    """
+    if on_date is None:
+        return None
+    day = on_date.date() if hasattr(on_date, "date") else on_date
+    return (
+        db.query(Leave)
+        .filter(
+            Leave.organization_id == org_id,
+            Leave.user_id == partner_id,
+            Leave.status == "approved",
+            Leave.start_date <= day,
+            Leave.end_date >= day,
+        )
+        .first()
+    )
+
+
+def require_partner_available(db: Session, org_id: str, partner: User, on_date) -> None:
+    """Raise 400 if `partner` has an approved Leave covering `on_date`.
+
+    Called at every place a Delivery Partner is assigned or reassigned to a
+    Delivery — planning a new one (`plan`), reassigning an existing one
+    (routers/deliveries.py::update_delivery), and the Order-side shortcut
+    (routers/sales_orders.py::assign_delivery_partner) — so the rule is
+    enforced server-side everywhere assignment can happen, not just in one
+    of them.
+    """
+    leave = _approved_leave_on(db, org_id, partner.id, on_date)
+    if leave is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{partner.name} is on approved leave from {leave.start_date} to "
+                   f"{leave.end_date} and cannot be assigned a delivery on that date",
+        )
 
 
 def amount_due(db: Session, delivery: Delivery) -> float:
@@ -171,6 +248,9 @@ def plan(
     org_id = order.organization_id
     by_id = {item.id: item for item in order.items}
 
+    if delivery_partner is not None:
+        require_partner_available(db, org_id, delivery_partner, scheduled_date or datetime.now(timezone.utc))
+
     if wanted is None:
         lines = [
             {"order_item_id": item.id, "planned_quantity": outstanding_for_order_item(db, item)}
@@ -235,6 +315,12 @@ def plan(
 
     db.add(delivery)
     db.flush()
+    record_history(db, delivery, "created", actor=user, new_status="planned")
+    if delivery_partner is not None:
+        record_history(
+            db, delivery, "assigned", actor=user,
+            metadata={"delivery_partner_id": delivery_partner.id, "delivery_partner_name": delivery_partner.name},
+        )
 
     # Planning is not dispatch — the order is being worked on, nothing has moved.
     if order.status == "placed":
@@ -254,7 +340,9 @@ def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This delivery is not assigned to you",
         )
+    previous = delivery.status
     delivery.status = "accepted"
+    record_history(db, delivery, "accepted", actor=user, previous_status=previous, new_status="accepted")
     return delivery
 
 
@@ -266,6 +354,7 @@ def reject(db: Session, user: User, delivery: Delivery, reason: str | None = Non
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This delivery is not assigned to you",
         )
+    previous = delivery.status
     delivery.status = "rejected"
     reason_str = reason.strip() if reason and reason.strip() else "no reason given"
     note_text = f"Rejected by partner: {reason_str}"
@@ -275,6 +364,44 @@ def reject(db: Session, user: User, delivery: Delivery, reason: str | None = Non
         delivery.notes = note_text
     delivery.delivery_partner_id = None
     delivery.vehicle_id = None
+    record_history(
+        db, delivery, "rejected", actor=user, previous_status=previous, new_status="rejected", notes=reason_str
+    )
+    return delivery
+
+
+def cancel(db: Session, delivery: Delivery, reason: str | None = None, actor: User | None = None) -> Delivery:
+    """Cancel a Delivery that has not had anything loaded onto a vehicle yet.
+    Does not commit.
+
+    A no-op if already cancelled. Raises HTTPException if the current status
+    cannot legally reach 'cancelled' (see workflow.DELIVERY_TRANSITIONS —
+    once loaded/in_transit/etc, this must not be used; that is the delivery
+    return / end-of-day flow instead) or if, despite the status, some
+    quantity is already loaded (defensive — mirrors the same check
+    routers/deliveries.py::update_delivery makes before cancelling).
+
+    Touches no stock: nothing physical has happened for any status this
+    can reach 'cancelled' from (planned/rejected/accepted/ready), so there
+    is nothing to reverse — matching the existing manual cancel path.
+    """
+    if delivery.status == "cancelled":
+        return delivery
+    _require_transition(delivery.status, "cancelled")
+    if delivery.loaded_total > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Goods are already on the vehicle. Bring them back with the "
+                   "end-of-day return instead of cancelling.",
+        )
+    previous = delivery.status
+    delivery.status = "cancelled"
+    if reason:
+        note_text = f"Cancelled: {reason}"
+        delivery.notes = f"{delivery.notes}\n{note_text}" if delivery.notes else note_text
+    record_history(
+        db, delivery, "cancelled", actor=actor, previous_status=previous, new_status="cancelled", notes=reason
+    )
     return delivery
 
 
@@ -499,6 +626,16 @@ def load(
             }
         )
 
+    # Only when this call actually loaded something new -- a retry that finds
+    # nothing left to load (results empty) writes no event, so calling this
+    # twice never duplicates the timeline entry.
+    if results:
+        previous = delivery.status
+        record_history(
+            db, delivery, "loaded", actor=user, previous_status=previous,
+            new_status="loaded" if delivery.loaded_total > 0 else previous,
+            metadata={"lines": results},
+        )
     if delivery.loaded_total > 0:
         delivery.status = "loaded"
         order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
@@ -515,9 +652,11 @@ def dispatch(db: Session, user: User, delivery: Delivery) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Nothing has been loaded onto the vehicle yet",
         )
+    previous = delivery.status
     delivery.status = "in_transit"
     delivery.dispatched_at = datetime.now(timezone.utc)
     delivery.dispatched_by_id = user.id
+    record_history(db, delivery, "dispatched", actor=user, previous_status=previous, new_status="in_transit")
     order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
     if order is not None:
         order.fulfilment_status = "in_transit"
@@ -548,6 +687,7 @@ def confirm(
     # exactly the states that may reach "partially_delivered" too, so validating
     # against either representative target correctly gates the real outcome,
     # which is computed further down once the delivered quantity is known.
+    previous = delivery.status
     _require_transition(delivery.status, "failed" if failed else "delivered")
 
     delivery.pod_photo_file_ids = list(pod_photo_file_ids or [])
@@ -563,6 +703,10 @@ def confirm(
         delivery.status = "failed"
         delivery.failure_reason = failure_reason
         delivery.delivery_status = "failed"
+        record_history(
+            db, delivery, "failed", actor=user, previous_status=previous, new_status="failed",
+            notes=failure_reason,
+        )
         order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
         if order is not None:
             order.fulfilment_status = "failed"
@@ -614,6 +758,14 @@ def confirm(
     planned = delivery.planned_total
     delivery.status = "delivered" if delivered + 0.001 >= planned else "partially_delivered"
     delivery.delivery_status = "delivered" if delivery.status == "delivered" else "partial"
+    record_history(
+        db, delivery, delivery.status, actor=user, previous_status=previous, new_status=delivery.status,
+        metadata={
+            "pod_photo_file_ids": delivery.pod_photo_file_ids,
+            "pod_signature_file_id": delivery.pod_signature_file_id,
+            "receiver_name": delivery.receiver_name,
+        },
+    )
 
     order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
     if order is not None:

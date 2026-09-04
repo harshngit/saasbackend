@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -144,3 +144,52 @@ class DeliveryItem(Base):
     def remaining_quantity(self) -> float:
         """Alias for pending_quantity: remaining unfulfilled quantity on this delivery."""
         return self.pending_quantity
+
+
+class DeliveryHistory(Base):
+    """One recorded event in a Delivery's timeline — the source of the Delivery
+    Detail "timeline" list. Written through `delivery_service.record_history()`,
+    always in the same transaction as the business action it describes (never a
+    separate commit), the same non-negotiable pairing `activity_service.record()`
+    already establishes for the org-wide activity feed elsewhere in this project.
+
+    The actor's name is denormalized onto the row (see ActivityLog.actor_name for
+    the same reasoning) so the timeline still reads correctly after the user who
+    performed the action has been deleted.
+    """
+
+    __tablename__ = "delivery_history"
+    __table_args__ = (Index("ix_delivery_history_org_delivery", "organization_id", "delivery_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    delivery_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("deliveries.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # created | assigned | reassigned | accepted | rejected | picking_started |
+    # picking_completed | loaded | dispatched | delivered | partially_delivered |
+    # failed | cancelled — see delivery_service.record_history's call sites for
+    # the exhaustive, authoritative list; nothing else writes this table.
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    previous_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    new_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    actor_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    actor_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Free-form extra detail for events that carry more than a status change —
+    # e.g. {"delivery_partner_id": "..."} for assigned/reassigned, or
+    # {"loaded_quantity": ...} for loaded. Nullable: most events need nothing here.
+    event_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False, index=True)
+
+    # No `actor` relationship here on purpose: actor_name is already
+    # denormalized onto the row (see class docstring), so building the
+    # response's actor object never needs a join back to `users` — avoiding
+    # both an N+1 load on the timeline and the loss of the actor's name once
+    # a user is deleted (ON DELETE SET NULL would otherwise take actor_id
+    # with it).
