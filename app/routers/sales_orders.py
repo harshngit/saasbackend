@@ -103,6 +103,29 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             out.invoice_id = latest_inv.id
             out.invoice_number = latest_inv.invoice_number
 
+    # Fallback source for historical rows
+    if order.source == "office":
+        out.source = "quotation" if order.quotation_id else "direct"
+
+    # Populate Financial Summary
+    cust = order.customer or (db.get(Customer, order.customer_id) if order.customer_id else None)
+    prev_bal = round(float(cust.outstanding_balance or 0.0), 2) if cust else 0.0
+    out.previous_balance = prev_bal
+    out.current_order_amount = round(float(order.total or 0.0), 2)
+
+    inv = None
+    if out.invoice_id:
+        inv = db.get(Invoice, out.invoice_id)
+
+    if inv:
+        out.paid_amount = round(float(inv.paid_amount or 0.0), 2)
+        out.remaining_balance = round(float(inv.balance_due or 0.0), 2)
+    else:
+        out.paid_amount = 0.0
+        out.remaining_balance = out.current_order_amount
+
+    out.total_due = round(prev_bal + out.remaining_balance, 2)
+
     return out
 
 
@@ -597,3 +620,26 @@ def confirm_order_pickup(
     db.commit()
     db.refresh(order)
     return _order_out(db, order)
+
+
+@router.post("/{order_id}/ready-for-pickup", response_model=OrderOut)
+def ready_order_for_pickup_alias(
+    order_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Alias for POST /orders/{id}/pickup/ready."""
+    return ready_order_for_pickup(order_id, user, _unlocked, db)
+
+
+@router.post("/{order_id}/picked-up", response_model=OrderOut)
+def confirm_order_pickup_alias(
+    order_id: str,
+    payload: PickupConfirmRequest | None = None,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderOut:
+    """Alias for POST /orders/{id}/pickup/confirm."""
+    return confirm_order_pickup(order_id, payload, user, _unlocked, db)

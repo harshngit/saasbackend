@@ -137,6 +137,12 @@ def place_order(
 
     number = next_order_number(db, org_id)
     resolved_shipping = shipping_address or delivery_address
+    resolved_source = source
+    if quotation_id and source in ("office", "direct"):
+        resolved_source = "quotation"
+    elif not quotation_id and source == "office":
+        resolved_source = "direct"
+
     order = SalesOrder(
         organization_id=org_id,
         order_number=number,
@@ -157,7 +163,7 @@ def place_order(
         fulfilment_method=fulfilment_method,
         payment_type=payment_type,
         payment_terms_days=payment_terms_days,
-        source=source,
+        source=resolved_source,
         created_by=user.id,
         discount=order_level_discount,
         notes=notes,

@@ -140,6 +140,8 @@ class ConvertedOrderBrief(BaseModel):
     id: str
     order_number: str
     status: str
+    source: str | None = None
+    quotation_id: str | None = None
     fulfilment_status: str | None = None
     total: float = 0
     billing_address: str | None = None

@@ -371,6 +371,7 @@ def convert_to_order(
         payment_terms_days=payload.payment_terms_days,
         salesperson_id=quotation.salesperson_id,
         quotation_id=quotation.id,
+        source="quotation",
         notes=quotation.notes,
         # Same shared path POST /orders uses: a draft-enabled firm gets an
         # unreserved draft here too, confirmed later via POST /orders/{id}/confirm.

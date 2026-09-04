@@ -65,6 +65,22 @@ class CustomerBrief(BaseModel):
     gst_number: str | None = None
 
 
+class SalespersonBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    email: str | None = None
+
+
+class UserBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    email: str | None = None
+
+
 class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -100,7 +116,8 @@ class OrderOut(BaseModel):
     delivery_address: str | None = None
     source: str
     assigned_delivery_partner_id: str | None
-    created_by: str | None
+    created_by: str | None = None
+    created_by_user: UserBrief | None = None
     subtotal: float
     discount: float
     tax: float
@@ -116,7 +133,15 @@ class OrderOut(BaseModel):
     sales_order_number: str | None = None
     order_date: datetime | None = None
     salesperson_id: str | None = None
+    salesperson: SalespersonBrief | None = None
     order_status: str | None = None
+
+    # Financial Summary
+    previous_balance: float = 0.0
+    current_order_amount: float = 0.0
+    total_due: float = 0.0
+    paid_amount: float = 0.0
+    remaining_balance: float = 0.0
 
     # Delivery & Invoice references
     delivery_id: str | None = None
@@ -168,7 +193,7 @@ class OrderCreate(BaseModel):
     billing_address: str | None = None
     shipping_address: str | None = None
     delivery_address: str | None = None
-    source: str = Field(default="office", description="office | delivery_vehicle")
+    source: str = Field(default="direct", description="direct | quotation | office | delivery_vehicle")
     discount: float = Field(default=0, ge=0)  # order-level
     tax: float = Field(default=0, ge=0)
     notes: str | None = None
@@ -177,8 +202,8 @@ class OrderCreate(BaseModel):
     @field_validator("source")
     @classmethod
     def _valid_source(cls, v: str) -> str:
-        if v not in ("office", "delivery_vehicle"):
-            raise ValueError("source must be 'office' or 'delivery_vehicle'")
+        if v not in ("direct", "quotation", "office", "delivery_vehicle"):
+            raise ValueError("source must be 'direct', 'quotation', 'office', or 'delivery_vehicle'")
         return v
 
     # Sheet fields (sales_order_number is auto-generated)
@@ -207,7 +232,7 @@ class OrderUpdate(BaseModel):
     billing_address: str | None = None
     shipping_address: str | None = None
     delivery_address: str | None = None
-    source: str | None = Field(default=None, description="office | delivery_vehicle")
+    source: str | None = Field(default=None, description="direct | quotation | office | delivery_vehicle")
     discount: float | None = Field(default=None, ge=0)
     tax: float | None = Field(default=None, ge=0)
     notes: str | None = None
@@ -221,8 +246,8 @@ class OrderUpdate(BaseModel):
     @field_validator("source")
     @classmethod
     def _valid_source(cls, v: str | None) -> str | None:
-        if v is not None and v not in ("office", "delivery_vehicle"):
-            raise ValueError("source must be 'office' or 'delivery_vehicle'")
+        if v is not None and v not in ("direct", "quotation", "office", "delivery_vehicle"):
+            raise ValueError("source must be 'direct', 'quotation', 'office', or 'delivery_vehicle'")
         return v
 
 

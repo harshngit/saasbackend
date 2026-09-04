@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -106,6 +106,12 @@ class SalesOrder(Base):
         back_populates="order", cascade="all, delete-orphan", lazy="joined"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined")  # noqa: F821
+    salesperson: Mapped["User | None"] = relationship(  # noqa: F821
+        lazy="joined", primaryjoin="SalesOrder.salesperson_id == User.id"
+    )
+    created_by_user: Mapped["User | None"] = relationship(  # noqa: F821
+        lazy="joined", primaryjoin="foreign(SalesOrder.created_by) == User.id"
+    )
     deliveries: Mapped[list["Delivery"]] = relationship(  # noqa: F821
         lazy="select", primaryjoin="SalesOrder.id == Delivery.sales_order_id", overlaps="sales_order"
     )
