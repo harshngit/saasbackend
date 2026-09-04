@@ -21,6 +21,7 @@ class FollowUp(Base):
     __tablename__ = "follow_ups"
     __table_args__ = (
         Index("ix_follow_ups_org_customer", "organization_id", "customer_id"),
+        Index("ix_follow_ups_org_lead", "organization_id", "lead_id"),
         Index("ix_follow_ups_org_due", "organization_id", "due_date"),
         Index("ix_follow_ups_org_assigned", "organization_id", "assigned_to_id"),
         Index("ix_follow_ups_org_status", "organization_id", "status"),
@@ -30,10 +31,16 @@ class FollowUp(Base):
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    # Nullable: a follow-up on a lead-only Visit (no converted Customer yet) has no
-    # customer to point at — its parent chain is FollowUp -> Visit -> Lead instead.
+    # A follow-up may belong directly to a Customer, directly to a Lead (before
+    # conversion — no Visit required), or reach either transitively through
+    # visit_id below. ON DELETE SET NULL on lead_id (not CASCADE, unlike
+    # customer_id): deleting an unconverted Lead must not delete the activity
+    # history recorded against it.
     customer_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("customers.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    lead_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("leads.id", ondelete="SET NULL"), nullable=True, index=True
     )
     visit_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("visits.id", ondelete="SET NULL"), nullable=True, index=True
@@ -55,5 +62,6 @@ class FollowUp(Base):
     )
 
     customer: Mapped["Customer | None"] = relationship(lazy="joined", foreign_keys=[customer_id])  # noqa: F821
+    lead: Mapped["Lead | None"] = relationship(lazy="joined", foreign_keys=[lead_id])  # noqa: F821
     visit: Mapped["Visit | None"] = relationship(back_populates="follow_ups", lazy="joined", foreign_keys=[visit_id])  # noqa: F821
     assigned_to: Mapped["User | None"] = relationship(lazy="joined", foreign_keys=[assigned_to_id])  # noqa: F821

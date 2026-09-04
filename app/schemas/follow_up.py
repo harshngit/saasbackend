@@ -17,8 +17,16 @@ class FollowUpUserBrief(BaseModel):
     email: str
 
 
+class FollowUpLeadBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str | None = None
+    contact_person: str | None = None
+
+
 class FollowUpBase(BaseModel):
     customer_id: str | None = None
+    lead_id: str | None = None
     visit_id: str | None = None
     assigned_to_id: str | None = None
     title: str
@@ -31,6 +39,7 @@ class FollowUpBase(BaseModel):
 
 class FollowUpCreate(BaseModel):
     customer_id: str | None = None
+    lead_id: str | None = None
     visit_id: str | None = None
     assigned_to_id: str | None = None
     title: str
@@ -42,6 +51,7 @@ class FollowUpCreate(BaseModel):
 
 class FollowUpUpdate(BaseModel):
     customer_id: str | None = None
+    lead_id: str | None = None
     visit_id: str | None = None
     assigned_to_id: str | None = None
     title: str | None = None
@@ -57,9 +67,11 @@ class FollowUpOut(BaseModel):
 
     id: str
     organization_id: str
-    # Null for a follow-up on a lead-only Visit (no converted Customer yet) —
-    # its parent chain is FollowUp -> Visit -> Lead instead.
+    # A follow-up may belong directly to a Customer, directly to a Lead
+    # (before conversion — no Visit required), or reach either transitively
+    # through visit_id.
     customer_id: str | None = None
+    lead_id: str | None = None
     visit_id: str | None = None
     assigned_to_id: str | None = None
     title: str
@@ -72,4 +84,5 @@ class FollowUpOut(BaseModel):
     updated_at: datetime
 
     customer: FollowUpCustomerBrief | None = None
+    lead: FollowUpLeadBrief | None = None
     assigned_to: FollowUpUserBrief | None = None

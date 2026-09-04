@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.workflow import LEAD_STATUSES, LeadTransitionError, validate_lead_transition
-from app.models import Customer, Lead, LeadInterestedProduct, Product, Quotation, Role, User
+from app.models import Customer, FollowUp, Lead, LeadInterestedProduct, Product, Quotation, Role, User, Visit
 from app.schemas.lead import LeadConvertToCustomerIn, LeadCreate, LeadUpdate
 from app.services import lookup_service, numbering_service, role_service
 
@@ -106,6 +106,30 @@ def get_lead(db: Session, org_id: str, lead_id: str, user: User | None = None) -
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lead not found")
     return record
+
+
+def validate_lead_reference(db: Session, org_id: str, user: User, lead_id: str) -> Lead:
+    """For code that references an existing Lead by ID from *another*
+    resource's create/update payload (e.g. a Follow-up or Visit's lead_id) —
+    as opposed to get_lead, which is for accessing a Lead directly as the
+    primary resource. Both "doesn't exist / wrong org" and "exists, but this
+    own-scope user doesn't have access to it" are reported the same way —
+    400 "Invalid lead_id" — so this slots into the existing "Invalid X" 400
+    contract every other referenced-foreign-key check in this codebase
+    already uses (see quotation_service._validate_lead, _validate_customer),
+    rather than introducing a second status code for what's conceptually the
+    same "you may not use this id" outcome. Deliberately does NOT reuse
+    get_lead's 404, which is specifically about not leaking whether an
+    out-of-scope Lead exists at all when it's the thing being looked up
+    directly — not the right shape for a field embedded in someone else's
+    payload.
+    """
+    lead = db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
+    if not scoping.owns_record(db, user, lead, "assigned_salesperson_id"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
+    return lead
 
 
 def create_lead(db: Session, org_id: str, user: User, payload: LeadCreate) -> Lead:
@@ -402,6 +426,23 @@ def convert_lead_to_customer(
         Quotation.organization_id == org_id,
         Quotation.lead_id == lead.id,
         Quotation.customer_id.is_(None),
+    ).update({"customer_id": customer.id})
+
+    # Same propagation, same reasoning, for the Lead's pre-conversion
+    # activity history: Follow-ups and Visits logged directly against the
+    # Lead (no Customer required — see follow_up_service.create_follow_up /
+    # visit_service.create_visit) must remain fully readable after
+    # conversion, and gain the new customer_id alongside their preserved
+    # lead_id rather than only being reachable via the now-closed Lead.
+    db.query(Visit).filter(
+        Visit.organization_id == org_id,
+        Visit.lead_id == lead.id,
+        Visit.customer_id.is_(None),
+    ).update({"customer_id": customer.id})
+    db.query(FollowUp).filter(
+        FollowUp.organization_id == org_id,
+        FollowUp.lead_id == lead.id,
+        FollowUp.customer_id.is_(None),
     ).update({"customer_id": customer.id})
 
     db.commit()

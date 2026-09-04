@@ -171,8 +171,9 @@ def run_fix1_tests():
     )
     log_test("Follow-up with no customer/lead/visit context -> 400", standalone_fu.status_code == 400)
     log_test(
-        "Error message is 'customer_id is required' (no visit context)",
-        standalone_fu.json()["detail"] == "customer_id is required",
+        "Error message is 'customer_id or lead_id is required' (no visit context) "
+        "-- updated wording now that a Follow-up may also belong directly to a Lead",
+        standalone_fu.json()["detail"] == "customer_id or lead_id is required",
     )
 
     # ---- TEST D: Cross-organization Visit ----

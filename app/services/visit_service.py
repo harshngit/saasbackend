@@ -4,8 +4,9 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.core import scoping
-from app.models import Customer, Lead, User, Visit
+from app.models import Customer, User, Visit
 from app.schemas.visit import VisitCreate, VisitUpdate
+from app.services import lead_service
 
 
 def _now() -> datetime:
@@ -26,18 +27,28 @@ def create_visit(db: Session, org_id: str, user: User, payload: VisitCreate) -> 
         if cust is None or cust.organization_id != org_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
 
-    # 2. Validate optional lead if provided
+    # 2. Validate optional lead if provided. Reuses
+    # lead_service.validate_lead_reference rather than a raw db.get: it
+    # enforces both the organization match and — for an "own"-scope role
+    # (Sales Officer) — that this is actually a Lead they're allowed to
+    # reference, while keeping the existing 400 "Invalid lead_id" contract.
+    lead = None
     if payload.lead_id:
-        lead = db.get(Lead, payload.lead_id)
-        if lead is None or lead.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
+        lead = lead_service.validate_lead_reference(db, org_id, user, payload.lead_id)
 
-    # 3. Validate user / salesperson
-    user_id = payload.user_id or user.id
-    if user_id:
-        sales = db.get(User, user_id)
-        if sales is None or sales.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id")
+    # 3. Validate user / salesperson. When this visit is for a Lead and no
+    # user_id was explicitly given, default to that Lead's own salesperson
+    # rather than the creator — otherwise an Admin logging a visit for a
+    # Lead assigned to a Sales Officer would default it to themselves, and
+    # the assigned officer (whose visibility is scoped to user_id) would
+    # never see it. Preserves the existing default (the creating user) for
+    # every other case.
+    user_id = payload.user_id
+    if not user_id:
+        user_id = lead.assigned_salesperson_id if lead is not None and lead.assigned_salesperson_id else user.id
+    sales = db.get(User, user_id)
+    if sales is None or sales.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id")
 
     valid_statuses = {"planned", "completed", "cancelled"}
     visit_status = payload.status or "planned"
@@ -128,9 +139,7 @@ def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: V
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
 
     if "lead_id" in data and data["lead_id"]:
-        lead = db.get(Lead, data["lead_id"])
-        if lead is None or lead.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
+        lead_service.validate_lead_reference(db, org_id, user, data["lead_id"])
 
     if "user_id" in data and data["user_id"]:
         sales = db.get(User, data["user_id"])

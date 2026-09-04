@@ -36,6 +36,7 @@ def create_follow_up(
 @router.get("", response_model=list[FollowUpOut])
 def list_follow_ups(
     customer_id: str | None = Query(default=None),
+    lead_id: str | None = Query(default=None),
     visit_id: str | None = Query(default=None),
     assigned_to_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
@@ -53,6 +54,7 @@ def list_follow_ups(
         org_id,
         user,
         customer_id=customer_id,
+        lead_id=lead_id,
         visit_id=visit_id,
         assigned_to_id=assigned_to_id,
         status_filter=status,

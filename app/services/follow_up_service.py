@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping
 from app.models import Customer, FollowUp, Lead, User, Visit
 from app.schemas.follow_up import FollowUpCreate, FollowUpUpdate
+from app.services import lead_service
 
 
 def _now() -> datetime:
@@ -19,6 +20,12 @@ def create_follow_up(
     payload: FollowUpCreate,
     default_visit_id: str | None = None,
 ) -> FollowUp:
+    """A follow-up may belong directly to a Customer, directly to a Lead
+    (before conversion — no Visit required), or reach either transitively
+    through a Visit. All three ways of arriving at a parent are independent
+    and may be combined (e.g. an explicit lead_id plus a visit_id for the
+    same lead) as long as they don't conflict.
+    """
     visit_id = payload.visit_id or default_visit_id
     visit = None
     if visit_id:
@@ -26,21 +33,23 @@ def create_follow_up(
         if visit is None or visit.organization_id != org_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid visit_id")
 
-    # Determine customer_id
+    # Determine customer_id and lead_id — explicit payload value first, else
+    # whatever the Visit (if any) resolves to.
     customer_id = payload.customer_id
     if not customer_id and visit is not None:
         customer_id = visit.customer_id
 
-    # A follow-up needs a valid parent: a customer, or — for a lead-only Visit that
-    # has not converted yet — the lead reached via FollowUp -> Visit -> Lead.
-    lead_id = visit.lead_id if visit is not None else None
+    lead_id = payload.lead_id
+    if not lead_id and visit is not None:
+        lead_id = visit.lead_id
+
     if not customer_id and not lead_id:
         if visit is not None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Visit must be linked to a customer or lead",
             )
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id is required")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="customer_id or lead_id is required")
 
     if customer_id:
         cust = db.get(Customer, customer_id)
@@ -53,17 +62,35 @@ def create_follow_up(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="visit_id belongs to a different customer than customer_id",
             )
-    elif lead_id:
-        lead = db.get(Lead, lead_id)
-        if lead is None or lead.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid lead_id")
 
-    # Validate assigned_to_id
-    assigned_to_id = payload.assigned_to_id or user.id
-    if assigned_to_id:
-        assignee = db.get(User, assigned_to_id)
-        if assignee is None or assignee.organization_id != org_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid assigned_to_id")
+    lead = None
+    if lead_id:
+        # Reuses lead_service.validate_lead_reference rather than a raw
+        # db.get: it enforces both the organization match and — for an
+        # "own"-scope role (Sales Officer) — that this Lead is actually one
+        # they're allowed to reference, while keeping the existing 400
+        # "Invalid lead_id" contract every other referenced-foreign-key
+        # check in this codebase uses.
+        lead = lead_service.validate_lead_reference(db, org_id, user, lead_id)
+        if visit is not None and visit.lead_id and visit.lead_id != lead_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="visit_id belongs to a different lead than lead_id",
+            )
+
+    # Validate assigned_to_id. When this follow-up resolves to a Lead and no
+    # assignee was explicitly given, default to that Lead's own salesperson
+    # (not the creator) — otherwise an Admin adding a follow-up for a Lead
+    # assigned to a Sales Officer would default it to themselves, and the
+    # assigned officer (whose visibility is scoped to assigned_to_id) would
+    # never see it. The pre-existing default (the creating user) is
+    # preserved for every other case, unchanged.
+    assigned_to_id = payload.assigned_to_id
+    if not assigned_to_id:
+        assigned_to_id = lead.assigned_salesperson_id if lead is not None and lead.assigned_salesperson_id else user.id
+    assignee = db.get(User, assigned_to_id)
+    if assignee is None or assignee.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid assigned_to_id")
 
     valid_statuses = {"pending", "completed", "cancelled"}
     task_status = payload.status or "pending"
@@ -76,6 +103,7 @@ def create_follow_up(
     follow_up = FollowUp(
         organization_id=org_id,
         customer_id=customer_id,
+        lead_id=lead_id,
         visit_id=visit_id,
         assigned_to_id=assigned_to_id,
         title=payload.title,
@@ -105,6 +133,7 @@ def list_follow_ups(
     org_id: str,
     user: User,
     customer_id: str | None = None,
+    lead_id: str | None = None,
     visit_id: str | None = None,
     assigned_to_id: str | None = None,
     status_filter: str | None = None,
@@ -118,6 +147,8 @@ def list_follow_ups(
 
     if customer_id:
         query = query.filter(FollowUp.customer_id == customer_id)
+    if lead_id:
+        query = query.filter(FollowUp.lead_id == lead_id)
     if visit_id:
         query = query.filter(FollowUp.visit_id == visit_id)
     if assigned_to_id:
@@ -147,6 +178,9 @@ def update_follow_up(
         cust = db.get(Customer, data["customer_id"])
         if cust is None or cust.organization_id != org_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid customer_id")
+
+    if "lead_id" in data and data["lead_id"]:
+        lead_service.validate_lead_reference(db, org_id, user, data["lead_id"])
 
     if "visit_id" in data and data["visit_id"]:
         visit = db.get(Visit, data["visit_id"])
