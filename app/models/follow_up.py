@@ -55,6 +55,8 @@ class FollowUp(Base):
     priority: Mapped[str] = mapped_column(String(20), default="medium", nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    outcome_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

@@ -35,6 +35,8 @@ class FollowUpBase(BaseModel):
     priority: str = "medium"
     status: str = "pending"
     completed_at: datetime | None = None
+    outcome: str | None = None
+    outcome_notes: str | None = None
 
 
 class FollowUpCreate(BaseModel):
@@ -60,6 +62,13 @@ class FollowUpUpdate(BaseModel):
     priority: str | None = None
     status: str | None = None
     completed_at: datetime | None = None
+    outcome: str | None = None
+    outcome_notes: str | None = None
+
+
+class FollowUpComplete(BaseModel):
+    outcome: str | None = None
+    outcome_notes: str | None = None
 
 
 class FollowUpOut(BaseModel):
@@ -80,6 +89,8 @@ class FollowUpOut(BaseModel):
     priority: str
     status: str
     completed_at: datetime | None = None
+    outcome: str | None = None
+    outcome_notes: str | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.models import Customer, FollowUp, Lead, User, Visit
-from app.schemas.follow_up import FollowUpCreate, FollowUpUpdate
+from app.schemas.follow_up import FollowUpComplete, FollowUpCreate, FollowUpUpdate
 from app.services import lead_service
 
 
@@ -215,10 +215,27 @@ def update_follow_up(
     return follow_up
 
 
-def complete_follow_up(db: Session, org_id: str, follow_up_id: str, user: User) -> FollowUp:
+def complete_follow_up(
+    db: Session,
+    org_id: str,
+    follow_up_id: str,
+    user: User,
+    payload: FollowUpComplete | None = None,
+) -> FollowUp:
     follow_up = get_follow_up(db, org_id, follow_up_id, user)
     follow_up.status = "completed"
-    follow_up.completed_at = _now()
+    if follow_up.completed_at is None:
+        follow_up.completed_at = _now()
+    else:
+        follow_up.completed_at = _now()
+
+    if payload is not None:
+        data = payload.model_dump(exclude_unset=True)
+        if "outcome" in data:
+            follow_up.outcome = data["outcome"]
+        if "outcome_notes" in data:
+            follow_up.outcome_notes = data["outcome_notes"]
+
     follow_up.updated_at = _now()
     db.commit()
     db.refresh(follow_up)

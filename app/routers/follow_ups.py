@@ -1,11 +1,11 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import FollowUp, User
-from app.schemas.follow_up import FollowUpCreate, FollowUpOut, FollowUpUpdate
+from app.schemas.follow_up import FollowUpComplete, FollowUpCreate, FollowUpOut, FollowUpUpdate
 from app.services import follow_up_service
 
 router = APIRouter(prefix="/follow-ups", tags=["follow_ups"])
@@ -91,12 +91,13 @@ def update_follow_up(
 @router.post("/{id}/complete", response_model=FollowUpOut)
 def complete_follow_up(
     id: str,
+    payload: FollowUpComplete | None = Body(default=None),
     user: User = Depends(_edit),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> FollowUp:
     org_id = _org_id(user)
-    return follow_up_service.complete_follow_up(db, org_id, id, user)
+    return follow_up_service.complete_follow_up(db, org_id, id, user, payload=payload)
 
 
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
