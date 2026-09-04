@@ -47,6 +47,16 @@ class Visit(Base):
     status: Mapped[str] = mapped_column(String(30), default="planned", nullable=False, index=True)
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Lifecycle timestamps -- all set by the backend as `status` moves
+    # through the lifecycle (see visit_service.update_visit), never by the
+    # client directly. Each is set only once (first time the corresponding
+    # transition happens) and never overwritten by a later transition.
+    checked_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    checked_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False

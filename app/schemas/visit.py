@@ -37,6 +37,7 @@ class VisitBase(BaseModel):
     outcome: str | None = None
     status: str = "planned"
     location: str | None = None
+    cancellation_reason: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -71,6 +72,7 @@ class VisitUpdate(BaseModel):
     outcome: str | None = None
     status: str | None = None
     location: str | None = None
+    cancellation_reason: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -98,6 +100,11 @@ class VisitOut(BaseModel):
     outcome: str | None = None
     status: str
     location: str | None = None
+    checked_in_at: datetime | None = None
+    checked_out_at: datetime | None = None
+    completed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    cancellation_reason: str | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -441,6 +441,66 @@ def validate_quotation_transition(current: str, new: str) -> None:
         raise QuotationTransitionError(f"Cannot move a quotation from '{current}' to '{new}'")
 
 
+# --------------------------------- visits ------------------------------------
+VISIT_STATUSES = ("planned", "in_progress", "completed", "cancelled")
+
+# Manual (PATCH) transitions. `in_progress` is a new intermediate state — a
+# direct `planned -> completed` is deliberately still allowed (as a
+# non-listed-but-permitted skip) for backward compatibility with clients
+# that never call the check-in step; see the direct-completion branch in
+# VISIT_TRANSITIONS below. `completed` and `cancelled` are both terminal —
+# nothing reopens a visit once it lands there.
+# `X -> X` (no-op) is always allowed and is not listed explicitly.
+VISIT_TRANSITIONS: dict[str, set[str]] = {
+    "planned": {"in_progress", "completed", "cancelled"},
+    "in_progress": {"completed", "cancelled"},
+    "completed": set(),   # terminal
+    "cancelled": set(),   # terminal
+}
+
+
+class VisitTransitionError(Exception):
+    """Raised by validate_visit_transition for a disallowed status change."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def validate_visit_transition(current: str, new: str) -> None:
+    """Raise VisitTransitionError unless `current -> new` is an allowed
+    Visit status change. The single source of truth for Visit lifecycle
+    rules — every caller that changes `Visit.status` validates against this
+    instead of duplicating its own inline check.
+    """
+    if new == current:
+        return
+    if new not in VISIT_STATUSES:
+        raise VisitTransitionError(f"Invalid status '{new}'. Valid statuses: {sorted(VISIT_STATUSES)}")
+    allowed = VISIT_TRANSITIONS.get(current, set())
+    if new not in allowed:
+        raise VisitTransitionError(f"Cannot move a visit from '{current}' to '{new}'")
+
+
+# Controlled Visit outcome values for new API writes only. Historical
+# free-text outcome values already sitting in the database are left
+# completely untouched and remain readable — this vocabulary is enforced
+# going forward, not backfilled or migrated onto old rows.
+#
+# `ready_to_convert` is a business signal only — it communicates that the
+# salesperson thinks the Lead is ready, nothing more. It must never trigger
+# an automatic conversion; the only authority for that remains
+# POST /leads/{id}/convert-to-customer (lead_service.convert_lead_to_customer).
+VISIT_OUTCOMES = (
+    "interested",
+    "follow_up_required",
+    "ready_to_convert",
+    "not_interested",
+    "meeting_completed",
+    "other",
+)
+
+
 def quotation_effective_status(status: str | None, valid_until: datetime | None) -> str:
     """The status a client should *display* — `status` itself, except a
     quotation still sitting at `sent` past its `valid_until` reads as

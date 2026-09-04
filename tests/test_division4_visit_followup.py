@@ -177,7 +177,7 @@ def run_all_tests():
         "visit_type": "site_visit",
         "purpose": "Quarterly requirement discussion",
         "notes": "Discussed bulk supply of components",
-        "outcome": "Client requested proposal next week",
+        "outcome": "follow_up_required",
         "status": "completed",
         "location": "Acme Headquarters, Floor 4",
     }
@@ -193,7 +193,7 @@ def run_all_tests():
     log_test("Visit type is 'site_visit'", visit_data["visit_type"] == "site_visit")
     log_test("Visit status is 'completed'", visit_data["status"] == "completed")
     log_test("Visit purpose matches", visit_data["purpose"] == "Quarterly requirement discussion")
-    log_test("Visit outcome matches", visit_data["outcome"] == "Client requested proposal next week")
+    log_test("Visit outcome matches", visit_data["outcome"] == "follow_up_required")
     log_test("Visit location matches", visit_data["location"] == "Acme Headquarters, Floor 4")
     log_test("Customer brief populated", visit_data.get("customer", {}).get("name") == "Alice Buyer")
 
@@ -239,13 +239,13 @@ def run_all_tests():
     # Update to completed
     r_patch = client.patch(
         f"/visits/{v2_id}",
-        json={"status": "completed", "outcome": "Demo successful"},
+        json={"status": "completed", "outcome": "meeting_completed"},
         headers=sales_auth,
     )
     log_test("PATCH /visits/{id} to completed succeeds", r_patch.status_code == 200)
     updated_v2 = r_patch.json()
     log_test("Status updated to completed", updated_v2["status"] == "completed")
-    log_test("Outcome updated", updated_v2["outcome"] == "Demo successful")
+    log_test("Outcome updated", updated_v2["outcome"] == "meeting_completed")
 
     # Invalid status rejected
     r_bad_status = client.patch(f"/visits/{v2_id}", json={"status": "invalid_status"}, headers=sales_auth)
@@ -499,5 +499,243 @@ def run_all_tests():
         sys.exit(1)
 
 
+def run_visit_lifecycle_ownership_tests():
+    """Visit lifecycle (planned -> in_progress -> completed / cancelled),
+    lifecycle timestamps, controlled outcomes (including ready_to_convert
+    NOT auto-converting a Lead), and Lead Visit default-ownership behavior.
+    Self-contained: its own org/fixtures, own PASSED/FAILED counters, same
+    style as run_all_tests() above.
+    """
+    global PASSED, FAILED
+    PASSED = 0
+    FAILED = 0
+
+    print("\n=======================================================")
+    print("TEST SUITE: Visit Lifecycle, Timestamps, Outcomes & Lead Visit Ownership")
+    print("=======================================================\n")
+
+    admin_auth = _register_org("Div4_Lifecycle")
+    org2_auth = _register_org("Div4_Lifecycle_Org2")
+
+    so_a, so_a_auth = _create_staff(admin_auth, "Officer A", "Sales Officer")
+    so_x, so_x_auth = _create_staff(admin_auth, "Officer X", "Sales Officer")
+    so_b, _so_b_auth = _create_staff(org2_auth, "Officer B", "Sales Officer")
+
+    cust_res = client.post(
+        "/customers", json={"name": "Lifecycle Customer", "phone": "9000000001"}, headers=admin_auth
+    )
+    assert cust_res.status_code == 201, cust_res.text
+    cust_id = cust_res.json()["id"]
+
+    lead_res = client.post(
+        "/leads",
+        json={
+            "name": "Lifecycle Lead",
+            "mobile_number": "9111111111",
+            "lead_source": "Referral",
+            "assigned_salesperson_id": so_a["id"],
+        },
+        headers=admin_auth,
+    )
+    assert lead_res.status_code == 201, lead_res.text
+    lead_id = lead_res.json()["id"]
+
+    # ----------------------------------------------------
+    # Required Test 1: planned -> in_progress sets checked_in_at
+    # ----------------------------------------------------
+    print("--- Required Test 1: planned -> in_progress ---")
+    r = client.post("/visits", json={"lead_id": lead_id, "visit_type": "site_visit"}, headers=admin_auth)
+    log_test("Visit created (201)", r.status_code == 201, r.text)
+    v_data = r.json()
+    v_id = v_data["id"]
+    log_test("Initial status is 'planned'", v_data["status"] == "planned")
+    log_test("Initial checked_in_at is null", v_data["checked_in_at"] is None)
+
+    r = client.patch(f"/visits/{v_id}", json={"status": "in_progress"}, headers=admin_auth)
+    log_test("PATCH to in_progress succeeds (200)", r.status_code == 200, r.text)
+    v_data = r.json()
+    log_test("Status is 'in_progress'", v_data["status"] == "in_progress")
+    log_test("checked_in_at populated", v_data["checked_in_at"] is not None)
+    first_checked_in_at = v_data["checked_in_at"]
+
+    # ----------------------------------------------------
+    # Required Test 2: repeated in_progress update doesn't overwrite checked_in_at
+    # ----------------------------------------------------
+    print("--- Required Test 2: checked_in_at not overwritten ---")
+    r = client.patch(
+        f"/visits/{v_id}", json={"status": "in_progress", "notes": "still on site"}, headers=admin_auth
+    )
+    log_test("Repeated in_progress PATCH succeeds", r.status_code == 200, r.text)
+    log_test("checked_in_at unchanged", r.json()["checked_in_at"] == first_checked_in_at)
+
+    # ----------------------------------------------------
+    # Required Test 3: in_progress -> completed sets checked_out_at/completed_at
+    # ----------------------------------------------------
+    print("--- Required Test 3: completion timestamps ---")
+    r = client.patch(
+        f"/visits/{v_id}", json={"status": "completed", "outcome": "meeting_completed"}, headers=admin_auth
+    )
+    log_test("PATCH to completed succeeds", r.status_code == 200, r.text)
+    v_data = r.json()
+    log_test("Status is 'completed'", v_data["status"] == "completed")
+    log_test("checked_out_at populated", v_data["checked_out_at"] is not None)
+    log_test("completed_at populated", v_data["completed_at"] is not None)
+    log_test("checked_in_at preserved from earlier check-in", v_data["checked_in_at"] == first_checked_in_at)
+
+    # ----------------------------------------------------
+    # Required Test 4: direct planned -> completed compatibility
+    # ----------------------------------------------------
+    print("--- Required Test 4: direct planned -> completed ---")
+    r = client.post("/visits", json={"customer_id": cust_id, "visit_type": "call"}, headers=admin_auth)
+    log_test("Second visit created (201)", r.status_code == 201, r.text)
+    v2_id = r.json()["id"]
+    r = client.patch(f"/visits/{v2_id}", json={"status": "completed"}, headers=admin_auth)
+    log_test("Direct planned -> completed succeeds", r.status_code == 200, r.text)
+    v2_data = r.json()
+    log_test("checked_in_at NOT invented", v2_data["checked_in_at"] is None)
+    log_test("checked_out_at populated", v2_data["checked_out_at"] is not None)
+    log_test("completed_at populated", v2_data["completed_at"] is not None)
+
+    # ----------------------------------------------------
+    # Required Test 5: cancellation
+    # ----------------------------------------------------
+    print("--- Required Test 5: cancellation with reason ---")
+    r = client.post("/visits", json={"customer_id": cust_id, "visit_type": "call"}, headers=admin_auth)
+    v3_id = r.json()["id"]
+    r = client.patch(
+        f"/visits/{v3_id}",
+        json={"status": "cancelled", "cancellation_reason": "Customer requested rescheduling"},
+        headers=admin_auth,
+    )
+    log_test("PATCH to cancelled succeeds", r.status_code == 200, r.text)
+    v3_data = r.json()
+    log_test("Status is 'cancelled'", v3_data["status"] == "cancelled")
+    log_test("cancelled_at populated", v3_data["cancelled_at"] is not None)
+    log_test("cancellation_reason persisted", v3_data["cancellation_reason"] == "Customer requested rescheduling")
+
+    # ----------------------------------------------------
+    # Required Test 6: controlled outcomes
+    # ----------------------------------------------------
+    print("--- Required Test 6: controlled Visit outcomes ---")
+    approved_outcomes = [
+        "interested", "follow_up_required", "ready_to_convert",
+        "not_interested", "meeting_completed", "other",
+    ]
+    for outcome in approved_outcomes:
+        r = client.post(
+            "/visits", json={"customer_id": cust_id, "visit_type": "call", "outcome": outcome}, headers=admin_auth
+        )
+        log_test(f"Outcome '{outcome}' accepted (201)", r.status_code == 201, r.text)
+
+    r = client.post(
+        "/visits",
+        json={"customer_id": cust_id, "visit_type": "call", "outcome": "not_a_real_outcome"},
+        headers=admin_auth,
+    )
+    log_test("Invalid outcome rejected (400)", r.status_code == 400, r.text)
+
+    # ----------------------------------------------------
+    # Required Test 7: ready_to_convert does NOT auto-convert the Lead
+    # ----------------------------------------------------
+    print("--- Required Test 7: ready_to_convert does not auto-convert Lead ---")
+    r = client.post(
+        "/visits",
+        json={"lead_id": lead_id, "visit_type": "site_visit", "outcome": "ready_to_convert"},
+        headers=admin_auth,
+    )
+    log_test("Visit with outcome='ready_to_convert' created", r.status_code == 201, r.text)
+    r_lead = client.get(f"/leads/{lead_id}", headers=admin_auth)
+    log_test(
+        "Lead.lead_status is still not 'won'",
+        r_lead.status_code == 200 and r_lead.json().get("lead_status") != "won",
+        r_lead.text,
+    )
+
+    # ----------------------------------------------------
+    # Required Test 8: Lead Visit default ownership
+    # ----------------------------------------------------
+    print("--- Required Test 8: Lead Visit defaults to lead.assigned_salesperson_id ---")
+    r = client.post("/visits", json={"lead_id": lead_id, "visit_type": "site_visit"}, headers=admin_auth)
+    log_test("Admin-created Lead visit succeeds", r.status_code == 201, r.text)
+    v8_data = r.json()
+    log_test("visit.user_id defaults to assigned Sales Officer A", v8_data["user_id"] == so_a["id"])
+
+    r_own = client.get(f"/visits?lead_id={lead_id}", headers=so_a_auth)
+    log_test(
+        "Sales Officer A (data_scope=own) sees the visit",
+        r_own.status_code == 200 and any(x["id"] == v8_data["id"] for x in r_own.json()),
+        r_own.text,
+    )
+
+    r_other = client.get(f"/visits?lead_id={lead_id}", headers=so_x_auth)
+    log_test(
+        "Unrelated Sales Officer X does NOT see the visit",
+        r_other.status_code == 200 and not any(x["id"] == v8_data["id"] for x in r_other.json()),
+        r_other.text,
+    )
+
+    # ----------------------------------------------------
+    # Required Test 9: explicit ownership override preserved
+    # ----------------------------------------------------
+    print("--- Required Test 9: explicit user_id override preserved ---")
+    r = client.post(
+        "/visits",
+        json={"lead_id": lead_id, "visit_type": "site_visit", "user_id": so_x["id"]},
+        headers=admin_auth,
+    )
+    log_test("Explicit user_id visit created", r.status_code == 201, r.text)
+    log_test("visit.user_id honors explicit override", r.json()["user_id"] == so_x["id"])
+
+    # ----------------------------------------------------
+    # Required Test 10: Customer Visit ownership regression
+    # ----------------------------------------------------
+    print("--- Required Test 10: Customer-only visit ownership unchanged ---")
+    r = client.post("/visits", json={"customer_id": cust_id, "visit_type": "call"}, headers=so_a_auth)
+    log_test("Customer-only visit created by Sales Officer A", r.status_code == 201, r.text)
+    log_test("Defaults to the creating user (unaffected by Lead defaulting)", r.json()["user_id"] == so_a["id"])
+
+    # ----------------------------------------------------
+    # Required Test 11: cross-organization protection
+    # ----------------------------------------------------
+    print("--- Required Test 11: cross-organization Lead/User rejected ---")
+    r = client.post("/visits", json={"lead_id": lead_id, "visit_type": "call"}, headers=org2_auth)
+    log_test("Org 2 cannot create a Visit against Org 1's Lead (400)", r.status_code == 400, r.text)
+
+    r = client.post(
+        "/visits",
+        json={"lead_id": lead_id, "visit_type": "call", "user_id": so_b["id"]},
+        headers=admin_auth,
+    )
+    log_test("Org 1 cannot assign a Visit to Org 2's user (400)", r.status_code == 400, r.text)
+
+    # ----------------------------------------------------
+    # Required Test 12: existing Lead Follow-up flows regression
+    # ----------------------------------------------------
+    print("--- Required Test 12: existing Lead Follow-up flows unaffected ---")
+    r = client.post(
+        "/follow-ups",
+        json={"lead_id": lead_id, "title": "Regression check", "due_date": "2026-09-10T00:00:00Z"},
+        headers=admin_auth,
+    )
+    log_test("POST /follow-ups with lead_id still works", r.status_code == 201, r.text)
+
+    r = client.get(f"/follow-ups?lead_id={lead_id}", headers=admin_auth)
+    log_test("GET /follow-ups?lead_id= still works", r.status_code == 200 and len(r.json()) >= 1, r.text)
+
+    r = client.post(
+        f"/visits/{v_id}/follow-ups",
+        json={"title": "Via visit", "due_date": "2026-09-11T00:00:00Z"},
+        headers=admin_auth,
+    )
+    log_test("POST /visits/{visit_id}/follow-ups still works", r.status_code == 201, r.text)
+
+    print("\n=======================================================")
+    print(f"RESULTS: {PASSED} passed, {FAILED} failed")
+    print("=======================================================\n")
+    if FAILED > 0:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     run_all_tests()
+    run_visit_lifecycle_ownership_tests()

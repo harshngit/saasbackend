@@ -4,6 +4,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.core import scoping
+from app.core.workflow import VISIT_OUTCOMES, VISIT_STATUSES, VisitTransitionError, validate_visit_transition
 from app.models import Customer, User, Visit
 from app.schemas.visit import VisitCreate, VisitUpdate
 from app.services import lead_service
@@ -50,13 +51,29 @@ def create_visit(db: Session, org_id: str, user: User, payload: VisitCreate) -> 
     if sales is None or sales.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id")
 
-    valid_statuses = {"planned", "completed", "cancelled"}
     visit_status = payload.status or "planned"
-    if visit_status not in valid_statuses:
+    if visit_status not in VISIT_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status '{visit_status}'. Valid statuses: {sorted(valid_statuses)}",
+            detail=f"Invalid status '{visit_status}'. Valid statuses: {sorted(VISIT_STATUSES)}",
         )
+
+    if payload.outcome is not None and payload.outcome not in VISIT_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid outcome '{payload.outcome}'. Valid outcomes: {sorted(VISIT_OUTCOMES)}",
+        )
+
+    now = _now()
+    # A visit created directly at a non-"planned" status still gets the
+    # timestamp(s) that status implies, for the same reason update_visit
+    # does — e.g. a client that logs a visit after the fact as already
+    # "completed" (see TEST 1 in test_division4_visit_followup.py, which has
+    # always created visits this way).
+    checked_in_at = now if visit_status == "in_progress" else None
+    checked_out_at = now if visit_status == "completed" else None
+    completed_at = now if visit_status == "completed" else None
+    cancelled_at = now if visit_status == "cancelled" else None
 
     visit = Visit(
         organization_id=org_id,
@@ -70,6 +87,11 @@ def create_visit(db: Session, org_id: str, user: User, payload: VisitCreate) -> 
         outcome=payload.outcome,
         status=visit_status,
         location=payload.location,
+        checked_in_at=checked_in_at,
+        checked_out_at=checked_out_at,
+        completed_at=completed_at,
+        cancelled_at=cancelled_at,
+        cancellation_reason=payload.cancellation_reason,
     )
     db.add(visit)
     db.commit()
@@ -121,7 +143,6 @@ def list_visits(
 def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: VisitUpdate) -> Visit:
     visit = get_visit(db, org_id, visit_id, user)
 
-    valid_statuses = {"planned", "completed", "cancelled"}
     data = payload.model_dump(exclude_unset=True)
 
     # Ensure at least one of customer_id or lead_id remains
@@ -146,13 +167,39 @@ def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: V
         if sales is None or sales.organization_id != org_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id")
 
+    if "outcome" in data and data["outcome"] is not None and data["outcome"] not in VISIT_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid outcome '{data['outcome']}'. Valid outcomes: {sorted(VISIT_OUTCOMES)}",
+        )
+
     if "status" in data and data["status"]:
         new_status = data["status"]
-        if new_status not in valid_statuses:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status '{new_status}'. Valid statuses: {sorted(valid_statuses)}",
-            )
+        try:
+            validate_visit_transition(visit.status, new_status)
+        except VisitTransitionError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)
+
+        now = _now()
+        # Each timestamp is set only the first time its transition happens
+        # and never overwritten afterwards — matches the same
+        # set-only-if-null rule complete_follow_up already uses for
+        # FollowUp.completed_at.
+        if new_status == "in_progress" and visit.checked_in_at is None:
+            visit.checked_in_at = now
+        elif new_status == "completed":
+            # Reachable directly from "planned" (skipping check-in) for
+            # backward compatibility -- see TEST 4 in
+            # test_division4_visit_followup.py, which has always completed
+            # a "planned" visit directly. checked_in_at is deliberately left
+            # untouched in that case rather than backfilled with a fake time.
+            if visit.checked_out_at is None:
+                visit.checked_out_at = now
+            if visit.completed_at is None:
+                visit.completed_at = now
+        elif new_status == "cancelled" and visit.cancelled_at is None:
+            visit.cancelled_at = now
+
         visit.status = new_status
 
     for k, v in data.items():
