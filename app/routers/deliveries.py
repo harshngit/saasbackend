@@ -11,6 +11,7 @@ from app.core import scoping, workflow
 from app.models.enums import UserRole
 from app.models import (
     Customer,
+    Invoice,
     Product,
     ProductVariant,
     SalesOrder,
@@ -23,7 +24,7 @@ from app.models import (
     DeliveryHistory,
     DeliveryItem,
 )
-from app.services import delivery_service, notification_service, numbering_service
+from app.services import delivery_service, notification_service, numbering_service, payment_service
 from app.schemas.delivery import (
     DeliveryCollectionCreate,
     DeliveryCollectionOut,
@@ -1012,6 +1013,54 @@ def reconcile_delivery_collection(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot reconcile collection in state '{coll.reconciliation_status}'. Only 'recorded' collections can be reconciled.",
         )
+
+    # Accounting handoff: create exactly ONE CustomerPayment using existing payment_service
+    if not coll.customer_payment_id:
+        customer = db.get(Customer, coll.customer_id) if coll.customer_id else None
+        
+        # Look for an invoice raised for this sales order
+        invoice = None
+        if coll.sales_order_id:
+            invoice = (
+                db.query(Invoice)
+                .filter(
+                    Invoice.order_id == coll.sales_order_id,
+                    Invoice.organization_id == org_id,
+                )
+                .first()
+            )
+
+        # Apply payment via existing payment service (reusing accounting calculations)
+        try:
+            inv_to_use = invoice if (invoice and payment_service.outstanding(invoice) >= coll.amount) else None
+            payment = payment_service.record(
+                db,
+                org_id,
+                customer=customer,
+                invoice=inv_to_use,
+                amount=coll.amount,
+                payment_mode=coll.payment_mode,
+                reference=coll.reference,
+                note=f"Reconciled Delivery Collection {coll.id}" + (f" ({coll.notes})" if coll.notes else ""),
+                order_id=coll.sales_order_id,
+                received_on=coll.collected_at or datetime.now(timezone.utc),
+            )
+            coll.customer_payment_id = payment.id
+        except ValueError:
+            # Fallback to customer advance / on-account payment if invoice check fails
+            payment = payment_service.record(
+                db,
+                org_id,
+                customer=customer,
+                invoice=None,
+                amount=coll.amount,
+                payment_mode=coll.payment_mode,
+                reference=coll.reference,
+                note=f"Reconciled Delivery Collection {coll.id}" + (f" ({coll.notes})" if coll.notes else ""),
+                order_id=coll.sales_order_id,
+                received_on=coll.collected_at or datetime.now(timezone.utc),
+            )
+            coll.customer_payment_id = payment.id
 
     coll.reconciliation_status = "reconciled"
     coll.reconciled_at = datetime.now(timezone.utc)

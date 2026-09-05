@@ -521,6 +521,7 @@ def cancel_order(
 
 
 @router.post("/{order_id}/pickup/pick", response_model=OrderOut)
+@router.post("/{order_id}/pickup/start", response_model=OrderOut)
 def pick_order_for_pickup(
     order_id: str,
     user: User = Depends(_edit),

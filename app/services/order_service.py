@@ -344,8 +344,8 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
                 detail={"error": "INSUFFICIENT_STOCK", "shortages": short}
             )
 
-    # Reserve
-    if settings["reserve_stock_on_order"]:
+    # Reserve required warehouse stock for every confirmed normal Sales Order
+    if order.warehouse_id:
         for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
             item = db.get(SalesOrderItem, reservation.order_item_id)
             if item is not None:

@@ -343,6 +343,120 @@ def test_7_accountant_void_flow():
     assert_eq(bad_rec.status_code, 400, "Cannot reconcile a voided collection")
 
 
+def test_8_stock_reservation_rules():
+    print("\n--- TEST 8: Stock Reservation Rules & Shortage Handling ---")
+    auth, wh_id, prod_id, cust_id, dp_data, dp_auth, acc_data, acc_auth = _setup_org("stock_res_test")
+
+    # 1. Draft has zero reservation
+    so = client.post("/orders", json={
+        "customer_id": cust_id,
+        "warehouse_id": wh_id,
+        "create_as_draft": True,
+        "items": [{"product_id": prod_id, "quantity": 10}],
+    }, headers=auth).json()
+    assert_eq(so["status"], "draft", "Order starts as draft")
+    assert_eq(so["fulfilment_status"], "not_started", "Draft has zero stock reservation")
+    assert_eq(so["items"][0].get("reserved_quantity", 0), 0, "Draft item reserved_quantity is 0")
+
+    # 2. Confirm creates reservation
+    so_confirmed = client.post(f"/orders/{so['id']}/confirm", headers=auth).json()
+    assert_eq(so_confirmed["status"], "confirmed", "Order status is confirmed")
+    assert_eq(so_confirmed["fulfilment_status"], "reserved", "Order fulfilment_status is reserved")
+    assert_eq(so_confirmed["items"][0]["reserved_quantity"], 10.0, "Reserved quantity set to 10.0")
+
+    # 3. Insufficient stock leaves Draft unchanged with zero partial reservation
+    so_huge = client.post("/orders", json={
+        "customer_id": cust_id,
+        "warehouse_id": wh_id,
+        "create_as_draft": True,
+        "items": [{"product_id": prod_id, "quantity": 999999}],
+    }, headers=auth).json()
+    assert_eq(so_huge["status"], "draft", "Huge order starts as draft")
+
+    fail_res = client.post(f"/orders/{so_huge['id']}/confirm", headers=auth)
+    assert_eq(fail_res.status_code, 400, "Insufficient stock confirmation fails with 400")
+    err = fail_res.json()["detail"]
+    assert_eq(err["error"], "INSUFFICIENT_STOCK", "Error details report INSUFFICIENT_STOCK")
+
+    so_huge_check = client.get(f"/orders/{so_huge['id']}", headers=auth).json()
+    assert_eq(so_huge_check["status"], "draft", "Order remains draft on confirmation failure")
+    assert_eq(so_huge_check["fulfilment_status"], "not_started", "Zero partial reservation on failure")
+
+
+def test_9_public_order_status_and_pickup_progress():
+    print("\n--- TEST 9: Public Order Status & Pickup Progress ---")
+    auth, wh_id, prod_id, cust_id, dp_data, dp_auth, acc_data, acc_auth = _setup_org("pickup_pub_status")
+
+    so = client.post("/orders", json={
+        "customer_id": cust_id,
+        "warehouse_id": wh_id,
+        "items": [{"product_id": prod_id, "quantity": 2}],
+    }, headers=auth).json()
+    so_confirmed = client.post(f"/orders/{so['id']}/confirm", headers=auth).json()
+    assert_eq(so_confirmed["status"], "confirmed", "Confirmed order public status is confirmed")
+
+    # Start pickup via canonical route /pickup/start
+    pick_start = client.post(f"/orders/{so['id']}/pickup/start", headers=auth).json()
+    assert_eq(pick_start["status"], "confirmed", "Pickup start exposes status: confirmed (never processing)")
+    assert_eq(pick_start["pickup_status"], "picking", "Pickup status is picking")
+
+    # Start pickup via route alias /pickup/pick
+    pick_alias = client.post(f"/orders/{so['id']}/pickup/pick", headers=auth).json()
+    assert_eq(pick_alias["status"], "confirmed", "Pickup pick alias exposes status: confirmed")
+
+    # Ready for pickup
+    ready_res = client.post(f"/orders/{so['id']}/pickup/ready", headers=auth).json()
+    assert_eq(ready_res["status"], "confirmed", "Pickup ready exposes status: confirmed")
+    assert_eq(ready_res["pickup_status"], "ready", "Pickup status is ready")
+
+    # Confirm pickup
+    confirm_pickup = client.post(f"/orders/{so['id']}/pickup/confirm", headers=auth).json()
+    assert_eq(confirm_pickup["status"], "completed", "Confirmed pickup exposes status: completed")
+    assert_eq(confirm_pickup["pickup_status"], "collected", "Pickup status is collected")
+    assert_eq(confirm_pickup["fulfilment_status"], "delivered", "Fulfilment status is delivered")
+
+
+def test_10_reconciliation_accounting_handoff_and_idempotency():
+    print("\n--- TEST 10: Reconciliation Accounting Handoff & Idempotency ---")
+    auth, wh_id, prod_id, cust_id, dp_data, dp_auth, acc_data, acc_auth = _setup_org("reconcile_handoff")
+
+    so = client.post("/orders", json={
+        "customer_id": cust_id,
+        "warehouse_id": wh_id,
+        "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 500.0, "tax_rate": 0.0}],
+    }, headers=auth).json()
+    client.post(f"/orders/{so['id']}/confirm", headers=auth)
+
+    deliv = client.post("/deliveries", json={"order_id": so["id"], "delivery_partner_id": dp_data["id"]}, headers=auth).json()
+    coll = client.post(f"/deliveries/{deliv['id']}/collections", json={"amount": 1000.0, "payment_mode": "cash"}, headers=dp_auth).json()
+
+    assert_eq(coll["customer_payment_id"], None, "Before reconciliation, customer_payment_id is None")
+    assert_eq(coll["reconciliation_status"], "recorded", "Status is recorded")
+
+    # Accountant reconciles
+    acc_rec = client.post(f"/deliveries/collections/{coll['id']}/reconcile", headers=acc_auth)
+    assert_eq(acc_rec.status_code, 200, "Accountant reconciles collection")
+    rec_data = acc_rec.json()
+    assert_eq(rec_data["reconciliation_status"], "reconciled", "Status is reconciled")
+    pmt_id = rec_data["customer_payment_id"]
+    assert pmt_id is not None, "customer_payment_id is set to newly created CustomerPayment"
+
+    # Verify CustomerPayment receipt in DB / API
+    pmt_res = client.get(f"/payment-receipts/{pmt_id}", headers=acc_auth)
+    assert_eq(pmt_res.status_code, 200, "Linked CustomerPayment receipt exists")
+    pmt_json = pmt_res.json()
+    assert_eq(pmt_json["amount_received"], 1000.0, "Payment receipt amount matches collection")
+
+    # Calling reconcile a second time -> 400 Bad Request and 0 duplicate payments
+    dup_rec = client.post(f"/deliveries/collections/{coll['id']}/reconcile", headers=acc_auth)
+    assert_eq(dup_rec.status_code, 400, "Duplicate reconcile returns 400 Bad Request")
+    assert_eq(rec_data["customer_payment_id"], pmt_id, "customer_payment_id remains unchanged")
+
+    # Reconciled collection cannot be voided -> 400 Bad Request
+    void_attempt = client.post(f"/deliveries/collections/{coll['id']}/void", headers=acc_auth)
+    assert_eq(void_attempt.status_code, 400, "Reconciled collection cannot be voided")
+
+
 def run_all_tests():
     print("\n=======================================================")
     print("TEST SUITE: Targeted Backend Implementation (Final Two Gaps)")
@@ -354,6 +468,9 @@ def run_all_tests():
     test_5_cross_tenant_collection_blocked()
     test_6_accountant_reconciliation_flow()
     test_7_accountant_void_flow()
+    test_8_stock_reservation_rules()
+    test_9_public_order_status_and_pickup_progress()
+    test_10_reconciliation_accounting_handoff_and_idempotency()
 
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")
@@ -364,3 +481,4 @@ def run_all_tests():
 
 if __name__ == "__main__":
     run_all_tests()
+

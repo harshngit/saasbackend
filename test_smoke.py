@@ -3544,28 +3544,19 @@ def _phase0_checks():
           client.post(f"/orders/{_second['id']}/confirm", headers=ah).status_code == 400)
     client.patch(f"/orders/{held['id']}/cancel", headers=ah, json={"reason": "done"})
 
-    print("\n== 6. Approval mode, for a firm that wants it ==")
+    print("\n== 6. Approval mode setting inactive in normal workflow ==")
     client.patch("/sales-workflow-settings", headers=ah, json={"order_requires_approval": True})
     r = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]})
     appr = r.json()
-    check("new order still starts as Draft even with approval mode on", appr["status"] == "draft", appr["status"])
+    check("new order still starts as Draft even with approval setting on", appr["status"] == "draft", appr["status"])
     r = client.post(f"/orders/{appr['id']}/confirm", headers=ah)
     appr = r.json()
-    check("confirming with approval on moves the order to awaiting approval",
-          # Public Order status contract: internal 'awaiting_approval' -> public 'confirmed'.
+    check("confirming produces operational confirmed order",
           appr["status"] == "confirmed", appr["status"])
-    check("its stock is now held while it waits", appr["fulfilment_status"] == "reserved", appr)
-    r = client.patch(f"/orders/{appr['id']}/approve", headers=ah)
-    check("approve -> confirmed, and still no stock movement",
-          r.json()["status"] == "confirmed"
-          and client.get(f"/inventory/{prod['id']}", headers=ah).json()["total_stock"] == 120, r.text[:200])
-    r2 = client.post("/orders", headers=ah, json={
-        "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]}).json()
-    client.post(f"/orders/{r2['id']}/confirm", headers=ah)
-    r = client.patch(f"/orders/{r2['id']}/reject", headers=ah, json={"reason": "no"})
-    check("reject -> cancelled and the hold released",
-          r.json()["status"] == "cancelled" and r.json()["fulfilment_status"] == "not_started", r.text[:200])
+    check("its stock is reserved immediately", appr["fulfilment_status"] == "reserved", appr)
+    check("approving already-confirmed order returns 400",
+          client.patch(f"/orders/{appr['id']}/approve", headers=ah).status_code == 400)
     client.patch("/sales-workflow-settings", headers=ah, json={"order_requires_approval": False})
     client.patch(f"/orders/{appr['id']}/cancel", headers=ah, json={"reason": "tidy up"})
 
@@ -5471,15 +5462,10 @@ order_b_approval = client.post("/orders", headers=so_b_hdr, json={
     "items": [{"product_id": sec_prod["id"], "quantity": 1}]
 }).json()
 order_b_approval = client.post(f"/orders/{order_b_approval['id']}/confirm", headers=so_b_hdr).json()
-# Public Order status contract: internal 'awaiting_approval' -> public 'confirmed'.
-check("Order confirmed into awaiting approval", order_b_approval["status"] == "confirmed")
-check("TEST 9: SO A without approve permission cannot approve -> 403",
-      client.patch(f"/orders/{order_b_approval['id']}/approve", headers=so_a_hdr).status_code == 403)
-check("TEST 9: SO A without approve permission cannot reject -> 403",
-      client.patch(f"/orders/{order_b_approval['id']}/reject", headers=so_a_hdr, json={"reason": "No"}).status_code == 403)
-# Admin approves successfully
-check("Admin approves order awaiting approval -> 200",
-      client.patch(f"/orders/{order_b_approval['id']}/approve", headers=sec_admin_hdr).status_code == 200)
+# Order is confirmed into operational confirmed state without approval steps
+check("Order confirmed into operational state", order_b_approval["status"] == "confirmed")
+check("TEST 9: Approving an already-confirmed order returns 400",
+      client.patch(f"/orders/{order_b_approval['id']}/approve", headers=sec_admin_hdr).status_code == 400)
 client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"order_requires_approval": False})
 
 # TEST 10: Invalid delivery partner (e.g. assigning Accountant or Sales Officer)
