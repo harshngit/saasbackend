@@ -96,14 +96,10 @@ def convert_to_order(
     fulfilment terms the order needs — warehouse, delivery date, fulfilment method,
     payment type and terms — come in the body.
 
-    The order is placed through exactly the same path as POST /orders: if the firm's
-    `draft_orders_enabled` is off, its stock is reserved and its status is `placed`
-    (or `awaiting_approval` if the firm asks for approval). If `draft_orders_enabled`
-    is on, the order lands as `draft` — no stock check, no reservation — until
-    POST /orders/{id}/confirm reserves it. The quotation becomes `converted` and is
-    frozen either way; converting twice, or converting concurrently, is refused —
-    exactly one Order is ever created for a given quotation, see
-    quotation_service.convert_to_order for the locking strategy.
+    The order is created as a draft through the same path as POST /orders: no
+    stock reservation occurs until POST /orders/{id}/confirm is called. The quotation
+    becomes `converted` and is frozen either way; converting twice, or converting
+    concurrently, is refused — exactly one Order is ever created for a given quotation.
 
     A shortage refuses the conversion with `INSUFFICIENT_STOCK` and leaves the
     quotation untouched — the same rule as placing an order by hand. A draft

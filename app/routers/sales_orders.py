@@ -141,8 +141,7 @@ def list_orders(
     user: User = Depends(_view),
     status_filter: str | None = Query(
         default=None, alias="status",
-        description="draft | placed | awaiting_approval | processing | completed | cancelled. "
-                    "Old values (pending, confirmed, out_for_delivery, …) still work.",
+        description="draft | confirmed | completed | cancelled. Filter orders by public status.",
     ),
     fulfilment_status: str | None = Query(
         default=None,
@@ -309,7 +308,7 @@ def confirm_order_endpoint(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> OrderOut:
-    """Confirm a draft order: perform stock checks, reserve and move to placed/awaiting_approval."""
+    """Confirm a draft order: perform stock checks, reserve stock and move status to confirmed."""
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id, user)
     order, warnings = order_service.confirm_order(db, user, order)

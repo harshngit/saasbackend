@@ -28,9 +28,8 @@ class SalesWorkflowSettings(BaseModel):
 
     order_requires_approval: bool = Field(
         default=False,
-        description="Off by default: an order is validated, reserved and placed on "
-                    "creation. Turn it on and orders land in awaiting_approval and the "
-                    "/approve and /reject routes apply — for that firm only.",
+        description="Legacy setting kept for schema backward compatibility. In the normal "
+                    "workflow, every confirmed order moves directly to confirmed.",
     )
     reserve_stock_on_order: bool = Field(
         default=True,

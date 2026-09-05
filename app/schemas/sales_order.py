@@ -90,9 +90,8 @@ class OrderOut(BaseModel):
     customer_id: str | None
     customer: CustomerBrief | None
     status: str = Field(
-        description="Client-facing Order status: draft | confirmed | completed | cancelled. "
-                    "(Internally the order may be draft/awaiting_approval/placed/processing/"
-                    "completed/cancelled — see app.core.workflow.public_order_status.)")
+        description="Client-facing Order status: draft | confirmed | completed | cancelled."
+    )
     fulfilment_status: str = Field(
         default="not_started",
         description="not_started | reserved | planned | loaded | in_transit | "

@@ -9,11 +9,10 @@ The flow, and what it deliberately does not do:
     validate customer, products, warehouse
       → check available stock (unless the firm allows backorders)
       → create the order and its items, each snapshotting its own tax rate
-      → reserve the stock
-      → status = placed (or awaiting_approval, if the firm asks for approval)
+      → status = draft (created) -> confirmed (on POST /orders/{id}/confirm)
 
 No warehouse deduction: on-hand only moves when a vehicle is loaded. No receivable:
-that starts at the invoice. No Admin approval unless the firm turned it on.
+that starts at the invoice.
 """
 
 from datetime import datetime, timezone

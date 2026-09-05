@@ -174,13 +174,42 @@ def test_1_order_approval_removal():
         "items": [{"product_id": prod_b, "quantity": 5}],
     }, headers=auth_b)
     order_b = create_res_b.json()
-
     confirm_res_b = client.post(f"/orders/{order_b['id']}/confirm", headers=auth_b)
     assert_eq(confirm_res_b.status_code, 200, "Draft order confirmed (B)")
     confirmed_b = confirm_res_b.json()
     assert_eq(confirmed_b["status"], "confirmed", "Confirmed order public status is confirmed with order_requires_approval=False")
 
     assert_eq(confirmed_a["status"], confirmed_b["status"], "Both setting values result in same operational confirmed behavior")
+
+    # Case C: Historical awaiting_approval DB row safely maps to "confirmed" at API boundary
+    db = SessionLocal()
+    try:
+        hist_order = SalesOrder(
+            organization_id=order_a["organization_id"],
+            order_number=f"SO-HIST-{uuid.uuid4().hex[:6]}",
+            customer_id=cust_a,
+            status="awaiting_approval",
+            fulfilment_status="not_started",
+            total=500.0,
+        )
+        db.add(hist_order)
+        db.commit()
+        hist_id = hist_order.id
+    finally:
+        db.close()
+
+    hist_res = client.get(f"/orders/{hist_id}", headers=auth_a)
+    assert_eq(hist_res.status_code, 200, "Historical awaiting_approval order fetched successfully")
+    hist_json = hist_res.json()
+    assert_eq(hist_json["status"], "confirmed", "Historical awaiting_approval maps to public status 'confirmed'")
+
+    # Case D: Strict OrderOut.status set verification
+    valid_statuses = {"draft", "confirmed", "completed", "cancelled"}
+    assert hist_json["status"] in valid_statuses, f"Status {hist_json['status']} not in canonical set"
+    assert confirmed_a["status"] in valid_statuses, f"Status {confirmed_a['status']} not in canonical set"
+    assert order_a["status"] in valid_statuses, f"Status {order_a['status']} not in canonical set"
+    ok("OrderOut.status always strictly remains within {draft, confirmed, completed, cancelled}")
+
 
 
 def test_2_delivery_collection_recording_and_audit_trail():
