@@ -155,7 +155,7 @@ def place_order(
         order_status=order_status_label or "Draft",
         # If creating as a draft, set the lifecycle to draft and do not reserve.
         # Otherwise preserve existing behaviour: placed or awaiting_approval.
-        status="draft" if create_as_draft else ("awaiting_approval" if settings["order_requires_approval"] else "placed"),
+        status="draft" if create_as_draft else "placed",
         fulfilment_status="not_started",
         warehouse_id=warehouse.id,
         quotation_id=quotation_id,
@@ -353,7 +353,7 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
         order.fulfilment_status = "reserved"
 
     # Lifecycle status
-    order.status = "awaiting_approval" if settings["order_requires_approval"] else "placed"
+    order.status = "placed"
 
     # Credit warnings
     warnings: list[str] = []

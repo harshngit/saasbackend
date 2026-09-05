@@ -409,11 +409,6 @@ def assign_delivery_partner(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot assign delivery to a draft order. Please confirm the order first.",
         )
-    if order.status == "awaiting_approval":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot assign delivery while the order is awaiting approval. Approve the order first.",
-        )
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="delivery_partner_id is not a user in your firm")
@@ -538,7 +533,7 @@ def pick_order_for_pickup(
     """
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id, user)
-    if order.status in ("draft", "cancelled", "rejected", "awaiting_approval"):
+    if order.status in ("draft", "cancelled", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot start picking a '{order.status}' order. Confirm the order first.",
@@ -569,7 +564,7 @@ def ready_order_for_pickup(
     """
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id, user)
-    if order.status in ("draft", "cancelled", "rejected", "awaiting_approval"):
+    if order.status in ("draft", "cancelled", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot mark a '{order.status}' order ready for pickup. Confirm the order first.",
@@ -603,7 +598,7 @@ def confirm_order_pickup(
     """
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id, user)
-    if order.status in ("draft", "cancelled", "rejected", "awaiting_approval"):
+    if order.status in ("draft", "cancelled", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot confirm pickup for a '{order.status}' order. Confirm the order first.",

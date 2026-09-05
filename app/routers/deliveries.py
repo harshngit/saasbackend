@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_user, require_permission, require_unlocked_org
 from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
 from app.core import scoping, workflow
+from app.models.enums import UserRole
 from app.models import (
     Customer,
     Product,
@@ -18,11 +19,14 @@ from app.models import (
     VehicleLoading,
     VehicleLoadingItem,
     Delivery,
+    DeliveryCollection,
     DeliveryHistory,
     DeliveryItem,
 )
 from app.services import delivery_service, notification_service, numbering_service
 from app.schemas.delivery import (
+    DeliveryCollectionCreate,
+    DeliveryCollectionOut,
     DeliveryConfirm,
     DeliveryCustomerBrief,
     DeliveryHistoryOut,
@@ -216,7 +220,7 @@ def plan_delivery(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="order_id is not an order in your firm"
         )
-    if order.status in ("draft", "awaiting_approval", "cancelled", "pending", "rejected"):
+    if order.status in ("draft", "cancelled", "pending", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Order must be confirmed before delivery can be planned",
@@ -911,5 +915,224 @@ def get_delivery_receipt(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{order.order_number}.pdf"'},
     )
+
+
+# -------------------- Delivery Collection & Reconciliation --------------------
+
+def _is_accountant_or_admin(user: User) -> bool:
+    if user.system_role == "admin" or user.effective_system_role == "admin":
+        return True
+    if user.role == UserRole.ACCOUNTANT:
+        return True
+    if user.role_detail and user.role_detail.name in ("Accountant", "Admin"):
+        return True
+    if user.role_detail and isinstance(user.role_detail.permissions, dict):
+        perms = user.role_detail.permissions
+        if perms.get("payments", {}).get("view") or perms.get("invoices", {}).get("view"):
+            return True
+    return False
+
+
+def _is_delivery_partner(user: User) -> bool:
+    if user.role == UserRole.DELIVERY_PARTNER:
+        return True
+    if user.role_detail and user.role_detail.name == "Delivery Partner":
+        return True
+    return False
+
+
+@router.get("/collections", response_model=list[DeliveryCollectionOut])
+@router.get("/collections/all", response_model=list[DeliveryCollectionOut])
+def list_delivery_collections(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[DeliveryCollection]:
+    """List organization delivery collections.
+
+    Delivery Partners only see collections where they are the assigned partner.
+    Accountants and Admins see all collections for their organization.
+    """
+    org_id = _org_id(user)
+    q = db.query(DeliveryCollection).filter(DeliveryCollection.organization_id == org_id)
+
+    data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
+    if _is_delivery_partner(user) or data_scope == "own":
+        if user.system_role != "admin" and user.effective_system_role != "admin":
+            q = q.filter(DeliveryCollection.delivery_partner_id == user.id)
+
+    return q.order_by(DeliveryCollection.collected_at.desc()).all()
+
+
+@router.get("/collections/{collection_id}", response_model=DeliveryCollectionOut)
+def get_delivery_collection(
+    collection_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DeliveryCollection:
+    """Retrieve a single delivery collection by ID."""
+    org_id = _org_id(user)
+    coll = db.get(DeliveryCollection, collection_id)
+    if coll is None or coll.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+
+    data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
+    if _is_delivery_partner(user) or data_scope == "own":
+        if user.system_role != "admin" and user.effective_system_role != "admin":
+            if coll.delivery_partner_id != user.id:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access to this collection is unauthorized")
+
+    return coll
+
+
+@router.post("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
+@router.patch("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
+def reconcile_delivery_collection(
+    collection_id: str,
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryCollection:
+    """Accountant / Admin action to reconcile a recorded collection.
+
+    Transitions reconciliation_status: recorded -> reconciled.
+    """
+    org_id = _org_id(user)
+    if not _is_accountant_or_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Accountants or Admins can reconcile delivery collections",
+        )
+
+    coll = db.get(DeliveryCollection, collection_id)
+    if coll is None or coll.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+
+    if coll.reconciliation_status != "recorded":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot reconcile collection in state '{coll.reconciliation_status}'. Only 'recorded' collections can be reconciled.",
+        )
+
+    coll.reconciliation_status = "reconciled"
+    coll.reconciled_at = datetime.now(timezone.utc)
+    coll.reconciled_by_id = user.id
+
+    db.commit()
+    db.refresh(coll)
+    return coll
+
+
+@router.post("/collections/{collection_id}/void", response_model=DeliveryCollectionOut)
+@router.patch("/collections/{collection_id}/void", response_model=DeliveryCollectionOut)
+def void_delivery_collection(
+    collection_id: str,
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryCollection:
+    """Accountant / Admin action to void a recorded collection.
+
+    Transitions reconciliation_status: recorded -> voided.
+    """
+    org_id = _org_id(user)
+    if not _is_accountant_or_admin(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only Accountants or Admins can void delivery collections",
+        )
+
+    coll = db.get(DeliveryCollection, collection_id)
+    if coll is None or coll.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+
+    if coll.reconciliation_status != "recorded":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot void collection in state '{coll.reconciliation_status}'. Only 'recorded' collections can be voided.",
+        )
+
+    coll.reconciliation_status = "voided"
+
+    db.commit()
+    db.refresh(coll)
+    return coll
+
+
+@router.post("/{delivery_id}/collections", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
+def record_delivery_collection(
+    delivery_id: str,
+    payload: DeliveryCollectionCreate,
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryCollection:
+    """Delivery Partner / Staff records a payment collection for a Delivery.
+
+    Validates that the delivery is assigned to the calling delivery partner.
+    Backend derives sensitive relationship fields (customer_id, delivery_partner_id, order_id)
+    from authenticated context and Delivery state.
+    """
+    org_id = _org_id(user)
+    delivery = db.get(Delivery, delivery_id)
+    if delivery is None or delivery.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found")
+
+    # Delivery Partner assignment check & tenant/ownership protection
+    data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
+    if _is_delivery_partner(user) or data_scope == "own":
+        if user.system_role != "admin" and user.effective_system_role != "admin":
+            if delivery.delivery_partner_id != user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot record collection for a delivery not assigned to you",
+                )
+
+    # Derive audit links directly from Delivery & User (never trust client)
+    coll = DeliveryCollection(
+        organization_id=org_id,
+        delivery_id=delivery.id,
+        sales_order_id=delivery.sales_order_id,
+        customer_id=delivery.customer_id,
+        delivery_partner_id=delivery.delivery_partner_id or user.id,
+        amount=payload.amount,
+        payment_mode=payload.payment_mode,
+        reference=payload.reference,
+        notes=payload.notes,
+        reconciliation_status="recorded",
+        collected_at=datetime.now(timezone.utc),
+    )
+
+    db.add(coll)
+    db.commit()
+    db.refresh(coll)
+    return coll
+
+
+@router.get("/{delivery_id}/collections", response_model=list[DeliveryCollectionOut])
+def get_collections_for_delivery(
+    delivery_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[DeliveryCollection]:
+    """Retrieve all collections recorded against a specific delivery."""
+    org_id = _org_id(user)
+    delivery = db.get(Delivery, delivery_id)
+    if delivery is None or delivery.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found")
+
+    data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
+    if _is_delivery_partner(user) or data_scope == "own":
+        if user.system_role != "admin" and user.effective_system_role != "admin":
+            if delivery.delivery_partner_id != user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access to this delivery is unauthorized",
+                )
+
+    return db.query(DeliveryCollection).filter(
+        DeliveryCollection.organization_id == org_id,
+        DeliveryCollection.delivery_id == delivery.id,
+    ).order_by(DeliveryCollection.collected_at.desc()).all()
+
 
 

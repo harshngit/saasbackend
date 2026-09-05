@@ -75,6 +75,9 @@ class Delivery(Base):
     items: Mapped[list["DeliveryItem"]] = relationship(
         back_populates="delivery", cascade="all, delete-orphan", lazy="joined"
     )
+    collections: Mapped[list["DeliveryCollection"]] = relationship(
+        back_populates="delivery", cascade="all, delete-orphan", lazy="selectin"
+    )
 
     @property
     def delivery_number(self) -> str:
@@ -193,3 +196,69 @@ class DeliveryHistory(Base):
     # both an N+1 load on the timeline and the loss of the actor's name once
     # a user is deleted (ON DELETE SET NULL would otherwise take actor_id
     # with it).
+
+
+class DeliveryCollection(Base):
+    """A collection recorded by a Delivery Partner against a Delivery.
+
+    Audit trail: Delivery -> Collection -> Delivery Partner -> Customer -> Order -> Reconciliation
+    """
+
+    __tablename__ = "delivery_collections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    delivery_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("deliveries.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sales_order_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("sales_orders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    customer_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    delivery_partner_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    payment_mode: Mapped[str] = mapped_column(String(30), default="cash", nullable=False)
+    reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    # recorded | reconciled | voided
+    reconciliation_status: Mapped[str] = mapped_column(String(30), default="recorded", nullable=False, index=True)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciled_by_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    customer_payment_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("customer_payments.id", ondelete="SET NULL"), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    delivery: Mapped["Delivery"] = relationship(back_populates="collections")
+    sales_order: Mapped["SalesOrder | None"] = relationship(
+        lazy="joined", primaryjoin="DeliveryCollection.sales_order_id == SalesOrder.id"
+    )
+    customer: Mapped["Customer | None"] = relationship(
+        lazy="joined", primaryjoin="DeliveryCollection.customer_id == Customer.id"
+    )
+    delivery_partner: Mapped["User | None"] = relationship(
+        lazy="joined", foreign_keys=[delivery_partner_id]
+    )
+    reconciled_by: Mapped["User | None"] = relationship(
+        lazy="joined", foreign_keys=[reconciled_by_id]
+    )
+
+    @property
+    def order_id(self) -> str | None:
+        """Alias for sales_order_id to match API conventions."""
+        return self.sales_order_id
+

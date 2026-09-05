@@ -381,3 +381,34 @@ class DeliveryConfirm(BaseModel):
         if not self.failed and not self.items:
             raise ValueError("Send the delivered quantities, or set failed with a reason")
         return self
+
+
+class DeliveryCollectionCreate(BaseModel):
+    amount: float = Field(gt=0, description="Collection amount")
+    payment_mode: str = Field(default="cash", description="cash | upi | cheque | bank_transfer | card | object")
+    reference: str | None = Field(default=None, max_length=150)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class DeliveryCollectionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    organization_id: str
+    delivery_id: str
+    order_id: str | None = None
+    sales_order_id: str | None = None
+    customer_id: str | None = None
+    delivery_partner_id: str | None = None
+    amount: float
+    payment_mode: str
+    reference: str | None = None
+    notes: str | None = None
+    collected_at: datetime
+    reconciliation_status: str = Field(description="recorded | reconciled | voided")
+    reconciled_at: datetime | None = None
+    reconciled_by_id: str | None = None
+    customer_payment_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+

@@ -57,7 +57,7 @@ from app.models.warehouse import (
 )
 from app.models.lead import Lead, LeadInterestedProduct
 from app.models.quotation import Quotation, QuotationItem
-from app.models.delivery import Delivery, DeliveryHistory, DeliveryItem
+from app.models.delivery import Delivery, DeliveryCollection, DeliveryHistory, DeliveryItem
 from app.models.sales_return import SalesReturn, ReturnItem
 from app.models.visit import Visit
 from app.models.follow_up import FollowUp
@@ -138,6 +138,7 @@ __all__ = [
     "Quotation",
     "QuotationItem",
     "Delivery",
+    "DeliveryCollection",
     "DeliveryItem",
     "DeliveryHistory",
     "SalesReturn",
