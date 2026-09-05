@@ -373,9 +373,10 @@ def convert_to_order(
         quotation_id=quotation.id,
         source="quotation",
         notes=quotation.notes,
-        # Same shared path POST /orders uses: a draft-enabled firm gets an
-        # unreserved draft here too, confirmed later via POST /orders/{id}/confirm.
-        create_as_draft=settings["draft_orders_enabled"],
+        # Same shared path POST /orders uses: every Order always starts as an
+        # unreserved Draft, confirmed later via POST /orders/{id}/confirm --
+        # draft_orders_enabled no longer gates this (finalized business rule).
+        create_as_draft=True,
         billing_address=resolved_billing,
         shipping_address=resolved_shipping,
         delivery_address=resolved_shipping,

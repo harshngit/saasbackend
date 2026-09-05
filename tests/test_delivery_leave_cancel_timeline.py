@@ -117,7 +117,12 @@ def _place_order(ctx: dict, qty: int = 10):
         headers=ctx["admin_auth"],
     )
     assert order.status_code == 201, order.text
-    return order.json()
+    # Every order now starts as an unreserved Draft (finalized business rule)
+    # -- confirm it so callers get the same "ready to plan a delivery for"
+    # order this helper always returned before that change.
+    confirmed = client.post(f"/orders/{order.json()['id']}/confirm", headers=ctx["admin_auth"])
+    assert confirmed.status_code == 200, confirmed.text
+    return confirmed.json()
 
 
 def _pick_and_ready(dlv: dict, admin_auth: dict):

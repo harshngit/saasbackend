@@ -144,6 +144,9 @@ def test_part_a_order_delivery_invoice_references():
     assert_eq(so_res.status_code, 201, "Sales order created")
     so = so_res.json()
     so_id = so["id"]
+    # Every order now starts as an unreserved Draft (finalized business rule)
+    # -- confirm it before planning a Delivery for it.
+    so = client.post(f"/orders/{so_id}/confirm", headers=auth).json()
     so_item_id = so["items"][0]["id"]
 
     # Initial state: no delivery or invoice exists
@@ -206,7 +209,8 @@ def test_part_b_delivery_previous_pending_balance():
         "items": [{"product_id": prod_id, "quantity": 10, "unit_price": 100.0, "tax_rate": 18.0}],
     }, headers=auth)
     so1_id = so1_res.json()["id"]
-    so1_item_id = so1_res.json()["items"][0]["id"]
+    so1_confirmed = client.post(f"/orders/{so1_id}/confirm", headers=auth).json()
+    so1_item_id = so1_confirmed["items"][0]["id"]
 
     deliv1_res = client.post("/deliveries", json={
         "order_id": so1_id,
@@ -231,7 +235,8 @@ def test_part_b_delivery_previous_pending_balance():
         "items": [{"product_id": prod_id, "quantity": 5, "unit_price": 100.0, "tax_rate": 18.0}],
     }, headers=auth)
     so2_id = so2_res.json()["id"]
-    so2_item_id = so2_res.json()["items"][0]["id"]
+    so2_confirmed = client.post(f"/orders/{so2_id}/confirm", headers=auth).json()
+    so2_item_id = so2_confirmed["items"][0]["id"]
 
     deliv2_res = client.post("/deliveries", json={
         "order_id": so2_id,
@@ -289,7 +294,8 @@ def test_part_b_delivery_previous_pending_balance():
         "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 100.0, "tax_rate": 18.0}],
     }, headers=auth)
     so_open_id = so_open_res.json()["id"]
-    so_open_item_id = so_open_res.json()["items"][0]["id"]
+    so_open_confirmed = client.post(f"/orders/{so_open_id}/confirm", headers=auth).json()
+    so_open_item_id = so_open_confirmed["items"][0]["id"]
 
     deliv_open_res = client.post("/deliveries", json={
         "order_id": so_open_id,
@@ -308,6 +314,7 @@ def test_part_b_delivery_previous_pending_balance():
         "warehouse_id": wh2_id,
         "items": [{"product_id": prod2_id, "quantity": 1, "unit_price": 100.0, "tax_rate": 18.0}],
     }, headers=auth_org2).json()
+    so_org2 = client.post(f"/orders/{so_org2['id']}/confirm", headers=auth_org2).json()
     deliv_org2 = client.post("/deliveries", json={
         "order_id": so_org2["id"],
         "warehouse_id": wh2_id,

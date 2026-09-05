@@ -716,11 +716,14 @@ ntr = client.post("/auth/register", json={
     "organization_name": "Notif Co", "admin_name": "N", "email": nt_email, "password": "Secret@123"}).json()
 nt_hdr = {"Authorization": f"Bearer {ntr['tokens']['access_token']}"}
 
-# order creation notifies the admin
+# order confirmation notifies the admin (creation itself is now always a
+# Draft with no stock committed yet -- notification-worthy only once the
+# order is genuinely confirmed, see order_service.place_order/confirm_order).
 ncust = client.post("/customers", headers=nt_hdr, json={"name": "C"}).json()
 nprod = client.post("/products", headers=nt_hdr, json={"name": "P", "pricing": {"purchase_price": 50, "selling_price": 100}, "total_inventory": 50}).json()
-client.post("/orders", headers=nt_hdr, json={"customer_id": ncust["id"], "items": [{"product_id": nprod["id"], "quantity": 2, "unit_price": 100}]})
-check("unread-count after order = 1", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 1)
+n_order = client.post("/orders", headers=nt_hdr, json={"customer_id": ncust["id"], "items": [{"product_id": nprod["id"], "quantity": 2, "unit_price": 100}]}).json()
+client.post(f"/orders/{n_order['id']}/confirm", headers=nt_hdr)
+check("unread-count after order confirm = 1", client.get("/notifications/unread-count", headers=nt_hdr).json()["unread"] == 1)
 notes = client.get("/notifications", headers=nt_hdr).json()
 check("notifications list has the order note", len(notes) == 1 and notes[0]["type"] == "order", notes)
 nid = notes[0]["id"]
@@ -768,7 +771,7 @@ rep_hdr = {"Authorization": f"Bearer {rpr['tokens']['access_token']}"}
 rc = client.post("/customers", headers=rep_hdr, json={"name": "Hotel X"}).json()
 rp = client.post("/products", headers=rep_hdr, json={"name": "Item", "pricing": {"purchase_price": 50, "selling_price": 200}, "total_inventory": 100}).json()
 ro = client.post("/orders", headers=rep_hdr, json={"customer_id": rc["id"], "tax": 90, "items": [{"product_id": rp["id"], "quantity": 5, "unit_price": 200}]}).json()
-client.patch(f"/orders/{ro['id']}/approve", headers=rep_hdr)
+client.post(f"/orders/{ro['id']}/confirm", headers=rep_hdr)
 client.post(f"/customers/{rc['id']}/payments", headers=rep_hdr, json={"amount": 400, "payment_mode": "cash"})
 client.post("/expenses", headers=rep_hdr, json={"category": "Rent", "amount": 300})
 rs = client.post("/suppliers", headers=rep_hdr, json={"name": "Sup"}).json()
@@ -871,6 +874,7 @@ o = client.post("/orders", headers=fin_hdr, json={"customer_id": fcust["id"], "i
 check("placing an order does not bill the customer",
       client.get(f"/customers/{fcust['id']}", headers=fin_hdr)
       .json()["financial_summary"]["outstanding_balance"] == 500)
+o = client.post(f"/orders/{o['id']}/confirm", headers=fin_hdr).json()
 client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
 _s_db = SessionLocal()
 _o_db = _s_db.get(SalesOrder, o["id"])
@@ -909,20 +913,25 @@ check("create order -> 201", r.status_code == 201, r.text)
 order = r.json()
 order_id = order["id"]
 check("order_number generated", order["order_number"].startswith("SO-"), order)
-check("order is placed on creation, no approval step", order["status"] == "placed", order)
+check("order starts as an unreserved Draft", order["status"] == "draft" and order["fulfilment_status"] == "not_started", order)
+check("line_total = 10*500-100 = 4900", order["items"][0]["line_total"] == 4900, order)
+check("order total = 4900-50+20 = 4870", order["total"] == 4870, order)
+check("physical stock is untouched (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+
+# Confirm the Draft: stock is validated + reserved here, not at creation.
+order = client.post(f"/orders/{order_id}/confirm", headers=so_hdr).json()
+check("confirming places the order, no approval step", order["status"] == "confirmed", order)
 check("its stock is reserved, not deducted", order["fulfilment_status"] == "reserved", order)
 check("the line reports what is held for it", order["items"][0]["reserved_quantity"] == 10, order["items"][0])
 check("the order names the warehouse it reserved from", order["warehouse_id"], order)
 check("stock_summary shows on hand / reserved / available",
       order["stock_summary"][0]["on_hand"] == 100 and order["stock_summary"][0]["reserved"] == 10
       and order["stock_summary"][0]["available"] == 90, order["stock_summary"])
-check("line_total = 10*500-100 = 4900", order["items"][0]["line_total"] == 4900, order)
-check("order total = 4900-50+20 = 4870", order["total"] == 4870, order)
-check("physical stock is untouched (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
+check("physical stock is still untouched (still 100)", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
 
 # With approval off — the default — an order never passes through /approve.
 r = client.patch(f"/orders/{order_id}/approve", headers=so_hdr)
-check("approving an already-placed order -> 400", r.status_code == 400, r.text[:200])
+check("approving an already-confirmed order -> 400", r.status_code == 400, r.text[:200])
 check("physical stock still untouched by that", client.get(f"/inventory/{prod['id']}", headers=so_hdr).json()["total_stock"] == 100)
 
 # assign delivery partner
@@ -959,25 +968,33 @@ client.patch(f"/orders/{oid2}/cancel", headers=so_hdr, json={"reason": "out of a
 check("list orders by status=cancelled", any(o["id"] == order_id for o in client.get("/orders", headers=so_hdr, params={"status": "cancelled"}).json()))
 o_other = client.post("/auth/register", json={"organization_name": "O2", "admin_name": "X", "email": f"o2_{uuid.uuid4().hex[:6]}@f.com", "password": "Secret@123"}).json()
 check("cross-org order get -> 404", client.get(f"/orders/{order_id}", headers={"Authorization": f"Bearer {o_other['tokens']['access_token']}"}).status_code == 404)
-# A shortage is caught when the order is placed, not later at approval, and the
-# response names exactly what is short.
+# Every order now always starts as an unreserved Draft (finalized business
+# rule) -- a shortage is no longer caught at creation, only at confirmation,
+# and the response names exactly what is short.
 r = client.post("/orders", headers=so_hdr, json={
     "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 99999}]})
-check("placing an order beyond available stock -> 400", r.status_code == 400, r.text[:200])
+check("placing an order beyond available stock still creates a Draft (201)", r.status_code == 201, r.text[:200])
+check("Draft order status is 'draft'", r.json()["status"] == "draft", r.text[:200])
+_oversized_order_id = r.json()["id"]
+r = client.post(f"/orders/{_oversized_order_id}/confirm", headers=so_hdr)
+check("confirming an order beyond available stock -> 400", r.status_code == 400, r.text[:200])
 _short = r.json()["detail"]
 check("the error names the shortage", _short["error"] == "INSUFFICIENT_STOCK"
       and _short["shortages"][0]["required_quantity"] == 99999
       and _short["shortages"][0]["available_quantity"] == 100
       and _short["shortages"][0]["short_quantity"] == 99899, _short)
+check("order remains Draft after the failed confirm",
+      client.get(f"/orders/{_oversized_order_id}", headers=so_hdr).json()["status"] == "draft")
 check("and nothing was reserved by the attempt",
       client.get("/warehouses/stock", headers=so_hdr, params={"product_id": prod["id"]})
       .json()[0]["available"] == 100)
 # Two lines of the same product are summed before the check, so they cannot each
-# pass against the full availability.
+# pass against the full availability. The check runs at confirm, not creation.
+_multi = client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [
+    {"product_id": prod["id"], "quantity": 60},
+    {"product_id": prod["id"], "quantity": 60}]}).json()
 check("two lines of the same product are summed against availability",
-      client.post("/orders", headers=so_hdr, json={"customer_id": cust["id"], "items": [
-          {"product_id": prod["id"], "quantity": 60},
-          {"product_id": prod["id"], "quantity": 60}]}).status_code == 400)
+      client.post(f"/orders/{_multi['id']}/confirm", headers=so_hdr).status_code == 400)
 # A firm that allows backorders can place it anyway.
 client.patch("/sales-workflow-settings", headers=so_hdr, json={"allow_backorder": True})
 check("with allow_backorder on, the same order is placed",
@@ -1238,8 +1255,8 @@ o_inv = client.post("/orders", headers=fin_hdr, json={
     "customer_id": fcust["id"],
     "items": [{"product_id": fprod["id"], "quantity": 3, "unit_price": 100}]
 }).json()
-# Approve order
-client.patch(f"/orders/{o_inv['id']}/approve", headers=fin_hdr)
+# Confirm order (every order now starts as an unreserved Draft)
+client.post(f"/orders/{o_inv['id']}/confirm", headers=fin_hdr)
 
 # Mark order delivered under after_full_order mode so we can invoice it
 client.patch("/sales-workflow-settings", headers=fin_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
@@ -1338,7 +1355,7 @@ o_del = client.post("/orders", headers=fin_hdr, json={
     "customer_id": fcust["id"],
     "items": [{"product_id": fprod["id"], "quantity": 1, "unit_price": 100}]
 }).json()
-client.patch(f"/orders/{o_del['id']}/approve", headers=fin_hdr)
+client.post(f"/orders/{o_del['id']}/confirm", headers=fin_hdr)
 client.patch(f"/orders/{o_del['id']}/assign-delivery-partner", headers=fin_hdr, json={"delivery_partner_id": dp_user["id"]})
 
 # GET assigned deliveries
@@ -2088,6 +2105,9 @@ check("place the HSN order -> 201", _hsn_r.status_code == 201, _hsn_r.text[:400]
 hsn_order = _hsn_r.json()
 _s_db = SessionLocal()
 _hsn_db = _s_db.get(SalesOrder, hsn_order["id"])
+# Every order now starts as an unreserved Draft -- simulate it having gone
+# through the normal confirm -> ... -> delivered path before invoicing.
+_hsn_db.status = "completed"
 _hsn_db.fulfilment_status = "delivered"
 _hsn_db.items[0].delivered_quantity = 1
 _s_db.commit()
@@ -2906,7 +2926,7 @@ def _roles_scoping_and_dashboard_checks():
     print("\n== 7. GET /dashboard/admin ==")
     # Some data to summarise, in the ABC firm.
     prod_id = my_order["items"][0]["product_id"]
-    client.patch(f"/orders/{my_order['id']}/approve", headers=abc_hdr)
+    client.post(f"/orders/{my_order['id']}/confirm", headers=abc_hdr)
     client.post("/expenses", headers=abc_hdr, json={"category": "Salaries", "amount": 12540})
     exp = client.post("/expenses", headers=abc_hdr, json={"category": "Fuel", "amount": 2000}).json()
     for e in client.get("/expenses", headers=abc_hdr).json():
@@ -3107,7 +3127,7 @@ def _staff_detail_checks():
     order = client.post("/orders", headers=sales_hdr, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 60}]}).json()
-    client.patch(f"/orders/{order['id']}/approve", headers=ah)
+    client.post(f"/orders/{order['id']}/confirm", headers=ah)
 
     r = client.get(f"/users/{sales_emp['id']}/overview", headers=ah)
     check("GET /users/{id}/overview -> 200", r.status_code == 200, r.text[:400])
@@ -3169,13 +3189,13 @@ def _staff_detail_checks():
     o2 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 60}]}).json()
-    client.patch(f"/orders/{o2['id']}/approve", headers=ah)
+    client.post(f"/orders/{o2['id']}/confirm", headers=ah)
     client.patch(f"/orders/{o2['id']}/assign-delivery-partner", headers=ah,
                  json={"delivery_partner_id": dp["id"]})
     o3 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 60}]}).json()
-    client.patch(f"/orders/{o3['id']}/approve", headers=ah)
+    client.post(f"/orders/{o3['id']}/confirm", headers=ah)
     client.patch(f"/orders/{o3['id']}/assign-delivery-partner", headers=ah,
                  json={"delivery_partner_id": dp["id"]})
     client.patch(f"/deliveries/{o3['id']}/status", headers=ah, json={"status": "Delivered"})
@@ -3453,11 +3473,13 @@ def _phase0_checks():
         "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100, "tax_rate": 18}]})
     check("POST /orders -> 201", r.status_code == 201, r.text[:400])
     order = r.json()
+    check("order starts as an unreserved Draft", order["status"] == "draft" and order["fulfilment_status"] == "not_started", order)
+    order = client.post(f"/orders/{order['id']}/confirm", headers=ah).json()
     print(json.dumps({k: order[k] for k in ("status", "fulfilment_status", "warehouse_id",
                                             "payment_type", "payment_terms_days", "subtotal",
                                             "tax", "total", "stock_summary", "warnings")}, indent=2))
-    check("placed and reserved, with no approval step",
-          order["status"] == "placed" and order["fulfilment_status"] == "reserved", order)
+    check("confirmed and reserved, with no approval step",
+          order["status"] == "confirmed" and order["fulfilment_status"] == "reserved", order)
     check("the order carries the flow's fields",
           order["payment_type"] == "credit" and order["payment_terms_days"] == 15
           and order["fulfilment_method"] == "delivery" and order["warehouse_id"] == main_wh["id"], order)
@@ -3484,10 +3506,11 @@ def _phase0_checks():
           order["warnings"] and "credit limit" in order["warnings"][0], order["warnings"])
 
     client.patch("/sales-workflow-settings", headers=ah, json={"credit_limit_action": "block"})
-    check("with credit_limit_action=block the same order is refused",
-          client.post("/orders", headers=ah, json={
-              "customer_id": cust["id"],
-              "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).status_code == 400)
+    _blocked_draft = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).json()
+    check("with credit_limit_action=block the same order is refused at confirm",
+          client.post(f"/orders/{_blocked_draft['id']}/confirm", headers=ah).status_code == 400)
     client.patch("/sales-workflow-settings", headers=ah, json={"credit_limit_action": "warn"})
 
     print("\n-- cancel releases the hold --")
@@ -3507,16 +3530,18 @@ def _phase0_checks():
     print("\n-- reserved stock cannot be adjusted away --")
     held = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 100}]}).json()
+    held = client.post(f"/orders/{held['id']}/confirm", headers=ah).json()
     check("an order holding 100 leaves 20 available",
           client.get("/warehouses/stock", headers=ah, params={"product_id": prod["id"]})
           .json()[0]["available"] == 20)
     check("adjusting below what is reserved -> 400",
           client.post(f"/warehouses/{main_wh['id']}/stock/adjust", headers=ah, json={
               "product_id": prod["id"], "quantity": -110}).status_code == 400)
-    check("a second order beyond availability -> 400",
-          client.post("/orders", headers=ah, json={
-              "customer_id": cust["id"],
-              "items": [{"product_id": prod["id"], "quantity": 30}]}).status_code == 400)
+    _second = client.post("/orders", headers=ah, json={
+        "customer_id": cust["id"],
+        "items": [{"product_id": prod["id"], "quantity": 30}]}).json()
+    check("a second order beyond availability -> 400 at confirm",
+          client.post(f"/orders/{_second['id']}/confirm", headers=ah).status_code == 400)
     client.patch(f"/orders/{held['id']}/cancel", headers=ah, json={"reason": "done"})
 
     print("\n== 6. Approval mode, for a firm that wants it ==")
@@ -3524,16 +3549,20 @@ def _phase0_checks():
     r = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]})
     appr = r.json()
-    check("with approval on, the order awaits approval",
-          # Public Order status contract: internal 'awaiting_approval' -> public 'placed'.
-          appr["status"] == "placed", appr["status"])
-    check("its stock is still held while it waits", appr["fulfilment_status"] == "reserved", appr)
+    check("new order still starts as Draft even with approval mode on", appr["status"] == "draft", appr["status"])
+    r = client.post(f"/orders/{appr['id']}/confirm", headers=ah)
+    appr = r.json()
+    check("confirming with approval on moves the order to awaiting approval",
+          # Public Order status contract: internal 'awaiting_approval' -> public 'confirmed'.
+          appr["status"] == "confirmed", appr["status"])
+    check("its stock is now held while it waits", appr["fulfilment_status"] == "reserved", appr)
     r = client.patch(f"/orders/{appr['id']}/approve", headers=ah)
-    check("approve -> placed, and still no stock movement",
-          r.json()["status"] == "placed"
+    check("approve -> confirmed, and still no stock movement",
+          r.json()["status"] == "confirmed"
           and client.get(f"/inventory/{prod['id']}", headers=ah).json()["total_stock"] == 120, r.text[:200])
     r2 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 5}]}).json()
+    client.post(f"/orders/{r2['id']}/confirm", headers=ah)
     r = client.patch(f"/orders/{r2['id']}/reject", headers=ah, json={"reason": "no"})
     check("reject -> cancelled and the hold released",
           r.json()["status"] == "cancelled" and r.json()["fulfilment_status"] == "not_started", r.text[:200])
@@ -3543,6 +3572,7 @@ def _phase0_checks():
     print("\n== 7. Status filters, old and new ==")
     o1 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "items": [{"product_id": prod["id"], "quantity": 1}]}).json()
+    o1 = client.post(f"/orders/{o1['id']}/confirm", headers=ah).json()
     check("filter by the new status",
           any(o["id"] == o1["id"] for o in client.get("/orders", headers=ah,
                                                       params={"status": "placed"}).json()))
@@ -3562,6 +3592,9 @@ def _phase0_checks():
         "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100, "tax_rate": 5}]}).json()
     _s_db = SessionLocal()
     _taxed_db = _s_db.get(SalesOrder, taxed["id"])
+    # Every order now starts as an unreserved Draft -- simulate it having
+    # gone through the normal confirm -> ... -> delivered path.
+    _taxed_db.status = "completed"
     _taxed_db.fulfilment_status = "delivered"
     _taxed_db.items[0].delivered_quantity = 2
     _s_db.commit()
@@ -3690,10 +3723,12 @@ def _phase1a_checks():
           set(conv) == {"quotation_id", "quotation_number", "quotation_status", "order"}, sorted(conv))
     check("the quotation is now converted",
           conv["quotation_status"] == "converted" and conv["quotation_id"] == q["id"], conv)
-    check("the order is placed and reserved",
-          conv["order"]["status"] == "placed"
-          and conv["order"]["fulfilment_status"] == "reserved", conv["order"])
-    order = client.get(f"/orders/{conv['order']['id']}", headers=ah).json()
+    check("the resulting order is an unreserved Draft",
+          conv["order"]["status"] == "draft"
+          and conv["order"]["fulfilment_status"] == "not_started", conv["order"])
+    order = client.post(f"/orders/{conv['order']['id']}/confirm", headers=ah).json()
+    check("confirming the converted order places and reserves it",
+          order["status"] == "confirmed" and order["fulfilment_status"] == "reserved", order)
     check("no lines were resent, yet the order carries them",
           len(order["items"]) == 1 and order["items"][0]["quantity"] == 10, order["items"])
     check("the quoted rate, discount and tax came across",
@@ -3740,10 +3775,14 @@ def _phase1a_checks():
     client.patch(f"/quotations/{big['id']}", headers=ah, json={"status": "sent"})
     client.patch(f"/quotations/{big['id']}", headers=ah, json={"status": "accepted"})
     r = client.post(f"/quotations/{big['id']}/convert-to-order", headers=ah, json={})
-    check("a shortage refuses the conversion",
-          r.status_code == 400 and r.json()["detail"]["error"] == "INSUFFICIENT_STOCK", r.text[:250])
-    check("and leaves the quotation unconverted",
-          client.get(f"/quotations/{big['id']}", headers=ah).json()["status"] != "converted")
+    check("conversion still succeeds as an unreserved Draft (shortage is checked at confirm, not conversion)",
+          r.status_code == 201 and r.json()["order"]["status"] == "draft", r.text[:250])
+    _short_order_id = r.json()["order"]["id"]
+    r2 = client.post(f"/orders/{_short_order_id}/confirm", headers=ah)
+    check("a shortage refuses confirmation of that draft",
+          r2.status_code == 400 and r2.json()["detail"]["error"] == "INSUFFICIENT_STOCK", r2.text[:250])
+    check("the quotation IS converted (conversion only creates the Draft; the shortage blocks confirm)",
+          client.get(f"/quotations/{big['id']}", headers=ah).json()["status"] == "converted")
     check("another firm cannot convert it -> 404",
           client.post(f"/quotations/{big['id']}/convert-to-order", headers=oh, json={}).status_code == 404)
 
@@ -3811,16 +3850,19 @@ def _phase1cf_checks():
     order = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).json()
-    check("order starts reserved", order["fulfilment_status"] == "reserved", order["fulfilment_status"])
+    check("order starts as an unreserved Draft", order["status"] == "draft" and order["fulfilment_status"] == "not_started", order["fulfilment_status"])
+    order = client.post(f"/orders/{order['id']}/confirm", headers=ah).json()
+    check("confirming reserves the stock", order["fulfilment_status"] == "reserved", order["fulfilment_status"])
     r = client.post("/deliveries", headers=ah, json={
         "order_id": order["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
         "scheduled_date": "2026-08-15",
         "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": 20}]})
     check("POST /deliveries -> 201", r.status_code == 201, r.text[:400])
     dlv = r.json()
-    print(json.dumps({k: dlv[k] for k in ("delivery_number", "status", "order_number",
-                                          "planned_total", "loaded_total", "delivered_total",
-                                          "amount_due", "items")}, indent=2))
+    if r.status_code == 201:
+        print(json.dumps({k: dlv[k] for k in ("delivery_number", "status", "order_number",
+                                              "planned_total", "loaded_total", "delivered_total",
+                                              "amount_due", "items")}, indent=2))
     check("it has its own id and human code",
           dlv["id"] and dlv["delivery_number"].startswith("DLV-"), dlv)
     # Public Delivery status contract: internal 'planned' -> public 'pending'.
@@ -4006,6 +4048,7 @@ def _phase1cf_checks():
     o2 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 4, "unit_price": 100}]}).json()
+    o2 = client.post(f"/orders/{o2['id']}/confirm", headers=ah).json()
     d2 = client.post("/deliveries", headers=ah, json={
         "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"]}).json()
     check("omitting items plans the whole outstanding order",
@@ -4037,6 +4080,7 @@ def _phase1cf_checks():
     o3 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 100}]}).json()
+    o3 = client.post(f"/orders/{o3['id']}/confirm", headers=ah).json()
     oi = o3["items"][0]["id"]
     a = client.post("/deliveries", headers=ah, json={
         "order_id": o3["id"], "delivery_partner_id": dp["id"],
@@ -4115,6 +4159,7 @@ def _phase1ij_checks():
     order = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "payment_terms_days": 15,
         "items": [{"product_id": prod["id"], "quantity": 20, "unit_price": 100}]}).json()
+    order = client.post(f"/orders/{order['id']}/confirm", headers=ah).json()
     first = deliver(order, 12)
     check("only 12 of 20 went out", first["delivered_total"] == 12, first["delivered_total"])
     r = client.post(f"/orders/{order['id']}/invoice", headers=ah,
@@ -4144,6 +4189,7 @@ def _phase1ij_checks():
     no_terms = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 100}]}).json()
+    no_terms = client.post(f"/orders/{no_terms['id']}/confirm", headers=ah).json()
     no_del = deliver(no_terms, 2)
     nb = client.post(f"/orders/{no_terms['id']}/invoice", headers=ah, json={"delivery_id": no_del["id"]}).json()
     check("no agreed terms -> no due date", nb["due_date"] is None, nb)
@@ -4174,6 +4220,7 @@ def _phase1ij_checks():
     slow = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 100}]}).json()
+    slow = client.post(f"/orders/{slow['id']}/confirm", headers=ah).json()
     part = deliver(slow, 4)
     r = client.post(f"/orders/{slow['id']}/invoice", headers=ah, json={"delivery_id": part["id"]})
     check("billing a part delivery under after_full_order -> 400", r.status_code == 400, r.text[:300])
@@ -4190,6 +4237,7 @@ def _phase1ij_checks():
     empty = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 100}]}).json()
+    empty = client.post(f"/orders/{empty['id']}/confirm", headers=ah).json()
     undelivered = client.post("/deliveries", headers=ah, json={
         "order_id": empty["id"], "delivery_partner_id": dp["id"]}).json()
     r = client.post(f"/orders/{empty['id']}/invoice", headers=ah,
@@ -4209,6 +4257,7 @@ def _phase1ij_checks():
     flat = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"], "discount": 50,
         "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 100}]}).json()
+    flat = client.post(f"/orders/{flat['id']}/confirm", headers=ah).json()
     _s_db = SessionLocal()
     _flat_db = _s_db.get(SalesOrder, flat["id"])
     _flat_db.fulfilment_status = "delivered"
@@ -5157,6 +5206,7 @@ def _staff_overview_fleet_checks():
     order = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 60}]}).json()
+    order = client.post(f"/orders/{order['id']}/confirm", headers=ah).json()
     dlv = client.post("/deliveries", headers=ah, json={
         "order_id": order["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
         "items": [{"order_item_id": order["items"][0]["id"], "planned_quantity": 5}]}).json()
@@ -5205,6 +5255,7 @@ def _staff_overview_fleet_checks():
     o2 = client.post("/orders", headers=ah, json={
         "customer_id": cust["id"],
         "items": [{"product_id": prod["id"], "quantity": 3, "unit_price": 60}]}).json()
+    o2 = client.post(f"/orders/{o2['id']}/confirm", headers=ah).json()
     d2 = client.post("/deliveries", headers=ah, json={
         "order_id": o2["id"], "delivery_partner_id": dp["id"], "vehicle_id": veh["id"],
         "items": [{"order_item_id": o2["items"][0]["id"], "planned_quantity": 3}]}).json()
@@ -5346,6 +5397,7 @@ order_a_res = client.post("/orders", headers=so_a_hdr, json={
 check("TEST 4: Sales Officer A creates order without salesperson_id -> 201", order_a_res.status_code == 201, order_a_res.text)
 order_a = order_a_res.json()
 check("TEST 4: Order A salesperson_id auto-assigned to SO A", order_a["salesperson_id"] == so_a["id"], order_a)
+order_a = client.post(f"/orders/{order_a['id']}/confirm", headers=so_a_hdr).json()
 
 # TEST 5: Sales Officer cannot impersonate another salesperson
 order_a_spoof = client.post("/orders", headers=so_a_hdr, json={
@@ -5418,8 +5470,9 @@ order_b_approval = client.post("/orders", headers=so_b_hdr, json={
     "customer_id": sec_cust["id"],
     "items": [{"product_id": sec_prod["id"], "quantity": 1}]
 }).json()
-# Public Order status contract: internal 'awaiting_approval' -> public 'placed'.
-check("Order created awaiting approval", order_b_approval["status"] == "placed")
+order_b_approval = client.post(f"/orders/{order_b_approval['id']}/confirm", headers=so_b_hdr).json()
+# Public Order status contract: internal 'awaiting_approval' -> public 'confirmed'.
+check("Order confirmed into awaiting approval", order_b_approval["status"] == "confirmed")
 check("TEST 9: SO A without approve permission cannot approve -> 403",
       client.patch(f"/orders/{order_b_approval['id']}/approve", headers=so_a_hdr).status_code == 403)
 check("TEST 9: SO A without approve permission cannot reject -> 403",
@@ -5456,28 +5509,29 @@ check("TEST 12: fulfilment_status moved to planned", va_json["fulfilment_status"
 # Public Order status contract: internal 'processing' -> public 'confirmed'.
 check("TEST 12: status moved to processing", va_json["status"] == "confirmed")
 
-# TEST 13: Existing normal order flow
+# TEST 13: Every order always starts as an unreserved Draft (mandatory, not settings-gated)
 norm_order = client.post("/orders", headers=sec_admin_hdr, json={
     "customer_id": sec_cust["id"],
     "items": [{"product_id": sec_prod["id"], "quantity": 5, "unit_price": 100}]
 }).json()
-check("TEST 13: Normal order placed on creation", norm_order["status"] == "placed" and norm_order["fulfilment_status"] == "reserved")
+check("TEST 13: Order created as an unreserved Draft", norm_order["status"] == "draft" and norm_order["fulfilment_status"] == "not_started")
+norm_order = client.post(f"/orders/{norm_order['id']}/confirm", headers=sec_admin_hdr).json()
+check("TEST 13: Confirming places and reserves it", norm_order["status"] == "confirmed" and norm_order["fulfilment_status"] == "reserved")
 cancel_res = client.patch(f"/orders/{norm_order['id']}/cancel", headers=sec_admin_hdr, json={"reason": "test cancel"})
 check("TEST 13: Order cancelled and reservation released",
       cancel_res.status_code == 200 and cancel_res.json()["status"] == "cancelled" and cancel_res.json()["fulfilment_status"] == "not_started")
 
-# TEST 14: Existing draft/confirm flow
+# TEST 14: draft_orders_enabled is a legacy setting; Draft is mandatory regardless of its value
 client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"draft_orders_enabled": True})
 draft_order = client.post("/orders", headers=sec_admin_hdr, json={
     "customer_id": sec_cust["id"],
     "items": [{"product_id": sec_prod["id"], "quantity": 4, "unit_price": 100}]
 }).json()
-# Public Order status contract: internal 'draft' -> public 'placed'.
-check("TEST 14: Order created as draft", draft_order["status"] == "placed" and draft_order["fulfilment_status"] == "not_started")
+check("TEST 14: Order created as draft", draft_order["status"] == "draft" and draft_order["fulfilment_status"] == "not_started")
 confirm_res = client.post(f"/orders/{draft_order['id']}/confirm", headers=sec_admin_hdr)
 check("TEST 14: Draft confirmed -> 200", confirm_res.status_code == 200, confirm_res.text)
 check("TEST 14: Confirmed order status placed and reserved",
-      confirm_res.json()["status"] == "placed" and confirm_res.json()["fulfilment_status"] == "reserved")
+      confirm_res.json()["status"] == "confirmed" and confirm_res.json()["fulfilment_status"] == "reserved")
 client.patch("/sales-workflow-settings", headers=sec_admin_hdr, json={"draft_orders_enabled": False})
 
 
@@ -5526,6 +5580,7 @@ order = client.post("/orders", headers=del_admin_hdr, json={
     "customer_id": cust["id"],
     "items": [{"product_id": prod["id"], "quantity": 10, "unit_price": 250.0}]
 }).json()
+order = client.post(f"/orders/{order['id']}/confirm", headers=del_admin_hdr).json()
 
 # Create Delivery with partner and vehicle
 dlv_create = client.post("/deliveries", headers=del_admin_hdr, json={
@@ -5686,6 +5741,7 @@ order_reassign = client.post("/orders", headers=del_admin_hdr, json={
     "customer_id": cust["id"],
     "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 250.0}]
 }).json()
+order_reassign = client.post(f"/orders/{order_reassign['id']}/confirm", headers=del_admin_hdr).json()
 
 dlv_rej = client.post("/deliveries", headers=del_admin_hdr, json={
     "order_id": order_reassign["id"],
@@ -5730,6 +5786,7 @@ order2 = client.post("/orders", headers=del_admin_hdr, json={
     "customer_id": cust["id"],
     "items": [{"product_id": prod["id"], "quantity": 2, "unit_price": 250.0}]
 }).json()
+order2 = client.post(f"/orders/{order2['id']}/confirm", headers=del_admin_hdr).json()
 unassigned_dlv_res = client.post("/deliveries", headers=del_admin_hdr, json={
     "order_id": order2["id"],
     "items": [{"order_item_id": order2["items"][0]["id"], "planned_quantity": 2}]
@@ -5926,6 +5983,7 @@ client.patch(f"/quotations/{prc_quote['id']}", headers=prc_hdr, json={"status": 
 prc_conv = client.post(f"/quotations/{prc_quote['id']}/convert-to-order", headers=prc_hdr, json={}).json()
 check("5. Quotation converted to order", prc_conv["quotation_status"] == "converted")
 prc_order_id = prc_conv["order"]["id"]
+client.post(f"/orders/{prc_order_id}/confirm", headers=prc_hdr)
 
 client.patch("/sales-workflow-settings", headers=prc_hdr, json={"partial_delivery_invoice_mode": "after_full_order"})
 _s_db = SessionLocal()

@@ -183,7 +183,8 @@ def run_all_tests():
     db_init: Session = next(get_db())
     o1_db = db_init.get(SalesOrder, order1["id"])
     log_test("Test 3: Internal status == 'draft'", o1_db.status == "draft")
-    log_test("Test 3: Public status == 'placed'", order1.get("status") == "placed")
+    # Finalized public status contract: internal 'draft' -> public 'draft'.
+    log_test("Test 3: Public status == 'draft'", order1.get("status") == "draft")
 
     # Test 4: Server-authoritative totals
     # Attempt to send arbitrary prices / totals in request
@@ -222,7 +223,8 @@ def run_all_tests():
     conf_res = client.post(f"/orders/{order1['id']}/confirm", headers=auth)
     log_test("Test 6: Confirm Draft Order -> 200", conf_res.status_code == 200, conf_res.text)
     conf_order = conf_res.json()
-    log_test("Test 6: Status moves to placed", conf_order["status"] == "placed")
+    # Finalized public status contract: internal 'placed' -> public 'confirmed'.
+    log_test("Test 6: Status moves to confirmed", conf_order["status"] == "confirmed")
     log_test("Test 6: Fulfilment status moves to reserved", conf_order["fulfilment_status"] == "reserved")
 
     reservations_conf = (
@@ -275,8 +277,8 @@ def run_all_tests():
     # ------------------------------------------------------------------
     print("\n--- TEST GROUP C: Status Regression (placed / processing) ---")
 
-    # Test 10: Placed order status
-    log_test("Test 10: Confirmed order status is placed", conf_order["status"] == "placed")
+    # Test 10: Confirmed order status
+    log_test("Test 10: Confirmed order status is confirmed", conf_order["status"] == "confirmed")
 
     # Test 11: Processing status on delivery assignment / pickup
     # Assign delivery partner moves order to processing

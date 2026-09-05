@@ -239,6 +239,7 @@ def run_group_c():
             "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 10.0}],
         }, headers=admin_auth,
     ).json()
+    client.post(f"/orders/{order['id']}/confirm", headers=admin_auth)
 
     # Unassigned delivery (no delivery_partner_id at all)
     unassigned = client.post(
@@ -264,6 +265,7 @@ def run_group_c():
             "items": [{"product_id": prod["id"], "quantity": 5, "unit_price": 10.0}],
         }, headers=admin_auth,
     ).json()
+    client.post(f"/orders/{order2['id']}/confirm", headers=admin_auth)
     assigned = client.post(
         "/deliveries", json={"order_id": order2["id"], "delivery_partner_id": dp1_id}, headers=admin_auth,
     ).json()

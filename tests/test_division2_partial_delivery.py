@@ -188,7 +188,14 @@ def run_all_tests():
     r = client.post("/orders", json=order_payload, headers=auth)
     log_test("Order created successfully", r.status_code == 201, r.text)
     order_data = r.json()
+    log_test("New order starts as Draft (finalized business rule)", order_data["status"] == "draft", order_data)
     order_id = order_data["id"]
+    # Every order now starts as an unreserved Draft -- confirm it so the
+    # remaining assertions (which test the reserved/fulfilment-status
+    # behavior that only exists from confirmation onward) see it as before.
+    r = client.post(f"/orders/{order_id}/confirm", headers=auth)
+    log_test("Order confirmed successfully", r.status_code == 200, r.text)
+    order_data = r.json()
     order_item_id = order_data["items"][0]["id"]
 
     log_test("OrderItemOut.ordered_quantity is 100", order_data["items"][0]["ordered_quantity"] == 100)

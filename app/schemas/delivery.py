@@ -293,6 +293,16 @@ class DeliveryOut(BaseModel):
                     "(Internally planned/accepted/rejected/ready/loaded/in_transit/"
                     "partially_delivered/delivered/failed/cancelled — see "
                     "app.core.workflow.public_delivery_status.)")
+    # The raw, ungrouped internal status — in particular, distinguishes
+    # `loaded` (goods on the vehicle, not yet dispatched) from `in_transit`
+    # (dispatched), which `status` above deliberately reports identically
+    # for the public/business-display contract. A timeline UI that needs a
+    # genuine "Vehicle Loaded" step distinct from "In Transit" should read
+    # this field (or the persisted `timeline`), not `status`.
+    internal_status: str = Field(
+        default="", description="planned | accepted | rejected | ready | loaded | in_transit | "
+                                 "partially_delivered | delivered | failed | cancelled"
+    )
     picking_status: str = "not_started"
     dispatched_at: datetime | None = None
     dispatched_by_id: str | None = None

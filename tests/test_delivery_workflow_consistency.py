@@ -119,6 +119,9 @@ def _place_and_plan_delivery(ctx: dict, qty: int = 10):
               "items": [{"product_id": ctx["prod_id"], "quantity": qty, "unit_price": 100.0}]},
         headers=ctx["admin_auth"],
     ).json()
+    # Every order now starts as an unreserved Draft (finalized business rule)
+    # -- confirm it before planning a Delivery for it.
+    order = client.post(f"/orders/{order['id']}/confirm", headers=ctx["admin_auth"]).json()
     dlv = client.post(
         "/deliveries",
         json={"order_id": order["id"], "delivery_partner_id": ctx["dp_id"], "vehicle_id": ctx["veh_id"]},
@@ -413,32 +416,44 @@ def run_stock_concurrency_test():
     ).json()[0]
     log_test("Setup: exactly 1 unit available before the race", stock_before["available"] == 1, stock_before)
 
+    # Every order now starts as an unreserved Draft (finalized business rule)
+    # -- creation itself never touches stock, so it can never race. The
+    # atomicity/locking guarantee this test exists to prove now lives at
+    # CONFIRM time (order_service.confirm_order), so both Draft orders are
+    # created up front (uncontended) and it is their concurrent /confirm
+    # calls that race for the single unit of stock.
+    order_a = client.post(
+        "/orders", json={"customer_id": ctx["cust_id"], "warehouse_id": ctx["wh_id"],
+                         "items": [{"product_id": ctx["prod_id"], "quantity": 1, "unit_price": 100.0}]},
+        headers=ctx["admin_auth"],
+    ).json()
+    order_b = client.post(
+        "/orders", json={"customer_id": ctx["cust_id"], "warehouse_id": ctx["wh_id"],
+                         "items": [{"product_id": ctx["prod_id"], "quantity": 1, "unit_price": 100.0}]},
+        headers=ctx["admin_auth"],
+    ).json()
+
     results = {}
 
-    def _place(label: str):
+    def _confirm(label: str, order_id: str):
         try:
-            r = client.post(
-                "/orders",
-                json={"customer_id": ctx["cust_id"], "warehouse_id": ctx["wh_id"],
-                      "items": [{"product_id": ctx["prod_id"], "quantity": 1, "unit_price": 100.0}]},
-                headers=ctx["admin_auth"],
-            )
+            r = client.post(f"/orders/{order_id}/confirm", headers=ctx["admin_auth"])
             results[label] = r.status_code
         except Exception as exc:  # TestClient re-raises unhandled server exceptions by
             # default (a debugging aid) rather than returning them as a 500 response the
             # way a real HTTP client would see — treat that the same as a failed request.
             results[label] = f"EXC:{type(exc).__name__}"
 
-    t1 = threading.Thread(target=_place, args=("A",))
-    t2 = threading.Thread(target=_place, args=("B",))
+    t1 = threading.Thread(target=_confirm, args=("A", order_a["id"]))
+    t2 = threading.Thread(target=_confirm, args=("B", order_b["id"]))
     t1.start()
     t2.start()
     t1.join()
     t2.join()
 
-    successes = [label for label, code in results.items() if code == 201]
-    log_test("At most one of the two concurrent orders reserved the unit (no double-reservation)", len(successes) <= 1, results)
-    log_test("Exactly one of the two concurrent orders succeeded", len(successes) == 1, results)
+    successes = [label for label, code in results.items() if code == 200]
+    log_test("At most one of the two concurrent confirms reserved the unit (no double-reservation)", len(successes) <= 1, results)
+    log_test("Exactly one of the two concurrent confirms succeeded", len(successes) == 1, results)
 
     stock_after = client.get(
         "/warehouses/stock", headers=ctx["admin_auth"], params={"product_id": ctx["prod_id"]}

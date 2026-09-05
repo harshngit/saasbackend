@@ -205,6 +205,7 @@ def main():
     }, headers=auth_admin1)
     assert_eq(order_res.status_code, 201, "Order created")
     order_id = order_res.json()["id"]
+    client.post(f"/orders/{order_id}/confirm", headers=auth_admin1)
 
     assign_res = client.patch(f"/orders/{order_id}/assign-delivery-partner", json={
         "delivery_partner_id": driver1["id"],
@@ -232,6 +233,11 @@ def main():
     order1 = o_res.json()
     order1_id = order1["id"]
     assert_eq(order1["total"], 580.0, "Initial total = 5*100 = 500 - 10 + 90 = 580")
+    # Every order now starts as an unreserved Draft -- confirm it so later
+    # line-item-edit assertions (which test reservation adjustment, only
+    # meaningful once an order is past Draft) see the same starting state
+    # they did before that change.
+    order1 = client.post(f"/orders/{order1_id}/confirm", headers=auth_sales1).json()
 
     # TEST 2.1: Header field update by Admin
     edit_header_res = client.patch(f"/orders/{order1_id}", json={
@@ -264,6 +270,7 @@ def main():
         "items": [{"product_id": prod1["id"], "quantity": 1}],
     }, headers=auth_admin1)
     order_admin_id = order_admin_res.json()["id"]
+    client.post(f"/orders/{order_admin_id}/confirm", headers=auth_admin1)
 
     sales_forbidden = client.patch(f"/orders/{order_admin_id}", json={
         "notes": "Hacked by Sales Officer",
@@ -355,6 +362,7 @@ def main():
         "fulfilment_method": "pickup",
     }, headers=auth_admin1)
     order_pickup_id = order_pickup_res.json()["id"]
+    client.post(f"/orders/{order_pickup_id}/confirm", headers=auth_admin1)
 
     client.post(f"/orders/{order_pickup_id}/pickup/pick", headers=auth_admin1)
     client.post(f"/orders/{order_pickup_id}/pickup/ready", headers=auth_admin1)
@@ -385,6 +393,7 @@ def main():
         "fulfilment_method": "pickup",
     }, headers=auth_admin1)
     order_inv_id = order_inv_res.json()["id"]
+    client.post(f"/orders/{order_inv_id}/confirm", headers=auth_admin1)
 
     # Edit before pickup / invoice
     edit_pre_inv = client.patch(f"/orders/{order_inv_id}", json={"notes": "Final edit before billing"}, headers=auth_admin1)

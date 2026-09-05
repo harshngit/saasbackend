@@ -147,6 +147,10 @@ def _owned_delivery(db: Session, delivery_id: str, user: User) -> Delivery:
 
 def _delivery_out(db: Session, delivery: Delivery, include_timeline: bool = False) -> DeliveryOut:
     out = DeliveryOut.model_validate(delivery)
+    # Raw internal status, before status's own public-mapping field_validator
+    # ran — see DeliveryOut.internal_status: distinguishes "loaded" from
+    # "in_transit", which the public `status` deliberately reports the same.
+    out.internal_status = delivery.status
     for key, value in delivery_service.sync_delivery_view(db, delivery).items():
         setattr(out, key, value)
 

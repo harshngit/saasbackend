@@ -58,17 +58,31 @@ LEGACY_ORDER_STATUS = {
 SALE_ORDER_STATUSES = ("placed", "processing", "completed")
 
 # ------------------------- public (client-facing) Order status -------------------------
-# The internal lifecycle above (draft / awaiting_approval / processing / …) is richer
-# than what the client should ever see — draft/awaiting_approval/placed all mean "not
-# yet confirmed" to a customer, and "processing" must never leak out as anything but
-# "confirmed". This maps ONLY at the API response boundary: the stored `status` value,
-# every transition above and every internal comparison against it are unaffected.
+# Finalized canonical commercial lifecycle: exactly four public values —
+# draft, confirmed, completed, cancelled. `placed`, `processing` and
+# `awaiting_approval` are internal-only from here on and must never appear
+# in an Order API response:
+#
+#   draft              -> draft       (the ONLY status with no stock reservation)
+#   placed              -> confirmed   (stock committed, no admin gate)
+#   processing          -> confirmed   (assigned for delivery — still commercially "confirmed")
+#   awaiting_approval    -> confirmed   (stock already reserved; order_requires_approval
+#                                        is a legacy/optional gate on top of an already-
+#                                        confirmed commitment, not a fourth public state)
+#   completed            -> completed
+#   cancelled            -> cancelled
+#
+# This maps ONLY at the API response boundary: the stored `status` value, every
+# transition above and every internal comparison against it are unaffected —
+# in particular, `order_requires_approval` firms still genuinely gate on
+# `awaiting_approval` internally (see routers/sales_orders.py's /approve and
+# /reject), it simply no longer reads as a distinct public status.
 # Centralized here — the one place every Order response (list/detail/create/update)
 # reads from — so no router or schema keeps its own copy that could drift.
 PUBLIC_ORDER_STATUS: dict[str, str] = {
-    "draft": "placed",
-    "awaiting_approval": "placed",
-    "placed": "placed",
+    "draft": "draft",
+    "awaiting_approval": "confirmed",
+    "placed": "confirmed",
     "processing": "confirmed",
     "completed": "completed",
     "cancelled": "cancelled",

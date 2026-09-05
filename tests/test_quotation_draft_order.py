@@ -142,7 +142,8 @@ def test_1_draft_enabled():
     confirm_res = client.post(f"/orders/{order_id}/confirm", headers=auth)
     assert_eq(confirm_res.status_code, 200, "Confirm draft order succeeds")
     confirmed = confirm_res.json()
-    assert_eq(confirmed["status"], "placed", "Confirmed order status is 'placed'")
+    # Public Order status contract: internal 'placed' -> public 'confirmed'.
+    assert_eq(confirmed["status"], "confirmed", "Confirmed order status is 'confirmed'")
     assert_eq(confirmed["fulfilment_status"], "reserved", "Confirmed order fulfilment_status is 'reserved'")
 
     on_hand, reserved, available = _stock(auth, wh_id, prod_id)
@@ -152,7 +153,7 @@ def test_1_draft_enabled():
 
 
 def test_2_draft_disabled():
-    print("\n--- TEST 2: draft_orders_enabled = false (existing direct-placement behaviour) ---")
+    print("\n--- TEST 2: draft_orders_enabled = false (now vestigial -- every conversion still starts Draft) ---")
     auth, wh_id, prod_id, cust_id = _setup_org("directco")
     client.patch("/sales-workflow-settings", json={"draft_orders_enabled": False}, headers=auth)
 
@@ -161,13 +162,28 @@ def test_2_draft_disabled():
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Convert-to-order succeeds")
     conv = conv_res.json()
-    assert_eq(conv["order"]["status"], "placed", "Converted order status is 'placed' directly (no draft)")
-    assert_eq(conv["order"]["fulfilment_status"], "reserved", "Converted order is reserved immediately")
+    order_id = conv["order"]["id"]
+    # Finalized business rule: draft_orders_enabled no longer gates this --
+    # every conversion starts as an unreserved Draft regardless of the
+    # (now vestigial) setting.
+    assert_eq(conv["order"]["status"], "draft", "Converted order still starts as Draft even with the setting off")
+    assert_eq(conv["order"]["fulfilment_status"], "not_started", "Draft order is not reserved")
 
     on_hand, reserved, available = _stock(auth, wh_id, prod_id)
     assert_eq(on_hand, 100.0, "Physical stock unchanged at 100")
-    assert_eq(reserved, 15.0, "Stock reserved immediately on direct conversion: 15")
-    assert_eq(available, 85.0, "Available drops to 85 immediately")
+    assert_eq(reserved, 0.0, "Nothing reserved while still Draft")
+    assert_eq(available, 100.0, "Available stays 100 while still Draft")
+
+    confirm_res = client.post(f"/orders/{order_id}/confirm", headers=auth)
+    assert_eq(confirm_res.status_code, 200, "Confirming the converted order succeeds")
+    # Public Order status contract: internal 'placed' -> public 'confirmed'.
+    assert_eq(confirm_res.json()["status"], "confirmed", "Confirmed order status is 'confirmed'")
+    assert_eq(confirm_res.json()["fulfilment_status"], "reserved", "Confirmed order is reserved")
+
+    on_hand, reserved, available = _stock(auth, wh_id, prod_id)
+    assert_eq(on_hand, 100.0, "Physical stock still unchanged at 100")
+    assert_eq(reserved, 15.0, "Stock reserved on confirm: 15")
+    assert_eq(available, 85.0, "Available drops to 85 after confirm")
 
 
 def test_3_no_double_reservation():

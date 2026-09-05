@@ -223,8 +223,8 @@ def run_tests():
     assert_eq(so_create_res.status_code, 201, "Created pickup sales order")
     so = so_create_res.json()
     order_id = so["id"]
-    # Public Order status contract: internal 'draft' -> public 'placed'.
-    assert_eq(so["status"], "placed", "Order is in draft status (public: 'placed')")
+    # Public Order status contract: internal 'draft' -> public 'draft'.
+    assert_eq(so["status"], "draft", "Order is in draft status (public: 'draft')")
     assert_eq(so["fulfilment_method"], "pickup", "Fulfilment method is 'pickup'")
     assert_eq(so["pickup_status"], "not_started", "Pickup status is 'not_started'")
 
@@ -238,7 +238,8 @@ def run_tests():
     conf_res = client.post(f"/orders/{order_id}/confirm", headers=auth1)
     assert_eq(conf_res.status_code, 200, "Confirmed draft pickup order")
     so_conf = conf_res.json()
-    assert_eq(so_conf["status"], "placed", "Confirmed order status is 'placed'")
+    # Public Order status contract: internal 'placed' -> public 'confirmed'.
+    assert_eq(so_conf["status"], "confirmed", "Confirmed order status is 'confirmed'")
     assert_eq(so_conf["fulfilment_status"], "reserved", "Confirmed order fulfilment_status is 'reserved'")
     assert_eq(so_conf["pickup_status"], "not_started", "Confirmed order pickup_status is 'not_started'")
 

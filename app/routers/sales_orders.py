@@ -266,7 +266,13 @@ def create_order(
         order_level_tax=payload.tax,
         notes=payload.notes,
         order_status_label=payload.order_status,
-        create_as_draft=settings["draft_orders_enabled"],
+        # Finalized business rule: every normal Order always starts as Draft
+        # (no stock check, no reservation) -- draft_orders_enabled no longer
+        # gates this; it is kept in the settings schema/DB only for backward
+        # compatibility (existing PATCH /sales-workflow-settings payloads
+        # still accept it) and is otherwise unused. Confirming is now always
+        # required via POST /orders/{id}/confirm.
+        create_as_draft=True,
         billing_address=payload.billing_address or customer.billing_address,
         shipping_address=payload.shipping_address or payload.delivery_address or customer.delivery_address,
         delivery_address=payload.delivery_address or payload.shipping_address or customer.delivery_address,
@@ -402,6 +408,11 @@ def assign_delivery_partner(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot assign delivery to a draft order. Please confirm the order first.",
+        )
+    if order.status == "awaiting_approval":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot assign delivery while the order is awaiting approval. Approve the order first.",
         )
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:

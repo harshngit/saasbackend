@@ -4,10 +4,14 @@ The internal database status vocabulary (app.core.workflow.ORDER_STATUSES /
 DELIVERY_STATUSES) is unchanged and is NOT what this file tests — it verifies
 only that the *public API* maps it correctly, per the approved contract:
 
-    Order:    draft | awaiting_approval | placed -> placed
-              processing                          -> confirmed
+    Order:    draft                                -> draft
+              awaiting_approval | placed | processing -> confirmed
               completed                            -> completed
               cancelled                            -> cancelled
+
+    (Finalized canonical commercial lifecycle: exactly draft / confirmed /
+    completed / cancelled. `placed`, `processing` and `awaiting_approval`
+    are internal-only — none of them may appear in an Order API response.)
 
     Delivery: planned | rejected                   -> pending
               accepted | ready | loaded             -> accepted
@@ -135,9 +139,9 @@ def run_all_tests():
     print("--- PART A: public_order_status() / public_delivery_status() ---")
 
     order_cases = [
-        ("draft", "placed"),
-        ("awaiting_approval", "placed"),
-        ("placed", "placed"),
+        ("draft", "draft"),
+        ("awaiting_approval", "confirmed"),
+        ("placed", "confirmed"),
         ("processing", "confirmed"),
         ("completed", "completed"),
         ("cancelled", "cancelled"),
