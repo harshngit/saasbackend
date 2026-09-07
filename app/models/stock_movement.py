@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -17,6 +17,8 @@ STOCK_MOVEMENT_TYPES = {
     "damaged",          # damaged stock removed (-)
     "expired",          # expired stock removed (-)
     "adjustment",       # manual correction (+/-)
+    "transfer_out",     # dispatched from source warehouse (-)
+    "transfer_in",      # received at destination warehouse (+)
 }
 
 
@@ -37,6 +39,9 @@ class StockMovement(Base):
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    warehouse_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("warehouses.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     product_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -51,3 +56,8 @@ class StockMovement(Base):
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)  # user id
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    warehouse: Mapped["Warehouse | None"] = relationship(foreign_keys=[warehouse_id], lazy="joined")  # noqa: F821
+    product: Mapped["Product"] = relationship(foreign_keys=[product_id], lazy="joined")  # noqa: F821
+    variant: Mapped["ProductVariant | None"] = relationship(foreign_keys=[variant_id], lazy="joined")  # noqa: F821
+

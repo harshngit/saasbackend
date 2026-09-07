@@ -34,13 +34,16 @@ class StockMovementOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    warehouse_id: str | None = None
     product_id: str
-    variant_id: str | None
+    variant_id: str | None = None
+    product_name: str | None = None
+    variant_name: str | None = None
     movement_type: str
     quantity: int                 # signed: + added, - removed
     balance_after: int
-    note: str | None
-    created_by: str | None
+    note: str | None = None
+    created_by: str | None = None
     created_at: datetime
 
 

@@ -17,7 +17,7 @@ from app.models import (
     VehicleReconciliationItem,
     VehicleStockReconciliation,
 )
-from app.services import delivery_service
+from app.services import delivery_service, stock_service
 from app.schemas.vehicle_stock import (
     DeliveryLoadOut,
     EndOfDayBody,
@@ -160,10 +160,15 @@ def load_vehicle(
             detail="Delivery partner already has an active vehicle loading session.",
         )
 
+    warehouse = stock_service.owned_warehouse(db, getattr(payload, "warehouse_id", None), org_id, require_active=True)
+    if warehouse is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid warehouse")
+
     loading = VehicleLoading(
         organization_id=org_id,
         delivery_partner_id=partner.id,
         vehicle_id=payload.vehicle_id,
+        warehouse_id=warehouse.id,
         date=payload.date or datetime.now(timezone.utc),
         status="active",
     )
@@ -179,32 +184,20 @@ def load_vehicle(
             if variant is None or variant.product_id != product.id:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An item's variant is invalid")
 
-        # Check stock in main warehouse
-        current_inv = variant.inventory if variant else product.total_inventory
-        if current_inv < it.loaded_qty:
+        # Check available stock in warehouse
+        current_avail = stock_service.available(db, warehouse.id, product.id, it.variant_id)
+        if current_avail < it.loaded_qty:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Insufficient warehouse stock for {product.name}",
             )
 
-        # Deduct warehouse stock
-        new_inv = current_inv - it.loaded_qty
-        if variant:
-            variant.inventory = new_inv
-        else:
-            product.total_inventory = new_inv
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=product.id,
-                variant_id=it.variant_id,
-                movement_type="delivery_out",
-                quantity=-it.loaded_qty,
-                balance_after=new_inv,
-                note=f"Vehicle Loading for partner {partner.name}",
-                created_by=user.id,
-            )
+        # Deduct warehouse stock safely
+        stock_service.adjust_on_hand(
+            db, org_id, warehouse.id, product.id, it.variant_id,
+            -it.loaded_qty, movement_type="delivery_out",
+            note=f"Vehicle Loading for partner {partner.name}",
+            created_by=user.id,
         )
 
         loading.items.append(
@@ -271,6 +264,11 @@ def add_extra_load(
     if loading.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Loading session is not active")
 
+    wh_id = loading.warehouse_id or stock_service.default_warehouse(db, org_id).id
+    warehouse = stock_service.owned_warehouse(db, wh_id, org_id, require_active=True)
+    if warehouse is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid source warehouse for extra load")
+
     for it in payload.items:
         product = db.get(Product, it.product_id)
         if product is None or product.organization_id != org_id:
@@ -283,31 +281,19 @@ def add_extra_load(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An item's variant is invalid")
 
         # Check warehouse stock
-        current_inv = variant.inventory if variant else product.total_inventory
-        if current_inv < it.quantity:
+        current_avail = stock_service.available(db, warehouse.id, product.id, it.variant_id)
+        if current_avail < it.quantity:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Insufficient warehouse stock for {product.name}",
             )
 
         # Deduct warehouse stock
-        new_inv = current_inv - it.quantity
-        if variant:
-            variant.inventory = new_inv
-        else:
-            product.total_inventory = new_inv
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=product.id,
-                variant_id=it.variant_id,
-                movement_type="delivery_out",
-                quantity=-it.quantity,
-                balance_after=new_inv,
-                note=f"Vehicle Extra Load (Session: {id[:8]})",
-                created_by=user.id,
-            )
+        stock_service.adjust_on_hand(
+            db, org_id, warehouse.id, product.id, it.variant_id,
+            -it.quantity, movement_type="delivery_out",
+            note=f"Vehicle Extra Load (Session: {id[:8]})",
+            created_by=user.id,
         )
 
         # Find existing item in loading session
@@ -353,6 +339,11 @@ def record_returns(
     if loading.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Loading session is not active")
 
+    wh_id = loading.warehouse_id or stock_service.default_warehouse(db, org_id).id
+    warehouse = stock_service.owned_warehouse(db, wh_id, org_id, require_active=True)
+    if warehouse is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid source warehouse for EOD return")
+
     for it in payload.items:
         match = next(
             (
@@ -380,29 +371,12 @@ def record_returns(
 
         match.returned_qty = it.returned_qty
 
-        # Return stock to warehouse
-        if it.variant_id:
-            variant = db.get(ProductVariant, it.variant_id)
-            if variant:
-                variant.inventory = (variant.inventory or 0) + it.returned_qty
-                new_inv = variant.inventory
-        else:
-            product = db.get(Product, it.product_id)
-            if product:
-                product.total_inventory = (product.total_inventory or 0) + it.returned_qty
-                new_inv = product.total_inventory
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=it.product_id,
-                variant_id=it.variant_id,
-                movement_type="adjustment",
-                quantity=it.returned_qty,
-                balance_after=new_inv,
-                note=f"Vehicle End-of-Day Return (Session: {id[:8]})",
-                created_by=user.id,
-            )
+        # Return stock to exact source warehouse
+        stock_service.adjust_on_hand(
+            db, org_id, warehouse.id, it.product_id, it.variant_id,
+            it.returned_qty, movement_type="adjustment",
+            note=f"Vehicle End-of-Day Return (Session: {id[:8]})",
+            created_by=user.id,
         )
 
     loading.status = "closed"

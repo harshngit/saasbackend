@@ -2619,10 +2619,10 @@ dp2_email = f"dp2_{uuid.uuid4().hex[:8]}@firm.com"
 dp2 = client.post("/users", headers=fin_hdr, json={
     "name": "DP Two", "email": dp2_email, "username": f"dp2_{uuid.uuid4().hex[:8]}",
     "password": "Partner@123", "role": "delivery_partner"}).json()
-client.post("/purchase-invoices", headers=fin_hdr, json={
+pi_res = client.post("/purchase-invoices", headers=fin_hdr, json={
     "invoice_number": f"PI-{uuid.uuid4().hex[:6]}", "supplier_id": fsup["id"],
-    "items": [{"product_id": fprod["id"], "quantity": 20, "purchase_price": 50}]})
-client.patch(f"/purchase-invoices/{client.get('/purchase-invoices', headers=fin_hdr).json()[0]['id']}/approve", headers=fin_hdr)
+    "items": [{"product_id": fprod["id"], "quantity": 20, "purchase_price": 50}]}).json()
+client.patch(f"/purchase-invoices/{pi_res['id']}/approve", headers=fin_hdr)
 dp2_load = client.post("/vehicle-stock/loading", headers=fin_hdr, json={
     "delivery_partner_id": dp2["id"], "items": [{"product_id": fprod["id"], "loaded_qty": 4}]}).json()
 check("delete partner with open loading -> 409",

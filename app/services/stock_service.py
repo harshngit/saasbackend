@@ -14,6 +14,7 @@ in step with the sum across warehouses, so every existing product, inventory and
 report endpoint keeps reporting the same figure it always did.
 """
 
+from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session, lazyload
 
@@ -92,14 +93,22 @@ def _seed_from_catalog(db: Session, org_id: str, warehouse: Warehouse) -> None:
     db.flush()
 
 
-def owned_warehouse(db: Session, warehouse_id: str | None, org_id: str) -> Warehouse | None:
+def owned_warehouse(
+    db: Session, warehouse_id: str | None, org_id: str, require_active: bool = False
+) -> Warehouse | None:
     """The warehouse if it belongs to this firm, else None. No id means the default."""
     if not warehouse_id:
-        return default_warehouse(db, org_id)
-    warehouse = db.get(Warehouse, warehouse_id)
-    if warehouse is None or warehouse.organization_id != org_id:
-        return None
-    return warehouse
+        wh = default_warehouse(db, org_id)
+    else:
+        wh = db.get(Warehouse, warehouse_id)
+        if wh is None or wh.organization_id != org_id:
+            return None
+    if require_active and wh is not None and not wh.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Warehouse '{wh.name}' ({wh.code}) is inactive and cannot perform operational transactions",
+        )
+    return wh
 
 
 # ------------------------------ stock figures ------------------------------
@@ -353,6 +362,7 @@ def move_tracked(
     db.add(
         StockMovement(
             organization_id=org_id,
+            warehouse_id=warehouse_id,
             product_id=product_id,
             variant_id=variant_id,
             movement_type=movement_type,

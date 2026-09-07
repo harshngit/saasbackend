@@ -87,6 +87,7 @@ from app.routers import (
     quotations,
     payment_receipts,
     sales_returns,
+    transfers,
 )
 
 app = FastAPI(
@@ -242,6 +243,8 @@ app.include_router(sales_returns.router)
 app.include_router(visits.router)
 app.include_router(follow_ups.router)
 app.include_router(leaves.router)
+app.include_router(transfers.router)
+
 
 
 

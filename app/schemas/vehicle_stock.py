@@ -76,6 +76,7 @@ class VehicleLoadingOut(BaseModel):
     delivery_partner: VehiclePartnerBrief | None = None
     vehicle_id: str | None = None
     vehicle: VehicleBrief | None = None
+    warehouse_id: str | None = None
     date: datetime
     status: str
     items: list[VehicleLoadingItemOut]
@@ -96,6 +97,7 @@ class VehicleLoadingCreate(BaseModel):
     delivery_partner_id: str | None = Field(
         default=None, description="Required unless delivery_id is given, which names the partner")
     delivery_id: str | None = None
+    warehouse_id: str | None = None
     vehicle_id: str | None = None
     date: datetime | None = None
     items: list[VehicleLoadingItemIn] = Field(default_factory=list)

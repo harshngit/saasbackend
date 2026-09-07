@@ -59,11 +59,14 @@ from app.models.lead import Lead, LeadInterestedProduct
 from app.models.quotation import Quotation, QuotationItem
 from app.models.delivery import Delivery, DeliveryCollection, DeliveryHistory, DeliveryItem
 from app.models.sales_return import SalesReturn, ReturnItem
+from app.models.transfer import WarehouseTransfer, WarehouseTransferItem
 from app.models.visit import Visit
 from app.models.follow_up import FollowUp
 from app.models.leave import LEAVE_STATUSES, LEAVE_TYPES, Leave
 
 __all__ = [
+    "WarehouseTransfer",
+    "WarehouseTransferItem",
     "Leave",
     "LEAVE_STATUSES",
     "LEAVE_TYPES",

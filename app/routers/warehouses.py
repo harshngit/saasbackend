@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Product, ProductVariant, StockReservation, User, Warehouse, WarehouseStock
+from app.models import Product, ProductVariant, StockMovement, StockReservation, User, Warehouse, WarehouseStock
+from app.schemas.inventory import StockMovementOut
 from app.schemas.warehouse import (
     StockAdjustment,
     StockRow,
@@ -214,6 +215,11 @@ def adjust_stock(
     """
     org_id = _org_id(user)
     warehouse = _owned(db, warehouse_id, org_id)
+    if not warehouse.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Warehouse '{warehouse.name}' is inactive and cannot perform operational transactions",
+        )
     product = db.get(Product, payload.product_id)
     if product is None or product.organization_id != org_id:
         raise HTTPException(
@@ -306,3 +312,53 @@ def delete_warehouse(
         )
     db.delete(warehouse)
     db.commit()
+
+
+@router.get("/{warehouse_id}/movements", response_model=list[StockMovementOut])
+def list_warehouse_movements(
+    warehouse_id: str,
+    user: User = Depends(_view),
+    product_id: str | None = Query(default=None),
+    variant_id: str | None = Query(default=None),
+    movement_type: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[StockMovementOut]:
+    """Canonical read API for warehouse stock movement audit ledger."""
+    org_id = _org_id(user)
+    warehouse = _owned(db, warehouse_id, org_id)
+
+    query = db.query(StockMovement).filter(
+        StockMovement.organization_id == org_id,
+        StockMovement.warehouse_id == warehouse.id,
+    )
+    if product_id:
+        query = query.filter(StockMovement.product_id == product_id)
+    if variant_id:
+        query = query.filter(StockMovement.variant_id == variant_id)
+    if movement_type:
+        query = query.filter(StockMovement.movement_type == movement_type)
+
+    movements = query.order_by(StockMovement.created_at.desc()).offset(offset).limit(limit).all()
+
+    results = []
+    for m in movements:
+        results.append(
+            StockMovementOut(
+                id=m.id,
+                warehouse_id=m.warehouse_id,
+                product_id=m.product_id,
+                variant_id=m.variant_id,
+                product_name=m.product.name if m.product else None,
+                variant_name=m.variant.name if m.variant else None,
+                movement_type=m.movement_type,
+                quantity=m.quantity,
+                balance_after=m.balance_after,
+                note=m.note,
+                created_by=m.created_by,
+                created_at=m.created_at,
+            )
+        )
+    return results
+

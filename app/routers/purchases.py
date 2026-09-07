@@ -18,7 +18,7 @@ from app.models import (
     User,
     Warehouse,
 )
-from app.services import numbering_service, lookup_service, purchase_service
+from app.services import numbering_service, lookup_service, purchase_service, stock_service
 from app.schemas.purchase import (
     CancelBody,
     PaymentStatusUpdate,
@@ -302,32 +302,19 @@ def approve_purchase(
             detail=f"Only pending invoices can be approved (this is '{inv.status}')",
         )
 
-    for item in inv.items:
-        if item.variant_id:
-            variant = db.get(ProductVariant, item.variant_id)
-            if variant:
-                variant.inventory = (variant.inventory or 0) + item.quantity
-                bal = variant.inventory
-            else:
-                continue
-        else:
-            product = db.get(Product, item.product_id) if item.product_id else None
-            if product is None:
-                continue
-            product.total_inventory = (product.total_inventory or 0) + item.quantity
-            bal = product.total_inventory
+    wh_id = inv.warehouse_id or stock_service.default_warehouse(db, org_id).id
+    warehouse = stock_service.owned_warehouse(db, wh_id, org_id, require_active=True)
+    if warehouse is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid warehouse for purchase invoice")
 
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=item.product_id,
-                variant_id=item.variant_id,
-                movement_type="purchase_in",
-                quantity=item.quantity,
-                balance_after=bal,
-                note=f"Purchase {inv.invoice_number}",
-                created_by=user.id,
-            )
+    for item in inv.items:
+        if not item.product_id:
+            continue
+        item_wh_id = item.warehouse_id or warehouse.id
+        stock_service.adjust_on_hand(
+            db, org_id, item_wh_id, item.product_id, item.variant_id,
+            item.quantity, movement_type="purchase_in",
+            note=f"Purchase {inv.invoice_number}", created_by=user.id,
         )
 
     if inv.supplier_id:

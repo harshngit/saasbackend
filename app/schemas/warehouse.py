@@ -12,7 +12,13 @@ class WarehouseOut(BaseModel):
     code: str
     address: str | None = None
     city: str | None = None
+    state: str | None = None
+    pincode: str | None = None
+    country: str | None = None
+    contact_person: str | None = None
     contact_number: str | None = None
+    email: str | None = None
+    notes: str | None = None
     is_default: bool
     is_active: bool
     created_at: datetime
@@ -25,7 +31,13 @@ class WarehouseCreate(BaseModel):
         default=None, max_length=30, description="Auto-assigned (WH-002, WH-003, …) when omitted")
     address: str | None = None
     city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    pincode: str | None = Field(default=None, max_length=20)
+    country: str | None = Field(default=None, max_length=100)
+    contact_person: str | None = Field(default=None, max_length=150)
     contact_number: str | None = Field(default=None, max_length=20)
+    email: str | None = Field(default=None, max_length=255)
+    notes: str | None = Field(default=None, max_length=1000)
     is_default: bool = Field(
         default=False, description="Making one default clears the flag on the previous one")
     is_active: bool = True
@@ -38,7 +50,13 @@ class WarehouseUpdate(BaseModel):
     code: str | None = Field(default=None, max_length=30)
     address: str | None = None
     city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    pincode: str | None = Field(default=None, max_length=20)
+    country: str | None = Field(default=None, max_length=100)
+    contact_person: str | None = Field(default=None, max_length=150)
     contact_number: str | None = Field(default=None, max_length=20)
+    email: str | None = Field(default=None, max_length=255)
+    notes: str | None = Field(default=None, max_length=1000)
     is_default: bool | None = None
     is_active: bool | None = None
 

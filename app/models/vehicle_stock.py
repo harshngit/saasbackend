@@ -28,6 +28,9 @@ class VehicleLoading(Base):
     vehicle_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("vehicles.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    warehouse_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("warehouses.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False, index=True)
 
@@ -44,6 +47,7 @@ class VehicleLoading(Base):
     )
     delivery_partner: Mapped["User"] = relationship(foreign_keys=[delivery_partner_id], lazy="joined")  # noqa: F821
     vehicle: Mapped["Vehicle | None"] = relationship(foreign_keys=[vehicle_id], lazy="joined")  # noqa: F821
+    warehouse: Mapped["Warehouse | None"] = relationship(foreign_keys=[warehouse_id], lazy="joined")  # noqa: F821
 
 
 class VehicleLoadingItem(Base):
