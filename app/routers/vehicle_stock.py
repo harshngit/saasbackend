@@ -12,6 +12,7 @@ from app.models import (
     ProductVariant,
     StockMovement,
     User,
+    Vehicle,
     VehicleLoading,
     VehicleLoadingItem,
     VehicleReconciliationItem,
@@ -85,6 +86,19 @@ def load_vehicle(
     to stock a van for ad-hoc field sales, as before.
     """
     org_id = _org_id(user)
+
+    if payload.vehicle_id:
+        v_check = db.get(Vehicle, payload.vehicle_id)
+        if v_check is None or v_check.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="vehicle_id is not a vehicle in your firm",
+            )
+        if not v_check.is_active or v_check.status != "active":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Vehicle '{v_check.vehicle_number}' is {v_check.status} and cannot be used for new vehicle loading",
+            )
 
     if payload.delivery_id:
         delivery = db.get(Delivery, payload.delivery_id)

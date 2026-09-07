@@ -252,6 +252,11 @@ def plan_delivery(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="vehicle_id is not a vehicle in your firm",
             )
+        if not vehicle.is_active or vehicle.status != "active":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Vehicle '{vehicle.vehicle_number}' is {vehicle.status} and cannot be assigned to new deliveries",
+            )
 
     delivery = delivery_service.plan(
         db, user, order,
@@ -459,6 +464,11 @@ def update_delivery(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="vehicle_id is not a vehicle in your firm",
+            )
+        if not vehicle.is_active or vehicle.status != "active":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Vehicle '{vehicle.vehicle_number}' is {vehicle.status} and cannot be assigned to new deliveries",
             )
 
     new_status = data.pop("status", None)

@@ -42,7 +42,7 @@ from app.models.tracking import ProductSerial, StockBatch
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
-from app.models.vehicle import Vehicle
+from app.models.vehicle import Vehicle, VehicleAssignmentHistory
 from app.models.vehicle_stock import (
     VehicleLoading,
     VehicleLoadingItem,
@@ -76,6 +76,7 @@ __all__ = [
     "VehicleReconciliationItem",
     "ActivityLog",
     "Vehicle",
+    "VehicleAssignmentHistory",
     "Warehouse",
     "WarehouseStock",
     "StockReservation",
