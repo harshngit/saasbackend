@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -26,13 +26,22 @@ class Supplier(Base):
     )
 
     name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    company_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     contact_person: Mapped[str | None] = mapped_column(String(150), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gst_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    pan_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    supplier_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payment_terms: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    credit_limit: Mapped[float | None] = mapped_column(Float, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     city: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    pincode: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Balances (all kept in sync). outstanding = opening + purchases - paid.
     opening_balance: Mapped[float] = mapped_column(Float, default=0, nullable=False)
@@ -47,6 +56,9 @@ class Supplier(Base):
     )
 
     payments: Mapped[list["SupplierPayment"]] = relationship(
+        back_populates="supplier", cascade="all, delete-orphan"
+    )
+    supplier_products: Mapped[list["SupplierProduct"]] = relationship(
         back_populates="supplier", cascade="all, delete-orphan"
     )
 
@@ -77,3 +89,28 @@ class SupplierPayment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     supplier: Mapped["Supplier"] = relationship(back_populates="payments")
+
+
+class SupplierProduct(Base):
+    """A link table representing many-to-many relationships between Suppliers and Products."""
+
+    __tablename__ = "supplier_products"
+    __table_args__ = (
+        UniqueConstraint("supplier_id", "product_id", name="uq_supplier_product"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    supplier_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("suppliers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    product_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    supplier: Mapped["Supplier"] = relationship(back_populates="supplier_products")
+    product: Mapped["Product"] = relationship(lazy="joined")  # noqa: F821
+

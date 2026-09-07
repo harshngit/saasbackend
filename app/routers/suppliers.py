@@ -6,12 +6,14 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Supplier, SupplierPayment, User
+from app.models import Product, PurchaseInvoice, Supplier, SupplierPayment, SupplierProduct, User
 from app.schemas.supplier import (
     PaymentCreate,
     PaymentOut,
     SupplierCreate,
     SupplierOut,
+    SupplierProductLinkCreate,
+    SupplierProductOut,
     SupplierStatusUpdate,
     SupplierUpdate,
 )
@@ -125,7 +127,151 @@ def delete_supplier(
     db: Session = Depends(get_db),
 ) -> None:
     supplier = _owned(db, supplier_id, _org_id(user))
+
+    # Check for historical purchase invoices to prevent unsafe deletion
+    has_purchases = (
+        db.query(PurchaseInvoice)
+        .filter(
+            PurchaseInvoice.organization_id == supplier.organization_id,
+            PurchaseInvoice.supplier_id == supplier_id,
+        )
+        .first()
+    )
+    if has_purchases:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete supplier with historical purchases. Deactivate the supplier instead.",
+        )
+
     db.delete(supplier)  # payments cascade
+    db.commit()
+
+
+# ---------------------------- Supplier Products Linkage ----------------------------
+
+
+@router.get("/{supplier_id}/products", response_model=list[SupplierProductOut])
+def list_supplier_products(
+    supplier_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """List products linked to a supplier."""
+    org_id = _org_id(user)
+    _owned(db, supplier_id, org_id)
+
+    links = (
+        db.query(SupplierProduct)
+        .filter(
+            SupplierProduct.organization_id == org_id,
+            SupplierProduct.supplier_id == supplier_id,
+        )
+        .order_by(SupplierProduct.created_at.desc())
+        .all()
+    )
+
+    result = []
+    for link in links:
+        prod = link.product
+        result.append({
+            "id": link.id,
+            "organization_id": link.organization_id,
+            "supplier_id": link.supplier_id,
+            "product_id": link.product_id,
+            "created_at": link.created_at,
+            "product_name": prod.name if prod else None,
+            "product_sku": prod.sku if prod else None,
+            "product_category_id": prod.category_id if prod else None,
+            "product_status": prod.status if prod else None,
+        })
+    return result
+
+
+@router.post("/{supplier_id}/products", response_model=SupplierProductOut, status_code=status.HTTP_201_CREATED)
+def link_supplier_product(
+    supplier_id: str,
+    payload: SupplierProductLinkCreate,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Link a product to a supplier."""
+    org_id = _org_id(user)
+    supplier = _owned(db, supplier_id, org_id)
+
+    product = db.get(Product, payload.product_id)
+    if product is None or product.organization_id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="product_id is not a product in your firm",
+        )
+
+    # Check for duplicate link
+    existing = (
+        db.query(SupplierProduct)
+        .filter(
+            SupplierProduct.organization_id == org_id,
+            SupplierProduct.supplier_id == supplier_id,
+            SupplierProduct.product_id == product.id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Product is already linked to this supplier.",
+        )
+
+    link = SupplierProduct(
+        organization_id=org_id,
+        supplier_id=supplier.id,
+        product_id=product.id,
+    )
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+
+    return {
+        "id": link.id,
+        "organization_id": link.organization_id,
+        "supplier_id": link.supplier_id,
+        "product_id": link.product_id,
+        "created_at": link.created_at,
+        "product_name": product.name,
+        "product_sku": product.sku,
+        "product_category_id": product.category_id,
+        "product_status": product.status,
+    }
+
+
+@router.delete("/{supplier_id}/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unlink_supplier_product(
+    supplier_id: str,
+    product_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    """Unlink a product from a supplier."""
+    org_id = _org_id(user)
+    _owned(db, supplier_id, org_id)
+
+    link = (
+        db.query(SupplierProduct)
+        .filter(
+            SupplierProduct.organization_id == org_id,
+            SupplierProduct.supplier_id == supplier_id,
+            SupplierProduct.product_id == product_id,
+        )
+        .first()
+    )
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Supplier product link not found",
+        )
+
+    db.delete(link)
     db.commit()
 
 
@@ -194,3 +340,4 @@ def void_payment(
     db.commit()
     db.refresh(supplier)
     return supplier
+

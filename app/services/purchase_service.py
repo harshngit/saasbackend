@@ -18,6 +18,11 @@ def validate_supplier(db: Session, org_id: str, supplier_id: str | None) -> Supp
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="supplier_id is not a supplier in your firm",
         )
+    if not supplier.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Supplier '{supplier.name}' is inactive and cannot be used for new purchases.",
+        )
     return supplier
 
 
