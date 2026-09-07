@@ -16,6 +16,7 @@ class SupplierOut(BaseModel):
     gst_number: str | None = None
     pan_number: str | None = None
     category: str | None = None
+    supplier_categories: list[str] = Field(default_factory=list)
     supplier_type: str | None = None
     payment_terms: str | None = None
     credit_limit: float | None = None
@@ -43,6 +44,7 @@ class SupplierCreate(BaseModel):
     gst_number: str | None = Field(default=None, max_length=20)
     pan_number: str | None = Field(default=None, max_length=20)
     category: str | None = Field(default=None, max_length=100)
+    supplier_categories: list[str] | None = Field(default=None)
     supplier_type: str | None = Field(default=None, max_length=100)
     payment_terms: str | None = Field(default=None, max_length=100)
     credit_limit: float | None = Field(default=None, ge=0)
@@ -66,6 +68,7 @@ class SupplierUpdate(BaseModel):
     gst_number: str | None = Field(default=None, max_length=20)
     pan_number: str | None = Field(default=None, max_length=20)
     category: str | None = Field(default=None, max_length=100)
+    supplier_categories: list[str] | None = Field(default=None)
     supplier_type: str | None = Field(default=None, max_length=100)
     payment_terms: str | None = Field(default=None, max_length=100)
     credit_limit: float | None = Field(default=None, ge=0)

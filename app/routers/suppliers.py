@@ -53,7 +53,15 @@ def create_supplier(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Supplier:
-    supplier = Supplier(organization_id=_org_id(user), **payload.model_dump())
+    data = payload.model_dump()
+    supplier_cats = data.pop("supplier_categories", None)
+    if supplier_cats is not None:
+        data["categories"] = supplier_cats
+        if supplier_cats and not data.get("category"):
+            data["category"] = supplier_cats[0]
+    elif data.get("category") and not data.get("categories"):
+        data["categories"] = [data["category"]]
+    supplier = Supplier(organization_id=_org_id(user), **data)
     db.add(supplier)
     db.commit()
     db.refresh(supplier)
@@ -97,8 +105,19 @@ def update_supplier(
     db: Session = Depends(get_db),
 ) -> Supplier:
     supplier = _owned(db, supplier_id, _org_id(user))
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(supplier, field, value)
+    data = payload.model_dump(exclude_unset=True)
+    if "supplier_categories" in data:
+        supplier_cats = data.pop("supplier_categories")
+        supplier.categories = supplier_cats
+        if supplier_cats:
+            supplier.category = supplier_cats[0]
+    if "category" in data:
+        supplier.category = data["category"]
+        if supplier.category and not supplier.categories:
+            supplier.categories = [supplier.category]
+    for field, value in data.items():
+        if field not in ("supplier_categories", "category"):
+            setattr(supplier, field, value)
     db.commit()
     db.refresh(supplier)
     return supplier

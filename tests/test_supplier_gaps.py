@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.main import app
 from app.core.database import Base, engine, get_db
 from app.core.security import create_access_token
-from app.models import Organization, Product, PurchaseInvoice, Supplier, SupplierPayment, User
+from app.models import Organization, Product, PurchaseInvoice, Role, Supplier, SupplierPayment, User, UserRole
 
 
 @pytest.fixture
@@ -303,3 +303,194 @@ def test_supplier_delete_safety(test_setup, db_session: Session):
 
     # Verify sup_clean is deleted
     assert db_session.query(Supplier).filter(Supplier.id == sup_clean_id).first() is None
+
+
+def test_supplier_multi_select_categories(test_setup):
+    client = TestClient(app)
+    headers_a = test_setup["headers_a"]
+
+    # 1. Create Supplier with multi-select supplier_categories
+    payload = {
+        "name": "Multi-Cat Distributors",
+        "supplier_type": "Distributor",
+        "supplier_categories": ["Electronics", "Accessories", "Packaging"],
+    }
+    resp = client.post("/suppliers", json=payload, headers=headers_a)
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    supplier_id = data["id"]
+
+    assert data["supplier_type"] == "Distributor"
+    assert data["supplier_categories"] == ["Electronics", "Accessories", "Packaging"]
+    assert data["category"] == "Electronics"  # Backward compatibility primary category
+
+    # 2. Get Supplier detail
+    get_resp = client.get(f"/suppliers/{supplier_id}", headers=headers_a)
+    assert get_resp.status_code == 200
+    get_data = get_resp.json()
+    assert get_data["supplier_categories"] == ["Electronics", "Accessories", "Packaging"]
+    assert get_data["category"] == "Electronics"
+
+    # 3. Update supplier_categories
+    update_payload = {
+        "supplier_categories": ["Hardware", "Tools"],
+    }
+    put_resp = client.put(f"/suppliers/{supplier_id}", json=update_payload, headers=headers_a)
+    assert put_resp.status_code == 200
+    put_data = put_resp.json()
+    assert put_data["supplier_categories"] == ["Hardware", "Tools"]
+    assert put_data["category"] == "Hardware"
+
+    # 4. Backward compatibility: create legacy supplier with single category string
+    legacy_payload = {
+        "name": "Legacy Vendor Inc",
+        "category": "Raw Materials",
+    }
+    leg_resp = client.post("/suppliers", json=legacy_payload, headers=headers_a)
+    assert leg_resp.status_code == 201
+    leg_data = leg_resp.json()
+    assert leg_data["category"] == "Raw Materials"
+    assert leg_data["supplier_categories"] == ["Raw Materials"]
+
+    # 5. Historical database record (categories JSON is NULL) compatibility
+    db_session = Session(bind=engine)
+    hist_sup = Supplier(
+        id=str(uuid.uuid4()),
+        organization_id=test_setup["org_a"].id,
+        name="Historical DB Vendor",
+        category="Historical Steel",
+        categories=None,
+        is_active=True,
+    )
+    db_session.add(hist_sup)
+    db_session.commit()
+    hist_id = hist_sup.id
+    db_session.close()
+
+    hist_resp = client.get(f"/suppliers/{hist_id}", headers=headers_a)
+    assert hist_resp.status_code == 200
+    hist_data = hist_resp.json()
+    assert hist_data["category"] == "Historical Steel"
+    assert hist_data["supplier_categories"] == ["Historical Steel"]
+
+
+def test_supplier_permissions_and_purchase_filtering(test_setup, db_session: Session):
+    client = TestClient(app)
+    org_a = test_setup["org_a"]
+    headers_admin_a = test_setup["headers_a"]
+
+    # Create Roles for Accountant, Sales Officer, Delivery Partner
+    role_acct = Role(
+        id=str(uuid.uuid4()),
+        organization_id=org_a.id,
+        name="Accountant Role",
+        permissions={"suppliers": {"view": True}, "payments": {"view": True, "create": True}},
+    )
+    role_sales = Role(
+        id=str(uuid.uuid4()),
+        organization_id=org_a.id,
+        name="Sales Officer Role",
+        permissions={"suppliers": {"view": True}},
+    )
+    role_deliv = Role(
+        id=str(uuid.uuid4()),
+        organization_id=org_a.id,
+        name="Delivery Partner Role",
+        permissions={"deliveries": {"view": True}},
+    )
+    db_session.add_all([role_acct, role_sales, role_deliv])
+    db_session.commit()
+
+    # Create users with assigned roles
+    accountant_user = User(
+        id=str(uuid.uuid4()),
+        organization_id=org_a.id,
+        email=f"accountant_{uuid.uuid4().hex[:6]}@example.com",
+        name="Accountant User",
+        password_hash="hashed_pw",
+        role=UserRole.ACCOUNTANT,
+        role_id=role_acct.id,
+        is_active=True,
+    )
+    sales_user = User(
+        id=str(uuid.uuid4()),
+        organization_id=org_a.id,
+        email=f"sales_{uuid.uuid4().hex[:6]}@example.com",
+        name="Sales Officer User",
+        password_hash="hashed_pw",
+        role=UserRole.SALES_OFFICER,
+        role_id=role_sales.id,
+        is_active=True,
+    )
+    delivery_user = User(
+        id=str(uuid.uuid4()),
+        organization_id=org_a.id,
+        email=f"delivery_{uuid.uuid4().hex[:6]}@example.com",
+        name="Delivery Partner User",
+        password_hash="hashed_pw",
+        role=UserRole.DELIVERY_PARTNER,
+        role_id=role_deliv.id,
+        is_active=True,
+    )
+    db_session.add_all([accountant_user, sales_user, delivery_user])
+    db_session.commit()
+
+    token_acct = create_access_token(accountant_user.id, UserRole.ACCOUNTANT.value, org_a.id)
+    headers_acct = {"Authorization": f"Bearer {token_acct}"}
+
+    token_sales = create_access_token(sales_user.id, UserRole.SALES_OFFICER.value, org_a.id)
+    headers_sales = {"Authorization": f"Bearer {token_sales}"}
+
+    token_deliv = create_access_token(delivery_user.id, UserRole.DELIVERY_PARTNER.value, org_a.id)
+    headers_deliv = {"Authorization": f"Bearer {token_deliv}"}
+
+    # 1. Test Admin permission -> Can create supplier
+    sup_resp = client.post("/suppliers", json={"name": "Perm Test Vendor"}, headers=headers_admin_a)
+    assert sup_resp.status_code == 201
+    sup_id = sup_resp.json()["id"]
+
+    # 2. Test Accountant permission -> Can view suppliers, but POST /suppliers is 403
+    acct_get = client.get(f"/suppliers/{sup_id}", headers=headers_acct)
+    assert acct_get.status_code == 200
+    acct_post = client.post("/suppliers", json={"name": "Forbidden Vendor"}, headers=headers_acct)
+    assert acct_post.status_code == 403
+
+    # 3. Test Sales Officer permission -> Can view suppliers, but POST /suppliers is 403
+    sales_get = client.get("/suppliers", headers=headers_sales)
+    assert sales_get.status_code == 200
+    sales_post = client.post("/suppliers", json={"name": "Forbidden Vendor 2"}, headers=headers_sales)
+    assert sales_post.status_code == 403
+
+    # 4. Test Delivery Partner permission -> Cannot view suppliers (403)
+    deliv_get = client.get("/suppliers", headers=headers_deliv)
+    assert deliv_get.status_code == 403
+
+    # 5. Test Purchase filtering by supplier_id (GET /purchases?supplier_id={supplier_id})
+    sup_b = Supplier(id=str(uuid.uuid4()), organization_id=org_a.id, name="Other Vendor", is_active=True)
+    prod = Product(id=str(uuid.uuid4()), organization_id=org_a.id, name="Test Product", price=100.0)
+    db_session.add_all([sup_b, prod])
+    db_session.commit()
+
+    # Create Purchase for sup_id
+    client.post("/purchases", json={
+        "invoice_number": "PO-SUP-A-1",
+        "supplier_id": sup_id,
+        "items": [{"product_id": prod.id, "quantity": 5, "purchase_price": 50.0}],
+    }, headers=headers_admin_a)
+
+    # Create Purchase for sup_b
+    client.post("/purchases", json={
+        "invoice_number": "PO-SUP-B-1",
+        "supplier_id": sup_b.id,
+        "items": [{"product_id": prod.id, "quantity": 10, "purchase_price": 50.0}],
+    }, headers=headers_admin_a)
+
+    # Query purchases filtered by sup_id
+    filter_resp = client.get(f"/purchases?supplier_id={sup_id}", headers=headers_admin_a)
+    assert filter_resp.status_code == 200
+    purchases_list = filter_resp.json()
+    assert len(purchases_list) >= 1
+    for p in purchases_list:
+        assert p["supplier_id"] == sup_id
+
+

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -33,6 +33,7 @@ class Supplier(Base):
     gst_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     pan_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    categories: Mapped[list | None] = mapped_column(JSON, nullable=True)
     supplier_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     payment_terms: Mapped[str | None] = mapped_column(String(100), nullable=True)
     credit_limit: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -65,6 +66,14 @@ class Supplier(Base):
     @property
     def outstanding_payable(self) -> float:
         return round((self.opening_balance or 0) + (self.total_purchases or 0) - (self.total_paid or 0), 2)
+
+    @property
+    def supplier_categories(self) -> list[str]:
+        if self.categories and isinstance(self.categories, list) and len(self.categories) > 0:
+            return self.categories
+        elif self.category:
+            return [self.category]
+        return []
 
 
 class SupplierPayment(Base):
