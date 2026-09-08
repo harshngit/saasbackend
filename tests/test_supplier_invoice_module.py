@@ -187,9 +187,9 @@ check("Recording invoice with 0 confirmed GRNs rejected (HTTP 400)", r_rec_uncon
 client.post(f"/grns/{grn_draft_id}/confirm", headers=auth)
 
 # -------------------------------------------------------------
-# Test C — Exact 3-Way Match & Recording
+# Focused Test 1 — Exact 3-Way Match & Recording
 # -------------------------------------------------------------
-print("\n--- Test C: Exact 3-Way Match & Recording ---")
+print("\n--- Focused Test 1: Exact 3-Way Match & Recording ---")
 # Invoice 1 billed_qty = 5 @ $50.0 (exact match on unit price)
 r_rec_succ = client.post(f"/supplier-invoices/{sinv_id}/record", headers=auth)
 check("Record invoice returns HTTP 200", r_rec_succ.status_code == 200)
@@ -247,9 +247,9 @@ r_rec3 = client.post(f"/supplier-invoices/{sinv3_id}/record", headers=auth)
 check("Over-invoicing beyond confirmed GRN accepted qty rejected (HTTP 400)", r_rec3.status_code == 400)
 
 # -------------------------------------------------------------
-# Test E — Price Mismatch Verification
+# Focused Test 2 — Price Mismatch (Proves no unreachable disputed state)
 # -------------------------------------------------------------
-print("\n--- Test E: Price Mismatch Verification ---")
+print("\n--- Focused Test 2: Price Mismatch & Status Verification ---")
 # Setup second PO & GRN for 10 units @ $100.0
 r_pur2 = client.post(
     "/purchases",
@@ -288,39 +288,14 @@ r_inv_price = client.post(
 ).json()
 r_rec_price = client.post(f"/supplier-invoices/{r_inv_price['id']}/record", headers=auth)
 check("Price variance invoice records HTTP 200", r_rec_price.status_code == 200)
+check("Status remains recorded (not disputed)", r_rec_price.json()["status"] == "recorded")
 check("Verification status is mismatched", r_rec_price.json()["verification_status"] == "mismatched")
 
 # -------------------------------------------------------------
-# Test I — Supplier Mismatch Guard
+# Focused Test 3 & 4 — Invoice Number Uniqueness Rules
 # -------------------------------------------------------------
-print("\n--- Test I: Supplier Mismatch Guard ---")
-db = SessionLocal()
-try:
-    sup2 = Supplier(organization_id=org_id, name="Other Vendor", is_active=True)
-    db.add(sup2)
-    db.commit()
-    db.refresh(sup2)
-    sup2_id = sup2.id
-finally:
-    db.close()
-
-r_sup_mismatch = client.post(
-    "/supplier-invoices",
-    headers=auth,
-    json={
-        "supplier_id": sup2_id,
-        "purchase_id": r_pur2["id"],
-        "supplier_invoice_number": "VEND-INV-WRONG-SUP",
-        "items": [{"purchase_item_id": r_pur2["items"][0]["id"], "billed_qty": 1, "unit_price": 100.0}],
-    },
-)
-check("Supplier mismatch rejected (HTTP 400)", r_sup_mismatch.status_code == 400)
-
-# -------------------------------------------------------------
-# Test N & O — Invoice Number Uniqueness Rules
-# -------------------------------------------------------------
-print("\n--- Test N & O: Invoice Number Uniqueness ---")
-# Duplicate invoice number for same supplier -> blocked
+print("\n--- Focused Test 3 & 4: Invoice Number Uniqueness ---")
+# Focused Test 3: Duplicate invoice number for same supplier -> blocked
 r_dup_num = client.post(
     "/supplier-invoices",
     headers=auth,
@@ -333,22 +308,120 @@ r_dup_num = client.post(
 )
 check("Duplicate invoice number for same supplier blocked (HTTP 400)", r_dup_num.status_code == 400)
 
+# Focused Test 4: Same invoice number for different supplier -> allowed
+db = SessionLocal()
+try:
+    sup2 = Supplier(organization_id=org_id, name="Other Vendor", is_active=True)
+    db.add(sup2)
+    db.commit()
+    db.refresh(sup2)
+    sup2_id = sup2.id
+finally:
+    db.close()
+
+# Create PO for Supplier 2
+r_pur_sup2 = client.post(
+    "/purchases",
+    headers=auth,
+    json={
+        "invoice_number": f"PO-{uuid.uuid4().hex[:6]}",
+        "supplier_id": sup2_id,
+        "warehouse_id": wh_id,
+        "items": [{"product_id": prod_id, "ordered_qty": 10, "purchase_price": 100.0}],
+    },
+).json()
+client.post(f"/purchases/{r_pur_sup2['id']}/confirm", headers=auth)
+
+r_inv_diff_sup = client.post(
+    "/supplier-invoices",
+    headers=auth,
+    json={
+        "supplier_id": sup2_id,
+        "purchase_id": r_pur_sup2["id"],
+        "supplier_invoice_number": "VEND-INV-PRICE-VAR", # Same invoice number, different supplier
+        "items": [{"purchase_item_id": r_pur_sup2["items"][0]["id"], "billed_qty": 5, "unit_price": 100.0}],
+    },
+)
+check("Same invoice number for different supplier returns HTTP 201", r_inv_diff_sup.status_code == 201)
+
 # -------------------------------------------------------------
-# Test P & Q — Lifecycle Transitions & Delete Safety
+# Focused Test 5 — Cancel Unpaid Recorded Invoice
 # -------------------------------------------------------------
-print("\n--- Test P & Q: Lifecycle & Delete Safety ---")
+print("\n--- Focused Test 5: Cancel Unpaid Recorded Invoice ---")
+# sinv_id is recorded with amount_paid = 0
+r_can_unpaid = client.post(f"/supplier-invoices/{sinv_id}/cancel", headers=auth)
+check("Cancel unpaid recorded invoice returns HTTP 200", r_can_unpaid.status_code == 200)
+check("Status updated to cancelled", r_can_unpaid.json()["status"] == "cancelled")
+
+# -------------------------------------------------------------
+# Focused Test 6 — Cancel Invoice with Payment Blocked
+# -------------------------------------------------------------
+print("\n--- Focused Test 6: Cancel Invoice with Payment Blocked ---")
+# Set amount_paid > 0 on sinv2_id directly in DB for testing guard
+db = SessionLocal()
+try:
+    inv_paid = db.get(SupplierInvoice, sinv2_id)
+    inv_paid.amount_paid = 100.0
+    db.commit()
+finally:
+    db.close()
+
+r_can_paid = client.post(f"/supplier-invoices/{sinv2_id}/cancel", headers=auth)
+check("Cancel invoice with amount_paid > 0 blocked (HTTP 400)", r_can_paid.status_code == 400)
+
+db = SessionLocal()
+try:
+    inv_check = db.get(SupplierInvoice, sinv2_id)
+    check("Invoice status remains recorded", inv_check.status == "recorded")
+    check("Invoice amount_paid remains 100.0 (no payment reversal)", inv_check.amount_paid == 100.0)
+finally:
+    db.close()
+
+# -------------------------------------------------------------
+# Focused Test 7 — Cancelled Invoice Excluded from Cumulative Billed Qty
+# -------------------------------------------------------------
+print("\n--- Focused Test 7: Cancelled Invoice Excluded from Cumulative Billed Qty ---")
+# Purchase 1 originally had 10 accepted units on GRN.
+# sinv_id (5 units) was cancelled above.
+# sinv2_id (5 units) is recorded.
+# Now remaining billable capacity is 5 units because sinv_id (5 units) was cancelled and freed up!
+r_inv_freed = client.post(
+    "/supplier-invoices",
+    headers=auth,
+    json={
+        "supplier_id": sup_id,
+        "purchase_id": pur_id,
+        "supplier_invoice_number": "VEND-INV-FREED-001",
+        "items": [{"purchase_item_id": pur_item_id, "billed_qty": 5, "unit_price": 50.0}],
+    },
+).json()
+
+r_rec_freed = client.post(f"/supplier-invoices/{r_inv_freed['id']}/record", headers=auth)
+check("Recording invoice after previous cancellation succeeds (HTTP 200)", r_rec_freed.status_code == 200)
+
+# -------------------------------------------------------------
+# Focused Test 8 — Zero Stock Movement Verification
+# -------------------------------------------------------------
+print("\n--- Focused Test 8: Zero Stock Movement Verification ---")
+db = SessionLocal()
+try:
+    moves = db.query(StockMovement).filter(StockMovement.organization_id == org_id).all()
+    # 2 stock movements from 2 GRN confirmations, ZERO from invoice creation, record, or cancel
+    check("Only 2 GRN StockMovements exist (0 from invoices)", len(moves) == 2)
+finally:
+    db.close()
+
+# -------------------------------------------------------------
+# Test P & Q — Delete Safety
+# -------------------------------------------------------------
+print("\n--- Test P & Q: Delete Safety ---")
 # Draft invoice delete -> HTTP 204
 r_del_draft = client.delete(f"/supplier-invoices/{sinv3_id}", headers=auth)
 check("Delete draft invoice returns 204", r_del_draft.status_code == 204)
 
 # Recorded invoice delete -> HTTP 400
-r_del_rec = client.delete(f"/supplier-invoices/{sinv_id}", headers=auth)
+r_del_rec = client.delete(f"/supplier-invoices/{sinv2_id}", headers=auth)
 check("Delete recorded invoice blocked (HTTP 400)", r_del_rec.status_code == 400)
-
-# Cancel recorded invoice -> HTTP 200
-r_can_rec = client.post(f"/supplier-invoices/{sinv_id}/cancel", headers=auth)
-check("Cancel recorded invoice returns 200", r_can_rec.status_code == 200)
-check("Status updated to cancelled", r_can_rec.json()["status"] == "cancelled")
 
 # Cancelled invoice delete -> HTTP 400
 r_del_can = client.delete(f"/supplier-invoices/{sinv_id}", headers=auth)

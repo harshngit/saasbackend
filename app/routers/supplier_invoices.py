@@ -251,6 +251,11 @@ def cancel_supplier_invoice(
     """Cancel Supplier Invoice (frees recorded quantity). NO stock movement."""
     org_id = _org_id(user)
     inv = _owned(db, id, org_id)
+    if inv.amount_paid > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot cancel a supplier invoice that has payment recorded.",
+        )
     inv.status = "cancelled"
     db.commit()
     db.refresh(inv)

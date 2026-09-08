@@ -6,7 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
-SUPPLIER_INVOICE_STATUSES = {"draft", "recorded", "disputed", "cancelled"}
+SUPPLIER_INVOICE_STATUSES = {"draft", "recorded", "cancelled"}
 VERIFICATION_STATUSES = {"pending", "matched", "mismatched"}
 PAYMENT_STATUSES = {"unpaid", "partially_paid", "paid"}
 
