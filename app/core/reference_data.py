@@ -105,8 +105,8 @@ INVOICE_PAYMENT_STATUSES = ["Unpaid", "Partial", "Paid", "Refunded"]
 ORDER_STATUSES_SHEET = ["Draft", "Confirmed", "Processing", "Completed", "Cancelled"]
 
 PURCHASE_TYPES = ["Purchase Order", "Direct Purchase", "Service Purchase", "Asset Purchase"]
-PURCHASE_STATUSES = ["Draft", "Ordered", "Received", "Invoiced", "Paid", "Cancelled"]
-RECEIVING_STATUSES = ["Pending", "Partial", "Completed"]
+PURCHASE_STATUSES = ["Draft", "Confirmed", "Closed", "Cancelled", "Ordered", "Received", "Invoiced", "Paid", "Pending", "Approved"]
+RECEIVING_STATUSES = ["not_received", "partially_received", "fully_received", "Pending", "Partial", "Completed"]
 PURCHASE_PAYMENT_STATUSES = ["Unpaid", "Partial", "Paid"]
 
 EXPENSE_STATUSES_SHEET = ["Draft", "Submitted", "Approved", "Rejected", "Paid"]

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
-PURCHASE_STATUSES = {"pending", "approved", "cancelled"}
+PURCHASE_STATUSES = {"draft", "confirmed", "closed", "cancelled", "pending", "approved"}
 PAYMENT_STATUSES = {"unpaid", "partial", "paid"}
 
 
@@ -31,7 +31,7 @@ class PurchaseInvoice(Base):
     )
     invoice_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
-    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False, index=True)
     payment_status: Mapped[str] = mapped_column(String(20), default="unpaid", nullable=False)
 
     subtotal: Mapped[float] = mapped_column(Float, default=0, nullable=False)
@@ -144,6 +144,7 @@ class PurchaseInvoiceItem(Base):
     )
     product_name: Mapped[str] = mapped_column(String(200), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    received_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     purchase_price: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     discount_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     discount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
@@ -156,3 +157,11 @@ class PurchaseInvoiceItem(Base):
     expiry_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     invoice: Mapped["PurchaseInvoice"] = relationship(back_populates="items")
+
+    @property
+    def ordered_qty(self) -> int:
+        return self.quantity
+
+    @property
+    def remaining_qty(self) -> int:
+        return max(self.quantity - (self.received_qty or 0), 0)

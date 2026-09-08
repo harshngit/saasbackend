@@ -71,6 +71,7 @@ from app.routers import (
     plans,
     products,
     purchases,
+    grns,
     reports,
     roles,
     sales_orders,
@@ -222,6 +223,7 @@ app.include_router(suppliers.router)
 app.include_router(sales_orders.router)
 app.include_router(purchases.router, prefix="/purchase-invoices")
 app.include_router(purchases.router, prefix="/purchases")
+app.include_router(grns.router)
 app.include_router(invoices.router)
 app.include_router(invoices.orders_router)  # POST /orders/{id}/invoice
 app.include_router(vehicle_stock.router)

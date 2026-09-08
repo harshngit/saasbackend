@@ -28,6 +28,7 @@ from app.models.purchase_invoice import (
     PurchaseInvoice,
     PurchaseInvoiceItem,
 )
+from app.models.grn import GoodsReceiptNote, GoodsReceiptNoteItem
 from app.models.sales_order import ORDER_STATUSES, SalesOrder, SalesOrderItem
 from app.models.password_reset_token import PasswordResetToken
 from app.models.oauth_exchange_ticket import OAuthExchangeTicket
@@ -111,6 +112,8 @@ __all__ = [
     "PaymentSplit",
     "PurchaseInvoice",
     "PurchaseInvoiceItem",
+    "GoodsReceiptNote",
+    "GoodsReceiptNoteItem",
     "PURCHASE_STATUSES",
     "PAYMENT_STATUSES",
     "Expense",

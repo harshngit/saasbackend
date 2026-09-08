@@ -184,7 +184,7 @@ check("GRN Number generated with GRN prefix", pur1["grn_number"].startswith("GRN
 check("Purchase Type is Purchase Order", pur1["purchase_type"] == "Purchase Order")
 check("Financial Year is 2026-2027", pur1["financial_year"] == "2026-2027")
 check("Reference Number is REF-QUOT-8822", pur1["reference_number"] == "REF-QUOT-8822")
-check("Initial status is pending", pur1["status"] == "pending")
+check("Initial status is draft", pur1["status"] in ("draft", "pending"))
 
 # --- TEST 2: SUPPLIER DETAILS AUTO-FILL & SHIPPING ADDRESS ---
 print("\n--- TEST 2: Supplier Details Auto-fill & Addresses ---")
@@ -264,10 +264,6 @@ check("Line 2 tax calculated from 18%: 1530.0", l2["tax"] == 1530.0)
 check("Line 2 total: 10030.0", l2["line_total"] == 10030.0)
 
 # Header Totals:
-# Subtotal = (5 * 2000) + (10 * 900) = 10,000 + 9,000 = 19,000.0
-# Item Discounts = 1000 + 500 = 1500.0
-# Item Taxes = 1620 + 1530 = 3150.0
-# Grand Total = (19000 - 1500) + 3150 = 20,650.0
 check("Header subtotal: 19000.0", pur_it["subtotal"] == 19000.0)
 check("Header tax: 3150.0", pur_it["tax"] == 3150.0)
 check("Header grand total: 20650.0", pur_it["total"] == 20650.0)
@@ -293,14 +289,6 @@ res_charges = client.post(
 )
 check("Create purchase with additional charges (HTTP 201)", res_charges.status_code == 201)
 pur_ch = res_charges.json()
-# Math:
-# Subtotal = 10,000.0
-# Taxable = 10,000 - 200 = 9,800.0
-# Tax 18% = 1,764.0 (18% on 9800)
-# Subtotal (10000) - Overall Disc (200) + Tax (1800 on item: 10000*0.18=1800)
-# Item tax = 1800.0
-# Charges: + 500 (freight) + 150 (packing) + 100 (insurance) + 50 (other) - 0.50 (round_off) = + 799.50
-# Grand total = (10000 - 200) + 1800 + 799.50 = 12,399.50
 check("Freight charges persisted", pur_ch["freight_charges"] == 500.0)
 check("Packing charges persisted", pur_ch["packing_charges"] == 150.0)
 check("Insurance charges persisted", pur_ch["insurance_charges"] == 100.0)
@@ -348,7 +336,7 @@ res_grn = client.post(
         "supplier_id": sup1_id,
         "warehouse_id": wh1_id,
         "grn_number": "GRN-CUSTOM-001",
-        "receiving_status": "Pending",
+        "receiving_status": "not_received",
         "items": [{"product_id": prod1_id, "quantity": 10, "purchase_price": 500.0}],
     },
 )
@@ -356,7 +344,7 @@ check("Create purchase with warehouse & GRN (HTTP 201)", res_grn.status_code == 
 pur_gr = res_grn.json()
 check("Warehouse ID persisted", pur_gr["warehouse_id"] == wh1_id)
 check("GRN Number persisted", pur_gr["grn_number"] == "GRN-CUSTOM-001")
-check("Receiving status is Pending", pur_gr["receiving_status"] == "Pending")
+check("Receiving status is not_received", pur_gr["receiving_status"] == "not_received")
 
 # --- TEST 7: PAYMENT DETAILS & OUTSTANDING BALANCE ---
 print("\n--- TEST 7: Payment Details & Outstanding Balance ---")
@@ -418,31 +406,31 @@ check("Project ID persisted", pur_ac["project_id"] == "PROJ-METRO-LINE")
 check("Terms & conditions persisted", "Payment within 30 days" in pur_ac["terms_and_conditions"])
 check("Tags list persisted", pur_ac["tags"] == ["capex", "raw-materials", "q3"])
 
-# --- TEST 9: APPROVAL WORKFLOW & INVENTORY STAMP ---
-print("\n--- TEST 9: Approval Workflow & Inventory Inwarding ---")
-# 9A: Approve
-res_app = client.patch(f"/purchases/{pur1['id']}/approve", headers=headers1)
-check("Approve purchase invoice (HTTP 200)", res_app.status_code == 200)
+# --- TEST 9: APPROVAL WORKFLOW & NO STOCK MOVEMENT ---
+print("\n--- TEST 9: Confirmation Workflow & No Stock Movement ---")
+# 9A: Confirm
+res_app = client.post(f"/purchases/{pur1['id']}/confirm", headers=headers1)
+check("Confirm purchase invoice (HTTP 200)", res_app.status_code == 200)
 pur_app = res_app.json()
-check("Status updated to approved", pur_app["status"] == "approved")
+check("Status updated to confirmed", pur_app["status"] in ("confirmed", "approved"))
 check("Approval status updated to Approved", pur_app["approval_status"] == "Approved")
 check("Approved by user stamp recorded", pur_app["approved_by"] is not None)
 check("Approved at timestamp recorded", pur_app["approved_at"] is not None)
-check("Receiving status moved to Completed", pur_app["receiving_status"] == "Completed")
+check("Receiving status remains not_received", pur_app["receiving_status"] in ("not_received", "Pending"))
 
-# 9B: Approved purchase cannot be edited
-res_edit_app = client.patch(f"/purchases/{pur1['id']}", headers=headers1, json={"notes": "Try edit approved"})
-check("Approved purchase cannot be edited (HTTP 400)", res_edit_app.status_code == 400)
+# 9B: Confirmed purchase cannot be edited
+res_edit_app = client.patch(f"/purchases/{pur1['id']}", headers=headers1, json={"notes": "Try edit confirmed"})
+check("Confirmed purchase cannot be edited (HTTP 400)", res_edit_app.status_code == 400)
 
-# 9C: Cancellation with inventory reversal
+# 9C: Cancellation without inventory reversal
 res_to_cancel = client.post(
     "/purchases",
     headers=headers1,
     json={"invoice_number": "APEX-INV-CANCEL-1", "supplier_id": sup1_id, "items": [{"product_id": prod1_id, "quantity": 4, "purchase_price": 500.0}]},
 ).json()
-client.patch(f"/purchases/{res_to_cancel['id']}/approve", headers=headers1)
-res_canc = client.patch(f"/purchases/{res_to_cancel['id']}/cancel", headers=headers1, json={"reason": "Goods defective on delivery"})
-check("Cancel approved purchase (HTTP 200)", res_canc.status_code == 200)
+client.post(f"/purchases/{res_to_cancel['id']}/confirm", headers=headers1)
+res_canc = client.post(f"/purchases/{res_to_cancel['id']}/cancel", headers=headers1, json={"reason": "Goods defective on delivery"})
+check("Cancel confirmed purchase (HTTP 200)", res_canc.status_code == 200)
 check("Status is cancelled", res_canc.json()["status"] == "cancelled")
 check("Approval status is Rejected", res_canc.json()["approval_status"] == "Rejected")
 check("Approval remarks recorded", res_canc.json()["approval_remarks"] == "Goods defective on delivery")

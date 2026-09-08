@@ -12,7 +12,8 @@ class PurchaseItemIn(BaseModel):
     description: str | None = None
     warehouse_id: str | None = None
     unit_of_measure_uom: str | None = None
-    quantity: int = Field(gt=0)
+    quantity: int = Field(default=0, ge=0)
+    ordered_qty: int | None = Field(default=None, gt=0)
     purchase_price: float = Field(ge=0, description="Unit cost")
     discount_percent: float = Field(default=0.0, ge=0, le=100)
     discount: float = Field(default=0.0, ge=0)
@@ -21,6 +22,11 @@ class PurchaseItemIn(BaseModel):
     batch_number: str | None = None
     serial_numbers: list[str] | None = None
     expiry_date: datetime | None = None
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def _validate_qty(cls, v: object) -> object:
+        return v
 
     @field_validator("variant_id", "warehouse_id", mode="before")
     @classmethod
@@ -40,6 +46,9 @@ class PurchaseItemOut(BaseModel):
     warehouse_id: str | None = None
     product_name: str
     quantity: int
+    ordered_qty: int = 0
+    received_qty: int = 0
+    remaining_qty: int = 0
     purchase_price: float
     discount_percent: float = 0.0
     discount: float
@@ -50,6 +59,14 @@ class PurchaseItemOut(BaseModel):
     batch_number: str | None = None
     serial_numbers: list[str] | None = None
     expiry_date: datetime | None = None
+
+    @field_validator("ordered_qty", mode="before")
+    @classmethod
+    def _fallback_ordered_qty(cls, v: object, info: object) -> object:
+        if v is None or v == 0:
+            data = getattr(info, "data", {})
+            return data.get("quantity", 0)
+        return v
 
 
 class SupplierBrief(BaseModel):

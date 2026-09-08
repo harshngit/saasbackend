@@ -35,6 +35,11 @@ def validate_warehouse(db: Session, org_id: str, warehouse_id: str | None) -> Wa
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="warehouse_id is not a warehouse in your firm",
         )
+    if not warehouse.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Warehouse '{warehouse.name}' is inactive and cannot be used.",
+        )
     return warehouse
 
 
@@ -57,7 +62,8 @@ def build_and_calculate_items(
     total_item_taxes = 0.0
 
     for it in items_in:
-        if it.quantity <= 0:
+        qty = it.ordered_qty if (it.ordered_qty is not None and it.ordered_qty > 0) else it.quantity
+        if qty <= 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Item quantity must be greater than 0",
@@ -102,7 +108,7 @@ def build_and_calculate_items(
                     detail="An item's warehouse is not in your firm",
                 )
 
-        line_subtotal = round(it.purchase_price * it.quantity, 2)
+        line_subtotal = round(it.purchase_price * qty, 2)
 
         # Discount calculation (prefer discount_percent if provided, else explicit discount)
         if it.discount_percent > 0:
@@ -142,7 +148,7 @@ def build_and_calculate_items(
                 description=it.description or item_name,
                 warehouse_id=it.warehouse_id,
                 product_name=item_name,
-                quantity=it.quantity,
+                quantity=qty,
                 purchase_price=it.purchase_price,
                 discount_percent=it.discount_percent,
                 discount=discount_amount,

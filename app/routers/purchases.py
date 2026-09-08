@@ -107,12 +107,24 @@ def create_purchase(
     else:
         pay_status = "unpaid"
 
+    initial_status = "draft"
+    if payload.purchase_status:
+        st_lower = payload.purchase_status.lower()
+        if st_lower in ("draft", "pending", "confirmed", "approved", "closed", "cancelled"):
+            initial_status = st_lower
+
+    rec_status = "not_received"
+    if payload.receiving_status:
+        rec_lower = payload.receiving_status.lower()
+        if rec_lower in ("not_received", "partially_received", "fully_received", "pending", "partial", "completed"):
+            rec_status = payload.receiving_status
+
     inv = PurchaseInvoice(
         organization_id=org_id,
         invoice_number=payload.invoice_number,
         supplier_id=supplier.id if supplier else None,
         invoice_date=payload.invoice_date or datetime.now(timezone.utc),
-        status="pending",
+        status=initial_status,
         payment_status=pay_status,
         subtotal=net_subtotal,
         discount=effective_discount,
@@ -148,7 +160,7 @@ def create_purchase(
         received_date=payload.received_date,
         warehouse_id=payload.warehouse_id,
         received_by=payload.received_by,
-        receiving_status=payload.receiving_status or "Pending",
+        receiving_status=rec_status,
         # 6. Payment Details
         payment_method=payload.payment_method,
         payment_terms=payload.payment_terms,
@@ -245,8 +257,11 @@ def update_purchase(
 ) -> PurchaseInvoice:
     org_id = _org_id(user)
     inv = _owned(db, id, org_id)
-    if inv.status != "pending":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending invoices can be edited")
+    if inv.status not in ("draft", "pending"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only draft purchases can be edited (current status: '{inv.status}')",
+        )
 
     data = payload.model_dump(exclude_unset=True)
     items_raw = data.pop("items", None)
@@ -286,6 +301,50 @@ def update_purchase(
     return inv
 
 
+def _do_confirm_purchase(inv: PurchaseInvoice, user: User, db: Session) -> PurchaseInvoice:
+    if inv.status in ("closed", "cancelled"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot confirm purchase in '{inv.status}' status",
+        )
+    if inv.status in ("confirmed", "approved"):
+        return inv
+
+    org_id = inv.organization_id
+    if inv.supplier_id:
+        purchase_service.validate_supplier(db, org_id, inv.supplier_id)
+
+    if inv.warehouse_id:
+        purchase_service.validate_warehouse(db, org_id, inv.warehouse_id)
+
+    now = datetime.now(timezone.utc)
+    inv.status = "confirmed"
+    inv.approval_status = "Approved"
+    inv.approved_by = user.id
+    inv.approved_at = now
+    # CRITICAL ARCHITECTURE RULE: Confirmation does NOT mutate warehouse stock.
+    # Stock inwarding is strictly owned by the GRN module upon receipt confirmation.
+    if not inv.receiving_status or inv.receiving_status in ("Pending", "pending"):
+        inv.receiving_status = "not_received"
+
+    db.commit()
+    db.refresh(inv)
+    return inv
+
+
+@router.post("/{id}/confirm", response_model=PurchaseOut)
+def confirm_purchase(
+    id: str,
+    user: User = Depends(_approve),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> PurchaseInvoice:
+    """Canonical route: Confirm purchase order (draft -> confirmed). NO stock movement."""
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
+    return _do_confirm_purchase(inv, user, db)
+
+
 @router.patch("/{id}/approve", response_model=PurchaseOut)
 def approve_purchase(
     id: str,
@@ -293,45 +352,33 @@ def approve_purchase(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
-    """Approve -> add stock (purchase_in) and increase the supplier's total_purchases."""
+    """Legacy alias route for confirm_purchase."""
     org_id = _org_id(user)
     inv = _owned(db, id, org_id)
-    if inv.status != "pending":
+    return _do_confirm_purchase(inv, user, db)
+
+
+@router.post("/{id}/close", response_model=PurchaseOut)
+def close_purchase(
+    id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> PurchaseInvoice:
+    """Canonical route: Close purchase order (confirmed -> closed)."""
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
+    if inv.status in ("draft", "pending"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Only pending invoices can be approved (this is '{inv.status}')",
+            detail="Only confirmed purchases can be closed",
         )
-
-    wh_id = inv.warehouse_id or stock_service.default_warehouse(db, org_id).id
-    warehouse = stock_service.owned_warehouse(db, wh_id, org_id, require_active=True)
-    if warehouse is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid warehouse for purchase invoice")
-
-    for item in inv.items:
-        if not item.product_id:
-            continue
-        item_wh_id = item.warehouse_id or warehouse.id
-        stock_service.adjust_on_hand(
-            db, org_id, item_wh_id, item.product_id, item.variant_id,
-            item.quantity, movement_type="purchase_in",
-            note=f"Purchase {inv.invoice_number}", created_by=user.id,
+    if inv.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot close a cancelled purchase",
         )
-
-    if inv.supplier_id:
-        supplier = db.get(Supplier, inv.supplier_id)
-        if supplier:
-            supplier.total_purchases = round((supplier.total_purchases or 0) + inv.total, 2)
-
-    now = datetime.now(timezone.utc)
-    inv.status = "approved"
-    inv.approval_status = "Approved"
-    inv.approved_by = user.id
-    inv.approved_at = now
-    inv.stock_added = True
-    inv.receiving_status = "Completed"
-    inv.received_date = inv.received_date or now
-    inv.received_by = inv.received_by or user.id
-
+    inv.status = "closed"
     db.commit()
     db.refresh(inv)
     return inv
@@ -363,84 +410,69 @@ def set_payment_status(
     return inv
 
 
-@router.patch("/{id}/cancel", response_model=PurchaseOut)
-def cancel_purchase(
-    id: str,
-    payload: CancelBody,
-    user: User = Depends(_approve),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> PurchaseInvoice:
-    """Cancel. If approved, reverse the stock-in and the supplier's total_purchases."""
-    org_id = _org_id(user)
-    inv = _owned(db, id, org_id)
+def _do_cancel_purchase(inv: PurchaseInvoice, payload: CancelBody | None, user: User, db: Session) -> PurchaseInvoice:
     if inv.status == "cancelled":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already cancelled")
+    if inv.status == "closed":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot cancel a closed purchase")
 
-    if inv.stock_added:
-        for item in inv.items:
-            if item.variant_id:
-                variant = db.get(ProductVariant, item.variant_id)
-                if variant is None:
-                    continue
-                new_bal = (variant.inventory or 0) - item.quantity
-                if new_bal < 0:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Cannot reverse: stock already consumed for {item.product_name}",
-                    )
-                variant.inventory = new_bal
-                bal = new_bal
-            else:
-                product = db.get(Product, item.product_id) if item.product_id else None
-                if product is None:
-                    continue
-                new_bal = (product.total_inventory or 0) - item.quantity
-                if new_bal < 0:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Cannot reverse: stock already consumed for {item.product_name}",
-                    )
-                product.total_inventory = new_bal
-                bal = new_bal
+    # If goods have already been received, cancellation is blocked.
+    if (inv.receiving_status in ("partially_received", "fully_received", "Partial", "Completed") and inv.stock_added) or any((item.received_qty or 0) > 0 for item in inv.items):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot cancel purchase after goods have been received. Use Purchase Return instead.",
+        )
 
-            db.add(
-                StockMovement(
-                    organization_id=org_id,
-                    product_id=item.product_id,
-                    variant_id=item.variant_id,
-                    movement_type="purchase_return",
-                    quantity=-item.quantity,
-                    balance_after=bal,
-                    note=f"Cancel purchase {inv.invoice_number}",
-                    created_by=user.id,
-                )
-            )
-
-        if inv.supplier_id:
-            supplier = db.get(Supplier, inv.supplier_id)
-            if supplier:
-                supplier.total_purchases = round((supplier.total_purchases or 0) - inv.total, 2)
-        inv.stock_added = False
-
+    # CRITICAL ARCHITECTURE RULE: Cancellation does NOT reverse stock (confirmation never added stock).
     inv.status = "cancelled"
     inv.approval_status = "Rejected"
-    inv.approval_remarks = payload.reason
+    if payload and payload.reason:
+        inv.approval_remarks = payload.reason
     db.commit()
     db.refresh(inv)
     return inv
 
 
-@router.patch("/{id}/reject", response_model=PurchaseOut)
-def reject_purchase(
+@router.post("/{id}/cancel", response_model=PurchaseOut)
+def cancel_purchase_canonical(
     id: str,
-    payload: CancelBody,
+    payload: CancelBody | None = None,
     user: User = Depends(_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
-    """Reject purchase invoice with manager remarks."""
-    return cancel_purchase(id, payload, user, _unlocked, db)
+    """Canonical route: Cancel purchase order (draft or confirmed -> cancelled). NO stock movement."""
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
+    return _do_cancel_purchase(inv, payload, user, db)
+
+
+@router.patch("/{id}/cancel", response_model=PurchaseOut)
+def cancel_purchase_legacy(
+    id: str,
+    payload: CancelBody | None = None,
+    user: User = Depends(_approve),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> PurchaseInvoice:
+    """Legacy alias route for cancel_purchase."""
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
+    return _do_cancel_purchase(inv, payload, user, db)
+
+
+@router.patch("/{id}/reject", response_model=PurchaseOut)
+def reject_purchase(
+    id: str,
+    payload: CancelBody | None = None,
+    user: User = Depends(_approve),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> PurchaseInvoice:
+    """Legacy alias route for reject/cancel purchase."""
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
+    return _do_cancel_purchase(inv, payload, user, db)
 
 
 @router.post("/{id}/documents", response_model=PurchaseOut)
@@ -476,8 +508,8 @@ def purchase_return(
     """Return items to the supplier: removes stock and reduces the supplier's payable."""
     org_id = _org_id(user)
     inv = _owned(db, id, org_id)
-    if inv.status != "approved":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only approved invoices can be returned")
+    if inv.status not in ("approved", "confirmed"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only confirmed purchases can be returned")
 
     reversed_value = 0.0
     for ri in payload.items:
@@ -532,7 +564,7 @@ def delete_purchase(
     db: Session = Depends(get_db),
 ) -> None:
     inv = _owned(db, id, _org_id(user))
-    if inv.status == "approved":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel an approved invoice before deleting")
+    if inv.status in ("approved", "confirmed", "closed"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel a confirmed purchase before deleting")
     db.delete(inv)
     db.commit()
