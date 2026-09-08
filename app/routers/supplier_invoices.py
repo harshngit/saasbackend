@@ -285,3 +285,17 @@ def delete_supplier_invoice(
 
     db.delete(inv)
     db.commit()
+
+
+@router.get("/{id}/payments", response_model=list[dict])
+def get_supplier_invoice_payment_history(
+    id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """GET /supplier-invoices/{id}/payments: List payment allocations for a specific Supplier Invoice."""
+    org_id = _org_id(user)
+    _owned(db, id, org_id)
+    from app.services import supplier_payment_service
+    allocations = supplier_payment_service.get_invoice_payment_history(db, org_id, id)
+    return [a.model_dump() for a in allocations]

@@ -308,18 +308,20 @@ def record_payment(
     """Record a payment to the supplier. Returns the supplier with updated balances."""
     org_id = _org_id(user)
     supplier = _owned(db, supplier_id, org_id)
-    payment = SupplierPayment(
+
+    from app.schemas.supplier_payment import SupplierPaymentCreate
+    from app.services import supplier_payment_service
+
+    sp_payload = SupplierPaymentCreate(
         supplier_id=supplier.id,
-        organization_id=org_id,
+        payment_date=payload.paid_on or datetime.now(timezone.utc),
         amount=payload.amount,
-        payment_mode=payload.payment_mode,
+        payment_method=payload.payment_mode or "cash",
         reference=payload.reference,
-        note=payload.note,
-        paid_on=payload.paid_on or datetime.now(timezone.utc),
+        notes=payload.note,
+        allocations=[],
     )
-    db.add(payment)
-    supplier.total_paid = round((supplier.total_paid or 0) + payload.amount, 2)  # keep balance in sync
-    db.commit()
+    supplier_payment_service.record_supplier_payment(db, org_id, sp_payload, user_id=user.id)
     db.refresh(supplier)
     return supplier
 
@@ -348,15 +350,15 @@ def void_payment(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Supplier:
-    """Void (delete) a payment and restore the supplier's outstanding balance."""
+    """Void a payment and restore the supplier's outstanding balance."""
     org_id = _org_id(user)
     supplier = _owned(db, supplier_id, org_id)
-    payment = db.get(SupplierPayment, payment_id)
-    if payment is None or payment.supplier_id != supplier_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
-    supplier.total_paid = round((supplier.total_paid or 0) - payment.amount, 2)  # reverse the payment
-    db.delete(payment)
-    db.commit()
+
+    from app.services import supplier_payment_service
+
+    supplier_payment_service.void_supplier_payment(
+        db, org_id, payment_id, reason="Voided via legacy supplier payment delete endpoint", user_id=user.id
+    )
     db.refresh(supplier)
     return supplier
 

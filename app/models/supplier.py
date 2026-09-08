@@ -89,15 +89,29 @@ class SupplierPayment(Base):
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
+    payment_number: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     payment_mode: Mapped[str] = mapped_column(String(30), default="cash", nullable=False)
+    payment_method: Mapped[str | None] = mapped_column(String(50), default="cash", nullable=True)
     reference: Mapped[str | None] = mapped_column(String(150), nullable=True)  # txn/cheque ref
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     paid_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
+    status: Mapped[str] = mapped_column(String(20), default="recorded", nullable=False, index=True)
+    allocated_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    unallocated_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    voided_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    void_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     supplier: Mapped["Supplier"] = relationship(back_populates="payments")
+    allocations: Mapped[list["SupplierPaymentAllocation"]] = relationship(  # noqa: F821
+        back_populates="supplier_payment", cascade="all, delete-orphan", lazy="joined"
+    )
 
 
 class SupplierProduct(Base):

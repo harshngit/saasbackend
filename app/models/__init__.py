@@ -47,6 +47,7 @@ from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
 from app.models.team import Team
 from app.models.tracking import ProductSerial, StockBatch
 from app.models.supplier import Supplier, SupplierPayment, SupplierProduct
+from app.models.supplier_payment_allocation import SupplierPaymentAllocation
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
 from app.models.vehicle import Vehicle, VehicleAssignmentHistory
@@ -106,6 +107,7 @@ __all__ = [
     "StockBatch",
     "Supplier",
     "SupplierPayment",
+    "SupplierPaymentAllocation",
     "SupplierProduct",
     "StockMovement",
     "STOCK_MOVEMENT_TYPES",
