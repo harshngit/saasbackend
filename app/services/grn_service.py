@@ -144,7 +144,13 @@ def confirm_grn(db: Session, grn: GoodsReceiptNote, org_id: str, user_id: str) -
             detail="Cannot confirm a cancelled GRN",
         )
 
-    purchase = db.get(PurchaseInvoice, grn.purchase_id)
+    # Lock PurchaseInvoice parent row to serialize concurrent GRN confirmations against the same purchase
+    purchase = (
+        db.query(PurchaseInvoice)
+        .filter(PurchaseInvoice.id == grn.purchase_id)
+        .with_for_update()
+        .first()
+    )
     if purchase is None or purchase.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Purchase not found")
 

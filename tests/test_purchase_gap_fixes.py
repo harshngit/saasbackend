@@ -124,8 +124,20 @@ finally:
 
 # TEST 3: Close Purchase (POST /purchases/{id}/close)
 print("\n--- TEST 3: Canonical Close Operation ---")
+res_close_blocked = client.post(f"/purchases/{pur['id']}/close", headers=headers)
+check("Close on unreceived purchase rejected (HTTP 400)", res_close_blocked.status_code == 400)
+
+# Create and confirm GRN to receive all 20 units
+res_grn = client.post("/grns", headers=headers, json={
+    "purchase_id": pur['id'],
+    "supplier_id": sup_id,
+    "warehouse_id": wh_id,
+    "items": [{"purchase_item_id": pur['items'][0]['id'], "product_id": prod_id, "received_qty": 20}]
+})
+client.post(f"/grns/{res_grn.json()['id']}/confirm", headers=headers)
+
 res_close = client.post(f"/purchases/{pur['id']}/close", headers=headers)
-check("Close confirmed purchase returns HTTP 200", res_close.status_code == 200)
+check("Close fully_received purchase returns HTTP 200", res_close.status_code == 200)
 check("Status updated to closed", res_close.json()["status"] == "closed")
 
 # TEST 4: Invalid Status Transitions
@@ -151,7 +163,7 @@ check("Status updated to cancelled", res_cancel.json()["status"] == "cancelled")
 db = SessionLocal()
 try:
     p_check = db.get(Product, prod_id)
-    check("Product inventory remains 50 after purchase cancellation", p_check.total_inventory == 50)
+    check("Product inventory remains 70 after purchase cancellation", p_check.total_inventory == 70)
 finally:
     db.close()
 
@@ -173,7 +185,7 @@ check("Status transitions to confirmed", res_legacy_app.json()["status"] in ("co
 db = SessionLocal()
 try:
     p_check = db.get(Product, prod_id)
-    check("Product inventory remains 50 after legacy approve", p_check.total_inventory == 50)
+    check("Product inventory remains 70 after legacy approve", p_check.total_inventory == 70)
 finally:
     db.close()
 

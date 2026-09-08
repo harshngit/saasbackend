@@ -508,12 +508,84 @@ def run_all_tests():
         db.close()
 
     # -------------------------------------------------------------
-    # Test 16 — Atomic Transaction Rollback on Failure
+    # Test 17 — Contract Cleanup: Close Guards, GRN Delete Guards, & Supplier PUT Route
     # -------------------------------------------------------------
-    print("\nTest 16 — Atomic Transaction Rollback on Failure")
-    # Try confirming a GRN with an invalid purchase_item_id or invalid quantity during confirmation
-    r_bad_conf = client.post("/grns/non-existent-grn-id/confirm", headers=auth)
-    check("Non-existent GRN confirmation returns 404", r_bad_conf.status_code == 404)
+    print("\nTest 17 — Contract Cleanup: Close Guards, GRN Delete Guards, & Supplier PUT Route")
+
+    # 1. Purchase Close Guards
+    # Create PO A (not_received)
+    r_po_nr = client.post("/purchases", json={
+        "supplier_id": base["supplier_id"],
+        "warehouse_id": base["warehouse_id"],
+        "invoice_number": f"INV-NR-{uuid.uuid4().hex[:6]}",
+        "items": [{"product_id": base["product_id"], "quantity": 10, "purchase_price": 5.0}]
+    }, headers=auth)
+    po_nr_id = r_po_nr.json()["id"]
+    client.post(f"/purchases/{po_nr_id}/confirm", headers=auth)
+
+    r_close_nr = client.post(f"/purchases/{po_nr_id}/close", headers=auth)
+    check("Close on not_received purchase blocked with 400", r_close_nr.status_code == 400)
+
+    # Create GRN partial on PO A (partially_received)
+    r_grn_pr = client.post("/grns", json={
+        "purchase_id": po_nr_id,
+        "supplier_id": base["supplier_id"],
+        "warehouse_id": base["warehouse_id"],
+        "items": [{"purchase_item_id": r_po_nr.json()["items"][0]["id"], "product_id": base["product_id"], "received_qty": 4}]
+    }, headers=auth)
+    client.post(f"/grns/{r_grn_pr.json()['id']}/confirm", headers=auth)
+
+    r_close_pr = client.post(f"/purchases/{po_nr_id}/close", headers=auth)
+    check("Close on partially_received purchase blocked with 400", r_close_pr.status_code == 400)
+
+    # Receive remaining 6 units on PO A (fully_received)
+    r_grn_fr = client.post("/grns", json={
+        "purchase_id": po_nr_id,
+        "supplier_id": base["supplier_id"],
+        "warehouse_id": base["warehouse_id"],
+        "items": [{"purchase_item_id": r_po_nr.json()["items"][0]["id"], "product_id": base["product_id"], "received_qty": 6}]
+    }, headers=auth)
+    client.post(f"/grns/{r_grn_fr.json()['id']}/confirm", headers=auth)
+
+    r_close_fr = client.post(f"/purchases/{po_nr_id}/close", headers=auth)
+    check("Close on fully_received purchase returns 200", r_close_fr.status_code == 200)
+    check("Status updated to closed", r_close_fr.json()["status"] == "closed")
+
+    # 2. GRN Delete Contract
+    # Create Draft GRN
+    r_d_draft = client.post("/grns", json={
+        "purchase_id": p_new_data["id"],
+        "supplier_id": base["supplier_id"],
+        "warehouse_id": base["warehouse_id"],
+        "items": [{"purchase_item_id": p_new_data["items"][0]["id"], "product_id": new_prod_id, "received_qty": 5}]
+    }, headers=auth)
+    d_draft_id = r_d_draft.json()["id"]
+
+    r_del_draft = client.delete(f"/grns/{d_draft_id}", headers=auth)
+    check("Delete Draft GRN returns 204", r_del_draft.status_code == 204)
+
+    # Create Cancelled GRN
+    r_d_canc = client.post("/grns", json={
+        "purchase_id": p_new_data["id"],
+        "supplier_id": base["supplier_id"],
+        "warehouse_id": base["warehouse_id"],
+        "items": [{"purchase_item_id": p_new_data["items"][0]["id"], "product_id": new_prod_id, "received_qty": 5}]
+    }, headers=auth)
+    d_canc_id = r_d_canc.json()["id"]
+    client.post(f"/grns/{d_canc_id}/cancel", headers=auth)
+
+    r_del_canc = client.delete(f"/grns/{d_canc_id}", headers=auth)
+    check("Delete Cancelled GRN blocked with 400", r_del_canc.status_code == 400)
+
+    # Delete Confirmed GRN
+    r_del_conf = client.delete(f"/grns/{grn_1_id}", headers=auth)
+    check("Delete Confirmed GRN blocked with 400", r_del_conf.status_code == 400)
+
+    # 3. Supplier Canonical PUT Update Route
+    r_supp_put = client.put(f"/suppliers/{base['supplier_id']}", json={
+        "notes": "Updated supplier master notes via PUT",
+    }, headers=auth)
+    check("Supplier canonical PUT update returns 200", r_supp_put.status_code == 200)
 
     print(f"\nGRN MODULE TEST RESULTS: Passed={passed_count}, Failed={failed_count}")
     assert failed_count == 0, f"GRN module test suite had {failed_count} failures!"

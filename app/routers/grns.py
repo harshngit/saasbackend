@@ -217,5 +217,10 @@ def delete_grn(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete a confirmed GRN",
         )
+    if grn.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete a cancelled GRN",
+        )
     db.delete(grn)
     db.commit()

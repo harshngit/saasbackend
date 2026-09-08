@@ -365,18 +365,18 @@ def close_purchase(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
-    """Canonical route: Close purchase order (confirmed -> closed)."""
+    """Canonical route: Close purchase order (confirmed -> closed, allowed ONLY when fully_received)."""
     org_id = _org_id(user)
     inv = _owned(db, id, org_id)
-    if inv.status in ("draft", "pending"):
+    if inv.status != "confirmed":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only confirmed purchases can be closed",
+            detail=f"Only confirmed purchases can be closed (current status: '{inv.status}')",
         )
-    if inv.status == "cancelled":
+    if inv.receiving_status != "fully_received":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot close a cancelled purchase",
+            detail="Purchase cannot be closed until all goods are received.",
         )
     inv.status = "closed"
     db.commit()
