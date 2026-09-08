@@ -28,6 +28,12 @@ from app.models.purchase_invoice import (
     PurchaseInvoice,
     PurchaseInvoiceItem,
 )
+from app.models.supplier_invoice import (
+    SUPPLIER_INVOICE_STATUSES,
+    VERIFICATION_STATUSES,
+    SupplierInvoice,
+    SupplierInvoiceItem,
+)
 from app.models.grn import GoodsReceiptNote, GoodsReceiptNoteItem
 from app.models.sales_order import ORDER_STATUSES, SalesOrder, SalesOrderItem
 from app.models.password_reset_token import PasswordResetToken
@@ -112,6 +118,10 @@ __all__ = [
     "PaymentSplit",
     "PurchaseInvoice",
     "PurchaseInvoiceItem",
+    "SupplierInvoice",
+    "SupplierInvoiceItem",
+    "SUPPLIER_INVOICE_STATUSES",
+    "VERIFICATION_STATUSES",
     "GoodsReceiptNote",
     "GoodsReceiptNoteItem",
     "PURCHASE_STATUSES",
