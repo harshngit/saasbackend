@@ -99,7 +99,7 @@ class DashboardFilters(BaseModel):
 
     date_from: str
     date_to: str
-    branch_id: str | None = None
+    company_id: str | None = None
     warehouse_id: str | None = None
     customer_id: str | None = None
     supplier_id: str | None = None
