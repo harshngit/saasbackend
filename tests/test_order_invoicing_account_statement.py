@@ -155,6 +155,7 @@ def run_tests():
     assert so1_res.status_code == 201, so1_res.text
     so1 = so1_res.json()
     so1_id = so1["id"]
+    client.post(f"/orders/{so1_id}/confirm", headers=auth1)
     so1_item_id = so1["items"][0]["id"]
     assert_eq(so1["total"], 672.0, "Sales Order total calculated: 20 * 30 + 12% GST = 672")
 
@@ -285,6 +286,7 @@ def run_tests():
     }, headers=auth1)
     so2 = so2_res.json()
     so2_id = so2["id"]
+    client.post(f"/orders/{so2_id}/confirm", headers=auth1)
     so2_item_id = so2["items"][0]["id"]
 
     # In per_delivery mode, invoicing without delivery_id must be rejected

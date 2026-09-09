@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, Delivery, Invoice, Role, SalesOrder, StockReservation, User, UserRole
+from app.models import Customer, Delivery, Invoice, Role, SalesOrder, StockReservation, User, UserRole, Vehicle
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
@@ -15,6 +15,7 @@ from app.schemas.sales_order import (
     OrderUpdate,
     PickupConfirmRequest,
     RejectBody,
+    UserBrief,
 )
 from app.services import delivery_service, lookup_service, order_service, payment_service, stock_service
 
@@ -133,6 +134,31 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
 
     out.total_due = round(prev_bal + out.remaining_balance, 2)
 
+    # Populate Enhanced Order Flow Fields
+    if order.fulfilment_method == "pickup":
+        out.delivery_method = "takeaway"
+    elif order.fulfilment_method == "delivery":
+        out.delivery_method = "home_delivery"
+    else:
+        out.delivery_method = order.fulfilment_method
+
+    if inv:
+        st = payment_service.payment_status(inv)
+        out.payment_status = "pending" if st == "unpaid" else st
+    else:
+        out.payment_status = "pending"
+
+    out.remaining_amount = out.remaining_balance
+
+    if order.assigned_delivery_partner_id:
+        partner_user = db.get(User, order.assigned_delivery_partner_id)
+        if partner_user:
+            out.delivery_partner = UserBrief.model_validate(partner_user)
+        else:
+            out.delivery_partner = None
+    else:
+        out.delivery_partner = None
+
     return out
 
 
@@ -200,19 +226,14 @@ def create_order(
 ) -> OrderOut:
     """Place a sales order.
 
-    Validated, priced, reserved and **placed** in one call — no Admin approval step
-    unless the firm has turned `order_requires_approval` on. Warehouse stock is held,
-    not deducted (that happens when a vehicle is loaded), and no receivable is
-    created (that starts at the invoice).
-
-    `warehouse_id` defaults to the firm's default warehouse. Each line snapshots the
-    tax rate it was sold at — its own `tax_rate`, else the product's — so an invoice
-    raised later bills the agreed figure.
-
-    A shortage returns 400 with `{"error": "INSUFFICIENT_STOCK", "shortages": [...]}`
-    naming what is short, unless the firm allows backorders. The response carries
-    `stock_summary` (on hand / reserved / available) and any `warnings`, such as the
-    customer going past their credit limit.
+    Validated, priced, reserved and placed in one call — supporting:
+    - Takeaway / Self Pickup
+    - Home Delivery (with address validation)
+    - Paid / Partial / Pending payment
+    - Optional Delivery Partner & Vehicle assignment
+    - Automatic Stock Reservation
+    - Automatic Invoice Generation
+    - Automatic Payment Recording
     """
     org_id = _org_id(user)
     settings = workflow.sales_settings(user.organization)
@@ -222,6 +243,64 @@ def create_order(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="customer_id is not a customer in your firm",
         )
+
+    # Resolve fulfilment_method (takeaway -> pickup, home_delivery -> delivery)
+    fulfilment_method = payload.fulfilment_method
+    if payload.delivery_method:
+        fulfilment_method = "pickup" if payload.delivery_method.lower() in ("takeaway", "pickup") else "delivery"
+
+    is_automated_flow = bool(
+        payload.delivery_method is not None
+        or payload.payment_status is not None
+        or payload.paid_amount is not None
+        or payload.delivery_partner_id is not None
+        or payload.vehicle_id is not None
+    )
+
+    resolved_delivery_address = payload.delivery_address or payload.shipping_address or customer.delivery_address
+
+    # Address validation for Home Delivery
+    if payload.delivery_method == "home_delivery" or (is_automated_flow and fulfilment_method == "delivery"):
+        if not resolved_delivery_address or not resolved_delivery_address.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="delivery_address is required for home delivery orders",
+            )
+
+    # Validate delivery partner if supplied
+    if payload.delivery_partner_id:
+        partner = db.get(User, payload.delivery_partner_id)
+        if partner is None or partner.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="delivery_partner_id is not a user in your firm",
+            )
+        if not delivery_service.is_delivery_partner(db, partner):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User is not a delivery partner",
+            )
+        try:
+            delivery_service.require_partner_available(db, org_id, partner, payload.delivery_date or datetime.now(timezone.utc))
+        except ValueError as err:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(err),
+            )
+
+    # Validate vehicle if supplied
+    if payload.vehicle_id:
+        veh = db.get(Vehicle, payload.vehicle_id)
+        if veh is None or veh.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="vehicle_id is not a vehicle in your firm",
+            )
+        if getattr(veh, "status", "active") != "active":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Vehicle '{veh.vehicle_number}' is not active",
+            )
 
     # Own-scope users (Sales Officers) are strictly forced to their own user ID
     if scoping.scope_to_own(db, user):
@@ -236,6 +315,7 @@ def create_order(
                     detail="salesperson_id is not a user in your firm",
                 )
 
+    # Place draft order
     order, warnings = order_service.place_order(
         db, user, customer,
         lines=[
@@ -255,8 +335,8 @@ def create_order(
         warehouse_id=payload.warehouse_id,
         order_date=payload.order_date,
         delivery_date=payload.delivery_date,
-        fulfilment_method=payload.fulfilment_method,
-        payment_type=payload.payment_type,
+        fulfilment_method=fulfilment_method,
+        payment_type=payload.payment_type or payload.payment_method,
         payment_terms_days=payload.payment_terms_days,
         salesperson_id=salesperson_id,
         quotation_id=payload.quotation_id,
@@ -265,20 +345,129 @@ def create_order(
         order_level_tax=payload.tax,
         notes=payload.notes,
         order_status_label=payload.order_status,
-        # Finalized business rule: every normal Order always starts as Draft
-        # (no stock check, no reservation) -- draft_orders_enabled no longer
-        # gates this; it is kept in the settings schema/DB only for backward
-        # compatibility (existing PATCH /sales-workflow-settings payloads
-        # still accept it) and is otherwise unused. Confirming is now always
-        # required via POST /orders/{id}/confirm.
         create_as_draft=True,
         billing_address=payload.billing_address or customer.billing_address,
-        shipping_address=payload.shipping_address or payload.delivery_address or customer.delivery_address,
-        delivery_address=payload.delivery_address or payload.shipping_address or customer.delivery_address,
+        shipping_address=resolved_delivery_address,
+        delivery_address=resolved_delivery_address,
         payment_terms=payload.payment_terms,
         delivery_terms=payload.delivery_terms,
         currency=payload.currency or "INR",
     )
+
+    if not is_automated_flow:
+        if payload.fulfilment_method == "delivery":
+            order, confirm_warnings = order_service.confirm_order(db, user, order)
+            warnings = (warnings or []) + (confirm_warnings or [])
+        db.commit()
+        db.refresh(order)
+        return _order_out(db, order, warnings)
+
+    if payload.delivery_partner_id:
+        order.assigned_delivery_partner_id = payload.delivery_partner_id
+
+    # Confirm order & reserve stock
+    order, confirm_warnings = order_service.confirm_order(db, user, order)
+    warnings = (warnings or []) + (confirm_warnings or [])
+
+    # Validate payment values against calculated order total
+    paid_amt = payload.paid_amount or 0.0
+    p_status = payload.payment_status.lower() if payload.payment_status else None
+    order_total = round(float(order.total or 0.0), 2)
+
+    if paid_amt > order_total:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"paid_amount ({paid_amt}) cannot exceed order total ({order_total})",
+        )
+    if p_status == "paid" and round(paid_amt, 2) < order_total:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"paid_amount ({paid_amt}) must equal order total ({order_total}) for paid payment_status",
+        )
+    if p_status == "partial" and (paid_amt <= 0 or round(paid_amt, 2) >= order_total):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"paid_amount ({paid_amt}) must be greater than zero and less than order total ({order_total}) for partial payment_status",
+        )
+
+    # Home Delivery creation
+    if fulfilment_method == "delivery":
+        partner_obj = db.get(User, payload.delivery_partner_id) if payload.delivery_partner_id else None
+        delivery_service.plan(
+            db,
+            user,
+            order,
+            delivery_partner=partner_obj,
+            vehicle_id=payload.vehicle_id,
+            warehouse_id=payload.warehouse_id,
+            scheduled_date=payload.delivery_date,
+            delivery_address=resolved_delivery_address,
+            notes=payload.notes,
+            wanted=None,
+        )
+
+    # Automatic Invoice Generation
+    from app.routers.invoices import generate_from_order
+    generate_from_order(order.id, payload=None, user=user, db=db, allow_upfront=True)
+
+    # Automatic Payment Recording
+    if paid_amt > 0:
+        inv = (
+            db.query(Invoice)
+            .filter(
+                Invoice.order_id == order.id,
+                Invoice.organization_id == org_id,
+                Invoice.is_credit_note.is_(False),
+            )
+            .first()
+        )
+        if inv:
+            pay_mode = payload.payment_method or payload.payment_type or "cash"
+            try:
+                payment_service.record(
+                    db,
+                    org_id,
+                    customer=customer,
+                    invoice=inv,
+                    amount=paid_amt,
+                    payment_mode=pay_mode,
+                    order_id=order.id,
+                    note=f"Payment recorded during order creation ({order.order_number})",
+                )
+            except ValueError as err:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(err),
+                )
+
+    # Takeaway completion
+    if fulfilment_method == "pickup":
+        for item in order.items:
+            qty = float(item.quantity or 0)
+            if qty > 0 and item.product_id and order.warehouse_id:
+                stock_service.adjust_on_hand(
+                    db, org_id, order.warehouse_id, item.product_id, item.variant_id,
+                    -qty, "sale", note=f"Pickup for order {order.order_number}", created_by=user.id,
+                )
+                res = (
+                    db.query(StockReservation)
+                    .filter(StockReservation.order_item_id == item.id, StockReservation.status == "active")
+                    .first()
+                )
+                if res:
+                    stock_service.consume_reservation(db, res, qty)
+                item.delivered_quantity = qty
+                item.reserved_quantity = 0.0
+
+        order.pickup_status = "collected"
+        order.collected_by = payload.notes or (customer.name if customer else None)
+        order.collected_at = datetime.now(timezone.utc)
+        order.status = "completed"
+        order.fulfilment_status = "delivered"
+
+    if customer:
+        customer.recompute_outstanding()
+
     db.commit()
     db.refresh(order)
     return _order_out(db, order, warnings)

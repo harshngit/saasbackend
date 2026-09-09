@@ -133,6 +133,7 @@ def generate_from_order(
     user: User = Depends(_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
+    allow_upfront: bool = False,
 ) -> Invoice:
     """Invoice a sales order.
 
@@ -157,8 +158,8 @@ def generate_from_order(
     if order is None or order.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
 
-    # An order past approval can be billed; a draft or cancelled one cannot.
-    if order.status not in ("placed", "processing", "completed"):
+    # An active order can be billed; a cancelled or rejected one cannot.
+    if order.status in ("cancelled", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot invoice a '{order.status}' order",
@@ -207,21 +208,36 @@ def generate_from_order(
                        "(partial_delivery_invoice_mode = after_full_order)",
             )
     else:
-        # No delivery_id provided. Check actual delivered quantity on the order.
+        # No delivery_id provided. Check if an invoice already exists for this order.
+        existing_ord = (
+            db.query(Invoice)
+            .filter(
+                Invoice.order_id == order.id,
+                Invoice.organization_id == org_id,
+                Invoice.is_credit_note.is_(False),
+            )
+            .first()
+        )
+        if existing_ord:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Invoice already exists for this order (Invoice ID: {existing_ord.id})",
+            )
+
         total_delivered = sum(float(item.delivered_quantity or 0) for item in order.items)
-        if total_delivered <= 0:
+        if total_delivered <= 0 and not allow_upfront:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No delivered quantity is available for invoicing",
             )
 
         mode = settings.get("partial_delivery_invoice_mode", "per_delivery")
-        if mode == "per_delivery" and order.fulfilment_method != "pickup":
+        if mode == "per_delivery" and order.fulfilment_method != "pickup" and not allow_upfront:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This organization bills per delivery. Please specify delivery_id.",
             )
-        elif mode == "after_full_order" or order.fulfilment_method == "pickup":
+        elif (mode == "after_full_order" or order.fulfilment_method == "pickup") and not allow_upfront:
             if order.fulfilment_status != "delivered":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -243,15 +259,6 @@ def generate_from_order(
                 if outstanding > 0:
                     agg_lines.append({"order_item": item, "delivery_item_id": None, "quantity": outstanding})
             if not agg_lines:
-                existing_ord = (
-                    db.query(Invoice)
-                    .filter(
-                        Invoice.order_id == order.id,
-                        Invoice.organization_id == org_id,
-                        Invoice.is_credit_note.is_(False),
-                    )
-                    .first()
-                )
                 detail = (
                     f"Invoice already exists for this order (Invoice ID: {existing_ord.id})"
                     if existing_ord
@@ -262,6 +269,8 @@ def generate_from_order(
                     detail=detail,
                 )
             lines = agg_lines
+        else:
+            lines = _billable_lines(db, order, None)
 
     if lines is None:
         lines = _billable_lines(db, order, delivery)

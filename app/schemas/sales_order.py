@@ -142,6 +142,12 @@ class OrderOut(BaseModel):
     paid_amount: float = 0.0
     remaining_balance: float = 0.0
 
+    # Enhanced Order Flow Output Fields
+    delivery_method: str | None = Field(default=None, description="takeaway | home_delivery")
+    payment_status: str | None = Field(default=None, description="paid | partial | pending")
+    remaining_amount: float = Field(default=0.0, description="Order total minus paid amount")
+    delivery_partner: UserBrief | None = Field(default=None, description="Brief partner object")
+
     # Delivery & Invoice references
     delivery_id: str | None = None
     delivery_number: str | None = None
@@ -198,12 +204,75 @@ class OrderCreate(BaseModel):
     notes: str | None = None
     items: list[OrderItemIn] = Field(min_length=1)
 
+    # Order Flow Enhancement additions
+    delivery_method: str | None = Field(default=None, description="takeaway | home_delivery")
+    payment_status: str | None = Field(default=None, description="paid | partial | pending")
+    paid_amount: float | None = Field(default=None, ge=0)
+    payment_method: str | None = Field(default=None, description="cash | credit | upi | card | bank_transfer | …")
+    delivery_partner_id: str | None = Field(default=None)
+    vehicle_id: str | None = Field(default=None)
+
     @field_validator("source")
     @classmethod
     def _valid_source(cls, v: str) -> str:
         if v not in ("direct", "quotation", "office", "delivery_vehicle"):
             raise ValueError("source must be 'direct', 'quotation', 'office', or 'delivery_vehicle'")
         return v
+
+    @field_validator("delivery_method")
+    @classmethod
+    def _valid_delivery_method(cls, v: str | None) -> str | None:
+        if v is not None:
+            v_lower = v.lower()
+            if v_lower not in ("takeaway", "home_delivery", "pickup", "delivery"):
+                raise ValueError("delivery_method must be 'takeaway' or 'home_delivery'")
+        return v
+
+    @field_validator("payment_status")
+    @classmethod
+    def _valid_payment_status(cls, v: str | None) -> str | None:
+        if v is not None:
+            v_lower = v.lower()
+            if v_lower not in ("paid", "partial", "pending", "unpaid"):
+                raise ValueError("payment_status must be 'paid', 'partial', or 'pending'")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_enhanced_order_fields(self) -> "OrderCreate":
+        # Conflict check for delivery_method vs fulfilment_method
+        if self.delivery_method and self.fulfilment_method:
+            dm_mapped = "pickup" if self.delivery_method.lower() in ("takeaway", "pickup") else "delivery"
+            fm_mapped = "pickup" if self.fulfilment_method.lower() in ("takeaway", "pickup") else "delivery"
+            if dm_mapped != fm_mapped:
+                raise ValueError(
+                    f"Conflicting delivery_method ('{self.delivery_method}') and fulfilment_method ('{self.fulfilment_method}')"
+                )
+
+        # Sync fulfilment_method from delivery_method if explicitly set
+        if self.delivery_method and not self.fulfilment_method:
+            self.fulfilment_method = "pickup" if self.delivery_method.lower() in ("takeaway", "pickup") else "delivery"
+
+        # Conflict check for payment_method vs payment_type
+        if self.payment_method and self.payment_type:
+            if self.payment_method.lower() != self.payment_type.lower():
+                raise ValueError(
+                    f"Conflicting payment_method ('{self.payment_method}') and payment_type ('{self.payment_type}')"
+                )
+
+        # Sync payment_type from payment_method if explicitly set
+        if self.payment_method and not self.payment_type:
+            self.payment_type = self.payment_method
+
+        # Payment status vs paid_amount validation
+        if self.payment_status is not None:
+            ps = self.payment_status.lower()
+            amt = self.paid_amount or 0.0
+            if ps == "pending" and amt > 0:
+                raise ValueError("paid_amount must be 0 for pending payment status")
+            if ps in ("paid", "partial") and amt <= 0:
+                raise ValueError(f"paid_amount must be greater than zero for {ps} payment status")
+
+        return self
 
     # Sheet fields (sales_order_number is auto-generated)
     order_date: datetime | None = None

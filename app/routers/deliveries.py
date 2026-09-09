@@ -24,7 +24,7 @@ from app.models import (
     DeliveryHistory,
     DeliveryItem,
 )
-from app.services import delivery_service, notification_service, numbering_service, payment_service
+from app.services import delivery_service, notification_service, numbering_service, order_service, payment_service
 from app.schemas.delivery import (
     DeliveryCollectionCreate,
     DeliveryCollectionOut,
@@ -221,7 +221,7 @@ def plan_delivery(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="order_id is not an order in your firm"
         )
-    if order.status in ("draft", "cancelled", "pending", "rejected"):
+    if order.status in ("draft", "cancelled", "pending", "rejected", "awaiting_approval"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Order must be confirmed before delivery can be planned",

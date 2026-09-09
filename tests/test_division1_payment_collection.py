@@ -125,6 +125,7 @@ def _complete_and_invoice_order(auth, wh_id, cust_id, prod_id, quantity=10, unit
     assert so_res.status_code == 201, so_res.text
     so = so_res.json()
     so_id = so["id"]
+    client.post(f"/orders/{so_id}/confirm", headers=auth)
     so_item_id = so["items"][0]["id"]
 
     # Plan delivery

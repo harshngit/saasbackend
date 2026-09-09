@@ -152,11 +152,14 @@ def test_suite():
     res_a = client.post("/orders", json=order_a_payload, headers=headers)
     if res_a.status_code in (200, 201):
         ok("TEST A.1: First order consuming last unit succeeded (HTTP 200/201)")
+        client.post(f"/orders/{res_a.json()['id']}/confirm", headers=headers)
     else:
         fail("TEST A.1: First order failed", res_a.text)
 
-    # Second order for same item in same warehouse must be rejected due to insufficient stock
-    res_b = client.post("/orders", json=order_a_payload, headers=headers)
+    # Second order for same item in same warehouse must be rejected due to insufficient stock at confirm
+    res_b_create = client.post("/orders", json=order_a_payload, headers=headers)
+    order_b_id = res_b_create.json()["id"] if res_b_create.status_code == 201 else None
+    res_b = client.post(f"/orders/{order_b_id}/confirm", headers=headers) if order_b_id else res_b_create
     if res_b.status_code == 400 and "INSUFFICIENT_STOCK" in res_b.text:
         ok("TEST A.2: Second order correctly rejected with INSUFFICIENT_STOCK")
     else:
@@ -192,6 +195,7 @@ def test_suite():
     }
     res_v1 = client.post("/orders", json=order_v1_payload, headers=headers)
     assert res_v1.status_code in (200, 201), f"Order v1 failed: {res_v1.text}"
+    client.post(f"/orders/{res_v1.json()['id']}/confirm", headers=headers)
     avail_v1 = stock_service.available(db, wh1.id, p_variant_parent.id, v1.id)
     avail_v2 = stock_service.available(db, wh1.id, p_variant_parent.id, v2.id)
     if avail_v1 == 1.0 and avail_v2 == 3.0:
