@@ -131,7 +131,7 @@ class ProductProfileIn(BaseModel):
         description="Kept in sync with is_active: only 'active' maps to is_active=True",
     )
 
-    # 2. Images & media — pass a URL / data: URL, or upload via /files/{field}
+    # 2. Images & media — pass a file URL or upload via /files/{field} (inline base64 data URIs are not allowed)
     product_video: str | None = None
     product_catalog_brochure: str | None = None
     product_manual: str | None = None
@@ -269,10 +269,8 @@ class ProductOut(ProductProfileIn):
 
 
 class ProductListItem(BaseModel):
-    """Lighter product shape for list responses. Omits `images` and every
-    file slot (video / brochure / manual / datasheet / certificates /
-    attachments) — those hold base64 data: URLs and would make a list of a few
-    hundred products enormous. Fetch one product to get them."""
+    """Lighter product shape for list responses. Omits images and file slot details
+    to keep list payload lightweight. Fetch one product to get full detail."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -343,6 +341,16 @@ class ProductCreate(ProductProfileIn):
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
 
+    @field_validator("cover_image")
+    @classmethod
+    def _validate_cover_image(cls, v: str | None) -> str | None:
+        if v is not None and isinstance(v, str) and v.strip().lower().startswith("data:"):
+            raise ValueError(
+                "cover_image cannot be an inline base64 data URI. Upload file via /files/upload or "
+                "/products/{id}/files/cover_image and pass the returned URL."
+            )
+        return v
+
 
 class ProductUpdate(ProductProfileIn):
     """Partial update. If `variations` is provided, it fully replaces the variant set."""
@@ -365,3 +373,13 @@ class ProductUpdate(ProductProfileIn):
     @classmethod
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
+
+    @field_validator("cover_image")
+    @classmethod
+    def _validate_cover_image(cls, v: str | None) -> str | None:
+        if v is not None and isinstance(v, str) and v.strip().lower().startswith("data:"):
+            raise ValueError(
+                "cover_image cannot be an inline base64 data URI. Upload file via /files/upload or "
+                "/products/{id}/files/cover_image and pass the returned URL."
+            )
+        return v
