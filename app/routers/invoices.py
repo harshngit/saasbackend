@@ -564,6 +564,7 @@ def create_direct_invoice(
                 reference=payload.payment.transaction_reference,
                 received_on=payload.payment.received_on,
                 note=f"Counter payment against {invoice.invoice_number}",
+                collected_by_user_id=user.id,
             )
         except ValueError as exc:
             # Nothing is committed yet, so a bad payment takes the whole sale with it

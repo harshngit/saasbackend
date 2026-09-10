@@ -167,6 +167,8 @@ class PaymentReceiptOut(BaseModel):
     created_at: datetime
     customer: ReceiptCustomerBrief | None = None
     invoice: ReceiptInvoiceBrief | None = None
+    collected_by_user_id: str | None = None
+    collector: dict | None = None
     splits: list[PaymentSplitOut] = Field(default_factory=list)
 
     @model_validator(mode="after")

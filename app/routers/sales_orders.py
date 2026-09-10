@@ -6,7 +6,20 @@ from sqlalchemy.orm import Session
 from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.models import Customer, Delivery, Invoice, Role, SalesOrder, StockReservation, User, UserRole, Vehicle
+from app.models import (
+    Customer,
+    CustomerPayment,
+    CustomerPaymentAllocation,
+    Delivery,
+    Invoice,
+    Role,
+    SalesOrder,
+    StockReservation,
+    User,
+    UserRole,
+    Vehicle,
+)
+from app.schemas.customer import CustomerPaymentOut
 from app.schemas.sales_order import (
     AssignDeliveryBody,
     CancelBody,
@@ -160,6 +173,35 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             out.delivery_partner = None
     else:
         out.delivery_partner = None
+
+    direct_payments = (
+        db.query(CustomerPayment)
+        .filter(
+            CustomerPayment.organization_id == order.organization_id,
+            CustomerPayment.order_id == order.id,
+        )
+        .all()
+    )
+
+    alloc_payments = (
+        db.query(CustomerPayment)
+        .join(CustomerPaymentAllocation, CustomerPaymentAllocation.customer_payment_id == CustomerPayment.id)
+        .join(Invoice, CustomerPaymentAllocation.invoice_id == Invoice.id)
+        .filter(
+            CustomerPayment.organization_id == order.organization_id,
+            Invoice.order_id == order.id,
+        )
+        .all()
+    )
+
+    seen_payment_ids: set[str] = set()
+    order_payments: list[CustomerPayment] = []
+    for p in direct_payments + alloc_payments:
+        if p.id not in seen_payment_ids:
+            seen_payment_ids.add(p.id)
+            order_payments.append(p)
+
+    out.payments = [CustomerPaymentOut.model_validate(p) for p in order_payments]
 
     return out
 
@@ -435,6 +477,7 @@ def create_order(
                     payment_mode=pay_mode,
                     order_id=order.id,
                     note=f"Payment recorded during order creation ({order.order_number})",
+                    collected_by_user_id=user.id,
                 )
             except ValueError as err:
                 raise HTTPException(

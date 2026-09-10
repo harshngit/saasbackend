@@ -133,6 +133,48 @@ class PaymentInvoiceBrief(BaseModel):
     status: str
 
 
+class CollectorBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    role: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_user_obj(cls, data: object) -> object:
+        if hasattr(data, "id") and hasattr(data, "name"):
+            user = data
+            role_str = None
+            role_val = getattr(user, "role", None)
+            if role_val is not None:
+                if hasattr(role_val, "value"):
+                    role_val = role_val.value
+                if role_val == "delivery_partner":
+                    role_str = "Delivery Partner"
+                elif role_val == "sales_officer":
+                    role_str = "Sales Officer"
+                elif role_val == "accountant":
+                    role_str = "Accountant"
+                elif role_val == "admin":
+                    role_str = "Admin"
+                elif role_val == "super_admin":
+                    role_str = "Super Admin"
+                else:
+                    role_str = str(role_val)
+            elif getattr(user, "role_detail", None) and getattr(user.role_detail, "name", None):
+                role_str = user.role_detail.name
+            elif getattr(user, "system_role", None):
+                role_str = str(user.system_role)
+
+            return {
+                "id": str(user.id),
+                "name": str(getattr(user, "display_name", None) or user.name),
+                "role": role_str,
+            }
+        return data
+
+
 class CustomerPaymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -152,9 +194,15 @@ class CustomerPaymentOut(BaseModel):
     note: str | None
     received_on: datetime
     created_at: datetime
+    date: datetime | None = None
     order_amount: float | None = None
     previous_pending: float | None = None
     remaining_receivable: float | None = None
+
+    collected_by_user_id: str | None = None
+    collector: CollectorBrief | None = None
+    source: str | None = None
+    status: str | None = None
 
     # Method-specific details, persisted alongside the payment.
     upi_id: str | None = None
@@ -163,12 +211,70 @@ class CustomerPaymentOut(BaseModel):
     collection_instructions: str | None = None
     splits: list[PaymentSplitOut] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_fields(cls, data: object) -> object:
+        if hasattr(data, "id"):
+            deliv_coll = getattr(data, "delivery_collection", None)
+            if deliv_coll is not None:
+                derived_status = getattr(deliv_coll, "reconciliation_status", "reconciled")
+                if getattr(deliv_coll, "delivery_id", None):
+                    derived_source = "delivery_cod"
+                else:
+                    derived_source = "field_collection"
+            else:
+                derived_status = "recorded"
+                if getattr(data, "order_id", None):
+                    derived_source = "sales_order"
+                elif getattr(data, "invoice_id", None):
+                    derived_source = "invoice"
+                elif getattr(data, "receipt_number", None):
+                    derived_source = "payment_receipt"
+                else:
+                    derived_source = "direct_payment"
+
+            collector_obj = getattr(data, "collector", None)
+            rec_on = getattr(data, "received_on", getattr(data, "created_at", None))
+
+            return {
+                "id": data.id,
+                "customer_id": getattr(data, "customer_id", None),
+                "receipt_number": getattr(data, "receipt_number", None),
+                "order_id": getattr(data, "order_id", None),
+                "invoice_id": getattr(data, "invoice_id", None),
+                "invoice": getattr(data, "invoice", None),
+                "amount": data.amount,
+                "payment_mode": data.payment_mode,
+                "amount_collected": getattr(data, "amount_collected", data.amount),
+                "payment_method": getattr(data, "payment_method", data.payment_mode),
+                "reference": getattr(data, "reference", None),
+                "note": getattr(data, "note", None),
+                "received_on": rec_on,
+                "created_at": getattr(data, "created_at", None),
+                "date": rec_on,
+                "order_amount": getattr(data, "order_amount", None),
+                "previous_pending": getattr(data, "previous_pending", None),
+                "remaining_receivable": getattr(data, "remaining_receivable", None),
+                "collected_by_user_id": getattr(data, "collected_by_user_id", None),
+                "collector": collector_obj,
+                "source": derived_source,
+                "status": derived_status,
+                "upi_id": getattr(data, "upi_id", None),
+                "card_type": getattr(data, "card_type", None),
+                "card_last_four": getattr(data, "card_last_four", None),
+                "collection_instructions": getattr(data, "collection_instructions", None),
+                "splits": getattr(data, "splits", []),
+            }
+        return data
+
     @model_validator(mode="after")
     def _populate_aliases(self) -> "CustomerPaymentOut":
         if self.amount_collected is None:
             self.amount_collected = self.amount
         if self.payment_method is None:
             self.payment_method = self.payment_mode
+        if self.date is None:
+            self.date = self.received_on
         return self
 
 

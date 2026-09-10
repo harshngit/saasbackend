@@ -76,6 +76,7 @@ def record(
     collection_instructions: str | None = None,
     splits: list | None = None,
     allocations: list | None = None,
+    collected_by_user_id: str | None = None,
 ) -> CustomerPayment:
     """Record one payment. Raises `ValueError` with a message fit to show a user.
 
@@ -187,6 +188,7 @@ def record(
         card_type=card_type,
         card_last_four=card_last_four,
         collection_instructions=collection_instructions,
+        collected_by_user_id=collected_by_user_id,
     )
     db.add(payment)
     db.flush()

@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -192,8 +192,19 @@ class CustomerPayment(Base):
     previous_pending: Mapped[float | None] = mapped_column(Float, nullable=True)
     remaining_receivable: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # Collector identity (User who collected this payment)
+    collected_by_user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
     # Loaded with the payment so history rows carry the invoice number, not just its id.
     invoice: Mapped["Invoice | None"] = relationship(lazy="joined")  # noqa: F821
+    collector: Mapped["User | None"] = relationship(
+        lazy="selectin", foreign_keys=[collected_by_user_id]
+    )  # noqa: F821
+    delivery_collection: Mapped["DeliveryCollection | None"] = relationship(
+        lazy="selectin", uselist=False, primaryjoin="CustomerPayment.id == foreign(DeliveryCollection.customer_payment_id)"
+    )  # noqa: F821
 
     splits: Mapped[list["PaymentSplit"]] = relationship(
         back_populates="payment", cascade="all, delete-orphan", lazy="joined"

@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.workflow import public_order_status
+from app.schemas.customer import CustomerPaymentOut
 
 
 class OrderItemIn(BaseModel):
@@ -153,6 +154,9 @@ class OrderOut(BaseModel):
     delivery_number: str | None = None
     invoice_id: str | None = None
     invoice_number: str | None = None
+
+    # Individual payment history for this order
+    payments: list[CustomerPaymentOut] = Field(default_factory=list)
 
     # What the warehouse holds for this order, reported so the sales screen can show
     # the effect of placing it without a second call.

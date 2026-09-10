@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, CustomerPayment, Invoice, User
+from app.schemas.customer import CollectorBrief
 from app.schemas.payment_receipt import (
     PaymentReceiptCreate,
     PaymentReceiptOut,
@@ -74,6 +75,8 @@ def _out(db: Session, payment: CustomerPayment) -> PaymentReceiptOut:
         created_at=payment.created_at,
         customer=customer,
         invoice=invoice,
+        collected_by_user_id=payment.collected_by_user_id,
+        collector=CollectorBrief.model_validate(payment.collector).model_dump() if payment.collector else None,
         splits=[PaymentSplitOut.model_validate(s) for s in payment.splits] if payment.splits else [],
     )
 
@@ -160,6 +163,7 @@ def create_receipt(
             card_last_four=payload.card_last_four,
             collection_instructions=payload.collection_instructions,
             splits=payload.splits,
+            collected_by_user_id=user.id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

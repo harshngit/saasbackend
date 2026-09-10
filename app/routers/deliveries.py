@@ -1041,6 +1041,7 @@ def reconcile_delivery_collection(
                 order_id=coll.sales_order_id,
                 received_on=coll.collected_at or datetime.now(timezone.utc),
                 allocations=alloc_list,
+                collected_by_user_id=coll.delivery_partner_id,
             )
             coll.customer_payment_id = payment.id
         except ValueError as exc:
