@@ -747,186 +747,6 @@ def get_delivery_note_detail(
     return d
 
 
-@router.get("/{id}")
-def get_delivery_details(
-    id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """Retrieve full details of one delivery, including customer outstanding balance."""
-    order = _owned_order(db, id, user)
-    customer = order.customer
-    
-    return {
-        "id": order.id,
-        "organization_id": order.organization_id,
-        "order_number": order.order_number,
-        "status": workflow.public_order_status(order.status),
-        "source": order.source,
-        "subtotal": order.subtotal,
-        "discount": order.discount,
-        "tax": order.tax,
-        "total": order.total,
-        "notes": order.notes,
-        "items": [OrderItemOut.model_validate(item) for item in order.items],
-        "created_at": order.created_at,
-        "customer": {
-            "id": customer.id if customer else None,
-            "name": customer.name if customer else "Unknown",
-            "business_name": customer.business_name if customer else None,
-            "phone": customer.phone if customer else None,
-            "email": customer.email if customer else None,
-            "billing_address": customer.billing_address if customer else None,
-            "delivery_address": customer.delivery_address if customer else None,
-            "outstanding_balance": customer.outstanding_balance if customer else 0.0,
-        } if customer else None
-    }
-
-
-@router.patch("/{id}/status")
-def update_delivery_status(
-    id: str,
-    payload: DeliveryStatusUpdate,
-    user: User = Depends(_edit),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> dict:
-    """Update delivery outcome. Syncs with delivery partner's vehicle stock if source is vehicle.
-
-    Legacy route, kept for backward compatibility — it serves a distinct, already
-    simplified flow (field/vehicle-stock sales completing a delivery in one step,
-    without the plan -> accept -> pick -> ready -> load -> dispatch -> confirm
-    sequence a warehouse delivery goes through). New integrations should use the
-    Delivery-id based endpoints above, which enforce the full transition rules.
-    This route now requires `deliveries:edit` (previously any authenticated user
-    could call it) — organization/ownership scoping was already enforced via
-    `_owned_order`.
-    """
-    org_id = _org_id(user)
-    order = _owned_order(db, id, user)
-
-    # Deliver outcome mapping
-    # choices: Delivered | Partial | Failed | Rescheduled
-    if payload.status == "Delivered":
-        order.fulfilment_status = "delivered"
-        order.status = "completed"
-        order.reject_reason = None
-        
-        # If source is vehicle stock, increment driver's loading delivered_qty
-        if order.source == "delivery_vehicle" and order.assigned_delivery_partner_id:
-            loading = (
-                db.query(VehicleLoading)
-                .filter(
-                    VehicleLoading.delivery_partner_id == order.assigned_delivery_partner_id,
-                    VehicleLoading.organization_id == org_id,
-                    VehicleLoading.status == "active",
-                )
-                .first()
-            )
-            if loading:
-                for item in order.items:
-                    match = next(
-                        (
-                            x
-                            for x in loading.items
-                            if x.product_id == item.product_id and x.variant_id == item.variant_id
-                        ),
-                        None,
-                    )
-                    if match:
-                        match.delivered_qty += item.quantity
-
-    elif payload.status == "Partial":
-        order.fulfilment_status = "partially_delivered"
-        order.status = "processing"
-        order.reject_reason = payload.reason
-        
-        # Assume order items were partially delivered
-        if order.source == "delivery_vehicle" and order.assigned_delivery_partner_id:
-            loading = (
-                db.query(VehicleLoading)
-                .filter(
-                    VehicleLoading.delivery_partner_id == order.assigned_delivery_partner_id,
-                    VehicleLoading.organization_id == org_id,
-                    VehicleLoading.status == "active",
-                )
-                .first()
-            )
-            if loading:
-                for item in order.items:
-                    match = next(
-                        (
-                            x
-                            for x in loading.items
-                            if x.product_id == item.product_id and x.variant_id == item.variant_id
-                        ),
-                        None,
-                    )
-                    if match:
-                        match.delivered_qty += item.quantity
-
-    elif payload.status == "Failed":
-        order.fulfilment_status = "failed"
-        order.status = "processing"
-        order.reject_reason = payload.reason
-
-    elif payload.status == "Rescheduled":
-        # Still out with the partner; only the reason is recorded.
-        order.fulfilment_status = "in_transit"
-        order.status = "processing"
-        order.reject_reason = f"Rescheduled: {payload.reason}"
-
-    # Move the order's own Delivery records with it. This older route reports an
-    # outcome against the order; the Delivery is the record everything else reads, so
-    # leaving it behind would have the partner's own deliveries disagree with the order.
-    delivery_status = {
-        "Delivered": "delivered",
-        "Partial": "partially_delivered",
-        "Failed": "failed",
-        "Rescheduled": "in_transit",
-    }.get(payload.status)
-    if delivery_status:
-        for delivery in db.query(Delivery).filter(
-            Delivery.sales_order_id == order.id,
-            Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES),
-        ):
-            delivery.status = delivery_status
-            if delivery_status in ("delivered", "partially_delivered"):
-                delivery.confirmed_at = delivery.confirmed_at or datetime.now(timezone.utc)
-                for line in delivery.items:
-                    if not line.delivered_quantity:
-                        line.delivered_quantity = line.planned_quantity
-            if delivery_status == "failed":
-                delivery.failure_reason = payload.reason or delivery.failure_reason
-
-    db.commit()
-    db.refresh(order)
-    return {
-        "status": "success",
-        "order_status": workflow.public_order_status(order.status),
-        "fulfilment_status": order.fulfilment_status,
-        "reject_reason": order.reject_reason,
-    }
-
-
-@router.get("/{id}/receipt")
-def get_delivery_receipt(
-    id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> Response:
-    """Download delivery receipt PDF."""
-    order = _owned_order(db, id, user)
-    if not order.customer:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order has no customer details")
-
-    pdf_bytes = delivery_receipt_pdf(user.organization, order.customer, order)
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{order.order_number}.pdf"'},
-    )
-
 
 # -------------------- Delivery Collection & Reconciliation --------------------
 
@@ -1230,5 +1050,184 @@ def get_collections_for_delivery(
         DeliveryCollection.delivery_id == delivery.id,
     ).order_by(DeliveryCollection.collected_at.desc()).all()
 
+@router.get("/{id}")
+def get_delivery_details(
+    id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Retrieve full details of one delivery, including customer outstanding balance."""
+    order = _owned_order(db, id, user)
+    customer = order.customer
+    
+    return {
+        "id": order.id,
+        "organization_id": order.organization_id,
+        "order_number": order.order_number,
+        "status": workflow.public_order_status(order.status),
+        "source": order.source,
+        "subtotal": order.subtotal,
+        "discount": order.discount,
+        "tax": order.tax,
+        "total": order.total,
+        "notes": order.notes,
+        "items": [OrderItemOut.model_validate(item) for item in order.items],
+        "created_at": order.created_at,
+        "customer": {
+            "id": customer.id if customer else None,
+            "name": customer.name if customer else "Unknown",
+            "business_name": customer.business_name if customer else None,
+            "phone": customer.phone if customer else None,
+            "email": customer.email if customer else None,
+            "billing_address": customer.billing_address if customer else None,
+            "delivery_address": customer.delivery_address if customer else None,
+            "outstanding_balance": customer.outstanding_balance if customer else 0.0,
+        } if customer else None
+    }
+
+
+@router.patch("/{id}/status")
+def update_delivery_status(
+    id: str,
+    payload: DeliveryStatusUpdate,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Update delivery outcome. Syncs with delivery partner's vehicle stock if source is vehicle.
+
+    Legacy route, kept for backward compatibility — it serves a distinct, already
+    simplified flow (field/vehicle-stock sales completing a delivery in one step,
+    without the plan -> accept -> pick -> ready -> load -> dispatch -> confirm
+    sequence a warehouse delivery goes through). New integrations should use the
+    Delivery-id based endpoints above, which enforce the full transition rules.
+    This route now requires `deliveries:edit` (previously any authenticated user
+    could call it) — organization/ownership scoping was already enforced via
+    `_owned_order`.
+    """
+    org_id = _org_id(user)
+    order = _owned_order(db, id, user)
+
+    # Deliver outcome mapping
+    # choices: Delivered | Partial | Failed | Rescheduled
+    if payload.status == "Delivered":
+        order.fulfilment_status = "delivered"
+        order.status = "completed"
+        order.reject_reason = None
+        
+        # If source is vehicle stock, increment driver's loading delivered_qty
+        if order.source == "delivery_vehicle" and order.assigned_delivery_partner_id:
+            loading = (
+                db.query(VehicleLoading)
+                .filter(
+                    VehicleLoading.delivery_partner_id == order.assigned_delivery_partner_id,
+                    VehicleLoading.organization_id == org_id,
+                    VehicleLoading.status == "active",
+                )
+                .first()
+            )
+            if loading:
+                for item in order.items:
+                    match = next(
+                        (
+                            x
+                            for x in loading.items
+                            if x.product_id == item.product_id and x.variant_id == item.variant_id
+                        ),
+                        None,
+                    )
+                    if match:
+                        match.delivered_qty += item.quantity
+
+    elif payload.status == "Partial":
+        order.fulfilment_status = "partially_delivered"
+        order.status = "processing"
+        order.reject_reason = payload.reason
+        
+        # Assume order items were partially delivered
+        if order.source == "delivery_vehicle" and order.assigned_delivery_partner_id:
+            loading = (
+                db.query(VehicleLoading)
+                .filter(
+                    VehicleLoading.delivery_partner_id == order.assigned_delivery_partner_id,
+                    VehicleLoading.organization_id == org_id,
+                    VehicleLoading.status == "active",
+                )
+                .first()
+            )
+            if loading:
+                for item in order.items:
+                    match = next(
+                        (
+                            x
+                            for x in loading.items
+                            if x.product_id == item.product_id and x.variant_id == item.variant_id
+                        ),
+                        None,
+                    )
+                    if match:
+                        match.delivered_qty += item.quantity
+
+    elif payload.status == "Failed":
+        order.fulfilment_status = "failed"
+        order.status = "processing"
+        order.reject_reason = payload.reason
+
+    elif payload.status == "Rescheduled":
+        # Still out with the partner; only the reason is recorded.
+        order.fulfilment_status = "in_transit"
+        order.status = "processing"
+        order.reject_reason = f"Rescheduled: {payload.reason}"
+
+    # Move the order's own Delivery records with it. This older route reports an
+    # outcome against the order; the Delivery is the record everything else reads, so
+    # leaving it behind would have the partner's own deliveries disagree with the order.
+    delivery_status = {
+        "Delivered": "delivered",
+        "Partial": "partially_delivered",
+        "Failed": "failed",
+        "Rescheduled": "in_transit",
+    }.get(payload.status)
+    if delivery_status:
+        for delivery in db.query(Delivery).filter(
+            Delivery.sales_order_id == order.id,
+            Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES),
+        ):
+            delivery.status = delivery_status
+            if delivery_status in ("delivered", "partially_delivered"):
+                delivery.confirmed_at = delivery.confirmed_at or datetime.now(timezone.utc)
+                for line in delivery.items:
+                    if not line.delivered_quantity:
+                        line.delivered_quantity = line.planned_quantity
+            if delivery_status == "failed":
+                delivery.failure_reason = payload.reason or delivery.failure_reason
+
+    db.commit()
+    db.refresh(order)
+    return {
+        "status": "success",
+        "order_status": workflow.public_order_status(order.status),
+        "fulfilment_status": order.fulfilment_status,
+        "reject_reason": order.reject_reason,
+    }
+
+
+@router.get("/{id}/receipt")
+def get_delivery_receipt(
+    id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Download delivery receipt PDF."""
+    order = _owned_order(db, id, user)
+    if not order.customer:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order has no customer details")
+
+    pdf_bytes = delivery_receipt_pdf(user.organization, order.customer, order)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{order.order_number}.pdf"'},
+    )
 
 

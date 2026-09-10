@@ -826,3 +826,15 @@ def test_25_delivery_collection_valid_and_overpayment():
     assert coll_data["amount"] == 700.0
     assert coll_data["reconciliation_status"] == "recorded"
 
+
+def test_26_delivery_collections_route_order_not_shadowed_by_id():
+    """Verify GET /deliveries/collections reaches list_delivery_collections and is not shadowed by GET /deliveries/{id}."""
+    auth, org_id = _register_org("RouteOrderCheck")
+    
+    # GET /deliveries/collections must return 200 list (not 404 Delivery/Order not found)
+    r = client.get("/deliveries/collections", headers=auth)
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json(), list)
+    assert r.json() != {"detail": "Delivery/Order not found"}
+
+
