@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import Customer, CustomerPayment, Invoice, PaymentSplit, SalesOrder
+from app.models import Customer, CustomerPayment, CustomerPaymentAllocation, Invoice, PaymentSplit, SalesOrder
 from app.services import numbering_service
 
 
@@ -75,6 +75,7 @@ def record(
     card_last_four: str | None = None,
     collection_instructions: str | None = None,
     splits: list | None = None,
+    allocations: list | None = None,
 ) -> CustomerPayment:
     """Record one payment. Raises `ValueError` with a message fit to show a user.
 
@@ -105,6 +106,40 @@ def record(
             raise ValueError(
                 f"Sum of payment splits ({split_sum:.2f}) does not match total payment amount ({amount:.2f})"
             )
+
+    # Validate multi-invoice allocations if provided
+    resolved_allocations: list[tuple[Invoice, float]] = []
+    if allocations:
+        alloc_sum = 0.0
+        for a in allocations:
+            inv_id = getattr(a, "invoice_id", None) if hasattr(a, "invoice_id") else (a.get("invoice_id") if isinstance(a, dict) else None)
+            a_amt = getattr(a, "amount", None) if hasattr(a, "amount") else (a.get("amount") if isinstance(a, dict) else None)
+            if not inv_id:
+                raise ValueError("Each allocation must specify an invoice_id")
+            if a_amt is None or float(a_amt) <= 0:
+                raise ValueError("Each allocation amount must be greater than zero")
+
+            target_inv = db.get(Invoice, inv_id)
+            if target_inv is None or target_inv.organization_id != org_id:
+                raise ValueError(f"Invoice {inv_id} not found in this firm")
+            if customer and target_inv.customer_id and target_inv.customer_id != customer.id:
+                raise ValueError(f"Invoice {target_inv.invoice_number} does not belong to customer {customer.name}")
+            if target_inv.is_credit_note:
+                raise ValueError(f"Credit note {target_inv.invoice_number} is not payable")
+
+            due = outstanding(target_inv)
+            if due <= 0:
+                raise ValueError(f"Invoice {target_inv.invoice_number} is already fully paid")
+            if round(float(a_amt), 2) > round(due + 0.01, 2):
+                raise ValueError(
+                    f"Allocation amount ({float(a_amt):.2f}) exceeds outstanding balance ({due:.2f}) for invoice {target_inv.invoice_number}"
+                )
+
+            alloc_sum += float(a_amt)
+            resolved_allocations.append((target_inv, float(a_amt)))
+
+        if round(alloc_sum, 2) > round(amount + 0.01, 2):
+            raise ValueError(f"Sum of allocations ({alloc_sum:.2f}) exceeds total payment amount ({amount:.2f})")
 
     if invoice is not None:
         if invoice.is_credit_note:
@@ -180,8 +215,21 @@ def record(
             db.add(split_row)
         db.flush()
 
-    if invoice is not None:
+    # Persist multi-invoice allocations if provided
+    if resolved_allocations:
+        for inv_obj, alloc_amt in resolved_allocations:
+            alloc_row = CustomerPaymentAllocation(
+                organization_id=org_id,
+                customer_payment_id=payment.id,
+                invoice_id=inv_obj.id,
+                amount=round(alloc_amt, 2),
+            )
+            db.add(alloc_row)
+            apply_to_invoice(inv_obj, alloc_amt)
+        db.flush()
+    elif invoice is not None:
         apply_to_invoice(invoice, payment.amount)
+
     if customer is not None:
         customer.total_received = round((customer.total_received or 0) + payment.amount, 2)
         customer.recompute_outstanding()
@@ -195,13 +243,21 @@ def record(
 
 def void(db: Session, payment: CustomerPayment) -> None:
     """Reverse a payment and delete it, leaving every balance as if it never happened."""
-    if payment.invoice_id:
+    if payment.allocations:
+        for alloc in payment.allocations:
+            inv = db.get(Invoice, alloc.invoice_id)
+            if inv is not None:
+                apply_to_invoice(inv, -alloc.amount)
+    elif payment.invoice_id:
         invoice = db.get(Invoice, payment.invoice_id)
         if invoice is not None:
             apply_to_invoice(invoice, -payment.amount)
+
     if payment.customer_id:
         customer = db.get(Customer, payment.customer_id)
         if customer is not None:
             customer.total_received = round((customer.total_received or 0) - payment.amount, 2)
             customer.recompute_outstanding()
+
     db.delete(payment)
+

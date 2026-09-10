@@ -16,7 +16,7 @@ from app.models.activity_log import ActivityLog
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.brand import Brand
 from app.models.category import Category
-from app.models.customer import Customer, CustomerDocument, CustomerPayment, PaymentSplit
+from app.models.customer import Customer, CustomerDocument, CustomerPayment, CustomerPaymentAllocation, PaymentSplit
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense, ExpenseItem
 from app.models.notification import Notification
 from app.models.number_sequence import NumberSequence
@@ -65,7 +65,7 @@ from app.models.warehouse import (
 )
 from app.models.lead import Lead, LeadInterestedProduct
 from app.models.quotation import Quotation, QuotationItem
-from app.models.delivery import Delivery, DeliveryCollection, DeliveryHistory, DeliveryItem
+from app.models.delivery import Delivery, DeliveryCollection, DeliveryCollectionAllocation, DeliveryHistory, DeliveryItem
 from app.models.sales_return import SalesReturn, ReturnItem
 from app.models.transfer import WarehouseTransfer, WarehouseTransferItem
 from app.models.visit import Visit

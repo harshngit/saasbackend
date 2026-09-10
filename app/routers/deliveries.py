@@ -11,6 +11,8 @@ from app.core import scoping, workflow
 from app.models.enums import UserRole
 from app.models import (
     Customer,
+    CustomerPayment,
+    CustomerPaymentAllocation,
     Invoice,
     Product,
     ProductVariant,
@@ -21,11 +23,15 @@ from app.models import (
     VehicleLoadingItem,
     Delivery,
     DeliveryCollection,
+    DeliveryCollectionAllocation,
     DeliveryHistory,
     DeliveryItem,
 )
 from app.services import delivery_service, notification_service, numbering_service, order_service, payment_service
 from app.schemas.delivery import (
+    CollectionAllocationIn,
+    CollectionAllocationOut,
+    CustomerCollectionCreate,
     DeliveryCollectionCreate,
     DeliveryCollectionOut,
     DeliveryConfirm,
@@ -44,6 +50,8 @@ from app.schemas.delivery import (
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
+customer_payments_router = APIRouter(tags=["customer-payments"])
+
 
 _view = require_permission("deliveries", "view")
 _edit = require_permission("deliveries", "edit")
@@ -815,6 +823,137 @@ def get_delivery_collection(
     return coll
 
 
+@customer_payments_router.post("/collections", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
+@router.post("/collections/customer", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
+def record_general_customer_collection(
+    payload: CustomerCollectionCreate,
+    user: User = Depends(get_current_user),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryCollection:
+    """Delivery Partner / Staff records a general field payment collection for a customer.
+
+    Can be recorded with or without a delivery_id (delivery_id = None for general field collection).
+    Does NOT require delivery assignment when delivery_id is None.
+    Validates tenant isolation, customer existence, amounts, and invoice allocations.
+    Collector identity is derived from authenticated user context.
+    """
+    org_id = _org_id(user)
+
+    # 1. Validate customer existence and organization
+    customer = db.get(Customer, payload.customer_id)
+    if customer is None or customer.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found in your organization")
+
+    # 2. Validate amount > 0
+    if payload.amount <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Collection amount must be greater than zero")
+
+    # 3. Validate collection amount <= customer's total outstanding balance
+    cust_outstanding = round(float(customer.outstanding_balance or 0.0), 2)
+    if round(payload.amount, 2) > round(cust_outstanding + 0.01, 2):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Collection amount ({payload.amount:.2f}) exceeds customer's total outstanding balance ({cust_outstanding:.2f})",
+        )
+
+    # 4. Validate delivery_id if provided
+    delivery = None
+    if payload.delivery_id:
+        delivery = db.get(Delivery, payload.delivery_id)
+        if delivery is None or delivery.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found in your organization")
+
+        data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
+        if _is_delivery_partner(user) or data_scope == "own":
+            if user.system_role != "admin" and user.effective_system_role != "admin":
+                if delivery.delivery_partner_id != user.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Cannot record collection for a delivery not assigned to you",
+                    )
+
+    # 5. Validate allocations if provided
+    allocations_to_create = []
+    if payload.allocations:
+        alloc_sum = 0.0
+        for alloc in payload.allocations:
+            if alloc.amount <= 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Allocation amount must be greater than zero")
+
+            invoice = db.get(Invoice, alloc.invoice_id)
+            if invoice is None or invoice.organization_id != org_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Invoice {alloc.invoice_id} not found in your organization")
+            if invoice.customer_id != customer.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invoice {invoice.invoice_number} does not belong to customer {customer.name}",
+                )
+            if invoice.is_credit_note:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Credit note {invoice.invoice_number} cannot receive payment allocations")
+            if invoice.status == "cancelled":
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Cancelled invoice {invoice.invoice_number} cannot receive payment allocations")
+
+            inv_due = payment_service.outstanding(invoice)
+            if inv_due <= 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invoice {invoice.invoice_number} is already fully paid")
+            if round(alloc.amount, 2) > round(inv_due + 0.01, 2):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Allocation amount ({alloc.amount:.2f}) exceeds outstanding balance ({inv_due:.2f}) for invoice {invoice.invoice_number}",
+                )
+
+            alloc_sum += alloc.amount
+            allocations_to_create.append((invoice, alloc.amount))
+
+        if round(alloc_sum, 2) > round(payload.amount + 0.01, 2):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Sum of allocations ({alloc_sum:.2f}) exceeds collection amount ({payload.amount:.2f})",
+            )
+
+    mode = payload.payment_mode or payload.payment_method or "cash"
+
+    collected_at = datetime.now(timezone.utc)
+    if payload.payment_date:
+        if isinstance(payload.payment_date, datetime):
+            collected_at = payload.payment_date
+        elif isinstance(payload.payment_date, str):
+            try:
+                collected_at = datetime.fromisoformat(payload.payment_date)
+            except ValueError:
+                pass
+
+    coll = DeliveryCollection(
+        organization_id=org_id,
+        delivery_id=delivery.id if delivery else None,
+        sales_order_id=delivery.sales_order_id if delivery else None,
+        customer_id=customer.id,
+        delivery_partner_id=user.id,
+        amount=round(payload.amount, 2),
+        payment_mode=mode,
+        reference=payload.reference,
+        notes=payload.notes,
+        reconciliation_status="recorded",
+        collected_at=collected_at,
+    )
+    db.add(coll)
+    db.flush()
+
+    for inv, a_amt in allocations_to_create:
+        coll_alloc = DeliveryCollectionAllocation(
+            organization_id=org_id,
+            delivery_collection_id=coll.id,
+            invoice_id=inv.id,
+            amount=round(a_amt, 2),
+        )
+        db.add(coll_alloc)
+
+    db.commit()
+    db.refresh(coll)
+    return coll
+
+
 @router.post("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
 @router.patch("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
 def reconcile_delivery_collection(
@@ -847,10 +986,14 @@ def reconcile_delivery_collection(
     # Accounting handoff: create exactly ONE CustomerPayment using existing payment_service
     if not coll.customer_payment_id:
         customer = db.get(Customer, coll.customer_id) if coll.customer_id else None
-        
-        # Look for an invoice raised for this sales order
+
+        alloc_list = [
+            {"invoice_id": a.invoice_id, "amount": a.amount}
+            for a in coll.allocations
+        ] if coll.allocations else None
+
         invoice = None
-        if coll.sales_order_id:
+        if not alloc_list and coll.sales_order_id:
             invoice = (
                 db.query(Invoice)
                 .filter(
@@ -860,7 +1003,6 @@ def reconcile_delivery_collection(
                 .first()
             )
 
-        # Apply payment via existing payment service (reusing accounting calculations)
         try:
             inv_to_use = invoice if (invoice and payment_service.outstanding(invoice) >= coll.amount) else None
             payment = payment_service.record(
@@ -874,23 +1016,14 @@ def reconcile_delivery_collection(
                 note=f"Reconciled Delivery Collection {coll.id}" + (f" ({coll.notes})" if coll.notes else ""),
                 order_id=coll.sales_order_id,
                 received_on=coll.collected_at or datetime.now(timezone.utc),
+                allocations=alloc_list,
             )
             coll.customer_payment_id = payment.id
-        except ValueError:
-            # Fallback to customer advance / on-account payment if invoice check fails
-            payment = payment_service.record(
-                db,
-                org_id,
-                customer=customer,
-                invoice=None,
-                amount=coll.amount,
-                payment_mode=coll.payment_mode,
-                reference=coll.reference,
-                note=f"Reconciled Delivery Collection {coll.id}" + (f" ({coll.notes})" if coll.notes else ""),
-                order_id=coll.sales_order_id,
-                received_on=coll.collected_at or datetime.now(timezone.utc),
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
             )
-            coll.customer_payment_id = payment.id
 
     coll.reconciliation_status = "reconciled"
     coll.reconciled_at = datetime.now(timezone.utc)
@@ -911,7 +1044,7 @@ def void_delivery_collection(
 ) -> DeliveryCollection:
     """Accountant / Admin action to void a recorded collection.
 
-    Transitions reconciliation_status: recorded -> voided.
+    Transitions reconciliation_status: recorded -> voided or reconciled -> voided.
     """
     org_id = _org_id(user)
     if not _is_accountant_or_admin(user):
@@ -924,11 +1057,17 @@ def void_delivery_collection(
     if coll is None or coll.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
 
-    if coll.reconciliation_status != "recorded":
+    if coll.reconciliation_status not in ("recorded", "reconciled"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot void collection in state '{coll.reconciliation_status}'. Only 'recorded' collections can be voided.",
+            detail=f"Cannot void collection in state '{coll.reconciliation_status}'. Only 'recorded' or 'reconciled' collections can be voided.",
         )
+
+    if coll.customer_payment_id:
+        payment = db.get(CustomerPayment, coll.customer_payment_id)
+        if payment:
+            payment_service.void(db, payment)
+            coll.customer_payment_id = None
 
     coll.reconciliation_status = "voided"
 

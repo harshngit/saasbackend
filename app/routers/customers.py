@@ -51,6 +51,15 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
+def _is_delivery_partner(user: User) -> bool:
+    from app.models.enums import UserRole
+    if user.role == UserRole.DELIVERY_PARTNER:
+        return True
+    if user.role_detail and user.role_detail.name == "Delivery Partner":
+        return True
+    return False
+
+
 def _owned_customer(db: Session, customer_id: str, user: User) -> Customer:
     """The customer, if this user may see it. Accepts the UUID or the customer code.
 
@@ -59,7 +68,9 @@ def _owned_customer(db: Session, customer_id: str, user: User) -> Customer:
     record = lookup_service.by_id_or_code(
         db, Customer, customer_id, _org_id(user), Customer.customer_id
     )
-    if record is None or not scoping.owns_record(db, user, record, "assigned_sales_officer_id"):
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+    if not _is_delivery_partner(user) and not scoping.owns_record(db, user, record, "assigned_sales_officer_id"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
     return record
 
@@ -150,6 +161,7 @@ def list_customers(
     category: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     assigned_sales_officer_id: str | None = Query(default=None),
+    has_outstanding: bool | None = Query(default=None, description="Filter customers with outstanding balance > 0"),
     db: Session = Depends(get_db),
 ) -> list[Customer]:
     org_id = _org_id(user)
@@ -171,7 +183,12 @@ def list_customers(
         query = query.filter(Customer.is_active == is_active)
     if assigned_sales_officer_id is not None:
         query = query.filter(Customer.assigned_sales_officer_id == assigned_sales_officer_id)
-    query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
+    if has_outstanding is True:
+        query = query.filter(Customer.outstanding_balance > 0)
+    elif has_outstanding is False:
+        query = query.filter(or_(Customer.outstanding_balance <= 0, Customer.outstanding_balance.is_(None)))
+    if not _is_delivery_partner(user):
+        query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
     customers = query.order_by(Customer.created_at.desc()).all()
 
     if customers:

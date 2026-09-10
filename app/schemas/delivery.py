@@ -390,17 +390,61 @@ class DeliveryCollectionCreate(BaseModel):
     notes: str | None = Field(default=None, max_length=1000)
 
 
+class CollectionAllocationIn(BaseModel):
+    invoice_id: str
+    amount: float = Field(gt=0)
+
+
+class CustomerCollectionCreate(BaseModel):
+    customer_id: str
+    amount: float = Field(gt=0, description="Collection amount must be greater than zero")
+    payment_method: str | None = Field(default="cash")
+    payment_mode: str | None = Field(default=None)
+    reference: str | None = Field(default=None, max_length=150)
+    notes: str | None = Field(default=None, max_length=1000)
+    payment_date: datetime | str | None = Field(default=None)
+    allocations: list[CollectionAllocationIn] | None = Field(default_factory=list)
+    source: str | None = Field(default="delivery_partner")
+    delivery_id: str | None = Field(default=None)
+
+
+class CollectionAllocationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    invoice_id: str
+    order_id: str | None = None
+    amount: float
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_order_id(cls, data: object) -> object:
+        if hasattr(data, "invoice") and getattr(data, "invoice"):
+            inv = getattr(data, "invoice")
+            if hasattr(inv, "order_id"):
+                return {
+                    "invoice_id": getattr(data, "invoice_id", None),
+                    "order_id": getattr(inv, "order_id", None),
+                    "amount": getattr(data, "amount", 0.0),
+                }
+        return data
+
+
+
 class DeliveryCollectionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
     organization_id: str
-    delivery_id: str
+    delivery_id: str | None = None
     order_id: str | None = None
     sales_order_id: str | None = None
     customer_id: str | None = None
     delivery_partner_id: str | None = None
+    collector_id: str | None = None
+    source: str | None = "delivery_partner"
     amount: float
+    allocated_amount: float | None = None
+    unallocated_amount: float | None = None
     payment_mode: str
     reference: str | None = None
     notes: str | None = None
@@ -409,6 +453,21 @@ class DeliveryCollectionOut(BaseModel):
     reconciled_at: datetime | None = None
     reconciled_by_id: str | None = None
     customer_payment_id: str | None = None
+    allocations: list[CollectionAllocationOut] | None = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def _populate_computed_fields(self) -> "DeliveryCollectionOut":
+        if not self.collector_id and self.delivery_partner_id:
+            self.collector_id = self.delivery_partner_id
+        if self.allocations:
+            alloc_sum = sum(a.amount for a in self.allocations)
+            self.allocated_amount = round(alloc_sum, 2)
+            self.unallocated_amount = round(max(self.amount - alloc_sum, 0.0), 2)
+        else:
+            self.allocated_amount = self.amount
+            self.unallocated_amount = 0.0
+        return self
+
 

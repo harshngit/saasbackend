@@ -210,8 +210,8 @@ class DeliveryCollection(Base):
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    delivery_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("deliveries.id", ondelete="CASCADE"), nullable=False, index=True
+    delivery_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("deliveries.id", ondelete="CASCADE"), nullable=True, index=True
     )
     sales_order_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("sales_orders.id", ondelete="SET NULL"), nullable=True, index=True
@@ -243,7 +243,7 @@ class DeliveryCollection(Base):
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
     )
 
-    delivery: Mapped["Delivery"] = relationship(back_populates="collections")
+    delivery: Mapped["Delivery | None"] = relationship(back_populates="collections")
     sales_order: Mapped["SalesOrder | None"] = relationship(
         lazy="joined", primaryjoin="DeliveryCollection.sales_order_id == SalesOrder.id"
     )
@@ -256,9 +256,39 @@ class DeliveryCollection(Base):
     reconciled_by: Mapped["User | None"] = relationship(
         lazy="joined", foreign_keys=[reconciled_by_id]
     )
+    allocations: Mapped[list["DeliveryCollectionAllocation"]] = relationship(
+        back_populates="collection", cascade="all, delete-orphan", lazy="joined"
+    )
+
+    @property
+    def collector_name(self) -> str | None:
+        if self.delivery_partner:
+            return self.delivery_partner.name
+        return None
 
     @property
     def order_id(self) -> str | None:
         """Alias for sales_order_id to match API conventions."""
         return self.sales_order_id
 
+
+class DeliveryCollectionAllocation(Base):
+    """An invoice allocation linked to a DeliveryCollection prior to reconciliation."""
+
+    __tablename__ = "delivery_collection_allocations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    delivery_collection_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("delivery_collections.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    invoice_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("invoices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    collection: Mapped["DeliveryCollection"] = relationship(back_populates="allocations")
+    invoice: Mapped["Invoice"] = relationship(lazy="joined")  # noqa: F821

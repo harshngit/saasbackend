@@ -198,6 +198,9 @@ class CustomerPayment(Base):
     splits: Mapped[list["PaymentSplit"]] = relationship(
         back_populates="payment", cascade="all, delete-orphan", lazy="joined"
     )
+    allocations: Mapped[list["CustomerPaymentAllocation"]] = relationship(
+        back_populates="payment", cascade="all, delete-orphan", lazy="joined"
+    )
 
     @property
     def amount_collected(self) -> float:
@@ -206,6 +209,28 @@ class CustomerPayment(Base):
     @property
     def payment_method(self) -> str:
         return self.payment_mode
+
+
+class CustomerPaymentAllocation(Base):
+    """One invoice allocation of a CustomerPayment."""
+
+    __tablename__ = "customer_payment_allocations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    customer_payment_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("customer_payments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    invoice_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("invoices.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    payment: Mapped["CustomerPayment"] = relationship(back_populates="allocations")
+    invoice: Mapped["Invoice"] = relationship(lazy="joined")  # noqa: F821
 
 
 class PaymentSplit(Base):
@@ -232,6 +257,7 @@ class PaymentSplit(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     payment: Mapped["CustomerPayment"] = relationship(back_populates="splits")
+
 
 
 class CustomerDocument(Base):

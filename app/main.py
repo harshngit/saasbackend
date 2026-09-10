@@ -236,6 +236,7 @@ app.include_router(invoices.orders_router)  # POST /orders/{id}/invoice
 app.include_router(vehicle_stock.router)
 app.include_router(vehicles.router)
 app.include_router(deliveries.router)
+app.include_router(deliveries.customer_payments_router)
 app.include_router(expenses.router)
 app.include_router(attendance.router)
 app.include_router(reports.router)
