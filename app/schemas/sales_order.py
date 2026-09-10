@@ -340,3 +340,30 @@ class PickupConfirmRequest(BaseModel):
     items: list[PickupItemConfirm] | None = None
     collected_by: str | None = Field(default=None, max_length=150)
     notes: str | None = Field(default=None, max_length=500)
+
+
+class OrderPaymentCreate(BaseModel):
+    amount: float = Field(gt=0, description="Payment amount must be greater than zero")
+    payment_method: str | None = Field(default="cash", description="cash | upi | card | bank_transfer | cheque | ...")
+    payment_mode: str | None = Field(default=None, description="Alias for payment_method")
+    reference: str | None = Field(default=None, max_length=150)
+    notes: str | None = Field(default=None, max_length=1000)
+    payment_date: datetime | str | None = Field(default=None, description="Date/time when payment was received")
+
+    @field_validator("amount")
+    @classmethod
+    def _valid_amount(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("amount must be greater than zero")
+        return v
+
+
+class OrderPaymentSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    order_id: str
+    order_amount: float
+    paid_amount: float
+    remaining_amount: float
+    payment_status: str
+

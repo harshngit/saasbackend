@@ -638,3 +638,191 @@ def test_20_conflicting_payment_fields():
         headers=auth,
     )
     assert r.status_code == 422, r.text
+
+
+def test_21_order_subsequent_payment_full():
+    auth, org_id = _register_org("OrderPayFull")
+    cust_id, wh_id, prod_id = _setup_entities(auth)
+
+    # Order total = 1000, paid upfront = 700
+    create_res = client.post(
+        "/orders",
+        json={
+            "customer_id": cust_id,
+            "warehouse_id": wh_id,
+            "delivery_method": "takeaway",
+            "payment_status": "partial",
+            "paid_amount": 700.0,
+            "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 500.0}],
+        },
+        headers=auth,
+    )
+    assert create_res.status_code == 201, create_res.text
+    order_id = create_res.json()["id"]
+
+    # Pay remaining 300
+    r = client.post(
+        f"/orders/{order_id}/payments",
+        json={
+            "amount": 300.0,
+            "payment_method": "cash",
+            "reference": "REF123",
+            "notes": "Full payment settled",
+            "payment_date": "2026-09-10",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["order_id"] == order_id
+    assert data["order_amount"] == 1000.0
+    assert data["paid_amount"] == 1000.0
+    assert data["remaining_amount"] == 0.0
+    assert data["payment_status"] == "paid"
+
+
+def test_22_order_subsequent_payment_partial():
+    auth, org_id = _register_org("OrderPayPart")
+    cust_id, wh_id, prod_id = _setup_entities(auth)
+
+    # Order total = 1000, paid upfront = 500
+    create_res = client.post(
+        "/orders",
+        json={
+            "customer_id": cust_id,
+            "warehouse_id": wh_id,
+            "delivery_method": "takeaway",
+            "payment_status": "partial",
+            "paid_amount": 500.0,
+            "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 500.0}],
+        },
+        headers=auth,
+    )
+    assert create_res.status_code == 201, create_res.text
+    order_id = create_res.json()["id"]
+
+    # Pay additional 200
+    r = client.post(
+        f"/orders/{order_id}/payments",
+        json={
+            "amount": 200.0,
+            "payment_method": "upi",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["paid_amount"] == 700.0
+    assert data["remaining_amount"] == 300.0
+    assert data["payment_status"] == "partial"
+
+
+def test_23_order_payment_overpayment():
+    auth, org_id = _register_org("OrderPayOver")
+    cust_id, wh_id, prod_id = _setup_entities(auth)
+
+    # Order total = 1000, paid upfront = 700 (remaining 300)
+    create_res = client.post(
+        "/orders",
+        json={
+            "customer_id": cust_id,
+            "warehouse_id": wh_id,
+            "delivery_method": "takeaway",
+            "payment_status": "partial",
+            "paid_amount": 700.0,
+            "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 500.0}],
+        },
+        headers=auth,
+    )
+    assert create_res.status_code == 201, create_res.text
+    order_id = create_res.json()["id"]
+
+    # Pay 500 (exceeds 300) -> 400
+    r = client.post(
+        f"/orders/{order_id}/payments",
+        json={
+            "amount": 500.0,
+            "payment_method": "cash",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 400, r.text
+    assert "Amount exceeds outstanding balance" in r.text
+
+
+def test_24_order_payment_zero_and_negative():
+    auth, org_id = _register_org("OrderPayZero")
+    cust_id, wh_id, prod_id = _setup_entities(auth)
+
+    create_res = client.post(
+        "/orders",
+        json={
+            "customer_id": cust_id,
+            "warehouse_id": wh_id,
+            "delivery_method": "takeaway",
+            "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 500.0}],
+        },
+        headers=auth,
+    )
+    assert create_res.status_code == 201, create_res.text
+    order_id = create_res.json()["id"]
+
+    # amount = 0
+    r = client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount": 0.0, "payment_method": "cash"},
+        headers=auth,
+    )
+    assert r.status_code == 422, r.text
+
+    # amount = -100
+    r = client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount": -100.0, "payment_method": "cash"},
+        headers=auth,
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_25_delivery_collection_valid_and_overpayment():
+    auth, org_id = _register_org("DelivCollValidation")
+    cust_id, wh_id, prod_id = _setup_entities(auth)
+
+    # Home delivery order total = 1000, paid upfront = 300 (remaining 700)
+    create_res = client.post(
+        "/orders",
+        json={
+            "customer_id": cust_id,
+            "warehouse_id": wh_id,
+            "delivery_method": "home_delivery",
+            "delivery_address": "123 Main St",
+            "payment_status": "partial",
+            "paid_amount": 300.0,
+            "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 500.0}],
+        },
+        headers=auth,
+    )
+    assert create_res.status_code == 201, create_res.text
+    delivery_id = create_res.json()["delivery_id"]
+    assert delivery_id is not None
+
+    # Attempt collection of 800 (exceeds remaining 700) -> 400
+    r_over = client.post(
+        f"/deliveries/{delivery_id}/collections",
+        json={"amount": 800.0, "payment_mode": "cash"},
+        headers=auth,
+    )
+    assert r_over.status_code == 400, r_over.text
+    assert "Collection amount exceeds remaining balance" in r_over.text
+
+    # Valid collection of 700 -> 201
+    r_valid = client.post(
+        f"/deliveries/{delivery_id}/collections",
+        json={"amount": 700.0, "payment_mode": "cash"},
+        headers=auth,
+    )
+    assert r_valid.status_code == 201, r_valid.text
+    coll_data = r_valid.json()
+    assert coll_data["amount"] == 700.0
+    assert coll_data["reconciliation_status"] == "recorded"
+

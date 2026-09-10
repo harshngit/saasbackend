@@ -12,6 +12,8 @@ from app.schemas.sales_order import (
     CancelBody,
     OrderCreate,
     OrderOut,
+    OrderPaymentCreate,
+    OrderPaymentSummary,
     OrderUpdate,
     PickupConfirmRequest,
     RejectBody,
@@ -880,3 +882,125 @@ def confirm_order_pickup_alias(
 ) -> OrderOut:
     """Alias for POST /orders/{id}/pickup/confirm."""
     return confirm_order_pickup(order_id, payload, user, _unlocked, db)
+
+
+@router.post("/{order_id}/payments", response_model=OrderPaymentSummary)
+def record_order_payment(
+    order_id: str,
+    payload: OrderPaymentCreate,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> OrderPaymentSummary:
+    """Receive a customer payment against an existing sales order's invoice.
+
+    Validates that:
+    - Order exists and belongs to user's organization
+    - Order is not cancelled
+    - Amount is greater than zero
+    - Amount does not exceed remaining outstanding balance
+    Delegates financial processing to payment_service.record(...).
+    """
+    org_id = _org_id(user)
+    order = _owned(db, order_id, org_id, user)
+    if order.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot record payment for a cancelled order",
+        )
+
+    if payload.amount <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Amount must be greater than zero",
+        )
+
+    # Locate or generate linked invoice for this order
+    invoice = (
+        db.query(Invoice)
+        .filter(
+            Invoice.order_id == order.id,
+            Invoice.organization_id == org_id,
+            Invoice.is_credit_note.is_(False),
+        )
+        .order_by(Invoice.created_at.desc())
+        .first()
+    )
+
+    if invoice is None:
+        from app.routers.invoices import generate_from_order
+        try:
+            invoice = generate_from_order(order.id, payload=None, user=user, db=db, allow_upfront=True)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot generate invoice for order: {exc}",
+            )
+
+    due = payment_service.outstanding(invoice)
+    if due <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Amount exceeds outstanding balance",
+        )
+
+    if round(payload.amount, 2) > round(due + 0.01, 2):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Amount exceeds outstanding balance",
+        )
+
+    customer = order.customer or (db.get(Customer, order.customer_id) if order.customer_id else None)
+
+    received_on = None
+    if payload.payment_date:
+        if isinstance(payload.payment_date, datetime):
+            received_on = payload.payment_date
+        elif isinstance(payload.payment_date, str):
+            try:
+                if "T" in payload.payment_date or " " in payload.payment_date:
+                    received_on = datetime.fromisoformat(payload.payment_date.replace("Z", "+00:00"))
+                else:
+                    parts = [int(p) for p in payload.payment_date.split("-")]
+                    received_on = datetime(parts[0], parts[1], parts[2], tzinfo=timezone.utc)
+            except Exception:
+                received_on = datetime.now(timezone.utc)
+
+    pay_mode = payload.payment_method or payload.payment_mode or "cash"
+
+    try:
+        payment_service.record(
+            db,
+            org_id,
+            customer=customer,
+            invoice=invoice,
+            amount=payload.amount,
+            payment_mode=pay_mode,
+            reference=payload.reference,
+            note=payload.notes or f"Payment for order {order.order_number}",
+            order_id=order.id,
+            received_on=received_on or datetime.now(timezone.utc),
+        )
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(err),
+        )
+
+    db.commit()
+    db.refresh(order)
+    db.refresh(invoice)
+
+    order_total = round(float(order.total or 0.0), 2)
+    paid_amount = round(float(invoice.amount_paid or 0.0), 2)
+    remaining_amount = payment_service.outstanding(invoice)
+    pay_status = payment_service.payment_status(invoice)
+
+    return OrderPaymentSummary(
+        order_id=order.id,
+        order_amount=order_total,
+        paid_amount=paid_amount,
+        remaining_amount=remaining_amount,
+        payment_status=pay_status,
+    )
+

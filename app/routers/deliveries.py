@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -1144,6 +1144,43 @@ def record_delivery_collection(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Cannot record collection for a delivery not assigned to you",
+                )
+
+    # Validate collection amount does not exceed remaining outstanding balance on linked order/invoice
+    if delivery.sales_order_id:
+        so = db.get(SalesOrder, delivery.sales_order_id)
+        if so:
+            inv = (
+                db.query(Invoice)
+                .filter(
+                    Invoice.order_id == so.id,
+                    Invoice.organization_id == org_id,
+                    Invoice.is_credit_note.is_(False),
+                )
+                .order_by(Invoice.created_at.desc())
+                .first()
+            )
+            if inv:
+                remaining = payment_service.outstanding(inv)
+            else:
+                remaining = round(float(so.total or 0.0), 2)
+
+            unreconciled = (
+                db.query(func.sum(DeliveryCollection.amount))
+                .filter(
+                    DeliveryCollection.organization_id == org_id,
+                    DeliveryCollection.sales_order_id == so.id,
+                    DeliveryCollection.reconciliation_status == "recorded",
+                )
+                .scalar()
+                or 0.0
+            )
+            effective_remaining = round(max(remaining - float(unreconciled), 0.0), 2)
+
+            if round(payload.amount, 2) > round(effective_remaining + 0.01, 2):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Collection amount exceeds remaining balance",
                 )
 
     # Derive audit links directly from Delivery & User (never trust client)
