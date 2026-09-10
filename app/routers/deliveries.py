@@ -50,7 +50,7 @@ from app.schemas.delivery import (
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
-customer_payments_router = APIRouter(tags=["customer-payments"])
+customer_payments_router = APIRouter(prefix="/customer-payments", tags=["customer-payments"])
 
 
 _view = require_permission("deliveries", "view")
@@ -911,6 +911,30 @@ def record_general_customer_collection(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Sum of allocations ({alloc_sum:.2f}) exceeds collection amount ({payload.amount:.2f})",
             )
+    else:
+        # Automatic FIFO allocation across open customer invoices
+        open_invoices = (
+            db.query(Invoice)
+            .filter(
+                Invoice.organization_id == org_id,
+                Invoice.customer_id == customer.id,
+                Invoice.status != "cancelled",
+                Invoice.is_credit_note.is_(False),
+                Invoice.status != "paid",
+            )
+            .order_by(Invoice.invoice_date.asc(), Invoice.created_at.asc())
+            .all()
+        )
+        remaining = round(payload.amount, 2)
+        for inv in open_invoices:
+            inv_due = round(payment_service.outstanding(inv), 2)
+            if inv_due <= 0:
+                continue
+            alloc_amt = min(remaining, inv_due)
+            allocations_to_create.append((inv, alloc_amt))
+            remaining = round(remaining - alloc_amt, 2)
+            if remaining <= 0:
+                break
 
     mode = payload.payment_mode or payload.payment_method or "cash"
 

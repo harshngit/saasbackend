@@ -44,6 +44,8 @@ def collection_setup():
         ts = int(datetime.now(timezone.utc).timestamp())
         org = Organization(name=f"Collection Test Org {ts}", company_code=f"CTO{ts}")
         db.add(org)
+        db.flush()
+
         # Admin / Accountant User
         admin = User(
             email=f"admin_coll_{ts}@test.com",
@@ -92,6 +94,7 @@ def collection_setup():
             name="Rahul Customer",
             phone="9998887771",
             opening_balance=0.0,
+            total_billed=1500.0,
             outstanding_balance=1500.0,
         )
         db.add(cust1)
@@ -103,6 +106,7 @@ def collection_setup():
             name="Priya Customer",
             phone="9998887772",
             opening_balance=0.0,
+            total_billed=1000.0,
             outstanding_balance=1000.0,
         )
         db.add(cust2)
@@ -114,6 +118,7 @@ def collection_setup():
             name="Other Org Customer",
             phone="9998887773",
             opening_balance=0.0,
+            total_billed=500.0,
             outstanding_balance=500.0,
         )
         db.add(cust_org2)

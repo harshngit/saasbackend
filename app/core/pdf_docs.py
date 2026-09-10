@@ -439,7 +439,40 @@ def _logo(pdf: FPDF, logo: bytes | None) -> None:
         pass
 
 
-def _branded_title(pdf: FPDF, settings: dict, title: str) -> None:
+def _draw_payment_status_badge(pdf: FPDF, status_str: str) -> None:
+    st = str(status_str or "unpaid").strip().lower()
+    if st == "paid":
+        bg = (40, 167, 69)      # Green
+        txt_color = (255, 255, 255)
+        label = "PAID"
+    elif st in ("partial", "partially_paid"):
+        bg = (255, 193, 7)      # Amber
+        txt_color = (33, 37, 41)
+        label = "PARTIAL"
+    else:
+        bg = (220, 53, 69)      # Red
+        txt_color = (255, 255, 255)
+        label = "UNPAID"
+
+    pdf.set_font("Helvetica", "B", 8)
+    badge_w = pdf.get_string_width(label) + 6
+    badge_h = 5
+    badge_x = pdf.w - pdf.r_margin - badge_w
+    badge_y = pdf.get_y() - 7
+
+    pdf.set_fill_color(*bg)
+    try:
+        pdf.rect(badge_x, badge_y, badge_w, badge_h, style="F", round_corners=True, corner_radius=2)
+    except Exception:
+        pdf.rect(badge_x, badge_y, badge_w, badge_h, style="F")
+
+    pdf.set_text_color(*txt_color)
+    pdf.set_xy(badge_x, badge_y + 0.8)
+    pdf.cell(badge_w, 3.5, label, align="C")
+    pdf.set_text_color(0, 0, 0)
+
+
+def _branded_title(pdf: FPDF, settings: dict, title: str, status_str: str | None = None) -> None:
     """The document title, in the firm's colour — or reversed out of a band of it."""
     style = _style(settings)
     rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
@@ -457,6 +490,9 @@ def _branded_title(pdf: FPDF, settings: dict, title: str) -> None:
             pdf.set_text_color(*rgb)
         pdf.cell(0, 8, _s(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(0, 0, 0)
+
+    if status_str:
+        _draw_payment_status_badge(pdf, status_str)
 
 
 def _two_column_rows(
@@ -481,9 +517,14 @@ def _two_column_rows(
         pdf.cell(column, height, _s(right), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
-def _amount_row(pdf: FPDF, label: str, value, width: float, height: float = 5) -> None:
+def _amount_row(
+    pdf: FPDF, label: str, value, width: float, height: float = 5, brand_rgb: tuple[int, int, int] | None = None
+) -> None:
+    if brand_rgb and label in ("Total", "Grand Total"):
+        pdf.set_text_color(*brand_rgb)
     pdf.cell(width - 30, height, _s(f"{label}:"), align="R")
     pdf.cell(30, height, _money(value), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_text_color(0, 0, 0)
 
 
 def _outstanding(invoice) -> float:
@@ -507,6 +548,17 @@ def _invoice_footer(
             pdf.multi_cell(0, 4, _s(f"Bank: {bank}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if fields.get("show_upi_qr") and org is not None and org.upi_id:
         pdf.multi_cell(0, 4, _s(f"UPI: {org.upi_id}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        # TODO: generate real QR code image via e.g. the `qrcode` python package and drop it in this box
+        qr_x = pdf.get_x()
+        qr_y = pdf.get_y()
+        try:
+            pdf.rect(qr_x, qr_y, 12, 12, style="D", round_corners=True, corner_radius=1.5)
+        except Exception:
+            pdf.rect(qr_x, qr_y, 12, 12, style="D")
+        pdf.set_xy(qr_x + 15, qr_y + 4)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 4, _s("Scan to pay via UPI"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_xy(qr_x, qr_y + 14)
     if fields.get("show_terms") and settings.get("terms"):
         pdf.multi_cell(0, 4, _s(f"Terms: {settings['terms']}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if settings.get("notes"):
@@ -516,8 +568,6 @@ def _invoice_footer(
         pdf.multi_cell(0, 4, _s(settings["footer_text"]), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if fields.get("show_signature"):
         pdf.ln(4)
-        # The firm's uploaded signature sits above the line it signs. An unreadable
-        # upload just leaves the line blank to sign by hand.
         drawn = False
         if signature:
             try:
@@ -546,7 +596,7 @@ def invoice_simple_pdf(
     pdf = _invoice_pdf_page(settings)
     _logo(pdf, logo)
     _org_header(pdf, org)
-    _branded_title(pdf, settings, "INVOICE")
+    _branded_title(pdf, settings, "INVOICE", status_str=invoice.status)
     pdf.ln(1)
 
     width = _usable_width(pdf)
@@ -584,6 +634,7 @@ def invoice_simple_pdf(
             pdf.cell(w, 6, text, border=1, align=align)
         pdf.ln(6)
 
+    brand_rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
     pdf.ln(2)
     pdf.set_font("Helvetica", size=9)
     _amount_row(pdf, "Subtotal", invoice.subtotal, width)
@@ -592,7 +643,7 @@ def invoice_simple_pdf(
     if invoice.tax:
         _amount_row(pdf, "Tax", invoice.tax, width)
     pdf.set_font("Helvetica", "B", 11)
-    _amount_row(pdf, "Total", invoice.total, width, height=7)
+    _amount_row(pdf, "Total", invoice.total, width, height=7, brand_rgb=brand_rgb)
     pdf.set_font("Helvetica", size=9)
     _amount_row(pdf, "Paid", invoice.amount_paid, width)
     _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
@@ -625,7 +676,8 @@ def invoice_detailed_pdf(
             0, 5, _s(f"GSTIN / PAN: {org.gst_number or org.gstin_pan}"),
             new_x=XPos.LMARGIN, new_y=YPos.NEXT,
         )
-    _branded_title(pdf, settings, "TAX INVOICE")
+    _branded_title(pdf, settings, "TAX INVOICE", status_str=invoice.status)
+
     pdf.ln(1)
 
     width = _usable_width(pdf)
