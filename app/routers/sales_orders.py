@@ -7,6 +7,7 @@ from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
+from app.core.realtime import queue_event
 from app.services.order_import_service import get_order_template, import_orders_from_file
 from app.models import (
     Customer,
@@ -774,6 +775,19 @@ def cancel_order(
             # never block the order cancellation that was already approved.
             continue
         delivery_service.cancel(db, delivery, reason=payload.reason, actor=user)
+
+    queue_event(
+        db,
+        org_id=order.organization_id,
+        event_name="order.cancelled",
+        data={
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "status": "cancelled",
+            "reason": payload.reason,
+        },
+        required_permission="sales_orders:view",
+    )
 
     db.commit()
     db.refresh(order)

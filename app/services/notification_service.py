@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 
+from app.core.realtime import queue_event
 from app.models import Notification, User, UserRole
 
 
@@ -8,6 +9,26 @@ def notify(db: Session, user_id: str, title: str, body: str | None = None,
     """Create a notification for a single user (does not commit)."""
     n = Notification(user_id=user_id, organization_id=organization_id, title=title, body=body, type=type, link=link)
     db.add(n)
+
+    resolved_org_id = organization_id
+    if not resolved_org_id:
+        user = db.get(User, user_id)
+        resolved_org_id = user.organization_id if user else "global"
+
+    queue_event(
+        db,
+        org_id=resolved_org_id or "global",
+        event_name="notification.created",
+        data={
+            "id": n.id,
+            "user_id": user_id,
+            "title": title,
+            "body": body,
+            "type": type,
+            "link": link,
+        },
+        user_id=user_id,
+    )
     return n
 
 

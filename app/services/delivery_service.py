@@ -19,6 +19,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
+from app.core.realtime import queue_event
 from app.core.workflow import DeliveryTransitionError, public_order_status, validate_delivery_transition
 from app.models import (
     Customer,
@@ -329,6 +330,19 @@ def plan(
         order.fulfilment_status = "planned"
     if delivery_partner is not None:
         order.assigned_delivery_partner_id = delivery_partner.id
+        queue_event(
+            db,
+            org_id=delivery.organization_id,
+            event_name="delivery.assigned",
+            data={
+                "delivery_id": delivery.id,
+                "delivery_number": delivery.delivery_number,
+                "sales_order_id": delivery.sales_order_id,
+                "delivery_partner_id": delivery_partner.id,
+                "status": delivery.status,
+            },
+            required_permission="deliveries:view",
+        )
     return delivery
 
 
@@ -343,6 +357,19 @@ def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
     previous = delivery.status
     delivery.status = "accepted"
     record_history(db, delivery, "accepted", actor=user, previous_status=previous, new_status="accepted")
+    queue_event(
+        db,
+        org_id=delivery.organization_id,
+        event_name="delivery.status_changed",
+        data={
+            "delivery_id": delivery.id,
+            "delivery_number": delivery.delivery_number,
+            "sales_order_id": delivery.sales_order_id,
+            "previous_status": previous,
+            "new_status": "accepted",
+        },
+        required_permission="deliveries:view",
+    )
     return delivery
 
 
@@ -366,6 +393,20 @@ def reject(db: Session, user: User, delivery: Delivery, reason: str | None = Non
     delivery.vehicle_id = None
     record_history(
         db, delivery, "rejected", actor=user, previous_status=previous, new_status="rejected", notes=reason_str
+    )
+    queue_event(
+        db,
+        org_id=delivery.organization_id,
+        event_name="delivery.status_changed",
+        data={
+            "delivery_id": delivery.id,
+            "delivery_number": delivery.delivery_number,
+            "sales_order_id": delivery.sales_order_id,
+            "previous_status": previous,
+            "new_status": "rejected",
+            "reason": reason_str,
+        },
+        required_permission="deliveries:view",
     )
     return delivery
 
@@ -401,6 +442,19 @@ def cancel(db: Session, delivery: Delivery, reason: str | None = None, actor: Us
         delivery.notes = f"{delivery.notes}\n{note_text}" if delivery.notes else note_text
     record_history(
         db, delivery, "cancelled", actor=actor, previous_status=previous, new_status="cancelled", notes=reason
+    )
+    queue_event(
+        db,
+        org_id=delivery.organization_id,
+        event_name="delivery.status_changed",
+        data={
+            "delivery_id": delivery.id,
+            "delivery_number": delivery.delivery_number,
+            "sales_order_id": delivery.sales_order_id,
+            "previous_status": previous,
+            "new_status": "cancelled",
+        },
+        required_permission="deliveries:view",
     )
     return delivery
 
@@ -770,6 +824,20 @@ def confirm(
     order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
     if order is not None:
         _settle_order_fulfilment(db, order)
+
+    queue_event(
+        db,
+        org_id=delivery.organization_id,
+        event_name="delivery.status_changed",
+        data={
+            "delivery_id": delivery.id,
+            "delivery_number": delivery.delivery_number,
+            "sales_order_id": delivery.sales_order_id,
+            "previous_status": previous,
+            "new_status": delivery.status,
+        },
+        required_permission="deliveries:view",
+    )
 
 
 def _settle_order_fulfilment(db: Session, order: SalesOrder) -> None:

@@ -21,6 +21,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core import scoping, workflow
+from app.core.realtime import queue_event
 from app.models import Customer, Delivery, Invoice, Product, ProductVariant, SalesOrder, SalesOrderItem, User
 from app.schemas.sales_order import OrderUpdate
 from app.services import notification_service, numbering_service, stock_service
@@ -282,6 +283,21 @@ def place_order(
             db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
             type="order", link=order.id,
         )
+
+    queue_event(
+        db,
+        org_id=org_id,
+        event_name="order.created",
+        data={
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "customer_id": order.customer_id,
+            "status": order.status,
+            "fulfilment_status": order.fulfilment_status,
+            "total": order.total,
+        },
+        required_permission="sales_orders:view",
+    )
     return order, warnings
 
 
@@ -364,6 +380,21 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
     notification_service.notify_org_admins(
         db, org_id, "Sales order confirmed", f"{order.order_number} — Rs {order.total:,.2f}",
         type="order", link=order.id,
+    )
+
+    queue_event(
+        db,
+        org_id=org_id,
+        event_name="order.status_changed",
+        data={
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "previous_status": "draft",
+            "new_status": "placed",
+            "fulfilment_status": order.fulfilment_status,
+            "total": order.total,
+        },
+        required_permission="sales_orders:view",
     )
     return order, warnings
 

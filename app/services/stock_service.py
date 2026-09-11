@@ -18,6 +18,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session, lazyload
 
+from app.core.realtime import queue_event
 from app.models import (
     Product,
     ProductVariant,
@@ -379,6 +380,19 @@ def move_tracked(
         db, org_id, warehouse_id, product_id, variant_id, delta,
         batch=batch, serial_numbers=serial_numbers,
     )
+    queue_event(
+        db,
+        org_id=org_id,
+        event_name="inventory.stock_updated",
+        data={
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "warehouse_id": warehouse_id,
+            "on_hand_quantity": row.on_hand_quantity,
+            "available_quantity": available(db, warehouse_id, product_id, variant_id),
+        },
+        required_permission="inventory:view",
+    )
     return row.on_hand_quantity, snapshot
 
 
@@ -460,6 +474,18 @@ def reserve_for_order(db: Session, order, warehouse_id: str) -> list[StockReserv
         )
         db.add(reservation)
         held.append(reservation)
+        queue_event(
+            db,
+            org_id=order.organization_id,
+            event_name="inventory.stock_updated",
+            data={
+                "product_id": item.product_id,
+                "variant_id": item.variant_id,
+                "warehouse_id": warehouse_id,
+                "available_quantity": available(db, warehouse_id, item.product_id, item.variant_id),
+            },
+            required_permission="inventory:view",
+        )
     db.flush()
     return held
 
@@ -478,6 +504,18 @@ def release_for_order(db: Session, order_id: str) -> int:
     rows = active_reservations(db, order_id)
     for row in rows:
         row.status = "released"
+        queue_event(
+            db,
+            org_id=row.organization_id,
+            event_name="inventory.stock_updated",
+            data={
+                "product_id": row.product_id,
+                "variant_id": row.variant_id,
+                "warehouse_id": row.warehouse_id,
+                "available_quantity": available(db, row.warehouse_id, row.product_id, row.variant_id),
+            },
+            required_permission="inventory:view",
+        )
     db.flush()
     return len(rows)
 
