@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
+from app.core.excel_import import ImportSummaryOut
+from app.services.purchase_import_service import get_purchase_template, import_purchases_from_file
 from app.models import (
     PAYMENT_STATUSES,
     Product,
@@ -58,6 +59,31 @@ def _owned(db: Session, id: str, org_id: str) -> PurchaseInvoice:
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Purchase invoice not found")
     return record
+
+
+@router.get("/import/template")
+def download_purchase_template(user: User = Depends(_view)) -> Response:
+    """Download the official 10-column Excel template for bulk purchase invoice import."""
+    content = get_purchase_template()
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="purchase-import-template.xlsx"'},
+    )
+
+
+@router.post("/import", response_model=ImportSummaryOut)
+def import_purchases(
+    file: UploadFile = File(..., description="Excel (.xlsx) or CSV (.csv) file to import"),
+    user: User = Depends(_create),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> ImportSummaryOut:
+    """Bulk import purchase invoices from an Excel (.xlsx) or CSV (.csv) file using the 10-column template."""
+    org_id = _org_id(user)
+    content = file.file.read()
+    filename = file.filename or "purchases.xlsx"
+    return import_purchases_from_file(db, org_id, user, content, filename)
 
 
 @router.post("", response_model=PurchaseOut, status_code=status.HTTP_201_CREATED)

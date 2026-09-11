@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core import scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
+from app.core.excel_import import ImportSummaryOut
+from app.services.order_import_service import get_order_template, import_orders_from_file
 from app.models import (
     Customer,
     CustomerPayment,
@@ -259,6 +261,31 @@ def list_orders(
 @router.get("/{order_id}", response_model=OrderOut)
 def get_order(order_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> OrderOut:
     return _order_out(db, _owned(db, order_id, _org_id(user), user))
+
+
+@router.get("/import/template")
+def download_order_template(user: User = Depends(_view)) -> Response:
+    """Download the official 10-column Excel template for bulk sales order import."""
+    content = get_order_template()
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="sales-order-import-template.xlsx"'},
+    )
+
+
+@router.post("/import", response_model=ImportSummaryOut)
+def import_orders(
+    file: UploadFile = File(..., description="Excel (.xlsx) or CSV (.csv) file to import"),
+    user: User = Depends(_create),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> ImportSummaryOut:
+    """Bulk import sales orders from an Excel (.xlsx) or CSV (.csv) file using the 10-column template."""
+    org_id = _org_id(user)
+    content = file.file.read()
+    filename = file.filename or "orders.xlsx"
+    return import_orders_from_file(db, org_id, user, content, filename)
 
 
 @router.post("", response_model=OrderOut, status_code=status.HTTP_201_CREATED)

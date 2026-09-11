@@ -30,6 +30,8 @@ from app.schemas.customer import (
     CustomerPaymentOut,
     CustomerUpdate,
 )
+from app.core.excel_import import ImportSummaryOut
+from app.services.customer_import_service import get_customer_template, import_customers_from_file
 from app.schemas.visit import VisitOut
 from app.schemas.follow_up import FollowUpOut
 
@@ -152,6 +154,32 @@ def create_customer(
     db.commit()
     db.refresh(customer)
     return customer_profile_service.build_profile(db, customer)
+
+
+@router.get("/import/template")
+def download_customer_template(user: User = Depends(_view)) -> Response:
+    """Download the official 10-column Excel template for bulk customer import."""
+    content = get_customer_template()
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="customer-import-template.xlsx"'},
+    )
+
+
+@router.post("/import", response_model=ImportSummaryOut)
+def import_customers(
+    file: UploadFile = File(..., description="Excel (.xlsx) or CSV (.csv) file to import"),
+    user: User = Depends(_create),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> ImportSummaryOut:
+    """Bulk import customers from an Excel (.xlsx) or CSV (.csv) file using the 10-column template."""
+    org_id = _org_id(user)
+    content = file.file.read()
+    filename = file.filename or "customers.xlsx"
+    return import_customers_from_file(db, org_id, user, content, filename)
+
 
 
 @router.get("", response_model=list[CustomerOut])
