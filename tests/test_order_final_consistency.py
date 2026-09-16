@@ -426,7 +426,7 @@ def run_financial_summary():
 
 
 # ============================================================================
-# DELIVERY PARTNER AUTHORIZATION -- 403 on ALL Order creation
+# DELIVERY PARTNER AUTHORIZATION -- Order creation allowed, other perms restricted
 # ============================================================================
 
 def run_delivery_partner_authorization():
@@ -443,14 +443,14 @@ def run_delivery_partner_authorization():
                              "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100.0}]},
             headers=dp_auth,
         )
-        log_test(f"35. Delivery Partner cannot POST Order (source={src}) (403)", r.status_code == 403, r.text)
+        log_test(f"35. Delivery Partner CAN POST Order (source={src}) (201)", r.status_code == 201, r.text)
 
     r_van = client.post(
         "/orders", json={"customer_id": cust["id"], "warehouse_id": wh["id"], "fulfilment_method": "delivery",
                          "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 100.0}]},
         headers=dp_auth,
     )
-    log_test("35. Delivery Partner cannot POST any Order variant (403)", r_van.status_code == 403, r_van.text)
+    log_test("35. Delivery Partner CAN POST delivery Order variant (201)", r_van.status_code == 201, r_van.text)
 
     r_admin = client.post(
         "/orders", json={"customer_id": cust["id"], "warehouse_id": wh["id"],

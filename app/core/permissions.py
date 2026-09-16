@@ -182,12 +182,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "vehicle_stock": _full(),
             "attendance": _full(),
             "customers": _view_only(),
-            # Delivery Partners are operational users: no Sales Order
-            # creation of any kind, including the legacy "Van Sales" /
-            # source=delivery_vehicle path (finalized business rule —
-            # previously this role held sales_orders: create-only for exactly
-            # that path; removed here, and backfilled onto already-seeded
-            # orgs by alembic revision <see the "van sales" migration>).
+            "sales_orders": _perm(create=True),
             "products": _view_only(),
             "leaves": _perm(view=True, create=True, edit=True, delete=True),
         },
