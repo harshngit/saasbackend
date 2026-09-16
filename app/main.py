@@ -102,15 +102,19 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# CORS: with credentials enabled, the browser rejects a wildcard "*" origin — the
-# response must echo the *specific* request origin. So when CORS_ORIGINS is "*",
-# use an allow-all regex (Starlette then echoes the caller's origin) instead of a
-# literal "*". Otherwise use the explicit allow-list.
+# CORS: with credentials enabled, browsers reject a wildcard "*" origin.
+# Support explicit production origins (e.g. https://crm-saas.asynk.in) alongside
+# regex matching for localhost / 127.0.0.1 development ports.
 _cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 if "*" in settings.cors_origin_list:
     app.add_middleware(CORSMiddleware, allow_origin_regex=".*", **_cors_kwargs)
 else:
-    app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, **_cors_kwargs)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_origin_regex=settings.cors_origin_regex if settings.cors_origin_regex else None,
+        **_cors_kwargs,
+    )
 
 
 import logging

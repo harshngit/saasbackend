@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     # the URL is derived from the request that uploaded the file.
     public_base_url: str = ""
 
-    cors_origins: str = "*"
+    cors_origins: str = "https://crm-saas.asynk.in"
+    cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
     # --- Google Sign-In & OAuth 2.0 Redirect ---
     google_client_id: str = ""
