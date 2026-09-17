@@ -184,6 +184,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "customers": _view_only(),
             "sales_orders": _perm(create=True),
             "products": _view_only(),
+            "inventory": _view_only(),
             "leaves": _perm(view=True, create=True, edit=True, delete=True),
         },
         "Accountant": {
