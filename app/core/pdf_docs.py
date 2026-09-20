@@ -532,7 +532,7 @@ def _outstanding(invoice) -> float:
 
 
 def _invoice_footer(
-    pdf: FPDF, org, settings: dict, fields: dict, signature: bytes | None = None
+    pdf: FPDF, org, settings: dict, fields: dict, signature: bytes | None = None, qr: bytes | None = None,
 ) -> None:
     """Bank, UPI, terms, notes, footer line and signature — each one a toggle."""
     pdf.ln(3)
@@ -546,19 +546,32 @@ def _invoice_footer(
         ) if part)
         if bank:
             pdf.multi_cell(0, 4, _s(f"Bank: {bank}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    if fields.get("show_upi_qr") and org is not None and org.upi_id:
-        pdf.multi_cell(0, 4, _s(f"UPI: {org.upi_id}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        # TODO: generate real QR code image via e.g. the `qrcode` python package and drop it in this box
+    if fields.get("show_upi_qr") and org is not None and (org.upi_id or qr):
+        if org.upi_id:
+            pdf.multi_cell(0, 4, _s(f"UPI: {org.upi_id}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         qr_x = pdf.get_x()
         qr_y = pdf.get_y()
-        try:
-            pdf.rect(qr_x, qr_y, 12, 12, style="D", round_corners=True, corner_radius=1.5)
-        except Exception:
-            pdf.rect(qr_x, qr_y, 12, 12, style="D")
-        pdf.set_xy(qr_x + 15, qr_y + 4)
-        pdf.set_font("Helvetica", "I", 8)
-        pdf.cell(0, 4, _s("Scan to pay via UPI"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_xy(qr_x, qr_y + 14)
+        drawn_qr = False
+        if qr:
+            try:
+                pdf.image(BytesIO(qr), x=qr_x, y=qr_y, w=16, h=16)
+                drawn_qr = True
+            except Exception:  # noqa: BLE001 - unreadable image, fallback to box
+                drawn_qr = False
+        if drawn_qr:
+            pdf.set_xy(qr_x + 19, qr_y + 6)
+            pdf.set_font("Helvetica", "I", 8)
+            pdf.cell(0, 4, _s("Scan to pay via UPI"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_xy(qr_x, qr_y + 18)
+        else:
+            try:
+                pdf.rect(qr_x, qr_y, 12, 12, style="D", round_corners=True, corner_radius=1.5)
+            except Exception:
+                pdf.rect(qr_x, qr_y, 12, 12, style="D")
+            pdf.set_xy(qr_x + 15, qr_y + 4)
+            pdf.set_font("Helvetica", "I", 8)
+            pdf.cell(0, 4, _s("Scan to pay via UPI"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_xy(qr_x, qr_y + 14)
     if fields.get("show_terms") and settings.get("terms"):
         pdf.multi_cell(0, 4, _s(f"Terms: {settings['terms']}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if settings.get("notes"):
@@ -583,7 +596,7 @@ def _invoice_footer(
 
 def invoice_simple_pdf(
     org, customer, invoice, settings: dict, logo: bytes | None = None,
-    signature: bytes | None = None,
+    signature: bytes | None = None, qr: bytes | None = None,
 ) -> bytes:
     """The short customer copy: what was bought, what is owed, when it is due.
 
@@ -650,14 +663,14 @@ def invoice_simple_pdf(
 
     # The short copy never carries bank details; everything else is the firm's choice.
     _invoice_footer(
-        pdf, org, settings, {**fields, "show_bank_details": False}, signature=signature
+        pdf, org, settings, {**fields, "show_bank_details": False}, signature=signature, qr=qr
     )
     return bytes(pdf.output())
 
 
 def invoice_detailed_pdf(
     org, customer, invoice, settings: dict, logo: bytes | None = None,
-    signature: bytes | None = None,
+    signature: bytes | None = None, qr: bytes | None = None,
 ) -> bytes:
     """The full tax invoice: GSTINs, both addresses, HSN/SAC and the tax split.
 
@@ -780,7 +793,7 @@ def invoice_detailed_pdf(
     _amount_row(pdf, "Paid", invoice.amount_paid, width)
     _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
 
-    _invoice_footer(pdf, org, settings, fields, signature=signature)
+    _invoice_footer(pdf, org, settings, fields, signature=signature, qr=qr)
     return bytes(pdf.output())
 
 

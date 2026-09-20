@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core import workflow
 from app.core.deps import require_permission, require_unlocked_org
+from app.core.files import decode_data_url
 from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf
 from app.models import (
     Customer,
@@ -601,6 +602,26 @@ def get_invoice(id: str, user: User = Depends(_view), db: Session = Depends(get_
     return _owned(db, id, _org_id(user))
 
 
+def _resolve_file_reference(db: Session, org_id: str, reference: str | None) -> bytes | None:
+    """Resolve a file reference (URL, file ID, or data: URL) to raw bytes.
+
+    Strict multi-tenant security: only files belonging to `org_id` are resolved.
+    """
+    if not reference:
+        return None
+    ref_str = str(reference).strip()
+    if not ref_str:
+        return None
+    if ref_str.startswith("data:"):
+        decoded = decode_data_url(ref_str)
+        return decoded[0] if decoded else None
+    file_id = ref_str.rstrip("/").rsplit("/", 1)[-1]
+    stored = db.get(StoredFile, file_id)
+    if stored is None or (stored.organization_id and stored.organization_id != org_id):
+        return None
+    return stored.data
+
+
 def _branding_file(db: Session, org_id: str, settings: dict, key: str) -> bytes | None:
     """The bytes behind a branding file id — the firm's logo or its signature.
 
@@ -608,13 +629,64 @@ def _branding_file(db: Session, org_id: str, settings: dict, key: str) -> bytes 
     and a full `/files/{id}` URL resolve. Another firm's file never does.
     """
     reference = (settings.get("branding") or {}).get(key)
-    if not reference:
+    return _resolve_file_reference(db, org_id, reference)
+
+
+def _resolve_logo_file(db: Session, org_id: str, org, settings: dict) -> bytes | None:
+    """Resolve the firm's logo bytes: explicit invoice template setting first, then org logo."""
+    # 1. Template override
+    ref = (settings.get("branding") or {}).get("logo_file_id")
+    if ref:
+        data = _resolve_file_reference(db, org_id, ref)
+        if data is not None:
+            return data
+    # 2. Company Settings fallback
+    if org is not None:
+        for candidate in (getattr(org, "logo_url", None), getattr(org, "company_logo", None)):
+            if candidate:
+                data = _resolve_file_reference(db, org_id, candidate)
+                if data is not None:
+                    return data
+    return None
+
+
+def _resolve_signature_file(db: Session, org_id: str, org, settings: dict) -> bytes | None:
+    """Resolve the authorized signature bytes: explicit invoice template setting first, then org signature."""
+    # 1. Template override
+    ref = (settings.get("branding") or {}).get("signature_file_id")
+    if ref:
+        data = _resolve_file_reference(db, org_id, ref)
+        if data is not None:
+            return data
+    # 2. Company Settings fallback
+    if org is not None:
+        for candidate in (
+            getattr(org, "signature_url", None),
+            getattr(org, "auth_person_signature_url", None),
+            getattr(org, "authorized_signature", None),
+        ):
+            if candidate:
+                data = _resolve_file_reference(db, org_id, candidate)
+                if data is not None:
+                    return data
+    return None
+
+
+def _resolve_qr_file(db: Session, org_id: str, org, settings: dict) -> bytes | None:
+    """Resolve the payment QR code image bytes if show_upi_qr is enabled."""
+    fields = settings.get("fields") or {}
+    if not fields.get("show_upi_qr", True):
         return None
-    file_id = str(reference).rstrip("/").rsplit("/", 1)[-1]
-    stored = db.get(StoredFile, file_id)
-    if stored is None or (stored.organization_id and stored.organization_id != org_id):
-        return None
-    return stored.data
+    if org is not None:
+        for candidate in (
+            getattr(org, "payment_qr_url", None),
+            getattr(org, "google_pay_phonepe_paytm_qr_code", None),
+        ):
+            if candidate:
+                data = _resolve_file_reference(db, org_id, candidate)
+                if data is not None:
+                    return data
+    return None
 
 
 @router.get("/{id}/pdf")
@@ -654,8 +726,9 @@ def download_invoice_pdf(
         invoice.customer,
         invoice,
         settings,
-        _branding_file(db, org_id, settings, "logo_file_id"),
-        _branding_file(db, org_id, settings, "signature_file_id"),
+        logo=_resolve_logo_file(db, org_id, user.organization, settings),
+        signature=_resolve_signature_file(db, org_id, user.organization, settings),
+        qr=_resolve_qr_file(db, org_id, user.organization, settings),
     )
     return Response(
         content=pdf_bytes,
