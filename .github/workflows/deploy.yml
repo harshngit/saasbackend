@@ -1,0 +1,303 @@
+name: Deploy to production (EC2)
+
+# Deploys origin/main to the EC2 host over SSH:
+#   fetch -> fast-forward -> (pip install if needed) -> alembic upgrade head
+#   -> restart crm-backend -> verify systemd + /health (status AND database ok)
+#
+# Manual only for now. To also deploy on every push to main, add this under `on:`
+# (nothing else in the workflow needs to change):
+#
+#   push:
+#     branches: [main]
+#     paths-ignore: ["**.md", "tests/**", ".github/workflows/keep-warm.yml"]
+#
+# Required secrets (Settings -> Environments -> production):
+#   EC2_HOST, EC2_USER, EC2_PORT, EC2_SSH_KEY, EC2_KNOWN_HOSTS
+# EC2_KNOWN_HOSTS is the pinned host key line(s), e.g. from `ssh-keyscan -p <port> <host>`
+# checked against the server's real fingerprint. For a non-22 port the line must look
+# like "[host]:port ssh-ed25519 AAAA...".
+#
+# There is deliberately NO automatic rollback: a migration cannot be undone by
+# reverting code. On failure the log prints OLD_COMMIT / NEW_COMMIT and diagnostics
+# for manual recovery.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Never let two deployments touch the production checkout / migrations / service at once.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    # Deploy only from main (workflow_dispatch lets you pick any branch in the UI).
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://api.asynk.in/health
+
+    steps:
+      - name: Configure SSH (key + pinned host key)
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          for name in EC2_HOST EC2_USER EC2_PORT EC2_SSH_KEY EC2_KNOWN_HOSTS; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Secret $name is not set for the 'production' environment"
+              exit 1
+            fi
+          done
+
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+          # Fail early (without printing the key) if the key is malformed.
+          ssh-keygen -y -f "$HOME/.ssh/deploy_key" > /dev/null
+          echo "SSH key and known_hosts written."
+
+      - name: Deploy over SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_PORT: ${{ secrets.EC2_PORT }}
+        run: |
+          set -euo pipefail
+          echo "===== 1. Connecting to EC2 ====="
+
+          SSH_OPTS=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$EC2_PORT"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=20
+            -o ServerAliveInterval=30
+            -o ServerAliveCountMax=10
+          )
+
+          # The heredoc delimiter is quoted, so everything below is sent verbatim and
+          # expanded on the EC2 host, not by this runner's shell.
+          ssh "${SSH_OPTS[@]}" "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          APP_DIR=/home/ubuntu/saasbackend
+          VENV="$APP_DIR/venv"
+          SERVICE=crm-backend
+          HEALTH_URL=https://api.asynk.in/health
+
+          STAGE=connect
+          OLD_COMMIT=unknown
+          NEW_COMMIT="not determined yet"
+
+          stage() {
+            STAGE="$1"
+            printf '\n===== %s =====\n' "$2"
+          }
+
+          # Best-effort masking of credentials in log output (this repo is public, so
+          # Actions logs are too).
+          redact() {
+            sed -E \
+              -e 's#(://[^:/@[:space:]]+:)[^@[:space:]]+@#\1***@#g' \
+              -e 's/((password|passwd|secret|token|api[_-]?key)["'"'"']?[=:] *["'"'"']?)[^ ,;"'"'"']+/\1***/Ig'
+          }
+
+          service_diagnostics() {
+            echo "--- sudo systemctl status $SERVICE --no-pager"
+            { sudo -n systemctl status "$SERVICE" --no-pager || systemctl status "$SERVICE" --no-pager; } 2>&1 | redact || true
+            echo "--- sudo journalctl -u $SERVICE -n 80 --no-pager"
+            { sudo -n journalctl -u "$SERVICE" -n 80 --no-pager || journalctl -u "$SERVICE" -n 80 --no-pager; } 2>&1 | redact || true
+          }
+
+          on_exit() {
+            rc=$?
+            trap - EXIT
+            set +e
+            if [ "$rc" -ne 0 ]; then
+              echo
+              echo "########## DEPLOYMENT FAILED (exit $rc) during stage: $STAGE ##########"
+              echo "OLD_COMMIT: $OLD_COMMIT"
+              echo "NEW_COMMIT: $NEW_COMMIT"
+              case "$STAGE" in
+                preflight|checkout|fetch)
+                  echo "Nothing was changed on the server." ;;
+                merge)
+                  echo "The fast-forward failed; the checkout should still be at OLD_COMMIT (verify with git status)." ;;
+                deps)
+                  echo "DEPENDENCY INSTALL FAILED. Code on disk is at NEW_COMMIT but the running service was NOT restarted"
+                  echo "and still runs OLD_COMMIT code. Do not restart until dependencies are fixed." ;;
+                migrate)
+                  echo "ALEMBIC MIGRATION FAILED. crm-backend was NOT restarted and still runs OLD_COMMIT code."
+                  echo "Code on disk is at NEW_COMMIT; the database may be partially migrated. Inspect with:"
+                  echo "  cd $APP_DIR && $VENV/bin/alembic current" ;;
+                restart|service|health)
+                  echo "Code is at NEW_COMMIT and migrations were applied, but the service restart/verification failed."
+                  service_diagnostics ;;
+              esac
+              echo
+              echo "No automatic rollback was performed (a migration cannot be undone by reverting code)."
+              echo "Recover manually using OLD_COMMIT / NEW_COMMIT above."
+            fi
+            exit "$rc"
+          }
+          trap on_exit EXIT
+
+          # ---- 2. Current production commit -------------------------------------
+          stage preflight "2. Current production commit"
+          echo "Connected as: $(whoami)"
+
+          for tool in pip alembic python; do
+            if [ ! -x "$VENV/bin/$tool" ]; then
+              echo "ERROR: $VENV/bin/$tool not found or not executable"
+              exit 1
+            fi
+          done
+
+          # Non-interactive sudo must work for the restart, checked before anything changes.
+          if ! sudo -n -l systemctl restart "$SERVICE" > /dev/null 2>&1; then
+            echo "ERROR: passwordless sudo for 'systemctl restart $SERVICE' is not available to $(whoami)."
+            echo "Adjust the sudoers configuration on the EC2 host first. Nothing was changed."
+            exit 1
+          fi
+          echo "Passwordless sudo for systemctl restart $SERVICE: OK"
+
+          stage checkout "2. Current production commit"
+          cd "$APP_DIR"
+          OLD_COMMIT=$(git rev-parse HEAD)
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "Directory : $APP_DIR"
+          echo "Branch    : $BRANCH"
+          echo "Commit    : $(git log -1 --format='%h %s (%an, %ad)' --date=short)"
+          echo "OLD_COMMIT: $OLD_COMMIT"
+          git status -sb --untracked-files=no
+
+          if [ "$BRANCH" != "main" ]; then
+            echo "ERROR: production checkout is on '$BRANCH', expected 'main'. Refusing to deploy."
+            exit 1
+          fi
+
+          DIRTY=$(git status --porcelain --untracked-files=no)
+          if [ -n "$DIRTY" ]; then
+            echo "ERROR: production checkout has uncommitted changes to tracked files. Refusing to deploy."
+            echo "$DIRTY"
+            git diff --stat
+            exit 1
+          fi
+
+          # ---- 3. Fetch ---------------------------------------------------------
+          stage fetch "3. Fetching main"
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            echo "ERROR: origin/main does not match the fetched main; check the remote configuration."
+            git remote -v
+            exit 1
+          fi
+          echo "origin/main: $(git rev-parse origin/main)"
+
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "ERROR: production checkout has diverged from origin/main (local commits not on origin/main)."
+            echo "Behind/ahead (origin/main...HEAD): $(git rev-list --left-right --count origin/main...HEAD)"
+            echo "Local-only commits:"
+            git log --oneline origin/main..HEAD
+            exit 1
+          fi
+
+          # ---- 4. Fast-forward --------------------------------------------------
+          stage merge "4. Fast-forwarding production checkout"
+          git merge --ff-only origin/main
+          NEW_COMMIT=$(git rev-parse HEAD)
+          echo "OLD_COMMIT: $OLD_COMMIT"
+          echo "NEW_COMMIT: $NEW_COMMIT"
+          if [ "$OLD_COMMIT" = "$NEW_COMMIT" ]; then
+            echo "Already up to date; continuing (migrations and restart still run)."
+          else
+            git log --oneline "$OLD_COMMIT..$NEW_COMMIT" | head -20
+          fi
+
+          # ---- 5. Dependencies (only if requirements.txt changed) ---------------
+          # Besides the OLD..NEW diff, compare against a hash recorded after the last
+          # successful install. Otherwise a run that fast-forwarded but then failed at
+          # pip would be skipped by the retry (OLD == NEW) and leave deps stale.
+          stage deps "5. Dependency installation (only if requirements.txt changed)"
+          REQ_DIFF=$(git diff --name-only "$OLD_COMMIT" "$NEW_COMMIT" -- requirements.txt)
+          REQ_HASH=$(sha256sum requirements.txt | cut -d' ' -f1)
+          HASH_FILE="$VENV/.requirements.sha256"
+          INSTALLED_HASH=$(cat "$HASH_FILE" 2>/dev/null || true)
+
+          if [ -n "$REQ_DIFF" ] || [ "$REQ_HASH" != "$INSTALLED_HASH" ]; then
+            [ -n "$REQ_DIFF" ] && echo "requirements.txt changed between $OLD_COMMIT and $NEW_COMMIT." \
+              || echo "requirements.txt has not been installed by a previous deploy; installing."
+            "$VENV/bin/pip" install -r requirements.txt
+            printf '%s\n' "$REQ_HASH" > "$HASH_FILE"
+          else
+            echo "requirements.txt unchanged; skipping dependency installation."
+          fi
+
+          # ---- 6. Migrations ----------------------------------------------------
+          stage migrate "6. Alembic migration"
+          "$VENV/bin/alembic" upgrade head
+
+          # ---- 7. Restart -------------------------------------------------------
+          stage restart "7. Restarting $SERVICE"
+          sudo -n systemctl restart "$SERVICE"
+
+          # ---- 8. systemd check -------------------------------------------------
+          stage service "8. Checking systemd service"
+          sleep 5
+          if ! systemctl is-active --quiet "$SERVICE"; then
+            echo "ERROR: $SERVICE is not active after restart."
+            exit 1
+          fi
+          echo "$SERVICE is active."
+
+          # ---- 9. Health --------------------------------------------------------
+          # /health can return HTTP 200 with database != ok, so parse the JSON.
+          stage health "9. Checking production health ($HEALTH_URL)"
+          healthy=0
+          for attempt in $(seq 1 12); do
+            if body=$(curl -fsS --max-time 10 "$HEALTH_URL" 2>&1); then
+              echo "Attempt $attempt: $body"
+              if "$VENV/bin/python" -c 'import json, sys; d = json.loads(sys.argv[1]); sys.exit(0 if d.get("status") == "ok" and d.get("database") == "ok" else 1)' "$body" 2> /dev/null; then
+                healthy=1
+                break
+              fi
+            else
+              echo "Attempt $attempt: request failed: $body"
+            fi
+            sleep 5
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "ERROR: health check did not report status=ok AND database=ok. Last response: $body"
+            exit 1
+          fi
+          if ! systemctl is-active --quiet "$SERVICE"; then
+            echo "ERROR: $SERVICE stopped being active after the health check passed."
+            exit 1
+          fi
+
+          # ---- 10. Done ---------------------------------------------------------
+          stage done "10. Deployment completed"
+          echo "OLD_COMMIT: $OLD_COMMIT"
+          echo "NEW_COMMIT: $NEW_COMMIT"
+          REMOTE
+
+      - name: Remove SSH material
+        if: always()
+        run: rm -f "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
