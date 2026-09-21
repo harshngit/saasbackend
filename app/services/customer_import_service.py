@@ -149,8 +149,7 @@ def import_customers_from_file(
         except Exception as exc:
             summary.errors.append(RowError(row=row_num, message=f"Failed to create customer: {exc}"))
 
-    summary.total_records = summary.success_count
-    summary.error_count = len(summary.errors)
+    summary.sync_counts()
     if summary.success_count > 0:
         db.commit()
     else:

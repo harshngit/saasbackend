@@ -1,4 +1,4 @@
-"""Comprehensive test suite for Bulk Excel/CSV Import and Template Download in Customer, Purchase, and Order modules."""
+"""Comprehensive test suite for Bulk Excel/CSV Import and Template Download in Customer, Supplier, Purchase, and Order modules."""
 
 import io
 import os
@@ -141,6 +141,7 @@ def run_customer_import_tests(org_id: str, headers: dict):
     check("POST /customers/import valid XLSX -> 200", r.status_code == 200, r.text)
     data = r.json()
     check("Customer import 2 successes, 0 errors", data["success_count"] == 2 and data["error_count"] == 0, str(data))
+    check("Returned valid_rows == 2 and failed_rows == 0", data["valid_rows"] == 2 and data["failed_rows"] == 0)
     check("Returned 2 created IDs", len(data["created_ids"]) == 2)
 
     # Verify DB records
@@ -191,6 +192,123 @@ def run_customer_import_tests(org_id: str, headers: dict):
     check("Recorded 3 errors, 0 successes", res["error_count"] == 3 and res["success_count"] == 0, str(res))
     err_rows = [e["row"] for e in res["errors"]]
     check("Errors accurately reference rows 2, 3, 4", err_rows == [2, 3, 4], str(err_rows))
+    check("Error items have both 'column' and 'field'", "field" in res["errors"][0] and "column" in res["errors"][0])
+
+
+def run_supplier_import_tests(org_id: str, headers: dict):
+    print("\n--- Testing Supplier Bulk Import & Template ---")
+
+    # 1. Template download verification
+    r = client.get("/suppliers/import/template", headers=headers)
+    check("GET /suppliers/import/template -> 200", r.status_code == 200)
+    wb = load_workbook(io.BytesIO(r.content))
+    ws = wb.active
+    template_cols = [str(c).strip() for c in next(ws.iter_rows(values_only=True))]
+    expected_cols = [
+        "supplier_name",
+        "contact_person",
+        "phone",
+        "email",
+        "gst_number",
+        "company_name",
+        "address",
+        "city",
+        "payment_terms",
+        "category",
+    ]
+    check(
+        "Supplier template has EXACTLY 10 expected columns in order",
+        template_cols == expected_cols,
+        f"got: {template_cols}",
+    )
+
+    # 2. Valid multi-row XLSX import
+    valid_rows = [
+        [
+            "Apex Industrial Supplies",
+            "Ramesh Patel",
+            "9871112223",
+            "ramesh@apexsupplies.com",
+            "27SUPPL0001A1Z5",
+            "Apex Corp",
+            "Plot 101 GIDC",
+            "Ahmedabad",
+            "net_30",
+            "Hardware",
+        ],
+        [
+            "Delta Chemical Distributors",
+            "Sunil Mehta",
+            "9872223334",
+            "sunil@deltachem.com",
+            "27SUPPL0002A1Z6",
+            "Delta Group",
+            "Plot 202 MIDC",
+            "Thane",
+            "net_15",
+            "Chemicals",
+        ],
+    ]
+    xlsx_bytes = create_xlsx_bytes(expected_cols, valid_rows)
+    r = client.post(
+        "/suppliers/import",
+        headers=headers,
+        files={"file": ("suppliers.xlsx", xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    check("POST /suppliers/import valid XLSX -> 200", r.status_code == 200, r.text)
+    data = r.json()
+    check("Supplier import 2 successes, 0 errors", data["success_count"] == 2 and data["error_count"] == 0, str(data))
+    check("Returned valid_rows == 2 and failed_rows == 0", data["valid_rows"] == 2 and data["failed_rows"] == 0)
+    check("Returned 2 created IDs", len(data["created_ids"]) == 2)
+
+    # Verify DB supplier records
+    db = SessionLocal()
+    s1 = db.query(Supplier).filter(Supplier.name == "Apex Industrial Supplies", Supplier.organization_id == org_id).first()
+    check("Supplier 1 persisted in DB", s1 is not None)
+    check("Supplier 1 categories stored properly", s1.category == "Hardware" and s1.categories == ["Hardware"])
+    check("Supplier 1 contact details stored", s1.contact_person == "Ramesh Patel" and s1.phone == "9871112223")
+    db.close()
+
+    # 3. Valid CSV import
+    csv_rows = [
+        [
+            "Echo Steel Fabricators",
+            "Kiran Rao",
+            "9873334445",
+            "kiran@echosteel.com",
+            "27SUPPL0003A1Z7",
+            "Echo Industries",
+            "Industrial Estate 5",
+            "Bengaluru",
+            "due_on_receipt",
+            "Metals",
+        ]
+    ]
+    csv_bytes = create_csv_bytes(expected_cols, csv_rows)
+    r = client.post(
+        "/suppliers/import",
+        headers=headers,
+        files={"file": ("suppliers.csv", csv_bytes, "text/csv")},
+    )
+    check("POST /suppliers/import valid CSV -> 200", r.status_code == 200, r.text)
+    check("Supplier CSV import 1 success", r.json()["success_count"] == 1)
+
+    # 4. Invalid rows (missing supplier_name, invalid email format)
+    bad_rows = [
+        ["", "No Name Supp", "9991112222", "noname@supp.com", "", "", "", "", "", ""],  # missing name
+        ["Bad Email Supp", "Contact Person", "9992223333", "not-an-email", "", "", "", "", "", ""],  # bad email
+    ]
+    bad_xlsx = create_xlsx_bytes(expected_cols, bad_rows)
+    r = client.post(
+        "/suppliers/import",
+        headers=headers,
+        files={"file": ("bad_suppliers.xlsx", bad_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    check("POST /suppliers/import bad rows -> 200 with row errors", r.status_code == 200)
+    res = r.json()
+    check("Recorded 2 errors, 0 successes", res["error_count"] == 2 and res["success_count"] == 0, str(res))
+    err_rows = [e["row"] for e in res["errors"]]
+    check("Supplier errors accurately reference rows 2, 3", err_rows == [2, 3], str(err_rows))
 
 
 def run_purchase_import_tests(org_id: str, headers: dict):
@@ -319,7 +437,7 @@ def run_purchase_import_tests(org_id: str, headers: dict):
 def run_order_import_tests(org_id: str, headers: dict):
     print("\n--- Testing Order Bulk Import & Template ---")
 
-    # Setup customer, products
+    # Setup customer, warehouse, products
     db = SessionLocal()
     cust1 = Customer(
         organization_id=org_id,
@@ -327,6 +445,12 @@ def run_order_import_tests(org_id: str, headers: dict):
         phone="9222222222",
         email="acme@retail.com",
         delivery_address="77 Commercial Street, Bengaluru",
+        is_active=True,
+    )
+    wh_sales = Warehouse(
+        organization_id=org_id,
+        name="South Retail Hub",
+        code="WH-SOUTH-01",
         is_active=True,
     )
     prod1 = Product(
@@ -343,9 +467,10 @@ def run_order_import_tests(org_id: str, headers: dict):
         price=8000.0,
         tax_rate=18.0,
     )
-    db.add_all([cust1, prod1, prod2])
+    db.add_all([cust1, wh_sales, prod1, prod2])
     db.commit()
     db.refresh(cust1)
+    db.refresh(wh_sales)
     db.refresh(prod1)
     db.refresh(prod2)
     cust1_id = cust1.id
@@ -363,6 +488,7 @@ def run_order_import_tests(org_id: str, headers: dict):
         "order_group_id",
         "customer_id",
         "order_date",
+        "warehouse_id",
         "delivery_method",
         "delivery_address",
         "payment_type",
@@ -370,20 +496,22 @@ def run_order_import_tests(org_id: str, headers: dict):
         "variant_id",
         "quantity",
         "unit_price",
+        "discount",
+        "tax_rate",
     ]
     check(
-        "Order template has EXACTLY 10 expected columns in order",
+        "Order template has EXACTLY 13 expected columns in order (including warehouse, discount, tax_rate)",
         template_cols == expected_cols,
         f"got: {template_cols}",
     )
 
-    # 2. Multi-item orders grouped by order_group_id
+    # 2. Multi-item orders grouped by order_group_id with warehouse, discounts and taxes
     rows = [
-        # Order 1 (2 items, takeaway, blank unit_price -> should use catalogue price)
-        ["ORD-GRP-001", "9222222222", "2026-09-11", "takeaway", "", "credit", "CHR-STD-01", "", 4, ""],
-        ["ORD-GRP-001", "9222222222", "2026-09-11", "takeaway", "", "credit", "DSK-PRO-02", "", 1, 7500.0],  # custom price
+        # Order 1 (2 items, takeaway, custom warehouse, custom discount & tax)
+        ["ORD-GRP-001", "9222222222", "2026-09-11", "WH-SOUTH-01", "takeaway", "", "credit", "CHR-STD-01", "", 4, "", 100.0, 18.0],
+        ["ORD-GRP-001", "9222222222", "2026-09-11", "WH-SOUTH-01", "takeaway", "", "credit", "DSK-PRO-02", "", 1, 7500.0, 500.0, 18.0],
         # Order 2 (1 item, home delivery with address)
-        ["ORD-GRP-002", cust1_id, "2026-09-11", "home_delivery", "99 MG Road, Suite 4", "cash", prod1_id, "", 2, 2400.0],
+        ["ORD-GRP-002", cust1_id, "2026-09-11", "", "home_delivery", "99 MG Road, Suite 4", "cash", prod1_id, "", 2, 2400.0, 0.0, 18.0],
     ]
     xlsx_bytes = create_xlsx_bytes(expected_cols, rows)
     r = client.post(
@@ -394,6 +522,7 @@ def run_order_import_tests(org_id: str, headers: dict):
     check("POST /orders/import grouped orders -> 200", r.status_code == 200, r.text)
     data = r.json()
     check("Created 2 orders (total 3 item rows)", data["success_count"] == 2 and data["total_rows"] == 3, str(data))
+    check("Returned valid_rows == 2 and failed_rows == 0", data["valid_rows"] == 2 and data["failed_rows"] == 0)
 
     # Verify DB orders and items
     db = SessionLocal()
@@ -401,12 +530,13 @@ def run_order_import_tests(org_id: str, headers: dict):
     check("Found 2 sales orders in DB", len(orders) == 2)
     o1 = orders[0]
     check("Order 1 has 2 items", len(o1.items) == 2)
-    # Check item 1 used catalogue fallback price (2500.0)
+    check("Order 1 warehouse assigned to South Retail Hub", o1.warehouse_id == wh_sales.id)
+    # Check item 1 used catalogue fallback price (2500.0) and discount 100.0
     item1 = next((i for i in o1.items if i.product_id == prod1_id), None)
-    check("Order 1 item 1 used catalogue price 2500.0", item1 is not None and item1.unit_price == 2500.0)
+    check("Order 1 item 1 used catalogue price 2500.0 and discount 100.0", item1 is not None and item1.unit_price == 2500.0 and item1.discount == 100.0)
     db.close()
 
-    # 3. Invalid orders (conflicting customer in group, home delivery missing address on cust with no address)
+    # 3. Invalid orders (conflicting customer in group, home delivery missing address on cust with no address, invalid warehouse)
     db = SessionLocal()
     cust_no_addr = Customer(organization_id=org_id, name="No Address Cust", is_active=True)
     db.add(cust_no_addr)
@@ -417,10 +547,12 @@ def run_order_import_tests(org_id: str, headers: dict):
 
     bad_rows = [
         # Conflicting customer in same order_group_id
-        ["ORD-BAD-01", cust1_id, "2026-09-11", "takeaway", "", "cash", "CHR-STD-01", "", 1, 2500.0],
-        ["ORD-BAD-01", cust_no_addr_id, "2026-09-11", "takeaway", "", "cash", "CHR-STD-01", "", 1, 2500.0],
+        ["ORD-BAD-01", cust1_id, "2026-09-11", "", "takeaway", "", "cash", "CHR-STD-01", "", 1, 2500.0, 0.0, 18.0],
+        ["ORD-BAD-01", cust_no_addr_id, "2026-09-11", "", "takeaway", "", "cash", "CHR-STD-01", "", 1, 2500.0, 0.0, 18.0],
         # Home delivery with no address anywhere
-        ["ORD-BAD-02", cust_no_addr_id, "2026-09-11", "home_delivery", "", "cash", "CHR-STD-01", "", 1, 2500.0],
+        ["ORD-BAD-02", cust_no_addr_id, "2026-09-11", "", "home_delivery", "", "cash", "CHR-STD-01", "", 1, 2500.0, 0.0, 18.0],
+        # Non-existent warehouse
+        ["ORD-BAD-03", cust1_id, "2026-09-11", "NON-EXISTENT-WH", "takeaway", "", "cash", "CHR-STD-01", "", 1, 2500.0, 0.0, 18.0],
     ]
     bad_xlsx = create_xlsx_bytes(expected_cols, bad_rows)
     r = client.post(
@@ -430,7 +562,7 @@ def run_order_import_tests(org_id: str, headers: dict):
     )
     check("POST /orders/import bad rows -> 200 with structured errors", r.status_code == 200)
     res = r.json()
-    check("Recorded errors for conflicting customer & missing address", res["error_count"] >= 2, str(res))
+    check("Recorded errors for conflicting customer, missing address, & bad warehouse", res["error_count"] >= 3, str(res))
 
 
 def main():
@@ -440,6 +572,7 @@ def main():
     org_id, headers = register_org()
 
     run_customer_import_tests(org_id, headers)
+    run_supplier_import_tests(org_id, headers)
     run_purchase_import_tests(org_id, headers)
     run_order_import_tests(org_id, headers)
 

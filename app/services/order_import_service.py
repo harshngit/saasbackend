@@ -6,13 +6,14 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.excel_import import ImportSummaryOut, RowError, generate_xlsx_template, parse_spreadsheet_rows
-from app.models import Customer, Product, ProductVariant, User
+from app.models import Customer, Product, ProductVariant, User, Warehouse
 from app.services import lookup_service, order_service
 
 ORDER_COLUMNS: list[str] = [
     "order_group_id",
     "customer_id",
     "order_date",
+    "warehouse_id",
     "delivery_method",
     "delivery_address",
     "payment_type",
@@ -20,12 +21,15 @@ ORDER_COLUMNS: list[str] = [
     "variant_id",
     "quantity",
     "unit_price",
+    "discount",
+    "tax_rate",
 ]
 
 ORDER_EXAMPLE_ROW: list[Any] = [
     "ORD-001",
     "CUST-001",
     "2026-09-11",
+    "WH-001",
     "takeaway",
     None,
     "credit",
@@ -33,6 +37,8 @@ ORDER_EXAMPLE_ROW: list[Any] = [
     None,
     2,
     150.0,
+    0.0,
+    18.0,
 ]
 
 
@@ -43,6 +49,12 @@ def get_order_template() -> bytes:
 def _resolve_customer(db: Session, org_id: str, ident: str) -> Customer | None:
     return lookup_service.by_id_or_code(
         db, Customer, ident, org_id, Customer.customer_id, Customer.name, Customer.business_name, Customer.phone, Customer.email
+    )
+
+
+def _resolve_warehouse(db: Session, org_id: str, ident: str) -> Warehouse | None:
+    return lookup_service.by_id_or_code(
+        db, Warehouse, ident, org_id, Warehouse.code, Warehouse.name
     )
 
 
@@ -79,7 +91,9 @@ def import_orders_from_file(
     required_hdrs = ["order_group_id", "customer_id", "product_id", "quantity"]
     rows, parse_errors = parse_spreadsheet_rows(content, filename, required_headers=required_hdrs)
     if parse_errors:
-        return ImportSummaryOut(total_rows=len(rows), error_count=len(parse_errors), errors=parse_errors)
+        summary = ImportSummaryOut(total_rows=len(rows), error_count=len(parse_errors), errors=parse_errors)
+        summary.sync_counts()
+        return summary
 
     summary = ImportSummaryOut(total_rows=len(rows))
 
@@ -94,13 +108,13 @@ def import_orders_from_file(
 
         if not group_id or not str(group_id).strip():
             summary.errors.append(
-                RowError(row=row_num, column="order_group_id", message="order_group_id is required")
+                RowError(row=row_num, column="order_group_id", field="order_group_id", message="order_group_id is required")
             )
             continue
 
         if not cust_ident or not str(cust_ident).strip():
             summary.errors.append(
-                RowError(row=row_num, column="customer_id", message="customer_id is required")
+                RowError(row=row_num, column="customer_id", field="customer_id", message="customer_id is required")
             )
             continue
 
@@ -121,6 +135,7 @@ def import_orders_from_file(
                 RowError(
                     row=first_row_num,
                     column="customer_id",
+                    field="customer_id",
                     value=cust_ident_first,
                     message=f"Customer '{cust_ident_first}' was not found in your organization",
                 )
@@ -129,6 +144,36 @@ def import_orders_from_file(
 
         # Header consistency check
         header_conflict = False
+        raw_wh_first = first_row.get("warehouse_id")
+        target_wh_id: str | None = None
+
+        if raw_wh_first and str(raw_wh_first).strip():
+            wh = _resolve_warehouse(db, org_id, str(raw_wh_first).strip())
+            if wh is None:
+                summary.errors.append(
+                    RowError(
+                        row=first_row_num,
+                        column="warehouse_id",
+                        field="warehouse_id",
+                        value=raw_wh_first,
+                        message=f"Warehouse '{raw_wh_first}' was not found in your organization",
+                    )
+                )
+                header_conflict = True
+            elif not wh.is_active:
+                summary.errors.append(
+                    RowError(
+                        row=first_row_num,
+                        column="warehouse_id",
+                        field="warehouse_id",
+                        value=raw_wh_first,
+                        message=f"Warehouse '{wh.name}' is inactive",
+                    )
+                )
+                header_conflict = True
+            else:
+                target_wh_id = wh.id
+
         for subsequent_row in item_rows[1:]:
             s_row_num = subsequent_row.get("_row_number", 0)
             sub_cust = str(subsequent_row.get("customer_id", "")).strip()
@@ -137,8 +182,22 @@ def import_orders_from_file(
                     RowError(
                         row=s_row_num,
                         column="customer_id",
+                        field="customer_id",
                         value=sub_cust,
                         message=f"Conflicting customer_id '{sub_cust}' within order_group_id '{group_id}'. Must match row {first_row_num} ('{cust_ident_first}')",
+                    )
+                )
+                header_conflict = True
+
+            sub_wh = subsequent_row.get("warehouse_id")
+            if sub_wh and raw_wh_first and str(sub_wh).strip().lower() != str(raw_wh_first).strip().lower():
+                summary.errors.append(
+                    RowError(
+                        row=s_row_num,
+                        column="warehouse_id",
+                        field="warehouse_id",
+                        value=sub_wh,
+                        message=f"Conflicting warehouse_id '{sub_wh}' within order_group_id '{group_id}'. Must match row {first_row_num} ('{raw_wh_first}')",
                     )
                 )
                 header_conflict = True
@@ -154,6 +213,7 @@ def import_orders_from_file(
                 RowError(
                     row=first_row_num,
                     column="delivery_method",
+                    field="delivery_method",
                     value=raw_del_method,
                     message=f"Invalid delivery_method '{raw_del_method}'. Allowed values: takeaway, home_delivery",
                 )
@@ -169,6 +229,7 @@ def import_orders_from_file(
                 RowError(
                     row=first_row_num,
                     column="delivery_address",
+                    field="delivery_address",
                     message="delivery_address is required for home delivery orders (no address found on customer profile)",
                 )
             )
@@ -193,7 +254,7 @@ def import_orders_from_file(
             prod_ident = r.get("product_id")
             if not prod_ident or not str(prod_ident).strip():
                 summary.errors.append(
-                    RowError(row=r_num, column="product_id", message="product_id is required")
+                    RowError(row=r_num, column="product_id", field="product_id", message="product_id is required")
                 )
                 item_has_error = True
                 continue
@@ -204,6 +265,7 @@ def import_orders_from_file(
                     RowError(
                         row=r_num,
                         column="product_id",
+                        field="product_id",
                         value=prod_ident,
                         message=f"Product '{prod_ident}' was not found in your organization",
                     )
@@ -220,6 +282,7 @@ def import_orders_from_file(
                         RowError(
                             row=r_num,
                             column="variant_id",
+                            field="variant_id",
                             value=var_ident,
                             message=f"Variant '{var_ident}' was not found for product '{product.name}'",
                         )
@@ -233,13 +296,13 @@ def import_orders_from_file(
                 qty = int(raw_qty) if raw_qty is not None else 0
                 if qty <= 0:
                     summary.errors.append(
-                        RowError(row=r_num, column="quantity", value=raw_qty, message="quantity must be greater than 0")
+                        RowError(row=r_num, column="quantity", field="quantity", value=raw_qty, message="quantity must be greater than 0")
                     )
                     item_has_error = True
                     continue
             except (ValueError, TypeError):
                 summary.errors.append(
-                    RowError(row=r_num, column="quantity", value=raw_qty, message=f"Invalid integer for quantity: '{raw_qty}'")
+                    RowError(row=r_num, column="quantity", field="quantity", value=raw_qty, message=f"Invalid integer for quantity: '{raw_qty}'")
                 )
                 item_has_error = True
                 continue
@@ -251,14 +314,54 @@ def import_orders_from_file(
                     p_val = float(str(raw_price).replace(",", "").strip())
                     if p_val < 0:
                         summary.errors.append(
-                            RowError(row=r_num, column="unit_price", value=raw_price, message="unit_price cannot be negative")
+                            RowError(row=r_num, column="unit_price", field="unit_price", value=raw_price, message="unit_price cannot be negative")
                         )
                         item_has_error = True
                         continue
                     unit_price = p_val
                 except (ValueError, TypeError):
                     summary.errors.append(
-                        RowError(row=r_num, column="unit_price", value=raw_price, message=f"Invalid numeric value for unit_price: '{raw_price}'")
+                        RowError(row=r_num, column="unit_price", field="unit_price", value=raw_price, message=f"Invalid numeric value for unit_price: '{raw_price}'")
+                    )
+                    item_has_error = True
+                    continue
+
+            # Optional Line Discount
+            raw_disc = r.get("discount")
+            discount_val = 0.0
+            if raw_disc is not None and str(raw_disc).strip() != "":
+                try:
+                    d_val = float(str(raw_disc).replace(",", "").strip())
+                    if d_val < 0:
+                        summary.errors.append(
+                            RowError(row=r_num, column="discount", field="discount", value=raw_disc, message="discount cannot be negative")
+                        )
+                        item_has_error = True
+                        continue
+                    discount_val = d_val
+                except (ValueError, TypeError):
+                    summary.errors.append(
+                        RowError(row=r_num, column="discount", field="discount", value=raw_disc, message=f"Invalid numeric value for discount: '{raw_disc}'")
+                    )
+                    item_has_error = True
+                    continue
+
+            # Optional Line Tax Rate Override
+            raw_tax = r.get("tax_rate") or r.get("tax")
+            tax_rate_val = None
+            if raw_tax is not None and str(raw_tax).strip() != "":
+                try:
+                    t_val = float(str(raw_tax).replace("%", "").strip())
+                    if t_val < 0 or t_val > 100:
+                        summary.errors.append(
+                            RowError(row=r_num, column="tax_rate", field="tax_rate", value=raw_tax, message="tax_rate must be between 0 and 100")
+                        )
+                        item_has_error = True
+                        continue
+                    tax_rate_val = t_val
+                except (ValueError, TypeError):
+                    summary.errors.append(
+                        RowError(row=r_num, column="tax_rate", field="tax_rate", value=raw_tax, message=f"Invalid numeric value for tax_rate: '{raw_tax}'")
                     )
                     item_has_error = True
                     continue
@@ -269,6 +372,8 @@ def import_orders_from_file(
                     variant_id=var_id,
                     quantity=qty,
                     unit_price=unit_price,
+                    discount=discount_val,
+                    tax_rate=tax_rate_val,
                 )
             )
 
@@ -283,6 +388,7 @@ def import_orders_from_file(
                 user=user,
                 customer=customer,
                 lines=lines,
+                warehouse_id=target_wh_id,
                 order_date=target_order_date or datetime.now(timezone.utc),
                 fulfilment_method=fulfilment_method,
                 payment_type=payment_type,
@@ -302,8 +408,7 @@ def import_orders_from_file(
                 RowError(row=first_row_num, message=f"Failed to place order '{group_id}': {exc}")
             )
 
-    summary.total_records = summary.success_count
-    summary.error_count = len(summary.errors)
+    summary.sync_counts()
     if summary.success_count > 0:
         db.commit()
     else:

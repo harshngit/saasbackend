@@ -10,8 +10,16 @@ from pydantic import BaseModel, Field
 class RowError(BaseModel):
     row: int
     column: str | None = None
+    field: str | None = None
     value: Any = None
     message: str
+
+    def __init__(self, **data: Any) -> None:
+        if "field" in data and "column" not in data:
+            data["column"] = data["field"]
+        elif "column" in data and "field" not in data:
+            data["field"] = data["column"]
+        super().__init__(**data)
 
 
 class ImportSummaryOut(BaseModel):
@@ -19,8 +27,29 @@ class ImportSummaryOut(BaseModel):
     total_records: int = 0
     success_count: int = 0
     error_count: int = 0
+    valid_rows: int = 0
+    failed_rows: int = 0
     created_ids: list[str] = Field(default_factory=list)
     errors: list[RowError] = Field(default_factory=list)
+
+    def __init__(self, **data: Any) -> None:
+        if "success_count" in data and "valid_rows" not in data:
+            data["valid_rows"] = data["success_count"]
+        elif "valid_rows" in data and "success_count" not in data:
+            data["success_count"] = data["valid_rows"]
+
+        if "error_count" in data and "failed_rows" not in data:
+            data["failed_rows"] = data["error_count"]
+        elif "failed_rows" in data and "error_count" not in data:
+            data["error_count"] = data["failed_rows"]
+
+        super().__init__(**data)
+
+    def sync_counts(self) -> None:
+        self.valid_rows = self.success_count
+        self.total_records = self.success_count
+        self.error_count = len(self.errors)
+        self.failed_rows = self.error_count
 
 
 def generate_xlsx_template(columns: list[str], example_row: list[Any] | None = None) -> bytes:
