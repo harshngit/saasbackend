@@ -105,6 +105,20 @@ pur_item_id = r_pur["items"][0]["id"]
 
 client.post(f"/purchases/{pur_id}/confirm", headers=auth)
 
+# Cancel auto-created invoice on pur_id so the manual AP test invoices can be created/recorded cleanly
+db = SessionLocal()
+try:
+    auto_inv_ap = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == pur_id, SupplierInvoice.status != "cancelled")
+        .first()
+    )
+    auto_inv_ap_id = auto_inv_ap.id if auto_inv_ap else None
+finally:
+    db.close()
+if auto_inv_ap_id:
+    client.post(f"/supplier-invoices/{auto_inv_ap_id}/cancel", headers=auth)
+
 r_grn = client.post(
     "/grns",
     headers=auth,

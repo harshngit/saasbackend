@@ -215,3 +215,112 @@ def record_supplier_invoice(
     db.commit()
     db.refresh(invoice)
     return invoice
+
+
+def auto_create_from_purchase(
+    db: Session,
+    purchase: PurchaseInvoice,
+    org_id: str,
+    user_id: str | None = None,
+) -> SupplierInvoice | None:
+    """Automatically create or reuse a recorded SupplierInvoice upon purchase confirmation.
+
+    Enforces server-side tenant-scoped idempotency:
+    If an active (non-cancelled) SupplierInvoice already exists for this purchase,
+    it returns the existing record and skips duplicate generation.
+    """
+    if not purchase.supplier_id:
+        return None
+
+    # 1. Idempotency Check: search for existing non-cancelled supplier invoice for this purchase
+    existing = (
+        db.query(SupplierInvoice)
+        .filter(
+            SupplierInvoice.organization_id == org_id,
+            SupplierInvoice.purchase_id == purchase.id,
+            SupplierInvoice.status != "cancelled",
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    # 2. Derive unique supplier_invoice_number safely within (org_id, supplier_id)
+    candidate_num = purchase.reference_number or purchase.invoice_number or f"SINV-{purchase.id[:8]}"
+    dup = (
+        db.query(SupplierInvoice)
+        .filter(
+            SupplierInvoice.organization_id == org_id,
+            SupplierInvoice.supplier_id == purchase.supplier_id,
+            SupplierInvoice.supplier_invoice_number == candidate_num,
+        )
+        .first()
+    )
+    if dup is not None:
+        candidate_num = f"{candidate_num}-{purchase.id[:6]}"
+    candidate_num = candidate_num[:100]
+
+    # 3. Determine payment status
+    amt_paid = round(purchase.amount_paid or 0.0, 2)
+    grand_tot = round(purchase.total or 0.0, 2)
+    if amt_paid >= grand_tot and grand_tot > 0:
+        pay_status = "paid"
+    elif amt_paid > 0:
+        pay_status = "partially_paid"
+    else:
+        pay_status = "unpaid"
+
+    # 4. Construct SupplierInvoice header
+    now = datetime.now(timezone.utc)
+    inv = SupplierInvoice(
+        organization_id=org_id,
+        supplier_id=purchase.supplier_id,
+        purchase_id=purchase.id,
+        supplier_invoice_number=candidate_num,
+        supplier_invoice_date=purchase.purchase_date or purchase.invoice_date or now,
+        due_date=purchase.due_date,
+        status="recorded",
+        verification_status="matched",
+        payment_status=pay_status,
+        subtotal=round(purchase.subtotal or 0.0, 2),
+        tax_amount=round(purchase.tax or 0.0, 2),
+        discount_amount=round(purchase.discount or 0.0, 2),
+        grand_total=grand_tot,
+        amount_paid=amt_paid,
+        notes=purchase.notes or purchase.internal_remarks,
+        attachment_url=purchase.supplier_invoice_url or purchase.attachment_url,
+        created_by=user_id or purchase.created_by,
+        recorded_at=now,
+        recorded_by=user_id or purchase.created_by,
+    )
+
+    # 5. Build line items corresponding to PurchaseInvoiceItem entries
+    built_items: list[SupplierInvoiceItem] = []
+    for p_item in (purchase.items or []):
+        qty = p_item.quantity or 0
+        price = round(p_item.purchase_price or 0.0, 2)
+        line_sub = round(qty * price, 2)
+        tax_amt = round(p_item.tax or 0.0, 2)
+        disc_amt = round(p_item.discount or 0.0, 2)
+        line_tot = round(p_item.line_total, 2) if p_item.line_total is not None else round(line_sub + tax_amt - disc_amt, 2)
+
+        built_items.append(
+            SupplierInvoiceItem(
+                purchase_item_id=p_item.id,
+                product_id=p_item.product_id,
+                variant_id=p_item.variant_id,
+                description=p_item.description or p_item.product_name,
+                billed_qty=qty,
+                unit_price=price,
+                tax_rate=p_item.tax_rate or 0.0,
+                tax_amount=tax_amt,
+                discount_amount=disc_amt,
+                line_total=line_tot,
+            )
+        )
+
+    inv.items = built_items
+    db.add(inv)
+    db.flush()
+    return inv
+

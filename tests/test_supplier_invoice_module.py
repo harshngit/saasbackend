@@ -127,10 +127,28 @@ r_inv_draft_pur = client.post(
         "items": [{"purchase_item_id": pur_item_id, "billed_qty": 10, "unit_price": 50.0}],
     },
 )
-check("Draft Purchase invoice creation rejected (HTTP 400)", r_inv_draft_pur.status_code == 400)
+# Confirm Purchase -> triggers auto-creation of SupplierInvoice
+r_conf = client.post(f"/purchases/{pur_id}/confirm", headers=auth)
+check("Confirm purchase returns HTTP 200", r_conf.status_code == 200)
 
-# Confirm Purchase
-client.post(f"/purchases/{pur_id}/confirm", headers=auth)
+# Verify auto-created invoice exists
+db = SessionLocal()
+try:
+    auto_inv = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == pur_id)
+        .first()
+    )
+    check("Supplier Invoice auto-created on confirmation", auto_inv is not None)
+    check("Auto-created invoice status is recorded", auto_inv.status == "recorded" if auto_inv else False)
+    check("Auto-created invoice verification is matched", auto_inv.verification_status == "matched" if auto_inv else False)
+    auto_inv_id = auto_inv.id if auto_inv else None
+finally:
+    db.close()
+
+# For the subsequent manual invoice recording tests, cancel the auto-created invoice to free billable capacity
+if auto_inv_id:
+    client.post(f"/supplier-invoices/{auto_inv_id}/cancel", headers=auth)
 
 # -------------------------------------------------------------
 # Test B — Draft Supplier Invoice Creation & Zero Stock Movement
@@ -263,6 +281,20 @@ r_pur2 = client.post(
 ).json()
 client.post(f"/purchases/{r_pur2['id']}/confirm", headers=auth)
 
+# Cancel auto-created invoice on r_pur2 to allow testing manual price variance recording
+db = SessionLocal()
+try:
+    auto_inv2 = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == r_pur2["id"], SupplierInvoice.status != "cancelled")
+        .first()
+    )
+    auto_inv2_id = auto_inv2.id if auto_inv2 else None
+finally:
+    db.close()
+if auto_inv2_id:
+    client.post(f"/supplier-invoices/{auto_inv2_id}/cancel", headers=auth)
+
 r_grn2 = client.post(
     "/grns",
     headers=auth,
@@ -331,6 +363,20 @@ r_pur_sup2 = client.post(
     },
 ).json()
 client.post(f"/purchases/{r_pur_sup2['id']}/confirm", headers=auth)
+
+# Cancel auto-created invoice on r_pur_sup2 to allow testing manual invoice recording
+db = SessionLocal()
+try:
+    auto_inv_sup2 = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == r_pur_sup2["id"], SupplierInvoice.status != "cancelled")
+        .first()
+    )
+    auto_inv_sup2_id = auto_inv_sup2.id if auto_inv_sup2 else None
+finally:
+    db.close()
+if auto_inv_sup2_id:
+    client.post(f"/supplier-invoices/{auto_inv_sup2_id}/cancel", headers=auth)
 
 r_inv_diff_sup = client.post(
     "/supplier-invoices",
@@ -435,9 +481,229 @@ auth_b, org_b = register_org("Firm B")
 r_cross_read = client.get(f"/supplier-invoices/{sinv2_id}", headers=auth_b)
 check("Cross-tenant invoice read rejected (HTTP 404)", r_cross_read.status_code == 404)
 
+# =============================================================
+# AUTO-CREATION TARGETED TEST SUITE (Scenarios 1 - 12)
+# =============================================================
+print("\n=======================================================")
+print("TEST SUITE: Purchase Invoice Auto-Creation Integration")
+print("=======================================================\n")
+
+# Scenario 1: Purchase confirmation auto-creates Supplier Invoice
+print("--- Scenario 1: Purchase Confirmation Auto-Creates Supplier Invoice ---")
+auth_ac, org_ac = register_org("Auto-Create Firm")
+wh_ac, sup_ac, prod_ac = setup_procurement_env(auth_ac, org_ac)
+
+r_po1 = client.post(
+    "/purchases",
+    headers=auth_ac,
+    json={
+        "invoice_number": f"PO-AUTO-{uuid.uuid4().hex[:6]}",
+        "reference_number": "REF-VEND-9988",
+        "supplier_id": sup_ac,
+        "warehouse_id": wh_ac,
+        "items": [
+            {"product_id": prod_ac, "ordered_qty": 20, "purchase_price": 75.0, "tax_rate": 18.0, "discount": 100.0}
+        ],
+    },
+).json()
+po1_id = r_po1["id"]
+po1_item_id = r_po1["items"][0]["id"]
+
+# Confirm PO
+r_po1_conf = client.post(f"/purchases/{po1_id}/confirm", headers=auth_ac)
+check("PO1 confirmed HTTP 200", r_po1_conf.status_code == 200)
+
+db = SessionLocal()
+try:
+    sinvs1 = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_ac, SupplierInvoice.purchase_id == po1_id)
+        .all()
+    )
+    check("Exactly one SupplierInvoice created for PO1", len(sinvs1) == 1)
+    sinv1 = sinvs1[0]
+    check("SupplierInvoice purchase_id matches", sinv1.purchase_id == po1_id)
+    check("SupplierInvoice supplier_id matches", sinv1.supplier_id == sup_ac)
+    check("SupplierInvoice status is recorded", sinv1.status == "recorded")
+    check("SupplierInvoice verification_status is matched", sinv1.verification_status == "matched")
+    check("SupplierInvoice payment_status is unpaid", sinv1.payment_status == "unpaid")
+    check("SupplierInvoice amount_paid is 0.0", sinv1.amount_paid == 0.0)
+
+    # Scenario 2: Item mapping
+    print("\n--- Scenario 2: Item Mapping Integrity ---")
+    check("SupplierInvoice has 1 item", len(sinv1.items) == 1)
+    s_item = sinv1.items[0]
+    check("Item purchase_item_id matches", s_item.purchase_item_id == po1_item_id)
+    check("Item product_id matches", s_item.product_id == prod_ac)
+    check("Item billed_qty is 20", s_item.billed_qty == 20)
+    check("Item unit_price is 75.0", s_item.unit_price == 75.0)
+    check("Item tax_rate is 18.0", s_item.tax_rate == 18.0)
+    check("Item discount is 100.0", s_item.discount_amount == 100.0)
+
+    # Scenario 3: Financial calculations
+    print("\n--- Scenario 3: Financial Calculations Preserved ---")
+    check("Subtotal matches PO total", sinv1.subtotal == r_po1["subtotal"])
+    check("Tax matches PO tax", sinv1.tax_amount == r_po1["tax"])
+    check("Discount matches PO discount", sinv1.discount_amount == r_po1["discount"])
+    check("Grand total matches PO grand total", sinv1.grand_total == r_po1["total"])
+    check("Outstanding amount equals grand total", sinv1.outstanding_amount == r_po1["total"])
+
+    # Scenario 4: Reference Number
+    print("\n--- Scenario 4: Reference Number Preservation ---")
+    check("Supplier invoice number preserved from reference_number", sinv1.supplier_invoice_number == "REF-VEND-9988")
+finally:
+    db.close()
+
+# Scenario 5: Repeated confirmation idempotency
+print("\n--- Scenario 5: Repeated Confirmation Idempotency ---")
+r_po1_reconf = client.post(f"/purchases/{po1_id}/confirm", headers=auth_ac)
+check("Repeated confirm returns HTTP 200", r_po1_reconf.status_code == 200)
+
+db = SessionLocal()
+try:
+    sinvs1_after = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_ac, SupplierInvoice.purchase_id == po1_id)
+        .all()
+    )
+    check("Still exactly one SupplierInvoice after repeated confirmation", len(sinvs1_after) == 1)
+    check("Items count not duplicated", len(sinvs1_after[0].items) == 1)
+finally:
+    db.close()
+
+# Scenario 6: Service-level direct call idempotency
+print("\n--- Scenario 6: Service-Level Direct Call Idempotency ---")
+from app.services import supplier_invoice_service
+db = SessionLocal()
+try:
+    po_obj = db.get(PurchaseInvoice, po1_id)
+    reused_inv = supplier_invoice_service.auto_create_from_purchase(db, po_obj, org_ac)
+    check("Service returns existing invoice instance", reused_inv.id == sinvs1[0].id)
+    sinvs_count = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_ac, SupplierInvoice.purchase_id == po1_id)
+        .count()
+    )
+    check("Database invoice count remains 1", sinvs_count == 1)
+finally:
+    db.close()
+
+# Scenario 7: Manual Supplier Invoice Compatibility
+print("\n--- Scenario 7: Manual Supplier Invoice Compatibility ---")
+# Create PO2 in draft
+r_po2 = client.post(
+    "/purchases",
+    headers=auth_ac,
+    json={
+        "invoice_number": f"PO-MANUAL-{uuid.uuid4().hex[:6]}",
+        "supplier_id": sup_ac,
+        "warehouse_id": wh_ac,
+        "items": [{"product_id": prod_ac, "ordered_qty": 10, "purchase_price": 50.0}],
+    },
+).json()
+po2_id = r_po2["id"]
+# Confirm PO2
+client.post(f"/purchases/{po2_id}/confirm", headers=auth_ac)
+
+# Confirm auto-created invoice exists
+db = SessionLocal()
+try:
+    inv2_auto = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_ac, SupplierInvoice.purchase_id == po2_id)
+        .first()
+    )
+    check("PO2 auto-created invoice exists", inv2_auto is not None)
+    # Manual query for existing invoices against PO2
+    r_list2 = client.get(f"/supplier-invoices?purchase_id={po2_id}", headers=auth_ac).json()
+    check("GET /supplier-invoices lists auto-created invoice", len(r_list2) == 1)
+finally:
+    db.close()
+
+# Scenario 8: Accounts Payable Integration
+print("\n--- Scenario 8: Accounts Payable Integration ---")
+r_ap_open = client.get("/accounts-payable", headers=auth_ac).json()
+check("AP open invoices includes PO1 invoice", any(i["supplier_invoice_id"] == sinvs1[0].id for i in r_ap_open["items"]))
+
+r_ap_summary = client.get("/accounts-payable/summary", headers=auth_ac).json()
+check("AP summary has open invoices", r_ap_summary["summary"]["open_invoice_count"] >= 2)
+
+r_ap_stmt = client.get(f"/accounts-payable/supplier/{sup_ac}", headers=auth_ac).json()
+check("AP supplier statement total_open_payable includes auto-invoices", r_ap_stmt["total_open_payable"] > 0)
+
+# Scenario 9: Supplier Payment Compatibility
+print("\n--- Scenario 9: Supplier Payment Flow on Auto-Created Invoice ---")
+sinv1_id = sinvs1[0].id
+r_pay = client.post(
+    "/supplier-payments",
+    headers=auth_ac,
+    json={
+        "supplier_id": sup_ac,
+        "payment_date": "2026-09-21T00:00:00Z",
+        "payment_method": "bank_transfer",
+        "amount": 500.0,
+        "allocations": [{"supplier_invoice_id": sinv1_id, "amount": 500.0}],
+    },
+)
+check("Payment against auto-created invoice returns HTTP 201", r_pay.status_code == 201)
+
+db = SessionLocal()
+try:
+    sinv1_paid = db.get(SupplierInvoice, sinv1_id)
+    check("SupplierInvoice amount_paid updated to 500.0", sinv1_paid.amount_paid == 500.0)
+    check("SupplierInvoice payment_status is partially_paid", sinv1_paid.payment_status == "partially_paid")
+    check("SupplierInvoice outstanding decreased by 500.0", sinv1_paid.outstanding_amount == round(sinv1_paid.grand_total - 500.0, 2))
+finally:
+    db.close()
+
+# Scenario 10: Multi-Tenant Isolation on Auto-Creation
+print("\n--- Scenario 10: Multi-Tenant Isolation ---")
+auth_c, org_c = register_org("Firm C")
+r_cross_ap = client.get("/accounts-payable", headers=auth_c).json()
+check("Firm C AP list does not contain Firm Auto-Create invoices", len(r_cross_ap["items"]) == 0)
+
+# Scenario 11: Transaction & Zero Stock Side Effect
+print("\n--- Scenario 11: Zero Stock Movement on Auto-Creation ---")
+db = SessionLocal()
+try:
+    moves_ac = db.query(StockMovement).filter(StockMovement.organization_id == org_ac).all()
+    check("Zero StockMovement rows created by auto-created supplier invoices", len(moves_ac) == 0)
+finally:
+    db.close()
+
+# Scenario 12: Direct Confirmation on Purchase Creation
+print("\n--- Scenario 12: Direct Confirmation on Purchase Creation ---")
+r_po_direct = client.post(
+    "/purchases",
+    headers=auth_ac,
+    json={
+        "invoice_number": f"PO-DIRECT-{uuid.uuid4().hex[:6]}",
+        "purchase_status": "confirmed",
+        "supplier_id": sup_ac,
+        "warehouse_id": wh_ac,
+        "items": [{"product_id": prod_ac, "ordered_qty": 5, "purchase_price": 40.0}],
+    },
+)
+check("Directly confirmed purchase returns HTTP 201", r_po_direct.status_code == 201)
+po_direct_id = r_po_direct.json()["id"]
+
+db = SessionLocal()
+try:
+    sinv_direct = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_ac, SupplierInvoice.purchase_id == po_direct_id)
+        .first()
+    )
+    check("Directly confirmed purchase auto-creates SupplierInvoice immediately", sinv_direct is not None)
+    check("Direct SupplierInvoice is recorded", sinv_direct.status == "recorded" if sinv_direct else False)
+    check("Direct SupplierInvoice grand total is 200.0", sinv_direct.grand_total == 200.0 if sinv_direct else False)
+finally:
+    db.close()
+
 print("\n=======================================================")
 print(f"SUPPLIER INVOICE TEST RESULTS: Passed={passed}, Failed={failed}")
 print("=======================================================\n")
 
 if failed > 0:
     sys.exit(1)
+

@@ -19,7 +19,7 @@ from app.models import (
     User,
     Warehouse,
 )
-from app.services import numbering_service, lookup_service, purchase_service, stock_service
+from app.services import numbering_service, lookup_service, purchase_service, stock_service, supplier_invoice_service
 from app.schemas.purchase import (
     CancelBody,
     PaymentStatusUpdate,
@@ -215,6 +215,17 @@ def create_purchase(
     db.add(inv)
     db.commit()
     db.refresh(inv)
+
+    if inv.status in ("confirmed", "approved") and inv.supplier_id:
+        supplier_invoice_service.auto_create_from_purchase(
+            db=db,
+            purchase=inv,
+            org_id=org_id,
+            user_id=user.id if user else None,
+        )
+        db.commit()
+        db.refresh(inv)
+
     return inv
 
 
@@ -334,6 +345,15 @@ def _do_confirm_purchase(inv: PurchaseInvoice, user: User, db: Session) -> Purch
             detail=f"Cannot confirm purchase in '{inv.status}' status",
         )
     if inv.status in ("confirmed", "approved"):
+        if inv.supplier_id:
+            supplier_invoice_service.auto_create_from_purchase(
+                db=db,
+                purchase=inv,
+                org_id=inv.organization_id,
+                user_id=user.id if user else None,
+            )
+            db.commit()
+            db.refresh(inv)
         return inv
 
     org_id = inv.organization_id
@@ -352,6 +372,15 @@ def _do_confirm_purchase(inv: PurchaseInvoice, user: User, db: Session) -> Purch
     # Stock inwarding is strictly owned by the GRN module upon receipt confirmation.
     if not inv.receiving_status or inv.receiving_status in ("Pending", "pending"):
         inv.receiving_status = "not_received"
+
+    # Automatically create/link the corresponding Supplier Invoice
+    if inv.supplier_id:
+        supplier_invoice_service.auto_create_from_purchase(
+            db=db,
+            purchase=inv,
+            org_id=org_id,
+            user_id=user.id if user else None,
+        )
 
     db.commit()
     db.refresh(inv)

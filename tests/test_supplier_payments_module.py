@@ -92,6 +92,18 @@ def create_recorded_invoice(auth: dict, sup_id: str, wh_id: str, prod_id: str, i
     pur_id = r_pur["id"]
     pur_item_id = r_pur["items"][0]["id"]
     client.post(f"/purchases/{pur_id}/confirm", headers=auth)
+    db = SessionLocal()
+    try:
+        auto_inv = (
+            db.query(SupplierInvoice)
+            .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == pur_id, SupplierInvoice.status != "cancelled")
+            .first()
+        )
+        auto_id = auto_inv.id if auto_inv else None
+    finally:
+        db.close()
+    if auto_id:
+        client.post(f"/supplier-invoices/{auto_id}/cancel", headers=auth)
 
     r_grn = client.post(
         "/grns",
@@ -303,6 +315,18 @@ r_pur_can = client.post(
 pur_can_id = r_pur_can["id"]
 pur_can_item_id = r_pur_can["items"][0]["id"]
 client.post(f"/purchases/{pur_can_id}/confirm", headers=auth)
+db = SessionLocal()
+try:
+    auto_inv_c = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == pur_can_id, SupplierInvoice.status != "cancelled")
+        .first()
+    )
+    auto_can_id = auto_inv_c.id if auto_inv_c else None
+finally:
+    db.close()
+if auto_can_id:
+    client.post(f"/supplier-invoices/{auto_can_id}/cancel", headers=auth)
 
 r_grn_can = client.post(
     "/grns",
@@ -433,6 +457,18 @@ r_pur_mis = client.post(
 pur_mis_id = r_pur_mis["id"]
 pur_mis_item_id = r_pur_mis["items"][0]["id"]
 client.post(f"/purchases/{pur_mis_id}/confirm", headers=auth)
+db = SessionLocal()
+try:
+    auto_inv_m = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.organization_id == org_id, SupplierInvoice.purchase_id == pur_mis_id, SupplierInvoice.status != "cancelled")
+        .first()
+    )
+    auto_mis_id = auto_inv_m.id if auto_inv_m else None
+finally:
+    db.close()
+if auto_mis_id:
+    client.post(f"/supplier-invoices/{auto_mis_id}/cancel", headers=auth)
 
 r_grn_mis = client.post(
     "/grns",
