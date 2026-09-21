@@ -689,6 +689,24 @@ def _resolve_qr_file(db: Session, org_id: str, org, settings: dict) -> bytes | N
     return None
 
 
+def _resolve_stamp_file(db: Session, org_id: str, org) -> bytes | None:
+    """Resolve the company stamp/seal bytes directly from Organization.stamp_url."""
+    if org is not None:
+        candidate = getattr(org, "stamp_url", None)
+        if candidate:
+            return _resolve_file_reference(db, org_id, candidate)
+    return None
+
+
+def _resolve_letterhead_file(db: Session, org_id: str, org) -> bytes | None:
+    """Resolve the company letterhead bytes directly from Organization.letterhead_url."""
+    if org is not None:
+        candidate = getattr(org, "letterhead_url", None)
+        if candidate:
+            return _resolve_file_reference(db, org_id, candidate)
+    return None
+
+
 @router.get("/{id}/pdf")
 def download_invoice_pdf(
     id: str,
@@ -729,6 +747,8 @@ def download_invoice_pdf(
         logo=_resolve_logo_file(db, org_id, user.organization, settings),
         signature=_resolve_signature_file(db, org_id, user.organization, settings),
         qr=_resolve_qr_file(db, org_id, user.organization, settings),
+        stamp=_resolve_stamp_file(db, org_id, user.organization),
+        letterhead=_resolve_letterhead_file(db, org_id, user.organization),
     )
     return Response(
         content=pdf_bytes,

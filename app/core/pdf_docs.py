@@ -424,6 +424,22 @@ def _usable_width(pdf: FPDF) -> float:
     return pdf.w - pdf.l_margin - pdf.r_margin
 
 
+def _letterhead(pdf: FPDF, letterhead: bytes | None, settings: dict) -> None:
+    """Draw company letterhead graphic if provided and template is not thermal.
+
+    Preserves aspect ratio and scales cleanly to the page width.
+    """
+    if not letterhead:
+        return
+    template = str(settings.get("template") or "classic").strip().lower()
+    if template == "thermal":
+        return
+    try:
+        pdf.image(BytesIO(letterhead), x=0, y=0, w=pdf.w)
+    except Exception:  # noqa: BLE001 - unreadable upload, print without it
+        pass
+
+
 def _logo(pdf: FPDF, logo: bytes | None) -> None:
     """Draw the firm's uploaded logo, if there is one it can read.
 
@@ -532,9 +548,15 @@ def _outstanding(invoice) -> float:
 
 
 def _invoice_footer(
-    pdf: FPDF, org, settings: dict, fields: dict, signature: bytes | None = None, qr: bytes | None = None,
+    pdf: FPDF,
+    org,
+    settings: dict,
+    fields: dict,
+    signature: bytes | None = None,
+    qr: bytes | None = None,
+    stamp: bytes | None = None,
 ) -> None:
-    """Bank, UPI, terms, notes, footer line and signature — each one a toggle."""
+    """Bank, UPI, terms, notes, footer line, stamp and signature — each one a toggle/asset."""
     pdf.ln(3)
     pdf.set_font("Helvetica", size=8)
     if fields.get("show_bank_details") and org is not None:
@@ -582,6 +604,7 @@ def _invoice_footer(
     if fields.get("show_signature"):
         pdf.ln(4)
         drawn = False
+        drawn_stamp = False
         if signature:
             try:
                 pdf.image(
@@ -590,13 +613,31 @@ def _invoice_footer(
                 drawn = True
             except Exception:  # noqa: BLE001 - unreadable upload, sign it by hand
                 drawn = False
-        pdf.ln(13 if drawn else 8)
+        if stamp:
+            try:
+                stamp_h = 13 if pdf.w >= 100 else 10
+                if pdf.w >= 100:
+                    stamp_x = (pdf.w - pdf.r_margin - 68) if signature else (pdf.w - pdf.r_margin - 40)
+                else:
+                    stamp_x = (pdf.l_margin + 2) if signature else (pdf.w - pdf.r_margin - 30)
+                pdf.image(BytesIO(stamp), x=stamp_x, y=pdf.get_y(), h=stamp_h)
+                drawn_stamp = True
+            except Exception:  # noqa: BLE001 - unreadable upload, skip stamp
+                drawn_stamp = False
+        pdf.ln(13 if (drawn or drawn_stamp) else 8)
         pdf.cell(0, 5, "Authorised signatory", border="T", align="R")
 
 
 def invoice_simple_pdf(
-    org, customer, invoice, settings: dict, logo: bytes | None = None,
-    signature: bytes | None = None, qr: bytes | None = None,
+    org,
+    customer,
+    invoice,
+    settings: dict,
+    logo: bytes | None = None,
+    signature: bytes | None = None,
+    qr: bytes | None = None,
+    stamp: bytes | None = None,
+    letterhead: bytes | None = None,
 ) -> bytes:
     """The short customer copy: what was bought, what is owed, when it is due.
 
@@ -607,6 +648,7 @@ def invoice_simple_pdf(
     fields = settings.get("fields") or {}
     style = _style(settings)
     pdf = _invoice_pdf_page(settings)
+    _letterhead(pdf, letterhead, settings)
     _logo(pdf, logo)
     _org_header(pdf, org)
     _branded_title(pdf, settings, "INVOICE", status_str=invoice.status)
@@ -663,14 +705,22 @@ def invoice_simple_pdf(
 
     # The short copy never carries bank details; everything else is the firm's choice.
     _invoice_footer(
-        pdf, org, settings, {**fields, "show_bank_details": False}, signature=signature, qr=qr
+        pdf, org, settings, {**fields, "show_bank_details": False},
+        signature=signature, qr=qr, stamp=stamp,
     )
     return bytes(pdf.output())
 
 
 def invoice_detailed_pdf(
-    org, customer, invoice, settings: dict, logo: bytes | None = None,
-    signature: bytes | None = None, qr: bytes | None = None,
+    org,
+    customer,
+    invoice,
+    settings: dict,
+    logo: bytes | None = None,
+    signature: bytes | None = None,
+    qr: bytes | None = None,
+    stamp: bytes | None = None,
+    letterhead: bytes | None = None,
 ) -> bytes:
     """The full tax invoice: GSTINs, both addresses, HSN/SAC and the tax split.
 
@@ -681,6 +731,7 @@ def invoice_detailed_pdf(
     fields = settings.get("fields") or {}
     style = _style(settings)
     pdf = _invoice_pdf_page(settings)
+    _letterhead(pdf, letterhead, settings)
     _logo(pdf, logo)
     _org_header(pdf, org)
     if fields.get("show_company_gstin") and org is not None and (org.gst_number or org.gstin_pan):
@@ -793,7 +844,7 @@ def invoice_detailed_pdf(
     _amount_row(pdf, "Paid", invoice.amount_paid, width)
     _amount_row(pdf, "Balance Due", _outstanding(invoice), width)
 
-    _invoice_footer(pdf, org, settings, fields, signature=signature, qr=qr)
+    _invoice_footer(pdf, org, settings, fields, signature=signature, qr=qr, stamp=stamp)
     return bytes(pdf.output())
 
 

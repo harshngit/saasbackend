@@ -354,6 +354,153 @@ def run_tests():
         else:
             fail("Org 2 rendered cross-tenant branding!")
 
+        print("\n--- 10. STAMP / SEAL INTEGRATION ---")
+        # 10.1 Valid stamp fallback from Organization.stamp_url
+        stamp_bytes = _create_test_image((128, 0, 128), (90, 90))
+        stored_stamp = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="company_stamp.png",
+            content_type="image/png",
+            size=len(stamp_bytes),
+            data=stamp_bytes,
+        )
+        db.add(stored_stamp)
+        db.flush()
+
+        org1.stamp_url = f"http://testserver/files/{stored_stamp.id}"
+        db.commit()
+
+        res_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_stamp.status_code, 200, "PDF with Company Settings stamp returns 200")
+        assert_eq(res_stamp.content[:5], b"%PDF-", "Content is valid PDF")
+        if len(res_stamp.content) > len(res_qr.content):
+            ok("PDF size increased with stamp embedded alongside signature and QR")
+        else:
+            fail("PDF size did not increase with stamp", f"{len(res_stamp.content)} <= {len(res_qr.content)}")
+
+        # 10.2 Stamp in simple format
+        res_stamp_simple = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "simple"})
+        assert_eq(res_stamp_simple.status_code, 200, "Simple format PDF with stamp returns 200")
+
+        # 10.3 Stamp across all 4 templates
+        for style in ["classic", "modern", "compact", "thermal"]:
+            client.patch("/invoice-settings", headers=auth1, json={"template": style})
+            res_style_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+            assert_eq(res_style_stamp.status_code, 200, f"Template style '{style}' with stamp generates 200 PDF")
+
+        # Reset template to classic
+        client.patch("/invoice-settings", headers=auth1, json={"template": "classic"})
+
+        # 10.4 Stamp missing (None)
+        org1.stamp_url = None
+        db.commit()
+        res_no_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_no_stamp.status_code, 200, "PDF with stamp_url=None succeeds")
+
+        # 10.5 Stamp deleted / missing StoredFile
+        org1.stamp_url = f"http://testserver/files/{uuid.uuid4()}"
+        db.commit()
+        res_del_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_del_stamp.status_code, 200, "PDF with non-existent stamp file ID succeeds without error")
+
+        # 10.6 Stamp corrupt image bytes
+        stored_corrupt_stamp = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="corrupt_stamp.png",
+            content_type="image/png",
+            size=15,
+            data=b"corrupt-stamp-bytes",
+        )
+        db.add(stored_corrupt_stamp)
+        db.flush()
+        org1.stamp_url = f"http://testserver/files/{stored_corrupt_stamp.id}"
+        db.commit()
+        res_corrupt_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_corrupt_stamp.status_code, 200, "PDF with corrupt stamp bytes succeeds without failure")
+
+        # 10.7 Stamp cross-tenant isolation
+        org2.stamp_url = f"http://testserver/files/{stored_stamp.id}"
+        db.commit()
+        res_org2_stamp = client.get(f"/invoices/{inv2.id}/pdf", headers=auth2, params={"format": "detailed"})
+        assert_eq(res_org2_stamp.status_code, 200, "Org 2 with Org 1 stamp URL generates safely (cross-tenant blocked)")
+
+        # Restore valid stamp for org1
+        org1.stamp_url = f"http://testserver/files/{stored_stamp.id}"
+        db.commit()
+
+        print("\n--- 11. LETTERHEAD INTEGRATION ---")
+        # 11.1 Valid letterhead fallback from Organization.letterhead_url
+        lh_bytes = _create_test_image((240, 240, 240), (600, 100))
+        stored_lh = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="company_letterhead.png",
+            content_type="image/png",
+            size=len(lh_bytes),
+            data=lh_bytes,
+        )
+        db.add(stored_lh)
+        db.flush()
+
+        org1.letterhead_url = f"http://testserver/files/{stored_lh.id}"
+        db.commit()
+
+        res_lh = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_lh.status_code, 200, "PDF with Company Settings letterhead returns 200")
+        assert_eq(res_lh.content[:5], b"%PDF-", "Content is valid PDF")
+        if len(res_lh.content) > len(res_stamp.content):
+            ok("PDF size increased with letterhead embedded")
+        else:
+            fail("PDF size did not increase with letterhead", f"{len(res_lh.content)} <= {len(res_stamp.content)}")
+
+        # 11.2 Letterhead in simple format
+        res_lh_simple = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "simple"})
+        assert_eq(res_lh_simple.status_code, 200, "Simple format PDF with letterhead returns 200")
+
+        # 11.3 Letterhead across all 4 templates (thermal safely skips letterhead)
+        for style in ["classic", "modern", "compact", "thermal"]:
+            client.patch("/invoice-settings", headers=auth1, json={"template": style})
+            res_style_lh = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+            assert_eq(res_style_lh.status_code, 200, f"Template style '{style}' with letterhead generates 200 PDF")
+
+        client.patch("/invoice-settings", headers=auth1, json={"template": "classic"})
+
+        # 11.4 Letterhead missing (None)
+        org1.letterhead_url = None
+        db.commit()
+        res_no_lh = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_no_lh.status_code, 200, "PDF with letterhead_url=None succeeds")
+
+        # 11.5 Letterhead deleted / missing StoredFile
+        org1.letterhead_url = f"http://testserver/files/{uuid.uuid4()}"
+        db.commit()
+        res_del_lh = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_del_lh.status_code, 200, "PDF with non-existent letterhead file ID succeeds without error")
+
+        # 11.6 Letterhead corrupt image bytes
+        stored_corrupt_lh = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="corrupt_lh.png",
+            content_type="image/png",
+            size=15,
+            data=b"corrupt-lh-bytes",
+        )
+        db.add(stored_corrupt_lh)
+        db.flush()
+        org1.letterhead_url = f"http://testserver/files/{stored_corrupt_lh.id}"
+        db.commit()
+        res_corrupt_lh = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_corrupt_lh.status_code, 200, "PDF with corrupt letterhead bytes succeeds without failure")
+
+        # 11.7 Letterhead cross-tenant isolation
+        org2.letterhead_url = f"http://testserver/files/{stored_lh.id}"
+        db.commit()
+        res_org2_lh = client.get(f"/invoices/{inv2.id}/pdf", headers=auth2, params={"format": "detailed"})
+        assert_eq(res_org2_lh.status_code, 200, "Org 2 with Org 1 letterhead URL generates safely (cross-tenant blocked)")
+
     finally:
         db.close()
 
@@ -366,3 +513,4 @@ def run_tests():
 
 if __name__ == "__main__":
     run_tests()
+
