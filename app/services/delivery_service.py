@@ -34,6 +34,7 @@ from app.models import (
     StockReservation,
     User,
     UserRole,
+    Vehicle,
     VehicleLoading,
     VehicleLoadingItem,
 )
@@ -48,6 +49,26 @@ def _require_transition(current: str, new: str) -> None:
         validate_delivery_transition(current, new)
     except DeliveryTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message) from exc
+
+
+def get_driver_active_vehicle(db: Session, org_id: str, driver_id: str) -> Vehicle | None:
+    """Find the active vehicle assigned to a delivery partner/driver.
+
+    Deterministically orders by most recent update/assignment (updated_at desc, created_at desc, id desc).
+    """
+    if not driver_id or not org_id:
+        return None
+    return (
+        db.query(Vehicle)
+        .filter(
+            Vehicle.organization_id == org_id,
+            Vehicle.default_driver_id == driver_id,
+            Vehicle.status == "active",
+            Vehicle.is_active.is_(True),
+        )
+        .order_by(Vehicle.updated_at.desc(), Vehicle.created_at.desc(), Vehicle.id.desc())
+        .first()
+    )
 
 
 def is_delivery_partner(db: Session, partner: User) -> bool:
@@ -251,6 +272,11 @@ def plan(
 
     if delivery_partner is not None:
         require_partner_available(db, org_id, delivery_partner, scheduled_date or datetime.now(timezone.utc))
+
+    if vehicle_id is None and delivery_partner is not None:
+        driver_vehicle = get_driver_active_vehicle(db, org_id, delivery_partner.id)
+        if driver_vehicle is not None:
+            vehicle_id = driver_vehicle.id
 
     if wanted is None:
         lines = [
@@ -543,11 +569,26 @@ def load(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Name a delivery partner before loading — the stock goes onto their vehicle",
         )
-    if not delivery.vehicle_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Assign a vehicle before loading — vehicle is required for loading",
-        )
+    if delivery.vehicle_id:
+        vehicle = db.get(Vehicle, delivery.vehicle_id)
+        if (
+            vehicle is None
+            or vehicle.organization_id != org_id
+            or not vehicle.is_active
+            or vehicle.status != "active"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Vehicle '{vehicle.vehicle_number if vehicle else delivery.vehicle_id}' is not an active vehicle in your firm",
+            )
+    else:
+        active_vehicle = get_driver_active_vehicle(db, org_id, delivery.delivery_partner_id)
+        if active_vehicle is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No active vehicle is assigned to this delivery partner. Please contact the administrator.",
+            )
+        delivery.vehicle_id = active_vehicle.id
     warehouse = (
         stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
         if delivery.warehouse_id

@@ -67,6 +67,7 @@ def list_vehicles(
     user: User = Depends(_view),
     is_active: bool | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    default_driver_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> list[VehicleOut]:
     query = db.query(Vehicle).filter(Vehicle.organization_id == _org_id(user))
@@ -74,6 +75,8 @@ def list_vehicles(
         query = query.filter(Vehicle.is_active == is_active)
     if status_filter:
         query = query.filter(Vehicle.status == status_filter)
+    if default_driver_id:
+        query = query.filter(Vehicle.default_driver_id == default_driver_id)
     vehicles = query.order_by(Vehicle.vehicle_number).all()
     return [_vehicle_out(v) for v in vehicles]
 

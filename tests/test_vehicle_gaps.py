@@ -6,7 +6,24 @@ from sqlalchemy.orm import Session
 from app.main import app
 from app.core.database import Base, auto_add_missing_columns, engine
 from app.core.security import create_access_token
-from app.models import User, Organization, Vehicle, VehicleLoading, Delivery, Warehouse, Product, SystemRole, UserRole, Role, StockMovement, VehicleAssignmentHistory
+from app.models import (
+    User,
+    Organization,
+    Vehicle,
+    VehicleLoading,
+    Delivery,
+    DeliveryItem,
+    Warehouse,
+    Product,
+    SystemRole,
+    UserRole,
+    Role,
+    StockMovement,
+    VehicleAssignmentHistory,
+    Customer,
+    SalesOrder,
+    SalesOrderItem,
+)
 
 client = TestClient(app)
 
@@ -248,5 +265,294 @@ def test_vehicle_gap_implementation():
 
         res_cross_act = client.get(f"/vehicles/{v_active['id']}/activity", headers=headers2)
         assert res_cross_act.status_code == 404, "Cross-tenant activity access must return 404"
+
+        # 10. Test Delivery Partner Vehicle Loading & Planning Fixes
+        # A. GET /vehicles?default_driver_id=<id>&status=active
+        res_filter_dp1 = client.get(f"/vehicles?default_driver_id={dp1.id}&status=active", headers=headers)
+        assert res_filter_dp1.status_code == 200
+        vehicles_dp1 = res_filter_dp1.json()
+        assert len(vehicles_dp1) == 1
+        assert vehicles_dp1[0]["id"] == v_active["id"]
+
+        # Filter with driver who has no vehicle
+        res_filter_dp2 = client.get(f"/vehicles?default_driver_id={dp2.id}&status=active", headers=headers)
+        assert res_filter_dp2.status_code == 200
+        assert len(res_filter_dp2.json()) == 0
+
+        # Cross-tenant driver filter isolation
+        res_filter_cross = client.get(f"/vehicles?default_driver_id={dp_org2.id}", headers=headers)
+        assert res_filter_cross.status_code == 200
+        assert len(res_filter_cross.json()) == 0
+
+        # Create Customer & Sales Order for delivery tests
+        cust = Customer(organization_id=org.id, name="VehGap Customer", phone="9999999999")
+        db.add(cust)
+        db.commit()
+
+        so1 = SalesOrder(
+            organization_id=org.id,
+            order_number="SO-VG-100",
+            customer_id=cust.id,
+            warehouse_id=wh.id,
+            status="confirmed",
+            fulfilment_status="unfulfilled",
+        )
+        db.add(so1)
+        db.commit()
+
+        so_item1 = SalesOrderItem(
+            order_id=so1.id,
+            product_id=p.id,
+            product_name="VehGap Product",
+            quantity=20,
+            unit_price=10.0,
+            line_total=200.0,
+        )
+        db.add(so_item1)
+        db.commit()
+
+        # B. Delivery Planning: Auto-assign active vehicle if vehicle_id omitted
+        res_plan_auto = client.post("/deliveries", json={
+            "order_id": so1.id,
+            "delivery_partner_id": dp1.id,
+            "warehouse_id": wh.id,
+        }, headers=headers)
+        assert res_plan_auto.status_code == 201
+        deliv_auto = res_plan_auto.json()
+        assert deliv_auto["delivery_partner"]["id"] == dp1.id
+        assert deliv_auto["vehicle"]["id"] == v_active["id"], "Planning must auto-populate active vehicle for partner"
+
+        # C. Delivery Planning: Explicit vehicle remains authoritative
+        res_v_other = client.post("/vehicles", json={
+            "vehicle_number": "MH12 OTHER",
+            "status": "active"
+        }, headers=headers)
+        assert res_v_other.status_code == 201
+        v_other = res_v_other.json()
+
+        so2 = SalesOrder(
+            organization_id=org.id,
+            order_number="SO-VG-101",
+            customer_id=cust.id,
+            warehouse_id=wh.id,
+            status="confirmed",
+            fulfilment_status="unfulfilled",
+        )
+        db.add(so2)
+        db.commit()
+        so_item2 = SalesOrderItem(
+            order_id=so2.id,
+            product_id=p.id,
+            product_name="VehGap Product",
+            quantity=10,
+            unit_price=10.0,
+            line_total=100.0,
+        )
+        db.add(so_item2)
+        db.commit()
+
+        res_plan_explicit = client.post("/deliveries", json={
+            "order_id": so2.id,
+            "delivery_partner_id": dp1.id,
+            "vehicle_id": v_other["id"],
+            "warehouse_id": wh.id,
+        }, headers=headers)
+        assert res_plan_explicit.status_code == 201
+        deliv_explicit = res_plan_explicit.json()
+        assert deliv_explicit["vehicle"]["id"] == v_other["id"], "Explicit vehicle must NOT be replaced by driver default"
+
+        # D. Delivery Loading: Lazy resolution on existing delivery with vehicle_id = NULL
+        # Close any open loading sessions from previous tests first
+        open_loads = db.query(VehicleLoading).filter(VehicleLoading.organization_id == org.id, VehicleLoading.status == "active").all()
+        for ol in open_loads:
+            ol.status = "reconciled"
+        db.commit()
+
+        # Create delivery with vehicle_id = NULL directly
+        deliv_null_veh = Delivery(
+            organization_id=org.id,
+            delivery_note_number="DN-NULL-001",
+            sales_order_id=so1.id,
+            customer_id=cust.id,
+            warehouse_id=wh.id,
+            delivery_partner_id=dp1.id,
+            vehicle_id=None,
+            status="ready",
+        )
+        db.add(deliv_null_veh)
+        db.flush()
+        deliv_null_item = DeliveryItem(
+            delivery_id=deliv_null_veh.id,
+            order_item_id=so_item1.id,
+            product_id=p.id,
+            product_name="VehGap Product",
+            planned_quantity=5,
+            loaded_quantity=0,
+        )
+        db.add(deliv_null_item)
+        db.commit()
+
+        # Load delivery: lazy resolution must resolve dp1's v_active and succeed
+        res_load_lazy = client.post(f"/deliveries/{deliv_null_veh.id}/load", headers=headers)
+        assert res_load_lazy.status_code == 200, f"Lazy loading failed: {res_load_lazy.text}"
+        assert res_load_lazy.json()["vehicle"]["id"] == v_active["id"]
+        assert res_load_lazy.json()["internal_status"] == "loaded"
+
+        # Verify DB delivery record updated
+        db.refresh(deliv_null_veh)
+        assert deliv_null_veh.vehicle_id == v_active["id"]
+
+        # E. Delivery Loading: Fail when driver has no active vehicle
+        deliv_no_veh_driver = Delivery(
+            organization_id=org.id,
+            delivery_note_number="DN-NO-VEH-002",
+            sales_order_id=so1.id,
+            customer_id=cust.id,
+            warehouse_id=wh.id,
+            delivery_partner_id=dp2.id,  # dp2 has no vehicle
+            vehicle_id=None,
+            status="ready",
+        )
+        db.add(deliv_no_veh_driver)
+        db.flush()
+        deliv_no_veh_item = DeliveryItem(
+            delivery_id=deliv_no_veh_driver.id,
+            order_item_id=so_item1.id,
+            product_id=p.id,
+            product_name="VehGap Product",
+            planned_quantity=2,
+            loaded_quantity=0,
+        )
+        db.add(deliv_no_veh_item)
+        db.commit()
+
+        res_load_no_veh = client.post(f"/deliveries/{deliv_no_veh_driver.id}/load", headers=headers)
+        assert res_load_no_veh.status_code == 400
+        assert res_load_no_veh.json()["detail"] == "No active vehicle is assigned to this delivery partner. Please contact the administrator."
+
+        # F. Delivery Loading: Fail when assigned driver vehicle is inactive or in maintenance
+        # Temporarily set v_active to maintenance (after closing active sessions)
+        for ol in db.query(VehicleLoading).filter(VehicleLoading.organization_id == org.id, VehicleLoading.status == "active").all():
+            ol.status = "reconciled"
+        db.commit()
+
+        # Set v_active status to inactive
+        v_active_db = db.get(Vehicle, v_active["id"])
+        v_active_db.status = "inactive"
+        v_active_db.is_active = False
+        db.commit()
+
+        deliv_inact_driver = Delivery(
+            organization_id=org.id,
+            delivery_note_number="DN-INACT-003",
+            sales_order_id=so1.id,
+            customer_id=cust.id,
+            warehouse_id=wh.id,
+            delivery_partner_id=dp1.id,
+            vehicle_id=None,
+            status="ready",
+        )
+        db.add(deliv_inact_driver)
+        db.flush()
+        db.add(DeliveryItem(
+            delivery_id=deliv_inact_driver.id,
+            order_item_id=so_item1.id,
+            product_id=p.id,
+            product_name="VehGap Product",
+            planned_quantity=1,
+            loaded_quantity=0,
+        ))
+        db.commit()
+
+        res_load_inact_driver = client.post(f"/deliveries/{deliv_inact_driver.id}/load", headers=headers)
+        assert res_load_inact_driver.status_code == 400
+        assert res_load_inact_driver.json()["detail"] == "No active vehicle is assigned to this delivery partner. Please contact the administrator."
+
+        # Restore v_active to active
+        v_active_db.status = "active"
+        v_active_db.is_active = True
+        db.commit()
+
+        # G. Loading Session Vehicle Conflict preserved
+        # Start a loading session for dp1 with v_other
+        session_v_other = VehicleLoading(
+            organization_id=org.id,
+            delivery_partner_id=dp1.id,
+            vehicle_id=v_other["id"],
+            status="active",
+        )
+        db.add(session_v_other)
+        db.commit()
+
+        # Try to load a delivery that resolves to v_active
+        deliv_conflict = Delivery(
+            organization_id=org.id,
+            delivery_note_number="DN-CONFLICT-004",
+            sales_order_id=so1.id,
+            customer_id=cust.id,
+            warehouse_id=wh.id,
+            delivery_partner_id=dp1.id,
+            vehicle_id=v_active["id"],
+            status="ready",
+        )
+        db.add(deliv_conflict)
+        db.flush()
+        db.add(DeliveryItem(
+            delivery_id=deliv_conflict.id,
+            order_item_id=so_item1.id,
+            product_id=p.id,
+            product_name="VehGap Product",
+            planned_quantity=1,
+            loaded_quantity=0,
+        ))
+        db.commit()
+
+        # 11. Test Deterministic Vehicle Resolution When Multiple Active Default Vehicles Exist
+        from app.services.delivery_service import get_driver_active_vehicle
+
+        # Create two active vehicles explicitly assigned to dp2
+        v_dp2_a = Vehicle(
+            organization_id=org.id,
+            vehicle_number="MH12 DET-A",
+            status="active",
+            is_active=True,
+            default_driver_id=dp2.id,
+        )
+        db.add(v_dp2_a)
+        db.commit()
+
+        v_dp2_b = Vehicle(
+            organization_id=org.id,
+            vehicle_number="MH12 DET-B",
+            status="active",
+            is_active=True,
+            default_driver_id=dp2.id,
+        )
+        db.add(v_dp2_b)
+        db.commit()
+
+        # Most recently created/updated vehicle (v_dp2_b) must be deterministically chosen
+        resolved = get_driver_active_vehicle(db, org.id, dp2.id)
+        assert resolved is not None
+        assert resolved.id == v_dp2_b.id
+
+        # Update v_dp2_a so its updated_at is newest -> must resolve v_dp2_a
+        v_dp2_a.vehicle_type = "Truck"
+        db.commit()
+        resolved_updated = get_driver_active_vehicle(db, org.id, dp2.id)
+        assert resolved_updated is not None
+        assert resolved_updated.id == v_dp2_a.id
+
+        # Inactive/maintenance vehicles ignored
+        v_dp2_a.status = "maintenance"
+        v_dp2_a.is_active = False
+        db.commit()
+        resolved_after_maint = get_driver_active_vehicle(db, org.id, dp2.id)
+        assert resolved_after_maint is not None
+        assert resolved_after_maint.id == v_dp2_b.id
+
+        # Cross-tenant driver lookup ignored
+        cross_res = get_driver_active_vehicle(db, org2.id, dp2.id)
+        assert cross_res is None
 
     print("--- ALL VEHICLE GAP REGRESSION TESTS PASSED CLEANLY ---")
