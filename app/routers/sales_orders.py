@@ -14,6 +14,7 @@ from app.models import (
     CustomerPayment,
     CustomerPaymentAllocation,
     Delivery,
+    DeliveryCollection,
     Invoice,
     Role,
     SalesOrder,
@@ -25,6 +26,8 @@ from app.models import (
 from app.schemas.customer import CustomerPaymentOut
 from app.schemas.sales_order import (
     AssignDeliveryBody,
+    BulkDelete,
+    BulkDeleteResult,
     CancelBody,
     OrderCreate,
     OrderOut,
@@ -43,6 +46,8 @@ _view = require_permission("sales_orders", "view")
 _create = require_permission("sales_orders", "create")
 _approve = require_permission("sales_orders", "approve")
 _edit = require_permission("sales_orders", "edit")
+_delete = require_permission("sales_orders", "delete")
+
 
 
 def _org_id(user: User) -> str:
@@ -209,8 +214,120 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
     return out
 
 
+def _validate_order_for_deletion(db: Session, order: SalesOrder) -> None:
+    """Validate that a sales order can be safely deleted without breaking financial,
+    inventory, or logistics integrity."""
+    if order.fulfilment_status in workflow.DISPATCHED_FULFILMENT or order.status == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Order {order.order_number} has already progressed ({order.fulfilment_status or order.status}) "
+                   "and cannot be deleted. Use returns or cancellation flows.",
+        )
+
+    # Check for active (non-cancelled / non-credit-note) invoices
+    active_invoices = (
+        db.query(Invoice)
+        .filter(
+            Invoice.order_id == order.id,
+            Invoice.organization_id == order.organization_id,
+            Invoice.is_credit_note.is_(False),
+            Invoice.status != "cancelled",
+        )
+        .all()
+    )
+    if active_invoices:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete an order with existing invoices. Credit note / void the invoice first.",
+        )
+
+    # Check for active deliveries
+    active_deliveries = (
+        db.query(Delivery)
+        .filter(
+            Delivery.sales_order_id == order.id,
+            Delivery.organization_id == order.organization_id,
+            Delivery.status != "cancelled",
+        )
+        .all()
+    )
+    if active_deliveries:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete order {order.order_number} because active deliveries exist. Cancel deliveries first.",
+        )
+
+    # Check for recorded payments or delivery collections
+    payments_count = (
+        db.query(CustomerPayment)
+        .filter(
+            CustomerPayment.order_id == order.id,
+            CustomerPayment.organization_id == order.organization_id,
+        )
+        .count()
+    )
+    collections_count = (
+        db.query(DeliveryCollection)
+        .filter(
+            DeliveryCollection.sales_order_id == order.id,
+            DeliveryCollection.organization_id == order.organization_id,
+        )
+        .count()
+    )
+    if payments_count > 0 or collections_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete order {order.order_number} because payments or collections are recorded against it.",
+        )
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_orders(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple sales orders atomically.
+
+    Accepts a list of order IDs (UUIDs or order numbers). Validates all orders
+    against data scope and business deletion guards. If ANY order cannot be
+    safely deleted, the entire transaction is aborted and rolled back.
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    if not unique_ids:
+        return BulkDeleteResult(deleted=0)
+
+    orders: list[SalesOrder] = []
+    for oid in unique_ids:
+        order = _owned(db, oid, org_id, user)
+        orders.append(order)
+
+    for order in orders:
+        _validate_order_for_deletion(db, order)
+
+    for order in orders:
+        stock_service.release_for_order(db, order.id)
+        queue_event(
+            db,
+            org_id=order.organization_id,
+            event_name="order.deleted",
+            data={
+                "order_id": order.id,
+                "order_number": order.order_number,
+            },
+            required_permission="sales_orders:view",
+        )
+        db.delete(order)
+
+    db.commit()
+    return BulkDeleteResult(deleted=len(orders))
+
+
 @router.get("", response_model=list[OrderOut])
 def list_orders(
+
     user: User = Depends(_view),
     status_filter: str | None = Query(
         default=None, alias="status",
@@ -794,7 +911,40 @@ def cancel_order(
     return _order_out(db, order)
 
 
+@router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_order(
+    order_id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    """Permanently delete a sales order.
+
+    Refused if the order has progressed to loading/dispatch/completion, or if
+    active invoices, deliveries, or payments are attached to it.
+    """
+    order = _owned(db, order_id, _org_id(user), user)
+    _validate_order_for_deletion(db, order)
+
+    stock_service.release_for_order(db, order.id)
+
+    queue_event(
+        db,
+        org_id=order.organization_id,
+        event_name="order.deleted",
+        data={
+            "order_id": order.id,
+            "order_number": order.order_number,
+        },
+        required_permission="sales_orders:view",
+    )
+
+    db.delete(order)
+    db.commit()
+
+
 @router.post("/{order_id}/pickup/pick", response_model=OrderOut)
+
 @router.post("/{order_id}/pickup/start", response_model=OrderOut)
 def pick_order_for_pickup(
     order_id: str,

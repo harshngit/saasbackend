@@ -375,3 +375,12 @@ class OrderPaymentSummary(BaseModel):
     remaining_amount: float
     payment_status: str
 
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int
+
+
