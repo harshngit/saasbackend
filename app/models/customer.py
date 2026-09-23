@@ -198,7 +198,7 @@ class CustomerPayment(Base):
     )
 
     # Loaded with the payment so history rows carry the invoice number, not just its id.
-    invoice: Mapped["Invoice | None"] = relationship(lazy="joined")  # noqa: F821
+    invoice: Mapped["Invoice | None"] = relationship(lazy="selectin")  # noqa: F821
     collector: Mapped["User | None"] = relationship(
         lazy="selectin", foreign_keys=[collected_by_user_id]
     )  # noqa: F821
@@ -241,7 +241,7 @@ class CustomerPaymentAllocation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     payment: Mapped["CustomerPayment"] = relationship(back_populates="allocations")
-    invoice: Mapped["Invoice"] = relationship(lazy="joined")  # noqa: F821
+    invoice: Mapped["Invoice"] = relationship(lazy="selectin")  # noqa: F821
 
 
 class PaymentSplit(Base):

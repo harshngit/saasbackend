@@ -32,11 +32,11 @@ def _org(admin: User) -> Organization:
 
 
 def _apply(stored: dict | None, changes: dict) -> dict:
-    """Merge a partial update into what is stored, one level deep for nested blocks."""
+    """Merge a partial update into what is stored, recursively for nested blocks."""
     result = dict(stored or {})
     for key, value in changes.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = {**result[key], **value}
+            result[key] = _apply(result[key], value)
         else:
             result[key] = value
     return result
@@ -87,7 +87,8 @@ def get_invoice_settings(
     admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
 ) -> InvoiceSettings:
     """The firm's invoice look: template, paper size, branding, which fields to
-    print, and the standing terms / footer. One record, used by both PDF formats."""
+    print, typography, item table columns, print settings, and the standing terms / footer.
+    One record, used by invoice PDF generation."""
     return InvoiceSettings(**workflow.invoice_settings(_org(admin)))
 
 
@@ -97,7 +98,7 @@ def update_invoice_settings(
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> InvoiceSettings:
-    """Partial update. `branding` and `fields` merge key by key, so one toggle can be
+    """Partial update. Nested blocks merge key by key, so one toggle can be
     flipped without resending the rest.
 
     The logo and signature are ordinary uploads: POST /files/upload and send the
@@ -105,14 +106,6 @@ def update_invoice_settings(
     """
     org = _org(admin)
     changes = payload.model_dump(exclude_unset=True)
-    # A nested block sent partially must merge, not replace, so drop the keys the
-    # caller did not mention inside it.
-    for block in ("branding", "fields"):
-        if block in changes and changes[block] is not None:
-            sent = getattr(payload, block).model_dump(exclude_unset=True)
-            changes[block] = sent
-        elif block in changes:
-            del changes[block]
     if changes:
         org.invoice_template_settings = _apply(org.invoice_template_settings, changes)
         activity_service.record(
@@ -121,3 +114,4 @@ def update_invoice_settings(
         db.commit()
         db.refresh(org)
     return InvoiceSettings(**workflow.invoice_settings(org))
+

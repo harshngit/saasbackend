@@ -739,6 +739,15 @@ def download_invoice_pdf(
     invoice = _owned(db, id, org_id)
     settings = workflow.invoice_settings(user.organization)
     builder = invoice_simple_pdf if format == "simple" else invoice_detailed_pdf
+
+    item_images: dict[str, bytes] = {}
+    for itm in invoice.items:
+        img_url = itm.product_image_url
+        if img_url:
+            data = _resolve_file_reference(db, org_id, img_url)
+            if data is not None:
+                item_images[itm.id] = data
+
     pdf_bytes = builder(
         user.organization,
         invoice.customer,
@@ -749,7 +758,9 @@ def download_invoice_pdf(
         qr=_resolve_qr_file(db, org_id, user.organization, settings),
         stamp=_resolve_stamp_file(db, org_id, user.organization),
         letterhead=_resolve_letterhead_file(db, org_id, user.organization),
+        item_images=item_images,
     )
+
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",

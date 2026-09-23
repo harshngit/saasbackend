@@ -141,6 +141,109 @@ SALES_WORKFLOW_CHOICES: dict[str, tuple[str, ...]] = {
 
 INVOICE_TEMPLATES = ("classic", "modern", "compact", "thermal")
 PAPER_SIZES = ("A4", "A5", "thermal")
+FONT_FAMILIES = ("Helvetica", "Times", "Courier")
+ALLOWED_ITEM_COLUMNS = (
+    "product",
+    "description",
+    "product_image",
+    "hsn_sac",
+    "quantity",
+    "uom",
+    "rate",
+    "mrp",
+    "discount",
+    "tax_rate",
+    "tax_amount",
+    "batch_number",
+    "expiry_date",
+    "amount",
+)
+THERMAL_PAPER_WIDTHS = ("58mm", "80mm", "110mm")
+
+TYPOGRAPHY_DEFAULTS: dict[str, object] = {
+    "font_family": "Helvetica",
+    "heading_size": 16,
+    "body_size": 9,
+    "table_size": 8,
+}
+
+BUSINESS_DETAILS_DEFAULTS: dict[str, bool] = {
+    "show_business_name": True,
+    "show_logo": True,
+    "show_address": True,
+    "show_phone": True,
+    "show_email": True,
+    "show_gstin": True,
+    "show_pan": False,
+}
+
+INVOICE_DETAILS_DEFAULTS: dict[str, bool] = {
+    "show_invoice_number": True,
+    "show_invoice_date": True,
+    "show_due_date": True,
+    "show_order_reference": True,
+    "show_po_number": False,
+    "show_eway_bill_number": False,
+    "show_vehicle_number": False,
+}
+
+PARTY_DETAILS_DEFAULTS: dict[str, bool] = {
+    "show_customer_name": True,
+    "show_customer_gstin": True,
+    "show_billing_address": True,
+    "show_shipping_address": True,
+    "show_customer_phone": True,
+}
+
+ITEM_TABLE_DEFAULTS: dict[str, object] = {
+    "show_product_image": False,
+    "show_description": False,
+    "columns": [
+        "product",
+        "hsn_sac",
+        "quantity",
+        "rate",
+        "discount",
+        "tax_rate",
+        "tax_amount",
+        "amount",
+    ],
+}
+
+PAYMENT_DETAILS_DEFAULTS: dict[str, bool] = {
+    "show_bank_details": True,
+    "show_upi_qr": True,
+}
+
+FOOTER_DEFAULTS: dict[str, object] = {
+    "show_terms": True,
+    "show_signature": True,
+    "show_stamp": True,
+    "terms": None,
+    "footer_text": None,
+    "notes": None,
+}
+
+REGULAR_PRINT_DEFAULTS: dict[str, object] = {
+    "layout": "standard",
+    "paper_size": "A4",
+    "orientation": "portrait",
+    "margin_top": 10.0,
+    "margin_right": 10.0,
+    "margin_bottom": 10.0,
+    "margin_left": 10.0,
+}
+
+THERMAL_PRINT_DEFAULTS: dict[str, object] = {
+    "layout": "standard",
+    "paper_width": "80mm",
+    "printing_type": "text",
+    "bold_text": True,
+    "auto_cut": False,
+    "open_cash_drawer": False,
+    "extra_lines": 0,
+    "copies": 1,
+}
 
 INVOICE_FIELD_DEFAULTS: dict[str, bool] = {
     "show_company_gstin": True,
@@ -168,20 +271,36 @@ INVOICE_SETTINGS_DEFAULTS: dict[str, object] = {
     "terms": None,
     "footer_text": None,
     "notes": None,
+    "typography": dict(TYPOGRAPHY_DEFAULTS),
+    "business_details": dict(BUSINESS_DETAILS_DEFAULTS),
+    "invoice_details": dict(INVOICE_DETAILS_DEFAULTS),
+    "party_details": dict(PARTY_DETAILS_DEFAULTS),
+    "item_table": dict(ITEM_TABLE_DEFAULTS),
+    "payment_details": dict(PAYMENT_DETAILS_DEFAULTS),
+    "footer": dict(FOOTER_DEFAULTS),
+    "regular_print": dict(REGULAR_PRINT_DEFAULTS),
+    "thermal_print": dict(THERMAL_PRINT_DEFAULTS),
 }
 
 
 def _merged(stored: object, defaults: dict) -> dict:
-    """Stored values on top of the defaults, one level deep for the nested blocks."""
-    result = {k: (dict(v) if isinstance(v, dict) else v) for k, v in defaults.items()}
-    if isinstance(stored, dict):
-        for key, value in stored.items():
-            if key not in defaults:
-                continue
-            if isinstance(defaults[key], dict) and isinstance(value, dict):
-                result[key].update({k: v for k, v in value.items() if k in defaults[key]})
+    """Recursively merge stored values on top of the defaults so any omitted
+    keys or newly-added nested blocks fall back cleanly."""
+    result = {}
+    for k, v in defaults.items():
+        if isinstance(v, dict):
+            stored_v = stored.get(k) if isinstance(stored, dict) else None
+            result[k] = _merged(stored_v, v)
+        elif isinstance(v, list):
+            if isinstance(stored, dict) and k in stored and isinstance(stored[k], list):
+                result[k] = list(stored[k])
             else:
-                result[key] = value
+                result[k] = list(v)
+        else:
+            if isinstance(stored, dict) and k in stored and stored[k] is not None:
+                result[k] = stored[k]
+            else:
+                result[k] = v
     return result
 
 
@@ -193,6 +312,7 @@ def sales_settings(org) -> dict:  # noqa: ANN001
 def invoice_settings(org) -> dict:  # noqa: ANN001
     """The firm's invoice template settings, defaults filled in."""
     return _merged(getattr(org, "invoice_template_settings", None), INVOICE_SETTINGS_DEFAULTS)
+
 
 
 # ------------------------------ deliveries --------------------------------

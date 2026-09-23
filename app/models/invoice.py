@@ -129,3 +129,17 @@ class InvoiceItem(Base):
     serial_numbers: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     invoice: Mapped["Invoice"] = relationship(back_populates="items")
+    product: Mapped["Product | None"] = relationship(foreign_keys=[product_id], lazy="joined")  # noqa: F821
+    variant: Mapped["ProductVariant | None"] = relationship(foreign_keys=[variant_id], lazy="joined")  # noqa: F821
+
+    @property
+    def product_image_url(self) -> str | None:
+        if self.variant and self.variant.image_url:
+            return self.variant.image_url
+        if self.product:
+            if self.product.cover_image:
+                return self.product.cover_image
+            if self.product.images and isinstance(self.product.images, list) and len(self.product.images) > 0:
+                return self.product.images[0]
+        return None
+

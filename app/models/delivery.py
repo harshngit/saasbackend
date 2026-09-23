@@ -76,7 +76,7 @@ class Delivery(Base):
         back_populates="delivery", cascade="all, delete-orphan", lazy="joined"
     )
     collections: Mapped[list["DeliveryCollection"]] = relationship(
-        back_populates="delivery", cascade="all, delete-orphan", lazy="selectin"
+        back_populates="delivery", cascade="all, delete-orphan", lazy="select"
     )
 
     @property
@@ -101,8 +101,8 @@ class Delivery(Base):
     @property
     def delivered_total(self) -> float:
         return round(sum(i.delivered_quantity or 0 for i in self.items), 3)
-    customer: Mapped["Customer | None"] = relationship(lazy="joined", primaryjoin="Delivery.customer_id == Customer.id")  # noqa: F821
-    sales_order: Mapped["SalesOrder | None"] = relationship(lazy="joined", primaryjoin="Delivery.sales_order_id == SalesOrder.id")  # noqa: F821
+    customer: Mapped["Customer | None"] = relationship(lazy="selectin", primaryjoin="Delivery.customer_id == Customer.id")  # noqa: F821
+    sales_order: Mapped["SalesOrder | None"] = relationship(lazy="selectin", primaryjoin="Delivery.sales_order_id == SalesOrder.id")  # noqa: F821
 
 
 class DeliveryItem(Base):
@@ -255,19 +255,19 @@ class DeliveryCollection(Base):
 
     delivery: Mapped["Delivery | None"] = relationship(back_populates="collections")
     sales_order: Mapped["SalesOrder | None"] = relationship(
-        lazy="joined", primaryjoin="DeliveryCollection.sales_order_id == SalesOrder.id"
+        lazy="selectin", primaryjoin="DeliveryCollection.sales_order_id == SalesOrder.id"
     )
     customer: Mapped["Customer | None"] = relationship(
-        lazy="joined", primaryjoin="DeliveryCollection.customer_id == Customer.id"
+        lazy="selectin", primaryjoin="DeliveryCollection.customer_id == Customer.id"
     )
     delivery_partner: Mapped["User | None"] = relationship(
-        lazy="joined", foreign_keys=[delivery_partner_id]
+        lazy="selectin", foreign_keys=[delivery_partner_id]
     )
     reconciled_by: Mapped["User | None"] = relationship(
-        lazy="joined", foreign_keys=[reconciled_by_id]
+        lazy="selectin", foreign_keys=[reconciled_by_id]
     )
     allocations: Mapped[list["DeliveryCollectionAllocation"]] = relationship(
-        back_populates="collection", cascade="all, delete-orphan", lazy="joined"
+        back_populates="collection", cascade="all, delete-orphan", lazy="selectin"
     )
 
     @property
@@ -301,4 +301,4 @@ class DeliveryCollectionAllocation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     collection: Mapped["DeliveryCollection"] = relationship(back_populates="allocations")
-    invoice: Mapped["Invoice"] = relationship(lazy="joined")  # noqa: F821
+    invoice: Mapped["Invoice"] = relationship(lazy="selectin")  # noqa: F821

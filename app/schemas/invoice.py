@@ -75,6 +75,8 @@ class InvoiceItemOut(BaseModel):
     serial_numbers: list[str] | None = None
     delivery_item_id: str | None = None
     order_item_id: str | None = None
+    product_image_url: str | None = None
+
 
 
 class CustomerBrief(BaseModel):

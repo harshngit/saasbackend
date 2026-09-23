@@ -1376,22 +1376,91 @@ def update_delivery_status(
     }
 
 
+def _owned_delivery_or_from_order(db: Session, id: str, user: User) -> tuple[Delivery, SalesOrder | None]:
+    org_id = _org_id(user)
+    # 1. Direct Delivery lookup
+    delivery = (
+        db.query(Delivery)
+        .filter(
+            Delivery.organization_id == org_id,
+            or_(Delivery.id == id, Delivery.delivery_note_number == id),
+        )
+        .first()
+    )
+    if delivery is not None:
+        if not scoping.owns_record(db, user, delivery, "delivery_partner_id", team_attributes=()):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This delivery is not assigned to you")
+        return delivery, delivery.sales_order
+
+    # 2. Backward compatibility fallback: check if id is a SalesOrder
+    order = (
+        db.query(SalesOrder)
+        .filter(
+            SalesOrder.organization_id == org_id,
+            or_(SalesOrder.id == id, SalesOrder.order_number == id),
+        )
+        .first()
+    )
+    if order is not None:
+        if not scoping.owns_record(db, user, order, "assigned_delivery_partner_id", team_attributes=()):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This delivery is not assigned to you")
+        delivery = (
+            db.query(Delivery)
+            .filter(
+                Delivery.organization_id == org_id,
+                Delivery.sales_order_id == order.id,
+                Delivery.status == "delivered",
+            )
+            .order_by(Delivery.created_at.desc())
+            .first()
+        )
+        if delivery is None:
+            delivery = (
+                db.query(Delivery)
+                .filter(
+                    Delivery.organization_id == org_id,
+                    Delivery.sales_order_id == order.id,
+                )
+                .order_by(Delivery.created_at.desc())
+                .first()
+            )
+        if delivery is not None:
+            return delivery, order
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery not found")
+
+
 @router.get("/{id}/receipt")
 def get_delivery_receipt(
     id: str,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    """Download delivery receipt PDF."""
-    order = _owned_order(db, id, user)
-    if not order.customer:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order has no customer details")
+    """Download delivery receipt PDF based on completed Delivery and delivered_quantity."""
+    delivery, order = _owned_delivery_or_from_order(db, id, user)
+    if delivery.status != "delivered":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Delivery receipt is only available for completed deliveries (status: delivered)",
+        )
 
-    pdf_bytes = delivery_receipt_pdf(user.organization, order.customer, order)
+    customer = delivery.customer or (order.customer if order else None)
+    partner = db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
+    vehicle = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
+
+    pdf_bytes = delivery_receipt_pdf(
+        user.organization,
+        customer,
+        delivery,
+        order=order,
+        partner=partner,
+        vehicle=vehicle,
+    )
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{order.order_number}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{delivery.delivery_note_number}.pdf"'},
     )
+
 
 
