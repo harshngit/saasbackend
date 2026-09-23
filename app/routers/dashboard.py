@@ -3,8 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission
-from app.models import Customer, Supplier, User, Warehouse
-from app.schemas.dashboard import AdminDashboardOut
+from app.models import Customer, SalesOrder, Supplier, User, Warehouse
+from app.schemas.dashboard import AdminDashboardOut, DeliveryPartnerDashboardOut
+from app.schemas.sales_order import OrderOut
 from app.services import dashboard_service
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -62,3 +63,47 @@ def admin_dashboard(
         date_from=date_from, date_to=date_to, company_id=company_id,
         warehouse_id=warehouse_id, customer_id=customer_id, supplier_id=supplier_id,
     )
+
+
+@router.get("/delivery-partner", response_model=DeliveryPartnerDashboardOut)
+def delivery_partner_dashboard(
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> DeliveryPartnerDashboardOut:
+    """Delivery partner dashboard KPIs: company-wide total orders and partner-assigned deliveries."""
+    org_id = _org_id(user)
+    return dashboard_service.build_delivery_partner_dashboard(db, org_id, user.id)
+
+
+@router.get("/delivery-partner/orders", response_model=list[OrderOut])
+def list_delivery_partner_company_orders(
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        description="draft | confirmed | completed | cancelled. Filter orders by status.",
+    ),
+    fulfilment_status: str | None = Query(
+        default=None,
+        description="not_started | reserved | planned | loaded | in_transit | "
+                    "partially_delivered | delivered | failed",
+    ),
+    customer_id: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="matches order_number"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[SalesOrder]:
+    """Read-only company-wide orders list for the authenticated delivery partner."""
+    org_id = _org_id(user)
+    return dashboard_service.list_delivery_partner_company_orders(
+        db,
+        org_id,
+        status_filter=status_filter,
+        fulfilment_status=fulfilment_status,
+        customer_id=customer_id,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+

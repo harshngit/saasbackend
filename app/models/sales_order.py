@@ -184,6 +184,16 @@ class SalesOrderItem(Base):
     # A request, not a hold: which lot actually goes out is settled at loading.
     batch_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
     order: Mapped["SalesOrder"] = relationship(back_populates="items")
+    product: Mapped["Product | None"] = relationship(foreign_keys=[product_id], lazy="joined")  # noqa: F821
+    variant: Mapped["ProductVariant | None"] = relationship(foreign_keys=[variant_id], lazy="joined")  # noqa: F821
+
+    @property
+    def product_image_url(self) -> str | None:
+        if self.variant and self.variant.image_url:
+            return self.variant.image_url
+        if self.product and self.product.cover_image:
+            return self.product.cover_image
+        return None
 
     @property
     def ordered_quantity(self) -> int:

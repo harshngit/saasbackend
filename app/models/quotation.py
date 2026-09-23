@@ -134,3 +134,14 @@ class QuotationItem(Base):
         return round(self.line_total * (self.tax_rate or 0) / 100, 2)
 
     quotation: Mapped["Quotation"] = relationship(back_populates="items")
+    product: Mapped["Product | None"] = relationship(foreign_keys=[product_id], lazy="joined")  # noqa: F821
+    variant: Mapped["ProductVariant | None"] = relationship(foreign_keys=[variant_id], lazy="joined")  # noqa: F821
+
+    @property
+    def product_image_url(self) -> str | None:
+        if self.variant and self.variant.image_url:
+            return self.variant.image_url
+        if self.product and self.product.cover_image:
+            return self.product.cover_image
+        return None
+

@@ -51,6 +51,10 @@ class OrderItemOut(BaseModel):
     tax_amount: float = 0
     line_total: float
     uom: str | None = None
+    product_image_url: str | None = Field(
+        default=None,
+        description="Resolved image URL: variant image if present, else product cover image",
+    )
 
 
 class CustomerBrief(BaseModel):

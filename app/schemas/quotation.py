@@ -73,6 +73,7 @@ class QuotationItemOut(QuotationItemBase):
     product_name: str
     line_total: float = 0
     tax_amount: float = 0
+    product_image_url: str | None = None
 
 
 class QuotationBase(BaseModel):

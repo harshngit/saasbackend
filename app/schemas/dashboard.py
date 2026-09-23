@@ -33,6 +33,11 @@ class DashboardOrders(BaseModel):
     cancelled: int
 
 
+class DeliveryPartnerDashboardOut(BaseModel):
+    total_company_orders: int
+    my_assigned_deliveries: int
+
+
 class CashflowPoint(BaseModel):
     date: str
     inflow: float

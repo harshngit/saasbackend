@@ -41,6 +41,7 @@ class DeliveryItemOut(DeliveryItemBase):
     model_config = ConfigDict(from_attributes=True)
     id: str
     product_name: str
+    product_image_url: str | None = None
 
 
 class DeliveryNoteBase(BaseModel):
@@ -179,6 +180,7 @@ class DeliveryLineOut(BaseModel):
     batch_number: str | None = None
     expiry_date: datetime | None = None
     serial_numbers: list | None = None
+    product_image_url: str | None = None
 
     @model_validator(mode="after")
     def _fill_remaining(self) -> "DeliveryLineOut":

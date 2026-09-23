@@ -17,8 +17,10 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core import workflow
 from app.models import (
     Customer,
     CustomerPayment,
@@ -38,6 +40,7 @@ from app.schemas.dashboard import (
     DashboardFilters,
     DashboardOrders,
     DashboardSummary,
+    DeliveryPartnerDashboardOut,
     ExpenseSlice,
     ReceivablesPayables,
     RecentOrder,
@@ -537,3 +540,74 @@ def build_admin_dashboard(
         stock_watch=_stock_watch(db, eff_org, warehouse_id, company_id),
         recent_orders=_recent_orders(db, eff_org, customer_id, company_id),
     )
+
+
+def build_delivery_partner_dashboard(
+    db: Session,
+    org_id: str,
+    user_id: str,
+) -> DeliveryPartnerDashboardOut:
+    total_company_orders = (
+        db.query(func.count(SalesOrder.id))
+        .filter(SalesOrder.organization_id == org_id)
+        .scalar()
+        or 0
+    )
+
+    my_assigned_deliveries = (
+        db.query(func.count(SalesOrder.id))
+        .filter(
+            SalesOrder.organization_id == org_id,
+            SalesOrder.assigned_delivery_partner_id == user_id,
+            SalesOrder.fulfilment_status.in_(
+                ("planned", "loaded", "in_transit", "partially_delivered")
+            ),
+        )
+        .scalar()
+        or 0
+    )
+
+    return DeliveryPartnerDashboardOut(
+        total_company_orders=total_company_orders,
+        my_assigned_deliveries=my_assigned_deliveries,
+    )
+
+
+def list_delivery_partner_company_orders(
+    db: Session,
+    org_id: str,
+    status_filter: str | None = None,
+    fulfilment_status: str | None = None,
+    customer_id: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[SalesOrder]:
+    query = db.query(SalesOrder).filter(SalesOrder.organization_id == org_id)
+
+    if status_filter:
+        mapped = workflow.LEGACY_ORDER_STATUS.get(status_filter)
+        if mapped and status_filter not in workflow.ORDER_STATUSES:
+            new_status, fulfilment = mapped
+            query = query.filter(
+                SalesOrder.status == new_status, SalesOrder.fulfilment_status == fulfilment
+            )
+        else:
+            query = query.filter(SalesOrder.status == status_filter)
+
+    if fulfilment_status:
+        query = query.filter(SalesOrder.fulfilment_status == fulfilment_status)
+
+    if customer_id:
+        query = query.filter(SalesOrder.customer_id == customer_id)
+
+    if search:
+        query = query.filter(SalesOrder.order_number.ilike(f"%{search}%"))
+
+    return (
+        query.order_by(SalesOrder.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
