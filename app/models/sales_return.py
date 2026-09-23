@@ -67,8 +67,8 @@ class SalesReturn(Base):
         back_populates="sales_return", cascade="all, delete-orphan", lazy="joined"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined", primaryjoin="SalesReturn.customer_id == Customer.id")  # noqa: F821
-    invoice: Mapped["Invoice | None"] = relationship(lazy="joined", primaryjoin="SalesReturn.invoice_reference_id == Invoice.id")  # noqa: F821
-    credit_note: Mapped["Invoice | None"] = relationship(lazy="joined", primaryjoin="SalesReturn.credit_note_id == Invoice.id")  # noqa: F821
+    invoice: Mapped["Invoice | None"] = relationship(lazy="selectin", primaryjoin="SalesReturn.invoice_reference_id == Invoice.id")  # noqa: F821
+    credit_note: Mapped["Invoice | None"] = relationship(lazy="selectin", primaryjoin="SalesReturn.credit_note_id == Invoice.id")  # noqa: F821
 
 
 class ReturnItem(Base):
