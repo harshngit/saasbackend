@@ -123,3 +123,11 @@ class SupplierProductOut(BaseModel):
     product_category_id: str | None = None
     product_status: str | None = None
 
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

@@ -21,6 +21,8 @@ from app.models import (
 )
 from app.services import numbering_service, lookup_service, purchase_service, stock_service, supplier_invoice_service
 from app.schemas.purchase import (
+    BulkDelete,
+    BulkDeleteResult,
     CancelBody,
     PaymentStatusUpdate,
     PurchaseCreate,
@@ -36,6 +38,7 @@ _view = require_permission("purchases", "view")
 _create = require_permission("purchases", "create")
 _edit = require_permission("purchases", "edit")
 _approve = require_permission("purchases", "approve")
+_delete = require_permission("purchases", "delete")
 
 
 def _org_id(user: User) -> str:
@@ -611,15 +614,49 @@ def purchase_return(
     return inv
 
 
+_PROTECTED_PURCHASE_STATUSES = ("approved", "confirmed", "closed")
+
+
+def _validate_purchase_for_deletion(purchase: PurchaseInvoice) -> None:
+    """Shared by single and bulk delete, so bulk can never be looser than single."""
+    if purchase.status in _PROTECTED_PURCHASE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cancel a confirmed purchase before deleting",
+        )
+
+
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_purchase(
     id: str,
-    user: User = Depends(require_permission("purchases", "delete")),
+    user: User = Depends(_delete),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> None:
     inv = _owned(db, id, _org_id(user))
-    if inv.status in ("approved", "confirmed", "closed"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel a confirmed purchase before deleting")
+    _validate_purchase_for_deletion(inv)
     db.delete(inv)
     db.commit()
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_purchases(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple purchase invoices atomically. An approved,
+    confirmed, or closed invoice blocks the whole request, exactly as it would
+    for a single delete."""
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    purchases = [_owned(db, pid, org_id) for pid in unique_ids]
+    for purchase in purchases:
+        _validate_purchase_for_deletion(purchase)
+
+    for purchase in purchases:
+        db.delete(purchase)
+    db.commit()
+    return BulkDeleteResult(deleted=len(purchases))

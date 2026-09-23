@@ -14,7 +14,7 @@ from app.models import (
     User,
     Warehouse,
 )
-from app.schemas.grn import GRNCreate, GRNItemIn, GRNOut, GRNUpdate
+from app.schemas.grn import BulkDelete, BulkDeleteResult, GRNCreate, GRNItemIn, GRNOut, GRNUpdate
 from app.services import grn_service, lookup_service, numbering_service, purchase_service, stock_service
 
 router = APIRouter(prefix="/grns", tags=["grn"])
@@ -203,15 +203,8 @@ def cancel_grn(
     return grn
 
 
-@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_grn(
-    id: str,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> None:
-    org_id = _org_id(user)
-    grn = _owned(db, id, org_id)
+def _validate_grn_for_deletion(grn: GoodsReceiptNote) -> None:
+    """Shared by single and bulk delete, so bulk can never be looser than single."""
     if grn.status == "confirmed":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -222,5 +215,39 @@ def delete_grn(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete a cancelled GRN",
         )
+
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_grn(
+    id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    org_id = _org_id(user)
+    grn = _owned(db, id, org_id)
+    _validate_grn_for_deletion(grn)
     db.delete(grn)
     db.commit()
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_grns(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple GRNs atomically. A confirmed or already-cancelled
+    GRN blocks the whole request, exactly as it would for a single delete."""
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    grns = [_owned(db, gid, org_id) for gid in unique_ids]
+    for grn in grns:
+        _validate_grn_for_deletion(grn)
+
+    for grn in grns:
+        db.delete(grn)
+    db.commit()
+    return BulkDeleteResult(deleted=len(grns))

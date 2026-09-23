@@ -37,6 +37,13 @@ MODULES: list[str] = [
     "visits",
     "follow_ups",
     "leaves",
+    # Registered here so roles can actually be granted these — routers already
+    # gated on these three module strings (require_permission("supplier_invoices", ...),
+    # etc.) before they were added to this catalog, which meant normalize_permissions
+    # silently dropped any attempt to grant them and they never appeared in catalog().
+    "supplier_invoices",
+    "supplier_payments",
+    "accounts_payable",
 ]
 
 # Friendlier names callers may send for a module, mapped to its canonical key. The
@@ -100,6 +107,9 @@ MODULE_LABELS: dict[str, str] = {
     "visits": "Visits",
     "follow_ups": "Follow-ups",
     "leaves": "Leaves",
+    "supplier_invoices": "Supplier Invoices",
+    "supplier_payments": "Supplier Payments",
+    "accounts_payable": "Accounts Payable",
 }
 ACTION_LABELS: dict[str, str] = {
     "view": "View",

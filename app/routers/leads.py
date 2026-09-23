@@ -8,6 +8,8 @@ from app.core.deps import require_permission, require_unlocked_org
 from app.models import Lead, User
 from app.services import lead_service
 from app.schemas.lead import (
+    BulkDelete,
+    BulkDeleteResult,
     LeadConvertToCustomerIn,
     LeadConvertResponse,
     LeadCreate,
@@ -115,3 +117,17 @@ def delete_lead(
     db: Session = Depends(get_db),
 ) -> None:
     lead_service.delete_lead(db, _org_id(user), id, user)
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_leads(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple leads atomically. A lead already converted to a
+    customer blocks the whole request, exactly as it would for a single delete."""
+    unique_ids = list(dict.fromkeys(payload.ids))
+    deleted = lead_service.bulk_delete_leads(db, _org_id(user), unique_ids, user)
+    return BulkDeleteResult(deleted=deleted)

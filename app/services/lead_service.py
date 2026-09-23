@@ -284,13 +284,16 @@ def update_lead(db: Session, org_id: str, lead_id: str, user: User, payload: Lea
     return lead
 
 
-def delete_lead(db: Session, org_id: str, lead_id: str, user: User) -> None:
-    lead = get_lead(db, org_id, lead_id, user)
+def _validate_lead_for_deletion(lead: Lead) -> None:
+    """Shared by single and bulk delete, so bulk can never be looser than single."""
     if is_converted(lead):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This Lead has been converted to a Customer and cannot be deleted",
         )
+
+
+def _detach_lead(db: Session, lead: Lead) -> None:
     # Quotation.lead_id declares ON DELETE SET NULL, but that only actually
     # exists in the database for a `quotations` table created fresh via
     # create_all() — a table that already existed before this column shipped
@@ -301,8 +304,28 @@ def delete_lead(db: Session, org_id: str, lead_id: str, user: User) -> None:
     # explicitly so a Lead's quotations survive its deletion on every
     # database this app actually runs against, not only a brand new one.
     db.query(Quotation).filter(Quotation.lead_id == lead.id).update({"lead_id": None})
+
+
+def delete_lead(db: Session, org_id: str, lead_id: str, user: User, *, commit: bool = True) -> None:
+    lead = get_lead(db, org_id, lead_id, user)
+    _validate_lead_for_deletion(lead)
+    _detach_lead(db, lead)
     db.delete(lead)
+    if commit:
+        db.commit()
+
+
+def bulk_delete_leads(db: Session, org_id: str, ids: list[str], user: User) -> int:
+    """Delete multiple leads atomically: every id is resolved and guard-checked
+    (exactly as delete_lead does one at a time) before anything is deleted."""
+    leads = [get_lead(db, org_id, lid, user) for lid in ids]
+    for lead in leads:
+        _validate_lead_for_deletion(lead)
+    for lead in leads:
+        _detach_lead(db, lead)
+        db.delete(lead)
     db.commit()
+    return len(leads)
 
 
 def convert_lead_to_customer(

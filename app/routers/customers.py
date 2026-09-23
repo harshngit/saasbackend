@@ -4,6 +4,7 @@ from fastapi import (
     APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status,
 )
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -23,6 +24,8 @@ from app.services.customer_profile_service import DOCUMENT_TYPES, OTHER_DOCUMENT
 from app.schemas.customer_profile import CustomerProfileIn, CustomerProfileOut
 from app.schemas.ledger import CustomerLedger
 from app.schemas.customer import (
+    BulkDelete,
+    BulkDeleteResult,
     CustomerCreate,
     CustomerDocumentOut,
     CustomerOut,
@@ -426,9 +429,65 @@ def delete_customer(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> None:
+    """Permanently delete a customer and everything that belongs to it.
+
+    By business decision, a customer's own data — payment history
+    (`CustomerPayment`, `ondelete="CASCADE"`), uploaded documents, follow-ups
+    and visits — is considered part of the customer record and is deleted
+    with it (enforced at the database level via each child table's FK
+    `ondelete` rule, so it happens atomically with the customer row in the
+    same transaction). Records that merely *reference* this customer but
+    belong to their own lifecycle — SalesOrder, Invoice, SalesReturn, Lead,
+    Quotation, Delivery — are preserved; their `customer_id` is set to NULL
+    instead (also enforced at the database level, `ondelete="SET NULL"`).
+    """
     customer = _owned_customer(db, customer_id, user)
     db.delete(customer)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not delete this customer — it is still referenced by a record that "
+                   "does not allow deletion. Nothing was changed.",
+        )
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_customers(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple customers atomically.
+
+    Every requested id must resolve to a customer in the caller's organization
+    (and, for a data-scoped role, one they own) or the whole request fails —
+    no customer is deleted unless all of them can be. Each customer's own
+    data (payments, documents, follow-ups, visits) is deleted with it, exactly
+    as in the single-delete endpoint above; records that only reference the
+    customer are preserved (`customer_id` set to NULL) by the same database
+    rules. One transaction, one commit — never a partially deleted batch.
+    """
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    customers = [_owned_customer(db, cid, user) for cid in unique_ids]
+
+    for customer in customers:
+        db.delete(customer)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not delete one or more of these customers — a record that does not "
+                   "allow deletion still references one of them. Nothing was deleted.",
+        )
+    return BulkDeleteResult(deleted=len(customers))
 
 
 # ------------------------------ Customer documents ------------------------------

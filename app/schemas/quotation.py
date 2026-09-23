@@ -201,3 +201,11 @@ class QuotationListItem(BaseModel):
     total: float = 0
     item_count: int = 0
     created_at: datetime
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

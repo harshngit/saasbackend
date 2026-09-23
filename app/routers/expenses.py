@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
-from app.schemas.expense import ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
+from app.schemas.expense import BulkDelete, BulkDeleteResult, ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
 from app.services import expense_service, lookup_service, notification_service, numbering_service
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
@@ -379,3 +379,22 @@ def delete_expense(
     expense = _owned(db, expense_id, _org_id(user), user)
     db.delete(expense)
     db.commit()
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_expenses(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple expenses atomically. No status guard exists
+    today (same as single delete — this task preserves that, not invents one)."""
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    expenses = [_owned(db, eid, org_id, user) for eid in unique_ids]
+    for expense in expenses:
+        db.delete(expense)
+    db.commit()
+    return BulkDeleteResult(deleted=len(expenses))

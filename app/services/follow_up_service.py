@@ -266,7 +266,20 @@ def complete_follow_up(
     return follow_up
 
 
-def delete_follow_up(db: Session, org_id: str, follow_up_id: str, user: User) -> None:
+def delete_follow_up(
+    db: Session, org_id: str, follow_up_id: str, user: User, *, commit: bool = True
+) -> None:
     follow_up = get_follow_up(db, org_id, follow_up_id, user)
     db.delete(follow_up)
+    if commit:
+        db.commit()
+
+
+def bulk_delete_follow_ups(db: Session, org_id: str, ids: list[str], user: User) -> int:
+    """Delete multiple follow-ups atomically: every id is resolved (exactly as
+    delete_follow_up does one at a time) before anything is deleted."""
+    follow_ups = [get_follow_up(db, org_id, fid, user) for fid in ids]
+    for follow_up in follow_ups:
+        db.delete(follow_up)
     db.commit()
+    return len(follow_ups)

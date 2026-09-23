@@ -321,3 +321,11 @@ class CustomerDocumentOut(BaseModel):
     size: int
     url: str
     uploaded_at: datetime
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

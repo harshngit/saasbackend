@@ -9,6 +9,8 @@ from app.core.deps import require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
 from app.models import Product, PurchaseInvoice, Supplier, SupplierPayment, SupplierProduct, User
 from app.schemas.supplier import (
+    BulkDelete,
+    BulkDeleteResult,
     PaymentCreate,
     PaymentOut,
     SupplierCreate,
@@ -166,21 +168,15 @@ def set_supplier_status(
     return supplier
 
 
-@router.delete("/{supplier_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_supplier(
-    supplier_id: str,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> None:
-    supplier = _owned(db, supplier_id, _org_id(user))
-
-    # Check for historical purchase invoices to prevent unsafe deletion
+def _validate_supplier_for_deletion(db: Session, supplier: Supplier) -> None:
+    """Refuse to delete a supplier with historical purchase invoices — that history
+    must be preserved; deactivate the supplier instead. Shared by single and bulk
+    delete so bulk can never be looser than single."""
     has_purchases = (
         db.query(PurchaseInvoice)
         .filter(
             PurchaseInvoice.organization_id == supplier.organization_id,
-            PurchaseInvoice.supplier_id == supplier_id,
+            PurchaseInvoice.supplier_id == supplier.id,
         )
         .first()
     )
@@ -190,8 +186,44 @@ def delete_supplier(
             detail="Cannot delete supplier with historical purchases. Deactivate the supplier instead.",
         )
 
+
+@router.delete("/{supplier_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_supplier(
+    supplier_id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    supplier = _owned(db, supplier_id, _org_id(user))
+    _validate_supplier_for_deletion(db, supplier)
     db.delete(supplier)  # payments cascade
     db.commit()
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_suppliers(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple suppliers atomically.
+
+    Every id must resolve to a supplier in the caller's organization with no
+    historical purchase invoices — the exact same guard as single delete — or
+    the whole request fails and nothing is deleted.
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    suppliers = [_owned(db, sid, org_id) for sid in unique_ids]
+    for supplier in suppliers:
+        _validate_supplier_for_deletion(db, supplier)
+
+    for supplier in suppliers:
+        db.delete(supplier)  # payments cascade
+    db.commit()
+    return BulkDeleteResult(deleted=len(suppliers))
 
 
 # ---------------------------- Supplier Products Linkage ----------------------------

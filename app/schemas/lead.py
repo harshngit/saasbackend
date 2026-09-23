@@ -189,3 +189,11 @@ class LeadConvertResponse(BaseModel):
     lead_status: str
     converted: bool = True
     customer: CustomerOut | None = None
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

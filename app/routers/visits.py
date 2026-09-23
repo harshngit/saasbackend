@@ -6,7 +6,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import User, Visit
 from app.schemas.follow_up import FollowUpCreate, FollowUpOut
-from app.schemas.visit import VisitCreate, VisitOut, VisitUpdate
+from app.schemas.visit import BulkDelete, BulkDeleteResult, VisitCreate, VisitOut, VisitUpdate
 from app.services import follow_up_service, visit_service
 
 router = APIRouter(prefix="/visits", tags=["visits"])
@@ -95,6 +95,20 @@ def delete_visit(
 ) -> None:
     org_id = _org_id(user)
     visit_service.delete_visit(db, org_id, id, user)
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_visits(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple visits atomically."""
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    deleted = visit_service.bulk_delete_visits(db, org_id, unique_ids, user)
+    return BulkDeleteResult(deleted=deleted)
 
 
 @router.post("/{visit_id}/follow-ups", response_model=FollowUpOut, status_code=status.HTTP_201_CREATED)

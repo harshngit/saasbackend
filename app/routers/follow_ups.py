@@ -5,7 +5,14 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import FollowUp, User
-from app.schemas.follow_up import FollowUpComplete, FollowUpCreate, FollowUpOut, FollowUpUpdate
+from app.schemas.follow_up import (
+    BulkDelete,
+    BulkDeleteResult,
+    FollowUpComplete,
+    FollowUpCreate,
+    FollowUpOut,
+    FollowUpUpdate,
+)
 from app.services import follow_up_service
 
 router = APIRouter(prefix="/follow-ups", tags=["follow_ups"])
@@ -109,3 +116,17 @@ def delete_follow_up(
 ) -> None:
     org_id = _org_id(user)
     follow_up_service.delete_follow_up(db, org_id, id, user)
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_follow_ups(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple follow-ups atomically."""
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    deleted = follow_up_service.bulk_delete_follow_ups(db, org_id, unique_ids, user)
+    return BulkDeleteResult(deleted=deleted)

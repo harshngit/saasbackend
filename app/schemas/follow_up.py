@@ -97,3 +97,11 @@ class FollowUpOut(BaseModel):
     customer: FollowUpCustomerBrief | None = None
     lead: FollowUpLeadBrief | None = None
     assigned_to: FollowUpUserBrief | None = None
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

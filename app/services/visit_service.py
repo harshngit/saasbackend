@@ -224,7 +224,18 @@ def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: V
     return visit
 
 
-def delete_visit(db: Session, org_id: str, visit_id: str, user: User) -> None:
+def delete_visit(db: Session, org_id: str, visit_id: str, user: User, *, commit: bool = True) -> None:
     visit = get_visit(db, org_id, visit_id, user)
     db.delete(visit)
+    if commit:
+        db.commit()
+
+
+def bulk_delete_visits(db: Session, org_id: str, ids: list[str], user: User) -> int:
+    """Delete multiple visits atomically: every id is resolved (exactly as
+    delete_visit does one at a time) before anything is deleted."""
+    visits = [get_visit(db, org_id, vid, user) for vid in ids]
+    for visit in visits:
+        db.delete(visit)
     db.commit()
+    return len(visits)

@@ -93,3 +93,11 @@ class GRNOut(BaseModel):
     confirmed_at: datetime | None = None
     confirmed_by: str | None = None
     items: list[GRNItemOut] = []
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

@@ -14,6 +14,8 @@ from app.models import (
     User,
 )
 from app.schemas.supplier_invoice import (
+    BulkDelete,
+    BulkDeleteResult,
     SupplierInvoiceCreate,
     SupplierInvoiceItemIn,
     SupplierInvoiceOut,
@@ -262,16 +264,8 @@ def cancel_supplier_invoice(
     return inv
 
 
-@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_supplier_invoice(
-    id: str,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> None:
-    org_id = _org_id(user)
-    inv = _owned(db, id, org_id)
-
+def _validate_supplier_invoice_for_deletion(inv: SupplierInvoice) -> None:
+    """Shared by single and bulk delete, so bulk can never be looser than single."""
     if inv.status == "recorded":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -283,8 +277,42 @@ def delete_supplier_invoice(
             detail="Cannot delete a cancelled supplier invoice. Cancelled invoices are preserved for audit trails.",
         )
 
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_supplier_invoice(
+    id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
+    _validate_supplier_invoice_for_deletion(inv)
     db.delete(inv)
     db.commit()
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_supplier_invoices(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple supplier invoices atomically. A recorded or
+    cancelled invoice blocks the whole request, exactly as it would for a single
+    delete — both are preserved for the audit trail."""
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    invoices = [_owned(db, iid, org_id) for iid in unique_ids]
+    for inv in invoices:
+        _validate_supplier_invoice_for_deletion(inv)
+
+    for inv in invoices:
+        db.delete(inv)
+    db.commit()
+    return BulkDeleteResult(deleted=len(invoices))
 
 
 @router.get("/{id}/payments", response_model=list[dict])

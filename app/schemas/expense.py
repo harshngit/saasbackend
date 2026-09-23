@@ -231,3 +231,11 @@ class ExpenseUpdate(BaseModel):
 
 class RejectBody(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

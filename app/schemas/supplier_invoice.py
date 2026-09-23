@@ -92,3 +92,11 @@ class SupplierInvoiceOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     items: list[SupplierInvoiceItemOut] = []
+
+
+class BulkDelete(BaseModel):
+    ids: list[str] = Field(min_length=1)
+
+
+class BulkDeleteResult(BaseModel):
+    deleted: int

@@ -270,8 +270,8 @@ def update_quotation(db: Session, org_id: str, quotation_id: str, user: User, pa
     return quotation
 
 
-def delete_quotation(db: Session, org_id: str, quotation_id: str, user: User) -> None:
-    quotation = get_quotation(db, org_id, quotation_id, user)
+def _validate_quotation_for_deletion(quotation: Quotation) -> None:
+    """Shared by single and bulk delete, so bulk can never be looser than single."""
     if quotation.status == "converted":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -282,8 +282,28 @@ def delete_quotation(db: Session, org_id: str, quotation_id: str, user: User) ->
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This quotation has been accepted and cannot be deleted",
         )
+
+
+def delete_quotation(
+    db: Session, org_id: str, quotation_id: str, user: User, *, commit: bool = True
+) -> None:
+    quotation = get_quotation(db, org_id, quotation_id, user)
+    _validate_quotation_for_deletion(quotation)
     db.delete(quotation)
+    if commit:
+        db.commit()
+
+
+def bulk_delete_quotations(db: Session, org_id: str, ids: list[str], user: User) -> int:
+    """Delete multiple quotations atomically: every id is resolved and guard-checked
+    (exactly as delete_quotation does one at a time) before anything is deleted."""
+    quotations = [get_quotation(db, org_id, qid, user) for qid in ids]
+    for quotation in quotations:
+        _validate_quotation_for_deletion(quotation)
+    for quotation in quotations:
+        db.delete(quotation)
     db.commit()
+    return len(quotations)
 
 
 def convert_to_order(

@@ -7,6 +7,8 @@ from app.models import Customer, Lead, Quotation, User
 from app.core.pdf_docs import quotation_pdf
 from app.services import quotation_service
 from app.schemas.quotation import (
+    BulkDelete,
+    BulkDeleteResult,
     ConversionOut,
     ConvertToOrder,
     QuotationCreate,
@@ -139,3 +141,18 @@ def delete_quotation(
     db: Session = Depends(get_db),
 ) -> None:
     quotation_service.delete_quotation(db, _org_id(user), id, user)
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_quotations(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple quotations atomically. A quotation already
+    `accepted` or `converted` blocks the whole request, exactly as it would for
+    a single delete."""
+    unique_ids = list(dict.fromkeys(payload.ids))
+    deleted = quotation_service.bulk_delete_quotations(db, _org_id(user), unique_ids, user)
+    return BulkDeleteResult(deleted=deleted)
