@@ -662,8 +662,99 @@ def run_tests():
         assert_eq(legacy_branding["signature_file_id"], None, "Legacy signature_file_id is null")
         assert_eq(legacy_branding["stamp_file_id"], None, "Legacy stamp_file_id is null")
         assert_eq(legacy_branding["payment_qr_file_id"], None, "Legacy payment_qr_file_id is null")
+        assert_eq(res_legacy_get.json().get("template_variant"), None, "Legacy template_variant is null when missing")
         res_legacy_pdf = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
         assert_eq(res_legacy_pdf.status_code, 200, "Legacy settings generate valid PDF without KeyError")
+
+        # ------------------------------------------------------------------
+        # 13: TEMPLATE VARIANT PERSISTENCE (TESTS 1 - 6)
+        # ------------------------------------------------------------------
+        print("\n--- 13: TEMPLATE VARIANT PERSISTENCE ---")
+
+        # TEST 1: GET /invoice-settings on existing settings returns template_variant = null when key does not exist
+        org1.invoice_template_settings = {"template": "classic"}
+        db.commit()
+        res_t1 = client.get("/invoice-settings", headers=auth1)
+        assert_eq(res_t1.status_code, 200, "TEST 1: GET /invoice-settings succeeds")
+        assert_eq(res_t1.json()["template_variant"], None, "TEST 1: template_variant is null when key does not exist")
+
+        # TEST 2: PATCH {"template_variant": "gst_theme_1"}
+        res_t2 = client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"template_variant": "gst_theme_1"},
+        )
+        assert_eq(res_t2.status_code, 200, "TEST 2: PATCH template_variant='gst_theme_1' succeeds")
+        assert_eq(res_t2.json()["template_variant"], "gst_theme_1", "TEST 2: PATCH response contains 'gst_theme_1'")
+        res_t2_get = client.get("/invoice-settings", headers=auth1)
+        assert_eq(res_t2_get.json()["template_variant"], "gst_theme_1", "TEST 2: subsequent GET returns 'gst_theme_1'")
+
+        # TEST 3: PATCH another variant ("french_elite") replaces previous value
+        res_t3 = client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"template_variant": "french_elite"},
+        )
+        assert_eq(res_t3.status_code, 200, "TEST 3: PATCH template_variant='french_elite' succeeds")
+        assert_eq(res_t3.json()["template_variant"], "french_elite", "TEST 3: previous value is replaced")
+        res_t3_get = client.get("/invoice-settings", headers=auth1)
+        assert_eq(res_t3_get.json()["template_variant"], "french_elite", "TEST 3: subsequent GET returns 'french_elite'")
+
+        # TEST 4: PATCH {"template_variant": null} clears the variant
+        res_t4 = client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"template_variant": None},
+        )
+        assert_eq(res_t4.status_code, 200, "TEST 4: PATCH template_variant=null succeeds")
+        assert_eq(res_t4.json()["template_variant"], None, "TEST 4: PATCH response returns null")
+        res_t4_get = client.get("/invoice-settings", headers=auth1)
+        assert_eq(res_t4_get.json()["template_variant"], None, "TEST 4: subsequent GET returns null")
+
+        # TEST 5: Partial update safety
+        # First set both branding and template_variant
+        res_t5_init = client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={
+                "branding": {"primary_color": "#123456"},
+                "template_variant": "double_divine",
+            },
+        )
+        assert_eq(res_t5_init.status_code, 200, "TEST 5: Init branding and template_variant")
+        assert_eq(res_t5_init.json()["branding"]["primary_color"], "#123456", "TEST 5: Branding color set")
+        assert_eq(res_t5_init.json()["template_variant"], "double_divine", "TEST 5: template_variant set")
+
+        # Update only template_variant -> branding remains unchanged
+        res_t5_var_only = client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"template_variant": "tally_classic"},
+        )
+        assert_eq(res_t5_var_only.status_code, 200, "TEST 5: Update only template_variant succeeds")
+        assert_eq(res_t5_var_only.json()["template_variant"], "tally_classic", "TEST 5: template_variant updated to 'tally_classic'")
+        assert_eq(res_t5_var_only.json()["branding"]["primary_color"], "#123456", "TEST 5: branding color preserved")
+
+        # Update only branding -> template_variant remains unchanged
+        res_t5_brand_only = client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"branding": {"primary_color": "#654321"}},
+        )
+        assert_eq(res_t5_brand_only.status_code, 200, "TEST 5: Update only branding succeeds")
+        assert_eq(res_t5_brand_only.json()["branding"]["primary_color"], "#654321", "TEST 5: branding color updated")
+        assert_eq(res_t5_brand_only.json()["template_variant"], "tally_classic", "TEST 5: template_variant preserved")
+
+        # TEST 6: Persistence across fresh DB session / reload
+        db.expire_all()
+        reloaded_org = db.query(Organization).filter(Organization.id == org1.id).first()
+        assert_eq(
+            reloaded_org.invoice_template_settings.get("template_variant"),
+            "tally_classic",
+            "TEST 6: Persisted directly in database JSON column"
+        )
+        res_t6_get = client.get("/invoice-settings", headers=auth1)
+        assert_eq(res_t6_get.json()["template_variant"], "tally_classic", "TEST 6: Fresh GET returns persisted variant")
 
     finally:
         db.close()

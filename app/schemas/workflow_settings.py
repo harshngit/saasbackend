@@ -408,6 +408,11 @@ class InvoiceSettings(BaseModel):
     """The firm's invoice look. One record, applied across invoice generation."""
 
     template: InvoiceTemplate = "classic"
+    template_variant: str | None = Field(
+        default=None,
+        max_length=50,
+        description="Exact invoice theme variant/preset ID",
+    )
     paper_size: PaperSize = "A4"
     branding: InvoiceBranding = Field(default_factory=InvoiceBranding)
     fields: InvoiceFields = Field(default_factory=InvoiceFields)
@@ -430,6 +435,11 @@ class InvoiceSettingsUpdate(BaseModel):
     toggle without resending the rest."""
 
     template: InvoiceTemplate | None = None
+    template_variant: str | None = Field(
+        default=None,
+        max_length=50,
+        description="Exact invoice theme variant/preset ID",
+    )
     paper_size: PaperSize | None = None
     branding: InvoiceBrandingUpdate | None = None
     fields: InvoiceFieldsUpdate | None = None
