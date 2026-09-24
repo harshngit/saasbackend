@@ -106,6 +106,12 @@ class InvoiceBranding(BaseModel):
     signature_file_id: str | None = Field(
         default=None,
         description="file_id from POST /files/upload — printed above the signatory line")
+    stamp_file_id: str | None = Field(
+        default=None,
+        description="file_id from POST /files/upload — printed alongside signatory line")
+    payment_qr_file_id: str | None = Field(
+        default=None,
+        description="file_id from POST /files/upload — invoice payment QR code")
     primary_color: str | None = Field(
         default=None, max_length=9, description="Hex, e.g. #166534")
 
@@ -115,6 +121,8 @@ class InvoiceBrandingUpdate(BaseModel):
 
     logo_file_id: str | None = None
     signature_file_id: str | None = None
+    stamp_file_id: str | None = None
+    payment_qr_file_id: str | None = None
     primary_color: str | None = Field(default=None, max_length=9)
 
 

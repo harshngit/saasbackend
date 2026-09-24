@@ -501,6 +501,170 @@ def run_tests():
         res_org2_lh = client.get(f"/invoices/{inv2.id}/pdf", headers=auth2, params={"format": "detailed"})
         assert_eq(res_org2_lh.status_code, 200, "Org 2 with Org 1 letterhead URL generates safely (cross-tenant blocked)")
 
+        print("\n--- 12. INVOICE-LEVEL STAMP & PAYMENT QR OVERRIDES & FALLBACK SCENARIOS ---")
+        # Ensure org1 has all 4 company assets set
+        org1.logo_url = f"http://testserver/files/{stored_logo.id}"
+        org1.signature_url = f"http://testserver/files/{stored_sig.id}"
+        org1.stamp_url = f"http://testserver/files/{stored_stamp.id}"
+        org1.payment_qr_url = f"http://testserver/files/{stored_qr.id}"
+        org1.letterhead_url = None
+        db.commit()
+
+        # Reset all invoice branding overrides to None
+        client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"branding": {
+                "logo_file_id": None,
+                "signature_file_id": None,
+                "stamp_file_id": None,
+                "payment_qr_file_id": None,
+            }},
+        )
+
+        # 12.A: NO INVOICE OVERRIDES (All 4 use Company Settings)
+        inv_settings_res = client.get("/invoice-settings", headers=auth1)
+        assert_eq(inv_settings_res.status_code, 200, "GET /invoice-settings returns 200")
+        b_data = inv_settings_res.json()["branding"]
+        assert_eq(b_data["stamp_file_id"], None, "Default stamp_file_id is null")
+        assert_eq(b_data["payment_qr_file_id"], None, "Default payment_qr_file_id is null")
+        res_all_company = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_all_company.status_code, 200, "PDF with all 4 Company Settings assets returns 200")
+        assert_eq(res_all_company.content[:5], b"%PDF-", "Valid PDF generated with company defaults")
+
+        # 12.B: LOGO OVERRIDE ONLY
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"logo_file_id": stored_override_logo.id}})
+        res_logo_only = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_logo_only.status_code, 200, "PDF with logo override returns 200")
+        assert_eq(res_logo_only.content != res_all_company.content, True, "Logo override alters PDF while company sig/stamp/QR persist")
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"logo_file_id": None}})
+
+        # 12.C: SIGNATURE OVERRIDE ONLY
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"signature_file_id": stored_override_sig.id}})
+        res_sig_only = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_sig_only.status_code, 200, "PDF with signature override returns 200")
+        assert_eq(res_sig_only.content != res_all_company.content, True, "Signature override alters PDF while company logo/stamp/QR persist")
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"signature_file_id": None}})
+
+        # 12.D: STAMP OVERRIDE (Invoice-specific stamp)
+        override_stamp_bytes = _create_test_image((200, 50, 50), (100, 100))
+        stored_override_stamp = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="override_stamp.png",
+            content_type="image/png",
+            size=len(override_stamp_bytes),
+            data=override_stamp_bytes,
+        )
+        db.add(stored_override_stamp)
+        db.commit()
+
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"stamp_file_id": stored_override_stamp.id}})
+        res_stamp_only = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_stamp_only.status_code, 200, "PDF with stamp override returns 200")
+        assert_eq(res_stamp_only.content != res_all_company.content, True, "Stamp override alters PDF while company logo/sig/QR persist")
+
+        # 12.E: PAYMENT QR OVERRIDE (Invoice-specific QR)
+        override_qr_bytes = _create_test_image((0, 200, 200), (110, 110))
+        stored_override_qr = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="override_qr.png",
+            content_type="image/png",
+            size=len(override_qr_bytes),
+            data=override_qr_bytes,
+        )
+        db.add(stored_override_qr)
+        db.commit()
+
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"stamp_file_id": None, "payment_qr_file_id": stored_override_qr.id}})
+        res_qr_only = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_qr_only.status_code, 200, "PDF with payment QR override returns 200")
+        assert_eq(res_qr_only.content != res_all_company.content, True, "Payment QR override alters PDF while company logo/sig/stamp persist")
+
+        # 12.F: ALL FOUR OVERRIDES SIMULTANEOUSLY
+        client.patch(
+            "/invoice-settings",
+            headers=auth1,
+            json={"branding": {
+                "logo_file_id": stored_override_logo.id,
+                "signature_file_id": stored_override_sig.id,
+                "stamp_file_id": stored_override_stamp.id,
+                "payment_qr_file_id": stored_override_qr.id,
+            }},
+        )
+        res_all_override = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_all_override.status_code, 200, "PDF with all 4 overrides returns 200")
+        assert_eq(res_all_override.content[:5], b"%PDF-", "Valid PDF generated with all 4 overrides")
+        # Simple format with all 4 overrides
+        res_simple_all_override = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "simple"})
+        assert_eq(res_simple_all_override.status_code, 200, "Simple PDF with all 4 overrides returns 200")
+
+        # 12.G: CLEAR STAMP OVERRIDE (PATCH stamp_file_id: null)
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"stamp_file_id": None}})
+        get_after_clear_stamp = client.get("/invoice-settings", headers=auth1)
+        assert_eq(get_after_clear_stamp.json()["branding"]["stamp_file_id"], None, "stamp_file_id cleared to null")
+        assert_eq(get_after_clear_stamp.json()["branding"]["logo_file_id"], stored_override_logo.id, "logo_file_id preserved after stamp clear")
+        assert_eq(get_after_clear_stamp.json()["branding"]["signature_file_id"], stored_override_sig.id, "signature_file_id preserved after stamp clear")
+        assert_eq(get_after_clear_stamp.json()["branding"]["payment_qr_file_id"], stored_override_qr.id, "payment_qr_file_id preserved after stamp clear")
+
+        # 12.H: CLEAR PAYMENT QR OVERRIDE (PATCH payment_qr_file_id: null)
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"payment_qr_file_id": None}})
+        get_after_clear_qr = client.get("/invoice-settings", headers=auth1)
+        assert_eq(get_after_clear_qr.json()["branding"]["payment_qr_file_id"], None, "payment_qr_file_id cleared to null")
+
+        # Clear remaining overrides
+        client.patch("/invoice-settings", headers=auth1, json={"branding": {"logo_file_id": None, "signature_file_id": None}})
+        res_cleared_all = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(len(res_cleared_all.content), len(res_all_company.content), "After clearing all overrides, PDF matches company baseline size exactly")
+
+        # 12.I: REPLACE COMPANY ASSET
+        new_company_stamp_bytes = _create_test_image((70, 70, 200), (95, 95))
+        stored_new_stamp = StoredFile(
+            id=str(uuid.uuid4()),
+            organization_id=org1.id,
+            filename="new_company_stamp.png",
+            content_type="image/png",
+            size=len(new_company_stamp_bytes),
+            data=new_company_stamp_bytes,
+        )
+        db.add(stored_new_stamp)
+        db.flush()
+        org1.stamp_url = f"http://testserver/files/{stored_new_stamp.id}"
+        db.commit()
+
+        res_replaced_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_replaced_stamp.status_code, 200, "PDF with replaced company stamp returns 200")
+        assert_eq(res_replaced_stamp.content != res_all_company.content, True, "Invoice without override reflects new company stamp automatically")
+
+        # 12.J: CROSS-TENANT FILE ISOLATION FOR STAMP AND PAYMENT QR
+        patch_cross_stamp_qr = client.patch(
+            "/invoice-settings",
+            headers=auth2,
+            json={"branding": {
+                "stamp_file_id": stored_override_stamp.id,
+                "payment_qr_file_id": stored_override_qr.id,
+            }},
+        )
+        assert_eq(patch_cross_stamp_qr.status_code, 200, "Org 2 patches cross-org stamp and QR file IDs")
+        res_org2_cross_stamp_qr = client.get(f"/invoices/{inv2.id}/pdf", headers=auth2, params={"format": "detailed"})
+        assert_eq(res_org2_cross_stamp_qr.status_code, 200, "Org 2 PDF generates cleanly without error")
+        # Ensure Org 2 did not embed Org 1's stamp or QR
+        assert_eq(res_org2_cross_stamp_qr.content != res_all_override.content, True, "Org 2 blocked Org 1's stamp and QR override files")
+
+        # 12.K: BACKWARD COMPATIBILITY WITH EMPTY / LEGACY SETTINGS
+        org1.invoice_template_settings = {"template": "classic"}
+        db.commit()
+        res_legacy_get = client.get("/invoice-settings", headers=auth1)
+        assert_eq(res_legacy_get.status_code, 200, "Legacy invoice settings GET returns 200")
+        legacy_branding = res_legacy_get.json()["branding"]
+        assert_eq(legacy_branding["logo_file_id"], None, "Legacy logo_file_id is null")
+        assert_eq(legacy_branding["signature_file_id"], None, "Legacy signature_file_id is null")
+        assert_eq(legacy_branding["stamp_file_id"], None, "Legacy stamp_file_id is null")
+        assert_eq(legacy_branding["payment_qr_file_id"], None, "Legacy payment_qr_file_id is null")
+        res_legacy_pdf = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
+        assert_eq(res_legacy_pdf.status_code, 200, "Legacy settings generate valid PDF without KeyError")
+
     finally:
         db.close()
 

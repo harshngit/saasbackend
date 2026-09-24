@@ -673,10 +673,19 @@ def _resolve_signature_file(db: Session, org_id: str, org, settings: dict) -> by
 
 
 def _resolve_qr_file(db: Session, org_id: str, org, settings: dict) -> bytes | None:
-    """Resolve the payment QR code image bytes if show_upi_qr is enabled."""
+    """Resolve the payment QR code image bytes if show_upi_qr is enabled:
+    explicit invoice template setting first, then org payment QR."""
     fields = settings.get("fields") or {}
-    if not fields.get("show_upi_qr", True):
+    payment_cfg = settings.get("payment_details") or {}
+    if not fields.get("show_upi_qr", True) or not payment_cfg.get("show_upi_qr", True):
         return None
+    # 1. Template override
+    ref = (settings.get("branding") or {}).get("payment_qr_file_id")
+    if ref:
+        data = _resolve_file_reference(db, org_id, ref)
+        if data is not None:
+            return data
+    # 2. Company Settings fallback
     if org is not None:
         for candidate in (
             getattr(org, "payment_qr_url", None),
@@ -689,8 +698,16 @@ def _resolve_qr_file(db: Session, org_id: str, org, settings: dict) -> bytes | N
     return None
 
 
-def _resolve_stamp_file(db: Session, org_id: str, org) -> bytes | None:
-    """Resolve the company stamp/seal bytes directly from Organization.stamp_url."""
+def _resolve_stamp_file(db: Session, org_id: str, org, settings: dict | None = None) -> bytes | None:
+    """Resolve the company stamp/seal bytes: explicit invoice template setting first, then org stamp."""
+    # 1. Template override
+    if settings:
+        ref = (settings.get("branding") or {}).get("stamp_file_id")
+        if ref:
+            data = _resolve_file_reference(db, org_id, ref)
+            if data is not None:
+                return data
+    # 2. Company Settings fallback
     if org is not None:
         candidate = getattr(org, "stamp_url", None)
         if candidate:
@@ -756,7 +773,7 @@ def download_invoice_pdf(
         logo=_resolve_logo_file(db, org_id, user.organization, settings),
         signature=_resolve_signature_file(db, org_id, user.organization, settings),
         qr=_resolve_qr_file(db, org_id, user.organization, settings),
-        stamp=_resolve_stamp_file(db, org_id, user.organization),
+        stamp=_resolve_stamp_file(db, org_id, user.organization, settings),
         letterhead=_resolve_letterhead_file(db, org_id, user.organization),
         item_images=item_images,
     )
