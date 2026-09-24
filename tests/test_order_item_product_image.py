@@ -368,5 +368,162 @@ def test_tenant_isolation_product_image():
         db.close()
 
 
+def test_order_customer_image_in_list_and_detail():
+    """GET /orders and GET /orders/{id} must expose the customer's image via
+    the same canonical field the Customer list/detail endpoints already use
+    (Customer.profile_image_id) — no second image field, no extra query
+    (SalesOrder.customer is lazy="joined")."""
+    headers, org_id = _register_org("Order Customer Image Org")
+
+    db = SessionLocal()
+    try:
+        customer = Customer(
+            organization_id=org_id,
+            name=f"Customer {uuid.uuid4().hex[:6]}",
+            phone=f"+91{uuid.uuid4().int % 10000000000:010d}",
+            profile_image_id="/files/customer-avatar-123.png",
+        )
+        customer_no_image = Customer(
+            organization_id=org_id,
+            name=f"Customer {uuid.uuid4().hex[:6]}",
+            phone=f"+91{uuid.uuid4().int % 10000000000:010d}",
+            profile_image_id=None,
+        )
+        db.add_all([customer, customer_no_image])
+        db.commit()
+        db.refresh(customer)
+        db.refresh(customer_no_image)
+
+        order = SalesOrder(
+            organization_id=org_id,
+            order_number=f"SO-CUST-IMG-{uuid.uuid4().hex[:6]}",
+            customer_id=customer.id,
+            status="confirmed",
+            fulfilment_status="not_started",
+            total=100.0,
+            subtotal=100.0,
+            source="direct",
+        )
+        order_no_image = SalesOrder(
+            organization_id=org_id,
+            order_number=f"SO-CUST-IMG-{uuid.uuid4().hex[:6]}",
+            customer_id=customer_no_image.id,
+            status="confirmed",
+            fulfilment_status="not_started",
+            total=50.0,
+            subtotal=50.0,
+            source="direct",
+        )
+        db.add_all([order, order_no_image])
+        db.commit()
+        db.refresh(order)
+        db.refresh(order_no_image)
+        order_id, order_no_image_id = order.id, order_no_image.id
+    finally:
+        db.close()
+
+    IMAGE_URL = "/files/customer-avatar-123.png"
+
+    # Order Detail: customer with an image — both fields present, both usable
+    # as a URL (profile_image_id already held the real URL; profile_image_url
+    # is the same value under an unambiguous name for the frontend).
+    r_detail = client.get(f"/orders/{order_id}", headers=headers)
+    assert r_detail.status_code == 200, r_detail.text
+    detail = r_detail.json()
+    assert detail["customer"]["id"] == customer.id
+    assert detail["customer"]["profile_image_id"] == IMAGE_URL
+    assert detail["customer"]["profile_image_url"] == IMAGE_URL
+
+    # Order Detail: customer with no image -> both fields null, not a broken URL
+    r_detail_no_image = client.get(f"/orders/{order_no_image_id}", headers=headers)
+    assert r_detail_no_image.status_code == 200, r_detail_no_image.text
+    no_image_customer = r_detail_no_image.json()["customer"]
+    assert no_image_customer["profile_image_id"] is None
+    assert no_image_customer["profile_image_url"] is None
+
+    # Order List: same fields, same source, for every row
+    r_list = client.get("/orders", headers=headers)
+    assert r_list.status_code == 200, r_list.text
+    by_id = {row["id"]: row for row in r_list.json()}
+    assert by_id[order_id]["customer"]["profile_image_url"] == IMAGE_URL
+    assert by_id[order_no_image_id]["customer"]["profile_image_url"] is None
+
+    # Consistency: Order's profile_image_url resolves from the exact same
+    # canonical value Customer List/Detail already expose as profile_image_id
+    # (Customer's own schemas are unchanged by this task — only Order gained
+    # the extra, unambiguously-named alias).
+    r_customer_list = client.get("/customers", headers=headers)
+    assert r_customer_list.status_code == 200, r_customer_list.text
+    customer_row = next(c for c in r_customer_list.json() if c["id"] == customer.id)
+    assert customer_row["profile_image_id"] == detail["customer"]["profile_image_url"]
+
+    r_customer_detail = client.get(f"/customers/{customer.id}", headers=headers)
+    assert r_customer_detail.status_code == 200, r_customer_detail.text
+    assert (
+        r_customer_detail.json()["basic_information"]["profile_image_id"]
+        == detail["customer"]["profile_image_url"]
+    )
+
+
+def test_order_customer_image_tenant_isolation():
+    """Org A's order response must only ever carry Org A's own customer image
+    value — never leak or coincide with another organization's."""
+    headers_a, org_a = _register_org("Order Image Tenant A")
+    headers_b, org_b = _register_org("Order Image Tenant B")
+
+    db = SessionLocal()
+    try:
+        cust_a = Customer(
+            organization_id=org_a, name="Org A Customer", phone="+911111111111",
+            profile_image_id="/files/org-a-customer.png",
+        )
+        cust_b = Customer(
+            organization_id=org_b, name="Org B Customer", phone="+912222222222",
+            profile_image_id="/files/org-b-customer.png",
+        )
+        db.add_all([cust_a, cust_b])
+        db.commit()
+        db.refresh(cust_a)
+        db.refresh(cust_b)
+
+        order_a = SalesOrder(
+            organization_id=org_a, order_number=f"SO-TEN-A-{uuid.uuid4().hex[:6]}",
+            customer_id=cust_a.id, status="confirmed", fulfilment_status="not_started",
+            total=10.0, subtotal=10.0, source="direct",
+        )
+        order_b = SalesOrder(
+            organization_id=org_b, order_number=f"SO-TEN-B-{uuid.uuid4().hex[:6]}",
+            customer_id=cust_b.id, status="confirmed", fulfilment_status="not_started",
+            total=10.0, subtotal=10.0, source="direct",
+        )
+        db.add_all([order_a, order_b])
+        db.commit()
+        db.refresh(order_a)
+        db.refresh(order_b)
+        order_a_id, order_b_id = order_a.id, order_b.id
+    finally:
+        db.close()
+
+    # Org A cannot even reach Org B's order (existing tenant scoping, unaffected).
+    r_cross = client.get(f"/orders/{order_b_id}", headers=headers_a)
+    assert r_cross.status_code == 404
+
+    # Org A's own order carries only Org A's own customer image.
+    r_a = client.get(f"/orders/{order_a_id}", headers=headers_a)
+    assert r_a.status_code == 200
+    assert r_a.json()["customer"]["profile_image_url"] == "/files/org-a-customer.png"
+
+    # Org A's list never contains Org B's image value anywhere.
+    r_list_a = client.get("/orders", headers=headers_a)
+    assert r_list_a.status_code == 200
+    urls_seen = {row["customer"]["profile_image_url"] for row in r_list_a.json() if row.get("customer")}
+    assert "/files/org-b-customer.png" not in urls_seen
+
+    # Org B sees its own image correctly too.
+    r_b = client.get(f"/orders/{order_b_id}", headers=headers_b)
+    assert r_b.status_code == 200
+    assert r_b.json()["customer"]["profile_image_url"] == "/files/org-b-customer.png"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -422,6 +422,48 @@ def void_customer_payment(
     return customer
 
 
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_customers(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple customers atomically.
+
+    Every requested id must resolve to a customer in the caller's organization
+    (and, for a data-scoped role, one they own) or the whole request fails —
+    no customer is deleted unless all of them can be. Each customer's own
+    data (payments, documents, follow-ups, visits) is deleted with it, exactly
+    as in the single-delete endpoint above; records that only reference the
+    customer are preserved (`customer_id` set to NULL) by the same database
+    rules. One transaction, one commit — never a partially deleted batch.
+
+    Registered *before* DELETE /{customer_id} below: both are now the same
+    HTTP method on the same router, and FastAPI/Starlette matches routes in
+    registration order, so this literal path must be tried before the
+    single-id path — otherwise "bulk-delete" would be consumed as a
+    customer_id by the route below and this one would never be reached.
+    """
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    customers = [_owned_customer(db, cid, user) for cid in unique_ids]
+
+    for customer in customers:
+        db.delete(customer)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not delete one or more of these customers — a record that does not "
+                   "allow deletion still references one of them. Nothing was deleted.",
+        )
+    return BulkDeleteResult(deleted=len(customers))
+
+
 @router.delete("/{customer_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_customer(
     customer_id: str,
@@ -452,42 +494,6 @@ def delete_customer(
             detail="Could not delete this customer — it is still referenced by a record that "
                    "does not allow deletion. Nothing was changed.",
         )
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
-def bulk_delete_customers(
-    payload: BulkDelete,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> BulkDeleteResult:
-    """Permanently delete multiple customers atomically.
-
-    Every requested id must resolve to a customer in the caller's organization
-    (and, for a data-scoped role, one they own) or the whole request fails —
-    no customer is deleted unless all of them can be. Each customer's own
-    data (payments, documents, follow-ups, visits) is deleted with it, exactly
-    as in the single-delete endpoint above; records that only reference the
-    customer are preserved (`customer_id` set to NULL) by the same database
-    rules. One transaction, one commit — never a partially deleted batch.
-    """
-    unique_ids = list(dict.fromkeys(payload.ids))
-
-    customers = [_owned_customer(db, cid, user) for cid in unique_ids]
-
-    for customer in customers:
-        db.delete(customer)
-
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Could not delete one or more of these customers — a record that does not "
-                   "allow deletion still references one of them. Nothing was deleted.",
-        )
-    return BulkDeleteResult(deleted=len(customers))
 
 
 # ------------------------------ Customer documents ------------------------------

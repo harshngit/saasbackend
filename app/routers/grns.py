@@ -217,6 +217,33 @@ def _validate_grn_for_deletion(grn: GoodsReceiptNote) -> None:
         )
 
 
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_grns(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple GRNs atomically. A confirmed or already-cancelled
+    GRN blocks the whole request, exactly as it would for a single delete.
+
+    Registered *before* DELETE /{id} below: both are now the same HTTP method,
+    and route matching follows registration order, so this literal path must
+    be tried first or it would never be reached.
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    grns = [_owned(db, gid, org_id) for gid in unique_ids]
+    for grn in grns:
+        _validate_grn_for_deletion(grn)
+
+    for grn in grns:
+        db.delete(grn)
+    db.commit()
+    return BulkDeleteResult(deleted=len(grns))
+
+
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_grn(
     id: str,
@@ -229,25 +256,3 @@ def delete_grn(
     _validate_grn_for_deletion(grn)
     db.delete(grn)
     db.commit()
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
-def bulk_delete_grns(
-    payload: BulkDelete,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> BulkDeleteResult:
-    """Permanently delete multiple GRNs atomically. A confirmed or already-cancelled
-    GRN blocks the whole request, exactly as it would for a single delete."""
-    org_id = _org_id(user)
-    unique_ids = list(dict.fromkeys(payload.ids))
-
-    grns = [_owned(db, gid, org_id) for gid in unique_ids]
-    for grn in grns:
-        _validate_grn_for_deletion(grn)
-
-    for grn in grns:
-        db.delete(grn)
-    db.commit()
-    return BulkDeleteResult(deleted=len(grns))

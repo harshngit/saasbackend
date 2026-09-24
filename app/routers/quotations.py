@@ -133,17 +133,7 @@ def quotation_pdf_download(
     )
 
 
-@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_quotation(
-    id: str,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> None:
-    quotation_service.delete_quotation(db, _org_id(user), id, user)
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_quotations(
     payload: BulkDelete,
     user: User = Depends(_delete),
@@ -152,7 +142,22 @@ def bulk_delete_quotations(
 ) -> BulkDeleteResult:
     """Permanently delete multiple quotations atomically. A quotation already
     `accepted` or `converted` blocks the whole request, exactly as it would for
-    a single delete."""
+    a single delete.
+
+    Registered *before* DELETE /{id} below: both are now the same HTTP method,
+    and route matching follows registration order, so this literal path must
+    be tried first or it would never be reached.
+    """
     unique_ids = list(dict.fromkeys(payload.ids))
     deleted = quotation_service.bulk_delete_quotations(db, _org_id(user), unique_ids, user)
     return BulkDeleteResult(deleted=deleted)
+
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_quotation(
+    id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    quotation_service.delete_quotation(db, _org_id(user), id, user)

@@ -278,6 +278,34 @@ def _validate_supplier_invoice_for_deletion(inv: SupplierInvoice) -> None:
         )
 
 
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_supplier_invoices(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple supplier invoices atomically. A recorded or
+    cancelled invoice blocks the whole request, exactly as it would for a single
+    delete — both are preserved for the audit trail.
+
+    Registered *before* DELETE /{id} below: both are now the same HTTP method,
+    and route matching follows registration order, so this literal path must
+    be tried first or it would never be reached.
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    invoices = [_owned(db, iid, org_id) for iid in unique_ids]
+    for inv in invoices:
+        _validate_supplier_invoice_for_deletion(inv)
+
+    for inv in invoices:
+        db.delete(inv)
+    db.commit()
+    return BulkDeleteResult(deleted=len(invoices))
+
+
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_supplier_invoice(
     id: str,
@@ -290,29 +318,6 @@ def delete_supplier_invoice(
     _validate_supplier_invoice_for_deletion(inv)
     db.delete(inv)
     db.commit()
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
-def bulk_delete_supplier_invoices(
-    payload: BulkDelete,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> BulkDeleteResult:
-    """Permanently delete multiple supplier invoices atomically. A recorded or
-    cancelled invoice blocks the whole request, exactly as it would for a single
-    delete — both are preserved for the audit trail."""
-    org_id = _org_id(user)
-    unique_ids = list(dict.fromkeys(payload.ids))
-
-    invoices = [_owned(db, iid, org_id) for iid in unique_ids]
-    for inv in invoices:
-        _validate_supplier_invoice_for_deletion(inv)
-
-    for inv in invoices:
-        db.delete(inv)
-    db.commit()
-    return BulkDeleteResult(deleted=len(invoices))
 
 
 @router.get("/{id}/payments", response_model=list[dict])

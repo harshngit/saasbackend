@@ -161,11 +161,13 @@ def test_customer_bulk_delete_valid_and_dedup_and_empty():
         db.close()
 
     # empty list rejected before anything runs (shared BulkDelete schema, min_length=1)
-    r = client.post("/customers/bulk-delete", json={"ids": []}, headers=auth)
+    r = client.request(
+        "DELETE", "/customers/bulk-delete", json={"ids": []}, headers=auth)
     check("empty ids list -> 422", r.status_code == 422, r.text)
 
     # duplicate ids collapse to one deletion attempt each
-    r = client.post("/customers/bulk-delete", json={"ids": [id1, id1, id2, id2]}, headers=auth)
+    r = client.request(
+        "DELETE", "/customers/bulk-delete", json={"ids": [id1, id1, id2, id2]}, headers=auth)
     check("bulk delete 2 unique customers (4 ids incl. duplicates) -> 200", r.status_code == 200, r.text)
     check("deleted count reflects unique records, not the duplicate-inflated list", r.json().get("deleted") == 2, r.text)
 
@@ -234,7 +236,8 @@ def test_customer_bulk_delete_nonexistent_id_is_atomic():
     finally:
         db.close()
 
-    r = client.post("/customers/bulk-delete", json={"ids": [keep_id, "does-not-exist"]}, headers=auth)
+    r = client.request(
+        "DELETE", "/customers/bulk-delete", json={"ids": [keep_id, "does-not-exist"]}, headers=auth)
     check("one nonexistent id in the batch -> 404, whole request fails", r.status_code == 404, r.text)
 
     db = db_session()
@@ -259,7 +262,8 @@ def test_customer_bulk_delete_cross_tenant_is_atomic_and_invisible():
     finally:
         db.close()
 
-    r = client.post("/customers/bulk-delete", json={"ids": [mine_id, theirs_id]}, headers=auth_a)
+    r = client.request(
+        "DELETE", "/customers/bulk-delete", json={"ids": [mine_id, theirs_id]}, headers=auth_a)
     check("a foreign-org id in the batch -> 404 (not leaked as 403), whole request fails", r.status_code == 404, r.text)
 
     db = db_session()
@@ -270,7 +274,8 @@ def test_customer_bulk_delete_cross_tenant_is_atomic_and_invisible():
         db.close()
 
     # And confirm tenant B truly cannot reach it either way via their own call:
-    r2 = client.post("/customers/bulk-delete", json={"ids": [theirs_id]}, headers=auth_b)
+    r2 = client.request(
+        "DELETE", "/customers/bulk-delete", json={"ids": [theirs_id]}, headers=auth_b)
     check("tenant B deleting their own customer works normally", r2.status_code == 200, r2.text)
 
 
@@ -287,7 +292,8 @@ def test_customer_bulk_delete_requires_permission():
     finally:
         db.close()
 
-    r = client.post("/customers/bulk-delete", json={"ids": [cid]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/customers/bulk-delete", json={"ids": [cid]}, headers=no_perm)
     check("a user with no customers:delete permission -> 403", r.status_code == 403, r.text)
 
     db = db_session()
@@ -325,11 +331,13 @@ def test_supplier_bulk_delete_valid_and_protected_and_permission():
         db.close()
 
     # permission
-    r = client.post("/suppliers/bulk-delete", json={"ids": [clean_id]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/suppliers/bulk-delete", json={"ids": [clean_id]}, headers=no_perm)
     check("no suppliers:delete permission -> 403", r.status_code == 403, r.text)
 
     # a protected supplier in the batch blocks the whole batch, same guard as single delete
-    r = client.post("/suppliers/bulk-delete", json={"ids": [clean_id, protected_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/suppliers/bulk-delete", json={"ids": [clean_id, protected_id]}, headers=auth)
     check("a supplier with historical purchases in the batch -> 400, whole batch fails", r.status_code == 400, r.text)
     db = db_session()
     try:
@@ -338,7 +346,8 @@ def test_supplier_bulk_delete_valid_and_protected_and_permission():
         db.close()
 
     # valid, deletable batch
-    r = client.post("/suppliers/bulk-delete", json={"ids": [clean_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/suppliers/bulk-delete", json={"ids": [clean_id]}, headers=auth)
     check("a clean supplier deletes normally", r.status_code == 200 and r.json()["deleted"] == 1, r.text)
 
 
@@ -363,10 +372,12 @@ def test_quotation_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/quotations/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/quotations/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
     check("no quotations:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/quotations/bulk-delete", json={"ids": [draft_id, accepted_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/quotations/bulk-delete", json={"ids": [draft_id, accepted_id]}, headers=auth)
     check("an accepted quotation in the batch -> 400, whole batch fails", r.status_code == 400, r.text)
     db = db_session()
     try:
@@ -374,7 +385,8 @@ def test_quotation_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/quotations/bulk-delete", json={"ids": [draft_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/quotations/bulk-delete", json={"ids": [draft_id]}, headers=auth)
     check("a draft quotation deletes normally", r.status_code == 200 and r.json()["deleted"] == 1, r.text)
 
 
@@ -410,10 +422,12 @@ def test_lead_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/leads/bulk-delete", json={"ids": [new_id]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/leads/bulk-delete", json={"ids": [new_id]}, headers=no_perm)
     check("no leads:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/leads/bulk-delete", json={"ids": [new_id, won_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/leads/bulk-delete", json={"ids": [new_id, won_id]}, headers=auth)
     check("a converted lead in the batch -> 400, whole batch fails", r.status_code == 400, r.text)
     db = db_session()
     try:
@@ -421,7 +435,8 @@ def test_lead_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/leads/bulk-delete", json={"ids": [new_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/leads/bulk-delete", json={"ids": [new_id]}, headers=auth)
     check("a fresh lead deletes normally", r.status_code == 200 and r.json()["deleted"] == 1, r.text)
 
 
@@ -466,10 +481,12 @@ def test_grn_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/grns/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/grns/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
     check("no grn:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/grns/bulk-delete", json={"ids": [draft_id, confirmed_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/grns/bulk-delete", json={"ids": [draft_id, confirmed_id]}, headers=auth)
     check("a confirmed GRN in the batch -> 400, whole batch fails", r.status_code == 400, r.text)
     db = db_session()
     try:
@@ -477,7 +494,8 @@ def test_grn_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/grns/bulk-delete", json={"ids": [draft_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/grns/bulk-delete", json={"ids": [draft_id]}, headers=auth)
     check("a draft GRN deletes normally", r.status_code == 200 and r.json()["deleted"] == 1, r.text)
 
 
@@ -513,13 +531,16 @@ def test_purchase_bulk_delete_valid_and_protected():
         db.close()
 
     for path in ("/purchase-invoices/bulk-delete", "/purchases/bulk-delete"):
-        r = client.post(path, json={"ids": []}, headers=auth)
+        r = client.request(
+        "DELETE", path, json={"ids": []}, headers=auth)
         check(f"{path}: empty ids -> 422 (dual-mounted router shares the same schema)", r.status_code == 422, r.text)
 
-    r = client.post("/purchase-invoices/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/purchase-invoices/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
     check("no purchases:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/purchase-invoices/bulk-delete", json={"ids": [draft_id, confirmed_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/purchase-invoices/bulk-delete", json={"ids": [draft_id, confirmed_id]}, headers=auth)
     check("a confirmed purchase invoice in the batch -> 400, whole batch fails", r.status_code == 400, r.text)
     db = db_session()
     try:
@@ -527,7 +548,8 @@ def test_purchase_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/purchases/bulk-delete", json={"ids": [draft_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/purchases/bulk-delete", json={"ids": [draft_id]}, headers=auth)
     check("a draft purchase invoice deletes normally via the /purchases alias", r.status_code == 200 and r.json()["deleted"] == 1, r.text)
 
 
@@ -570,10 +592,12 @@ def test_supplier_invoice_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/supplier-invoices/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/supplier-invoices/bulk-delete", json={"ids": [draft_id]}, headers=no_perm)
     check("no supplier_invoices:delete permission -> 403 (permission catalog fix in effect)", r.status_code == 403, r.text)
 
-    r = client.post("/supplier-invoices/bulk-delete", json={"ids": [draft_id, recorded_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/supplier-invoices/bulk-delete", json={"ids": [draft_id, recorded_id]}, headers=auth)
     check("a recorded supplier invoice in the batch -> 400, whole batch fails", r.status_code == 400, r.text)
     db = db_session()
     try:
@@ -581,7 +605,8 @@ def test_supplier_invoice_bulk_delete_valid_and_protected():
     finally:
         db.close()
 
-    r = client.post("/supplier-invoices/bulk-delete", json={"ids": [draft_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/supplier-invoices/bulk-delete", json={"ids": [draft_id]}, headers=auth)
     check("a draft supplier invoice deletes normally", r.status_code == 200 and r.json()["deleted"] == 1, r.text)
 
 
@@ -609,10 +634,12 @@ def test_expense_bulk_delete_valid_and_cross_tenant():
     finally:
         db.close()
 
-    r = client.post("/expenses/bulk-delete", json={"ids": [id1]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/expenses/bulk-delete", json={"ids": [id1]}, headers=no_perm)
     check("no expenses:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/expenses/bulk-delete", json={"ids": [id1, foreign_id]}, headers=auth)
+    r = client.request(
+        "DELETE", "/expenses/bulk-delete", json={"ids": [id1, foreign_id]}, headers=auth)
     check("a foreign-org expense id in the batch -> 404, whole batch fails", r.status_code == 404, r.text)
     db = db_session()
     try:
@@ -621,7 +648,8 @@ def test_expense_bulk_delete_valid_and_cross_tenant():
     finally:
         db.close()
 
-    r = client.post("/expenses/bulk-delete", json={"ids": [id1, id1, id2]}, headers=auth)
+    r = client.request(
+        "DELETE", "/expenses/bulk-delete", json={"ids": [id1, id1, id2]}, headers=auth)
     check("valid multi-expense bulk delete with a duplicate id -> 200, deleted=2", r.status_code == 200 and r.json()["deleted"] == 2, r.text)
 
 
@@ -646,10 +674,12 @@ def test_visit_bulk_delete_valid_and_permission():
     finally:
         db.close()
 
-    r = client.post("/visits/bulk-delete", json={"ids": [id1]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/visits/bulk-delete", json={"ids": [id1]}, headers=no_perm)
     check("no visits:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/visits/bulk-delete", json={"ids": [id1, id2]}, headers=auth)
+    r = client.request(
+        "DELETE", "/visits/bulk-delete", json={"ids": [id1, id2]}, headers=auth)
     check("valid multi-visit bulk delete -> 200, deleted=2", r.status_code == 200 and r.json()["deleted"] == 2, r.text)
     db = db_session()
     try:
@@ -679,10 +709,12 @@ def test_follow_up_bulk_delete_valid_and_permission():
     finally:
         db.close()
 
-    r = client.post("/follow-ups/bulk-delete", json={"ids": [id1]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/follow-ups/bulk-delete", json={"ids": [id1]}, headers=no_perm)
     check("no follow_ups:delete permission -> 403", r.status_code == 403, r.text)
 
-    r = client.post("/follow-ups/bulk-delete", json={"ids": [id1, id2]}, headers=auth)
+    r = client.request(
+        "DELETE", "/follow-ups/bulk-delete", json={"ids": [id1, id2]}, headers=auth)
     check("valid multi-follow-up bulk delete -> 200, deleted=2", r.status_code == 200 and r.json()["deleted"] == 2, r.text)
     db = db_session()
     try:
@@ -712,7 +744,8 @@ def test_sales_order_delete_permission_unchanged():
 
     r = client.delete(f"/orders/{oid}", headers=no_perm)
     check("DELETE /orders/{id} still requires sales_orders:delete -> 403 for a user without it", r.status_code == 403, r.text)
-    r = client.post("/orders/bulk-delete", json={"ids": [oid]}, headers=no_perm)
+    r = client.request(
+        "DELETE", "/orders/bulk-delete", json={"ids": [oid]}, headers=no_perm)
     check("POST /orders/bulk-delete still requires sales_orders:delete -> 403 for a user without it", r.status_code == 403, r.text)
 
     db = db_session()

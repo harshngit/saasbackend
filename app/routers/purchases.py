@@ -626,20 +626,7 @@ def _validate_purchase_for_deletion(purchase: PurchaseInvoice) -> None:
         )
 
 
-@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_purchase(
-    id: str,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> None:
-    inv = _owned(db, id, _org_id(user))
-    _validate_purchase_for_deletion(inv)
-    db.delete(inv)
-    db.commit()
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_purchases(
     payload: BulkDelete,
     user: User = Depends(_delete),
@@ -648,7 +635,14 @@ def bulk_delete_purchases(
 ) -> BulkDeleteResult:
     """Permanently delete multiple purchase invoices atomically. An approved,
     confirmed, or closed invoice blocks the whole request, exactly as it would
-    for a single delete."""
+    for a single delete.
+
+    Registered *before* DELETE /{id} below: both are now the same HTTP method,
+    and route matching follows registration order, so this literal path must
+    be tried first or it would never be reached. (This router is mounted
+    twice — under /purchase-invoices and /purchases — so this ordering
+    applies identically on both paths.)
+    """
     org_id = _org_id(user)
     unique_ids = list(dict.fromkeys(payload.ids))
 
@@ -660,3 +654,16 @@ def bulk_delete_purchases(
         db.delete(purchase)
     db.commit()
     return BulkDeleteResult(deleted=len(purchases))
+
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_purchase(
+    id: str,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    inv = _owned(db, id, _org_id(user))
+    _validate_purchase_for_deletion(inv)
+    db.delete(inv)
+    db.commit()

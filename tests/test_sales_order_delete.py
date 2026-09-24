@@ -411,16 +411,18 @@ def run_tests():
     print("\n--- 5. BULK DELETE: VALIDATION & PERMISSIONS ---")
 
     # Empty IDs -> 422 Unprocessable Entity
-    res_bulk_empty = client.post("/orders/bulk-delete", json={"ids": []}, headers=env_a["admin_headers"])
+    res_bulk_empty = client.request(
+        "DELETE", "/orders/bulk-delete", json={"ids": []}, headers=env_a["admin_headers"])
     assert_eq(res_bulk_empty.status_code, 422, "Empty ids list rejected with 422 Unprocessable Entity")
 
     # Sales Officer without delete permission -> 403 Forbidden
-    res_bulk_sales = client.post("/orders/bulk-delete", json={"ids": ["dummy-id"]}, headers=env_a["sales_headers"])
+    res_bulk_sales = client.request(
+        "DELETE", "/orders/bulk-delete", json={"ids": ["dummy-id"]}, headers=env_a["sales_headers"])
     assert_eq(res_bulk_sales.status_code, 403, "Bulk delete with unauthorized role returns 403 Forbidden")
 
     # Nonexistent ID in batch -> 404 Not Found
-    res_bulk_404 = client.post(
-        "/orders/bulk-delete", json={"ids": [str(uuid.uuid4())]}, headers=env_a["admin_headers"]
+    res_bulk_404 = client.request(
+        "DELETE", "/orders/bulk-delete", json={"ids": [str(uuid.uuid4())]}, headers=env_a["admin_headers"]
     )
     assert_eq(res_bulk_404.status_code, 404, "Bulk delete with nonexistent ID returns 404 Not Found")
 
@@ -430,8 +432,8 @@ def run_tests():
     b_id3, _ = _create_order(env_a, status="cancelled")
 
     # Bulk delete 3 orders
-    res_bulk_ok = client.post(
-        "/orders/bulk-delete",
+    res_bulk_ok = client.request(
+        "DELETE", "/orders/bulk-delete",
         json={"ids": [b_id1, b_id2, b_id3]},
         headers=env_a["admin_headers"],
     )
@@ -450,8 +452,8 @@ def run_tests():
     d_id1, _ = _create_order(env_a, status="draft")
     d_id2, _ = _create_order(env_a, status="placed")
 
-    res_dup = client.post(
-        "/orders/bulk-delete",
+    res_dup = client.request(
+        "DELETE", "/orders/bulk-delete",
         json={"ids": [d_id1, d_id1, d_id2, d_id2, d_id1]},
         headers=env_a["admin_headers"],
     )
@@ -463,8 +465,8 @@ def run_tests():
     org_a_order, _ = _create_order(env_a, status="draft")
 
     # Org A tries to bulk delete a batch containing Org B's order
-    res_cross_bulk = client.post(
-        "/orders/bulk-delete",
+    res_cross_bulk = client.request(
+        "DELETE", "/orders/bulk-delete",
         json={"ids": [org_a_order, org_b_order]},
         headers=env_a["admin_headers"],
     )
@@ -503,8 +505,8 @@ def run_tests():
 
 
     # Attempt to bulk delete all 3
-    res_conflict_batch = client.post(
-        "/orders/bulk-delete",
+    res_conflict_batch = client.request(
+        "DELETE", "/orders/bulk-delete",
         json={"ids": [valid_id_1, conflict_id, valid_id_2]},
         headers=env_a["admin_headers"],
     )

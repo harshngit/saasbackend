@@ -369,6 +369,30 @@ def process_recurring(
     return expense_service.process_due_recurring_expenses(db, org_id)
 
 
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_expenses(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple expenses atomically. No status guard exists
+    today (same as single delete — this task preserves that, not invents one).
+
+    Registered *before* DELETE /{expense_id} below: both are now the same
+    HTTP method, and route matching follows registration order, so this
+    literal path must be tried first or it would never be reached.
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+
+    expenses = [_owned(db, eid, org_id, user) for eid in unique_ids]
+    for expense in expenses:
+        db.delete(expense)
+    db.commit()
+    return BulkDeleteResult(deleted=len(expenses))
+
+
 @router.delete("/{expense_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_expense(
     expense_id: str,
@@ -379,22 +403,3 @@ def delete_expense(
     expense = _owned(db, expense_id, _org_id(user), user)
     db.delete(expense)
     db.commit()
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
-def bulk_delete_expenses(
-    payload: BulkDelete,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> BulkDeleteResult:
-    """Permanently delete multiple expenses atomically. No status guard exists
-    today (same as single delete — this task preserves that, not invents one)."""
-    org_id = _org_id(user)
-    unique_ids = list(dict.fromkeys(payload.ids))
-
-    expenses = [_owned(db, eid, org_id, user) for eid in unique_ids]
-    for expense in expenses:
-        db.delete(expense)
-    db.commit()
-    return BulkDeleteResult(deleted=len(expenses))

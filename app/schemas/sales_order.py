@@ -68,6 +68,24 @@ class CustomerBrief(BaseModel):
     delivery_address: str | None = None
     billing_address: str | None = None
     gst_number: str | None = None
+    # Same field/source as CustomerOut.profile_image_id and
+    # CustomerProfileOut.profile_image_id — a URL from POST /files/upload, not a
+    # second image system. SalesOrder.customer is lazy="joined", so this comes
+    # from the same already-loaded row; no extra query.
+    profile_image_id: str | None = None
+    # Despite its name, Customer.profile_image_id already stores the ready-to-use
+    # URL from POST /files/upload (see app/core/files.py:public_url and
+    # app/schemas/customer_profile.py's own field doc) — there is no separate id
+    # to resolve. profile_image_url is that exact same value, exposed under a
+    # name the frontend doesn't have to guess about; profile_image_id above is
+    # kept unchanged for backward compatibility.
+    profile_image_url: str | None = None
+
+    @model_validator(mode="after")
+    def _alias_profile_image_url(self) -> "CustomerBrief":
+        if self.profile_image_url is None:
+            self.profile_image_url = self.profile_image_id
+        return self
 
 
 class SalespersonBrief(BaseModel):

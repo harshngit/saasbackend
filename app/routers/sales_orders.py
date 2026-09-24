@@ -281,7 +281,7 @@ def _validate_order_for_deletion(db: Session, order: SalesOrder) -> None:
         )
 
 
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_orders(
     payload: BulkDelete,
     user: User = Depends(_delete),

@@ -109,6 +109,25 @@ def convert_lead_to_customer(
     return lead_service.convert_lead_to_customer(db, org_id, user, lead, payload)
 
 
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_leads(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple leads atomically. A lead already converted to a
+    customer blocks the whole request, exactly as it would for a single delete.
+
+    Registered *before* DELETE /{id} below: both are now the same HTTP method,
+    and route matching follows registration order, so this literal path must
+    be tried first or it would never be reached.
+    """
+    unique_ids = list(dict.fromkeys(payload.ids))
+    deleted = lead_service.bulk_delete_leads(db, _org_id(user), unique_ids, user)
+    return BulkDeleteResult(deleted=deleted)
+
+
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_lead(
     id: str,
@@ -117,17 +136,3 @@ def delete_lead(
     db: Session = Depends(get_db),
 ) -> None:
     lead_service.delete_lead(db, _org_id(user), id, user)
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
-def bulk_delete_leads(
-    payload: BulkDelete,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> BulkDeleteResult:
-    """Permanently delete multiple leads atomically. A lead already converted to a
-    customer blocks the whole request, exactly as it would for a single delete."""
-    unique_ids = list(dict.fromkeys(payload.ids))
-    deleted = lead_service.bulk_delete_leads(db, _org_id(user), unique_ids, user)
-    return BulkDeleteResult(deleted=deleted)

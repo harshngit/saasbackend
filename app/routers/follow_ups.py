@@ -107,6 +107,25 @@ def complete_follow_up(
     return follow_up_service.complete_follow_up(db, org_id, id, user, payload=payload)
 
 
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_follow_ups(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple follow-ups atomically.
+
+    Registered *before* DELETE /{id} below: both are now the same HTTP method,
+    and route matching follows registration order, so this literal path must
+    be tried first or it would never be reached.
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    deleted = follow_up_service.bulk_delete_follow_ups(db, org_id, unique_ids, user)
+    return BulkDeleteResult(deleted=deleted)
+
+
 @router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_follow_up(
     id: str,
@@ -116,17 +135,3 @@ def delete_follow_up(
 ) -> None:
     org_id = _org_id(user)
     follow_up_service.delete_follow_up(db, org_id, id, user)
-
-
-@router.post("/bulk-delete", response_model=BulkDeleteResult)
-def bulk_delete_follow_ups(
-    payload: BulkDelete,
-    user: User = Depends(_delete),
-    _unlocked: User = Depends(require_unlocked_org),
-    db: Session = Depends(get_db),
-) -> BulkDeleteResult:
-    """Permanently delete multiple follow-ups atomically."""
-    org_id = _org_id(user)
-    unique_ids = list(dict.fromkeys(payload.ids))
-    deleted = follow_up_service.bulk_delete_follow_ups(db, org_id, unique_ids, user)
-    return BulkDeleteResult(deleted=deleted)
