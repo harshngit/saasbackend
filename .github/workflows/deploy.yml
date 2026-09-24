@@ -4,12 +4,7 @@ name: Deploy to production (EC2)
 #   fetch -> fast-forward -> (pip install if needed) -> alembic upgrade head
 #   -> restart crm-backend -> verify systemd + /health (status AND database ok)
 #
-# Manual only for now. To also deploy on every push to main, add this under `on:`
-# (nothing else in the workflow needs to change):
-#
-#   push:
-#     branches: [main]
-#     paths-ignore: ["**.md", "tests/**", ".github/workflows/keep-warm.yml"]
+# Runs automatically on every push to main (and manually from the Actions tab).
 #
 # Required secrets (Settings -> Environments -> production):
 #   EC2_HOST, EC2_USER, EC2_PORT, EC2_SSH_KEY, EC2_KNOWN_HOSTS
@@ -23,6 +18,9 @@ name: Deploy to production (EC2)
 
 on:
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "tests/**", ".github/workflows/keep-warm.yml"]
 
 permissions:
   contents: read
@@ -98,7 +96,7 @@ jobs:
           set -euo pipefail
 
           APP_DIR=/home/ubuntu/saasbackend
-          VENV="$APP_DIR/venv"
+          VENV="$APP_DIR/venv312"
           SERVICE=crm-backend
           HEALTH_URL=https://api.asynk.in/health
 
