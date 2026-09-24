@@ -22,11 +22,11 @@ def _org_header(pdf: FPDF, org, settings: dict | None = None) -> None:
     show_phone = biz.get("show_phone", True)
     show_email = biz.get("show_email", True)
 
-    _font(pdf, settings, "B", "heading", custom_size=16)
+    _font(pdf, settings, "B", "heading")
     if show_name:
         pdf.cell(0, 9, _s(org.name if org else "Company"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     
-    _font(pdf, settings, "", "body", custom_size=9)
+    _font(pdf, settings, "", "body")
     if org and show_gstin and org.gst_number:
         pdf.cell(0, 5, _s(f"GSTIN: {org.gst_number}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if org and show_pan:
@@ -497,6 +497,7 @@ def _font(
     style_weight: str = "",
     size_type: str = "body",
     custom_size: float | None = None,
+    offset: float = 0.0,
 ) -> None:
     """Centralized font setter that respects typography settings and font family."""
     settings = settings or {}
@@ -504,6 +505,11 @@ def _font(
     family = str(typography.get("font_family") or "Helvetica").strip().title()
     if family not in ("Helvetica", "Times", "Courier"):
         family = "Helvetica"
+
+    template = str(settings.get("template") or "classic").strip().lower()
+    thermal_cfg = settings.get("thermal_print") or {}
+    if template == "thermal" and thermal_cfg.get("bold_text") is False and style_weight == "B":
+        style_weight = ""
 
     if custom_size is not None:
         size = float(custom_size)
@@ -514,7 +520,7 @@ def _font(
     else:
         size = float(typography.get("body_size", 9))
 
-    pdf.set_font(family, style_weight, size)
+    pdf.set_font(family, style_weight, max(size + offset, 4.0))
 
 
 def _invoice_pdf_page(settings: dict) -> FPDF:
@@ -589,14 +595,15 @@ def _branded_title(pdf: FPDF, settings: dict, title: str) -> None:
     """
     style = _style(settings)
     rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
+    heading_size = float((settings.get("typography") or {}).get("heading_size", 16))
     
-    _font(pdf, settings, "B", "heading", custom_size=style["title_size"])
+    _font(pdf, settings, "B", "heading")
     if style["header_band"]:
         band = rgb or (33, 37, 41)
         pdf.set_fill_color(*band)
         pdf.set_text_color(255, 255, 255)
         pdf.cell(
-            0, style["title_size"] * 0.75, _s(f"  {title}"), fill=True,
+            0, heading_size * 0.75, _s(f"  {title}"), fill=True,
             new_x=XPos.LMARGIN, new_y=YPos.NEXT,
         )
     else:
@@ -611,7 +618,7 @@ def _two_column_rows(
 ) -> None:
     """Who it is for on the left, the invoice's own details on the right."""
     style = style or _TEMPLATE_STYLES["classic"]
-    _font(pdf, settings, "", "body", custom_size=style["body_size"])
+    _font(pdf, settings, "", "body")
     height = max(style["row_height"] - 1, 4)
     if column < 60:
         for left, right in rows:
@@ -825,12 +832,12 @@ def invoice_simple_pdf(
 
     shares = [0.52, 0.12, 0.16, 0.20]
     widths = [round(width * share, 2) for share in shares]
-    _font(pdf, settings, "B", "table", custom_size=style["table_size"])
+    _font(pdf, settings, "B", "table")
     for w, header, align in zip(widths, ["Item", "Qty", "Rate", "Amount"], "LRRR"):
         pdf.cell(w, 7, header, border=1, align=align)
     pdf.ln(7)
 
-    _font(pdf, settings, "", "table", custom_size=style["table_size"])
+    _font(pdf, settings, "", "table")
     for item in invoice.items:
         cells = [
             _s(item.product_name)[:44],
@@ -844,13 +851,13 @@ def invoice_simple_pdf(
 
     brand_rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
     pdf.ln(2)
-    _font(pdf, settings, "", "body", custom_size=style["body_size"])
+    _font(pdf, settings, "", "body")
     _amount_row(pdf, "Subtotal", invoice.subtotal, width, settings=settings)
     if invoice.discount:
         _amount_row(pdf, "Discount", -(invoice.discount or 0), width, settings=settings)
     if invoice.tax:
         _amount_row(pdf, "Tax", invoice.tax, width, settings=settings)
-    _font(pdf, settings, "B", "body", custom_size=style["body_size"] + 2)
+    _font(pdf, settings, "B", "body", offset=2)
     _amount_row(pdf, "Total", invoice.total, width, height=7, brand_rgb=brand_rgb, settings=settings)
 
     # The short copy never carries bank details; everything else is the firm's choice.
@@ -944,7 +951,7 @@ def invoice_detailed_pdf(
     rows = list(zip(left + pad if len(left) < len(right) else left,
                     right + pad if len(right) < len(left) else right))
 
-    _font(pdf, settings, "B", "body", custom_size=style["body_size"] + 1)
+    _font(pdf, settings, "B", "body", offset=1)
     if column < 60:
         pdf.cell(0, 5, "BILLED TO:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     else:
@@ -986,12 +993,12 @@ def invoice_detailed_pdf(
     has_img_col = ("product_image" in active_cols) and show_images
     row_height = max(style["row_height"], 12) if has_img_col else style["row_height"]
 
-    _font(pdf, settings, "B", "table", custom_size=style["table_size"])
+    _font(pdf, settings, "B", "table")
     for w, c in zip(col_widths, active_cols):
         pdf.cell(w, style["row_height"] + 1, COLUMN_HEADERS[c], border=style["border"], align=COLUMN_ALIGNS[c])
     pdf.ln(style["row_height"] + 1)
 
-    _font(pdf, settings, "", "table", custom_size=style["table_size"])
+    _font(pdf, settings, "", "table")
     for item in invoice.items:
         cell_y = pdf.get_y()
         for w, c in zip(col_widths, active_cols):
@@ -1016,7 +1023,7 @@ def invoice_detailed_pdf(
 
     brand_rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
     pdf.ln(2)
-    _font(pdf, settings, "", "body", custom_size=style["body_size"])
+    _font(pdf, settings, "", "body")
     _amount_row(pdf, "Subtotal", invoice.subtotal, width, settings=settings)
     if fields.get("show_discount", True) and invoice.discount:
         _amount_row(pdf, "Discount", -(invoice.discount or 0), width, settings=settings)
@@ -1026,7 +1033,7 @@ def invoice_detailed_pdf(
         _amount_row(pdf, "Additional Charges", invoice.additional_charges, width, settings=settings)
     if invoice.round_off:
         _amount_row(pdf, "Round Off", invoice.round_off, width, settings=settings)
-    _font(pdf, settings, "B", "body", custom_size=style["body_size"] + 2)
+    _font(pdf, settings, "B", "body", offset=2)
     _amount_row(pdf, "Grand Total", invoice.total, width, height=7, brand_rgb=brand_rgb, settings=settings)
 
     _invoice_footer(pdf, org, settings, fields, signature=signature, qr=qr, stamp=stamp)

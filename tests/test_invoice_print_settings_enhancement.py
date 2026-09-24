@@ -202,11 +202,15 @@ def run_tests():
         r = client.patch("/invoice-settings", json={"item_table": {"columns": ["product", "quantity", "rate"]}}, headers=auth1)
         assert_eq(r.status_code, 422, "Missing amount column rejected with 422")
 
-        # Valid item table patch
-        valid_cols = ["product", "product_image", "hsn_sac", "quantity", "rate", "tax_amount", "amount"]
-        r = client.patch("/invoice-settings", json={"item_table": {"show_product_image": True, "columns": valid_cols}}, headers=auth1)
-        assert_eq(r.status_code, 200, "Valid item table configuration accepted with 200")
-        assert_eq(r.json()["item_table"]["columns"], valid_cols, "Item table columns match frontend specified order")
+        # More than 5 columns rejected
+        r = client.patch("/invoice-settings", json={"item_table": {"columns": ["product", "hsn_sac", "quantity", "rate", "tax_amount", "amount"]}}, headers=auth1)
+        assert_eq(r.status_code, 422, "More than 5 columns rejected with 422")
+
+        # Valid 5-column item table patch
+        valid_cols_5 = ["product", "product_image", "quantity", "rate", "amount"]
+        r = client.patch("/invoice-settings", json={"item_table": {"show_product_image": True, "columns": valid_cols_5}}, headers=auth1)
+        assert_eq(r.status_code, 200, "Valid 5-column item table configuration accepted with 200")
+        assert_eq(r.json()["item_table"]["columns"], valid_cols_5, "Item table columns match frontend specified order")
 
         # =====================================================
         # 2. INVOICE PRODUCT IMAGE SUPPORT TESTS
@@ -368,7 +372,14 @@ def run_tests():
         pdf_times = invoice_detailed_pdf(org1, cust1, inv, settings_times)
         assert_eq(isinstance(pdf_times, bytes), True, "Times font + A5 Landscape PDF generated successfully")
 
-        # 3.5: Product thumbnail image embedding
+        # 3.5: Custom typography size variation test (heading_size=24, body_size=12, table_size=10)
+        settings_large_type = dict(settings_dict)
+        settings_large_type["typography"] = {"font_family": "Helvetica", "heading_size": 24, "body_size": 12, "table_size": 10}
+        pdf_large = invoice_detailed_pdf(org1, cust1, inv, settings_large_type)
+        assert_eq(isinstance(pdf_large, bytes), True, "Custom large typography PDF generated successfully")
+        assert_eq(len(pdf_large) > len(pdf_times) * 0.5, True, "Large typography PDF has valid content length")
+
+        # 3.6: Product thumbnail image embedding
         fake_img_bytes = _create_test_image()
         item_images = {item1.id: fake_img_bytes}
         settings_with_img = dict(settings_dict)
@@ -384,21 +395,21 @@ def run_tests():
         # 4.1: 58mm thermal
         settings_thermal_58 = dict(settings_dict)
         settings_thermal_58["template"] = "thermal"
-        settings_thermal_58["thermal_print"] = {"paper_width": "58mm", "extra_lines": 3, "copies": 1}
+        settings_thermal_58["thermal_print"] = {"paper_width": "58mm", "extra_lines": 3, "copies": 1, "bold_text": True}
         pdf_58 = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_58)
         assert_eq(isinstance(pdf_58, bytes), True, "58mm Thermal PDF generated successfully")
 
-        # 4.2: 80mm thermal
+        # 4.2: 80mm thermal with bold_text=False
         settings_thermal_80 = dict(settings_dict)
         settings_thermal_80["template"] = "thermal"
-        settings_thermal_80["thermal_print"] = {"paper_width": "80mm", "extra_lines": 2, "copies": 2}
+        settings_thermal_80["thermal_print"] = {"paper_width": "80mm", "extra_lines": 2, "copies": 2, "bold_text": False}
         pdf_80 = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_80)
-        assert_eq(isinstance(pdf_80, bytes), True, "80mm Thermal PDF generated successfully")
+        assert_eq(isinstance(pdf_80, bytes), True, "80mm Thermal PDF (non-bold) generated successfully")
 
         # 4.3: 110mm thermal
         settings_thermal_110 = dict(settings_dict)
         settings_thermal_110["template"] = "thermal"
-        settings_thermal_110["thermal_print"] = {"paper_width": "110mm", "extra_lines": 1, "copies": 1}
+        settings_thermal_110["thermal_print"] = {"paper_width": "110mm", "extra_lines": 1, "copies": 1, "bold_text": True}
         pdf_110 = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_110)
         assert_eq(isinstance(pdf_110, bytes), True, "110mm Thermal PDF generated successfully")
 

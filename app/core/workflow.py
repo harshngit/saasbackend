@@ -203,9 +203,6 @@ ITEM_TABLE_DEFAULTS: dict[str, object] = {
         "hsn_sac",
         "quantity",
         "rate",
-        "discount",
-        "tax_rate",
-        "tax_amount",
         "amount",
     ],
 }
