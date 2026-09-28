@@ -21,7 +21,8 @@ from app.models import (
     Supplier,
     User,
 )
-from app.services import numbering_service, lookup_service
+from app.services import numbering_service, lookup_service, catalog_hierarchy_service
+from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
 from app.schemas.category import BulkDelete, BulkDeleteResult
 from app.schemas.inventory import BatchOut, SerialOut
 from app.schemas.product import (
@@ -101,6 +102,9 @@ def create_product(
     _validate_category(db, org_id, payload.sub_category_id)
     _validate_supplier(db, org_id, payload.preferred_supplier_id)
     _validate_brand(db, org_id, payload.brand_id)
+    catalog_hierarchy_service.validate_product_catalog_hierarchy(
+        db, org_id, payload.preferred_supplier_id, payload.brand_id, payload.category_id
+    )
     data = payload.model_dump()
     variations = data.pop("variations")
     has_variants = data.pop("has_variants")
@@ -295,6 +299,43 @@ def update_product(
         _validate_supplier(db, org_id, data["preferred_supplier_id"])
     if "brand_id" in data:
         _validate_brand(db, org_id, data["brand_id"])
+
+    effective_supplier_id = data.get("preferred_supplier_id", product.preferred_supplier_id)
+    effective_brand_id = data.get("brand_id", product.brand_id)
+    effective_category_id = data.get("category_id", product.category_id)
+
+    if ("preferred_supplier_id" in data or "brand_id" in data) and effective_supplier_id and effective_brand_id:
+        link = (
+            db.query(SupplierBrand)
+            .filter(
+                SupplierBrand.organization_id == org_id,
+                SupplierBrand.supplier_id == effective_supplier_id,
+                SupplierBrand.brand_id == effective_brand_id,
+            )
+            .first()
+        )
+        if link is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Brand is not associated with the selected supplier.",
+            )
+
+    if ("brand_id" in data or "category_id" in data) and effective_brand_id and effective_category_id:
+        link = (
+            db.query(BrandCategory)
+            .filter(
+                BrandCategory.organization_id == org_id,
+                BrandCategory.brand_id == effective_brand_id,
+                BrandCategory.category_id == effective_category_id,
+            )
+            .first()
+        )
+        if link is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Category is not associated with the selected brand.",
+            )
+
     variations = data.pop("variations", None)
     pricing_data = data.pop("pricing", None)
     if data.get("has_variants") is None:

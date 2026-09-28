@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Brand, User
+from app.models.catalog_hierarchy import BrandCategory
 from app.schemas.brand import (
     BrandCreate,
     BrandOut,
@@ -12,6 +13,8 @@ from app.schemas.brand import (
     BulkDelete,
     BulkDeleteResult,
 )
+from app.schemas.catalog_hierarchy import BrandCategoryLinkCreate, BrandCategoryOut
+from app.services import catalog_hierarchy_service
 
 router = APIRouter(prefix="/brands", tags=["brands"])
 
@@ -123,4 +126,99 @@ def delete_brand(
 ) -> None:
     brand = _owned(db, brand_id, _org_id(user))
     db.delete(brand)  # products referencing this brand get brand_id set to NULL (FK ON DELETE SET NULL)
+    db.commit()
+
+
+# ---------------------------- Brand Categories Linkage ----------------------------
+
+
+@router.get("/{brand_id}/categories", response_model=list[BrandCategoryOut])
+def list_brand_categories(
+    brand_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """List categories associated with a brand."""
+    org_id = _org_id(user)
+    _owned(db, brand_id, org_id)
+
+    links = (
+        db.query(BrandCategory)
+        .filter(
+            BrandCategory.organization_id == org_id,
+            BrandCategory.brand_id == brand_id,
+        )
+        .order_by(BrandCategory.created_at.desc())
+        .all()
+    )
+
+    result = []
+    for link in links:
+        cat = link.category
+        result.append({
+            "id": link.id,
+            "organization_id": link.organization_id,
+            "brand_id": link.brand_id,
+            "category_id": link.category_id,
+            "category_name": cat.name if cat else None,
+            "created_at": link.created_at,
+        })
+    return result
+
+
+@router.post("/{brand_id}/categories", response_model=BrandCategoryOut, status_code=status.HTTP_201_CREATED)
+def link_brand_category(
+    brand_id: str,
+    payload: BrandCategoryLinkCreate,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Link a category to a brand."""
+    org_id = _org_id(user)
+    brand = _owned(db, brand_id, org_id)
+
+    link = catalog_hierarchy_service.ensure_brand_category(db, org_id, brand.id, payload.category_id)
+    db.commit()
+    db.refresh(link)
+
+    cat = link.category
+    return {
+        "id": link.id,
+        "organization_id": link.organization_id,
+        "brand_id": link.brand_id,
+        "category_id": link.category_id,
+        "category_name": cat.name if cat else None,
+        "created_at": link.created_at,
+    }
+
+
+@router.delete("/{brand_id}/categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unlink_brand_category(
+    brand_id: str,
+    category_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    """Unlink a category from a brand."""
+    org_id = _org_id(user)
+    _owned(db, brand_id, org_id)
+
+    link = (
+        db.query(BrandCategory)
+        .filter(
+            BrandCategory.organization_id == org_id,
+            BrandCategory.brand_id == brand_id,
+            BrandCategory.category_id == category_id,
+        )
+        .first()
+    )
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand category link not found",
+        )
+
+    db.delete(link)
     db.commit()

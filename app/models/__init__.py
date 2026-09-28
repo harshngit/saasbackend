@@ -47,6 +47,7 @@ from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
 from app.models.team import Team
 from app.models.tracking import ProductSerial, StockBatch
 from app.models.supplier import Supplier, SupplierPayment, SupplierProduct
+from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
 from app.models.supplier_payment_allocation import SupplierPaymentAllocation
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
@@ -73,6 +74,8 @@ from app.models.follow_up import FollowUp
 from app.models.leave import LEAVE_STATUSES, LEAVE_TYPES, Leave
 
 __all__ = [
+    "SupplierBrand",
+    "BrandCategory",
     "WarehouseTransfer",
     "WarehouseTransferItem",
     "Leave",

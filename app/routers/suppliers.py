@@ -8,6 +8,8 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
 from app.models import Product, PurchaseInvoice, Supplier, SupplierPayment, SupplierProduct, User
+from app.models.catalog_hierarchy import SupplierBrand
+from app.schemas.catalog_hierarchy import SupplierBrandLinkCreate, SupplierBrandOut
 from app.schemas.supplier import (
     BulkDelete,
     BulkDeleteResult,
@@ -20,6 +22,7 @@ from app.schemas.supplier import (
     SupplierStatusUpdate,
     SupplierUpdate,
 )
+from app.services import catalog_hierarchy_service
 from app.services.supplier_import_service import get_supplier_template, import_suppliers_from_file
 
 router = APIRouter(prefix="/suppliers", tags=["suppliers"])
@@ -311,6 +314,13 @@ def link_supplier_product(
         product_id=product.id,
     )
     db.add(link)
+
+    # Auto-sync catalog hierarchy
+    if product.brand_id:
+        catalog_hierarchy_service.ensure_supplier_brand(db, org_id, supplier.id, product.brand_id)
+        if product.category_id:
+            catalog_hierarchy_service.ensure_brand_category(db, org_id, product.brand_id, product.category_id)
+
     db.commit()
     db.refresh(link)
 
@@ -352,6 +362,101 @@ def unlink_supplier_product(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Supplier product link not found",
+        )
+
+    db.delete(link)
+    db.commit()
+
+
+# ---------------------------- Supplier Brands Linkage ----------------------------
+
+
+@router.get("/{supplier_id}/brands", response_model=list[SupplierBrandOut])
+def list_supplier_brands(
+    supplier_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """List brands associated with a supplier."""
+    org_id = _org_id(user)
+    _owned(db, supplier_id, org_id)
+
+    links = (
+        db.query(SupplierBrand)
+        .filter(
+            SupplierBrand.organization_id == org_id,
+            SupplierBrand.supplier_id == supplier_id,
+        )
+        .order_by(SupplierBrand.created_at.desc())
+        .all()
+    )
+
+    result = []
+    for link in links:
+        brand = link.brand
+        result.append({
+            "id": link.id,
+            "organization_id": link.organization_id,
+            "supplier_id": link.supplier_id,
+            "brand_id": link.brand_id,
+            "brand_name": brand.name if brand else None,
+            "created_at": link.created_at,
+        })
+    return result
+
+
+@router.post("/{supplier_id}/brands", response_model=SupplierBrandOut, status_code=status.HTTP_201_CREATED)
+def link_supplier_brand(
+    supplier_id: str,
+    payload: SupplierBrandLinkCreate,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Link a brand to a supplier."""
+    org_id = _org_id(user)
+    supplier = _owned(db, supplier_id, org_id)
+
+    link = catalog_hierarchy_service.ensure_supplier_brand(db, org_id, supplier.id, payload.brand_id)
+    db.commit()
+    db.refresh(link)
+
+    brand = link.brand
+    return {
+        "id": link.id,
+        "organization_id": link.organization_id,
+        "supplier_id": link.supplier_id,
+        "brand_id": link.brand_id,
+        "brand_name": brand.name if brand else None,
+        "created_at": link.created_at,
+    }
+
+
+@router.delete("/{supplier_id}/brands/{brand_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unlink_supplier_brand(
+    supplier_id: str,
+    brand_id: str,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> None:
+    """Unlink a brand from a supplier."""
+    org_id = _org_id(user)
+    _owned(db, supplier_id, org_id)
+
+    link = (
+        db.query(SupplierBrand)
+        .filter(
+            SupplierBrand.organization_id == org_id,
+            SupplierBrand.supplier_id == supplier_id,
+            SupplierBrand.brand_id == brand_id,
+        )
+        .first()
+    )
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Supplier brand link not found",
         )
 
     db.delete(link)
