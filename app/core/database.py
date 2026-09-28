@@ -64,10 +64,37 @@ logger = logging.getLogger("crm.db")
 
 DATABASE_URL = settings.sqlalchemy_database_url
 
-# SQLite needs check_same_thread=False for use across FastAPI's threadpool.
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+def build_engine_kwargs(database_url: str, *, pool_size: int, max_overflow: int, pool_recycle: int) -> dict:
+    """The create_engine() kwargs for `database_url` — a pure function (no I/O,
+    no connection attempt) so the PostgreSQL-vs-SQLite branching is directly
+    unit-testable without needing a real database of either kind.
+
+    SQLite needs check_same_thread=False for use across FastAPI's threadpool,
+    and has no connection-pool concept of its own — pool_size/max_overflow/
+    pool_recycle are PostgreSQL-only, included only on that branch so SQLite
+    (local dev and the test suite) is completely unaffected.
+    """
+    if database_url.startswith("sqlite"):
+        return {"connect_args": {"check_same_thread": False}, "pool_pre_ping": True}
+    return {
+        "connect_args": {},
+        "pool_pre_ping": True,
+        "pool_size": pool_size,
+        "max_overflow": max_overflow,
+        "pool_recycle": pool_recycle,
+    }
+
+
+engine = create_engine(
+    DATABASE_URL,
+    **build_engine_kwargs(
+        DATABASE_URL,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_recycle=settings.db_pool_recycle,
+    ),
+)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 

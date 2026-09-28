@@ -1,6 +1,11 @@
 # Render Blueprint — provisions the API + a free PostgreSQL database in one go.
 # In Render: New + > Blueprint > connect this repo. Render reads this file.
 # Docs: https://render.com/docs/blueprint-spec
+#
+# STALE / NOT USED BY CURRENT PRODUCTION: production now runs on EC2, deployed via
+# .github/workflows/deploy.yml (SSH + systemd), not via Render. This file is left
+# here undeployed rather than deleted, in case Render is ever reused; it plays no
+# part in the current PlanetScale/R2 migration or any current deployment.
 
 databases:
   - name: crm-saas-db

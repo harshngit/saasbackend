@@ -59,6 +59,18 @@ missing_item_cols = required_item_cols - item_cols
 assert not missing_item_cols, f"Missing expense_item columns on fresh DB: {missing_item_cols}"
 print(f"  PASS  All {len(required_item_cols)} ExpenseItem columns exist on fresh DB")
 
+# Phase 1 (PlanetScale + R2): stored_files.storage_key exists and stored_files.data
+# is nullable on a fresh DB — i.e. the current StoredFile model (which the fresh-DB
+# create_all() above already built from) matches what the new hand-written Alembic
+# revision (alembic/versions/i7d8e9f0a1b2_stored_files_r2_storage_key.py) does to an
+# existing database. See tests/test_planetscale_r2_config.py for the Alembic
+# revision-chain/parent-revision checks themselves.
+stored_files_cols = {c["name"]: c for c in inspector.get_columns("stored_files")}
+assert "storage_key" in stored_files_cols, "stored_files.storage_key missing on fresh DB"
+assert stored_files_cols["storage_key"]["nullable"] is True, "stored_files.storage_key must be nullable"
+assert stored_files_cols["data"]["nullable"] is True, "stored_files.data must be nullable (R2-backed rows have no DB bytes)"
+print("  PASS  stored_files.storage_key exists and stored_files.data is nullable on fresh DB")
+
 # Clean up fresh db
 fresh_engine.dispose()
 try:

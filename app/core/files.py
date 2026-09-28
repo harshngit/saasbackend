@@ -47,6 +47,46 @@ def public_url(request: Request | None, file_id: str) -> str:
     return f"{base}{FILES_PATH}/{file_id}"
 
 
+def _persist(
+    db: Session, org_id: str | None, filename: str, content: bytes, content_type: str,
+) -> "StoredFile":  # noqa: F821
+    """Create the StoredFile row and, when R2 is configured, upload the bytes
+    to it. Shared by save_upload/save_bytes so there is exactly one place that
+    decides DB-backed vs. R2-backed storage.
+
+    The row's id is generated up front (rather than left to the column default)
+    so the R2 key can be derived from it before the row is even added — and if
+    the R2 upload itself fails, no row is created at all: a StoredFile must
+    never claim an R2 object exists that was never actually written.
+    """
+    import uuid
+
+    from app.core.config import settings
+    from app.models.stored_file import StoredFile
+
+    stored = StoredFile(
+        id=str(uuid.uuid4()),  # generated up front so the R2 key can use it before the row exists
+        organization_id=org_id,
+        filename=filename,
+        content_type=content_type or "application/octet-stream",
+        size=len(content),
+    )
+
+    if settings.r2_configured:
+        from app.core import r2
+
+        key = r2.object_key(org_id, stored.id)
+        r2.put_object(key, content, stored.content_type)  # raises on failure — nothing persisted below if so
+        stored.storage_key = key
+        stored.data = None
+    else:
+        stored.data = content
+
+    db.add(stored)
+    db.flush()
+    return stored
+
+
 def save_upload(
     db: Session,
     org_id: str | None,
@@ -57,9 +97,11 @@ def save_upload(
     allow_any: bool = False,
     max_bytes: int = MAX_UPLOAD_BYTES,
 ) -> tuple[str, int]:
-    """Validate and store one upload. Returns its public URL and byte size."""
-    from app.models.stored_file import StoredFile
+    """Validate and store one upload. Returns its public URL and byte size.
 
+    The returned URL/size contract is unchanged regardless of whether R2 is
+    configured — every existing caller keeps working without modification.
+    """
     content_type = file.content_type or "application/octet-stream"
     _check_type(content_type, allow_pdf, allow_video, allow_any)
 
@@ -70,15 +112,7 @@ def save_upload(
             detail=f"File too large (max {max_bytes // (1024 * 1024)} MB)",
         )
 
-    stored = StoredFile(
-        organization_id=org_id,
-        filename=file.filename or "upload",
-        content_type=content_type,
-        size=len(content),
-        data=content,
-    )
-    db.add(stored)
-    db.flush()  # assigns the id we build the URL from
+    stored = _persist(db, org_id, file.filename or "upload", content, content_type)
     return public_url(request, stored.id), stored.size
 
 
@@ -91,18 +125,27 @@ def save_bytes(
     request: Request | None = None,
 ) -> str:
     """Store raw bytes (used when converting old inline data: URLs)."""
-    from app.models.stored_file import StoredFile
-
-    stored = StoredFile(
-        organization_id=org_id,
-        filename=filename,
-        content_type=content_type or "application/octet-stream",
-        size=len(content),
-        data=content,
-    )
-    db.add(stored)
-    db.flush()
+    stored = _persist(db, org_id, filename, content, content_type)
     return public_url(request, stored.id)
+
+
+def get_bytes(stored: "StoredFile") -> bytes:  # noqa: F821
+    """The actual bytes for a StoredFile row, regardless of where they live —
+    the one shared helper every internal consumer (PDF generation, branding,
+    document rows, …) should use instead of touching `.data`/`.storage_key`
+    directly, so DB-backed and R2-backed rows behave identically to callers.
+
+    Raises if neither location has the bytes (a row that's neither
+    storage_key-set nor data-set is a data-integrity problem, not something to
+    paper over with an empty result).
+    """
+    if stored.storage_key:
+        from app.core import r2
+
+        return r2.get_object_bytes(stored.storage_key)
+    if stored.data is not None:
+        return stored.data
+    raise ValueError(f"StoredFile {stored.id} has neither storage_key nor data")
 
 
 def decode_data_url(value: str) -> tuple[bytes, str] | None:

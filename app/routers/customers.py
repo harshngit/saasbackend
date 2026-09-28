@@ -11,7 +11,7 @@ from app.core.database import get_db
 from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
-from app.core.files import save_upload
+from app.core.files import get_bytes, save_upload
 from app.models import Customer, CustomerDocument, CustomerPayment, Invoice, StoredFile, User
 from app.services import (
     customer_profile_service,
@@ -623,8 +623,12 @@ def download_customer_document(
     stored = db.get(StoredFile, document.file_id) if document.file_id else None
     if stored is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File no longer stored")
+    try:
+        content = get_bytes(stored)  # DB-backed or R2-backed — see app/core/files.py
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File no longer stored")
     return Response(
-        content=stored.data,
+        content=content,
         media_type=document.content_type,
         headers={"Content-Disposition": f'attachment; filename="{document.name}"'},
     )

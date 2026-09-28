@@ -10,6 +10,7 @@ Idempotent: a value that is already a URL is skipped, so it is safe on every boo
 """
 
 import logging
+from typing import NamedTuple
 
 from app.core.files import decode_data_url, save_bytes
 
@@ -32,7 +33,14 @@ TARGETS: list[tuple[str, list[str], list[str]]] = [
         "download_file", "product_datasheet", "compliance_certificate", "warranty_document",
     ], ["other_attachments", "images"]),
     ("Category", ["image"], []),
-    ("Customer", ["doc_gst_url", "doc_pan_url"], ["documents"]),
+    # NOT ["documents"]: Customer.documents is a SQLAlchemy relationship to
+    # CustomerDocument, not a JSON/list column — treating it as one crashed this
+    # entire function (AttributeError from calling .get("url") on a
+    # CustomerDocument ORM instance), aborting every model listed after this one.
+    # CustomerDocument.url is always created via save_upload() (see
+    # app/routers/customers.py) and never holds a legacy data: URL, so there is
+    # nothing to convert here anyway.
+    ("Customer", ["doc_gst_url", "doc_pan_url"], []),
     ("Vehicle", ["rc_document_url", "insurance_document_url", "fitness_document_url", "puc_document_url"], []),
     ("Expense", ["receipt_url", "vendor_invoice_url"], ["supporting_documents"]),
     ("PurchaseInvoice", [
@@ -52,67 +60,95 @@ def _filename(model_name: str, column: str, content_type: str) -> str:
     return f"{model_name.lower()}-{column}.{_EXTENSIONS.get(content_type, 'bin')}"
 
 
-def convert_inline_uploads() -> None:
-    """Replace every stored `data:` URL with a link to a stored file."""
+def _convert_model(db, model_name: str, model, single_columns, list_columns) -> int:
+    """Convert one model's rows. Raises on failure — the caller decides what
+    that means for the rest of the run (see convert_inline_uploads)."""
+    converted = 0
+    for row in db.query(model).all():
+        org_id = getattr(row, "organization_id", None) or getattr(row, "id", None)
+
+        for column in single_columns:
+            value = getattr(row, column, None)
+            if not isinstance(value, str) or not value.startswith("data:"):
+                continue
+            decoded = decode_data_url(value)
+            if decoded is None:
+                continue
+            content, content_type = decoded
+            setattr(row, column, save_bytes(
+                db, org_id, content, _filename(model_name, column, content_type), content_type
+            ))
+            converted += 1
+
+        for column in list_columns:
+            entries = getattr(row, column, None)
+            if not isinstance(entries, list) or not entries:
+                continue
+            changed = False
+            rebuilt = []
+            for entry in entries:
+                # `images` is a list of plain strings; the document slots
+                # are dicts with a "url" key.
+                target = entry if isinstance(entry, str) else (entry or {}).get("url")
+                decoded = decode_data_url(target) if isinstance(target, str) else None
+                if decoded is None:
+                    rebuilt.append(entry)
+                    continue
+                content, content_type = decoded
+                url = save_bytes(
+                    db, org_id, content,
+                    (entry.get("name") if isinstance(entry, dict) else None)
+                    or _filename(model_name, column, content_type),
+                    content_type,
+                )
+                rebuilt.append(url if isinstance(entry, str) else {**entry, "url": url})
+                changed = True
+                converted += 1
+            if changed:
+                # Reassign wholesale — SQLAlchemy does not track in-place
+                # mutation of a JSON column.
+                setattr(row, column, rebuilt)
+    return converted
+
+
+class ConversionResult(NamedTuple):
+    converted: int
+    failed_models: list[str]
+
+
+def convert_inline_uploads() -> ConversionResult:
+    """Replace every stored `data:` URL with a link to a stored file.
+
+    Each model in TARGETS gets its own failure boundary: a model that raises
+    is rolled back and logged, and every *other* model in the list still runs
+    — one bad model must never silently prevent the rest from converting, the
+    way the old single-try/except-for-everything shape did. Returns a summary
+    (rather than raising) so both the startup step and the CLI entry point
+    (app/scripts/convert_inline_uploads.py) can report exactly what happened;
+    the CLI turns a non-empty `failed_models` into a non-zero exit status.
+    """
     from app import models
     from app.core.database import SessionLocal
 
     db = SessionLocal()
     converted = 0
+    failed: list[str] = []
     try:
         for model_name, single_columns, list_columns in TARGETS:
             model = getattr(models, model_name, None)
             if model is None:
                 continue
-            for row in db.query(model).all():
-                org_id = getattr(row, "organization_id", None) or getattr(row, "id", None)
-
-                for column in single_columns:
-                    value = getattr(row, column, None)
-                    if not isinstance(value, str) or not value.startswith("data:"):
-                        continue
-                    decoded = decode_data_url(value)
-                    if decoded is None:
-                        continue
-                    content, content_type = decoded
-                    setattr(row, column, save_bytes(
-                        db, org_id, content, _filename(model_name, column, content_type), content_type
-                    ))
-                    converted += 1
-
-                for column in list_columns:
-                    entries = getattr(row, column, None)
-                    if not isinstance(entries, list) or not entries:
-                        continue
-                    changed = False
-                    rebuilt = []
-                    for entry in entries:
-                        # `images` is a list of plain strings; the document slots
-                        # are dicts with a "url" key.
-                        target = entry if isinstance(entry, str) else (entry or {}).get("url")
-                        decoded = decode_data_url(target) if isinstance(target, str) else None
-                        if decoded is None:
-                            rebuilt.append(entry)
-                            continue
-                        content, content_type = decoded
-                        url = save_bytes(
-                            db, org_id, content,
-                            (entry.get("name") if isinstance(entry, dict) else None)
-                            or _filename(model_name, column, content_type),
-                            content_type,
-                        )
-                        rebuilt.append(url if isinstance(entry, str) else {**entry, "url": url})
-                        changed = True
-                        converted += 1
-                    if changed:
-                        # Reassign wholesale — SQLAlchemy does not track in-place
-                        # mutation of a JSON column.
-                        setattr(row, column, rebuilt)
-            db.commit()
+            try:
+                converted += _convert_model(db, model_name, model, single_columns, list_columns)
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                failed.append(model_name)
+                logger.exception("Inline-upload conversion failed for model %s — other models still ran", model_name)
         if converted:
             logger.info("Converted %d inline uploads into stored files", converted)
-    except Exception:  # noqa: BLE001
-        db.rollback()
-        raise
+        if failed:
+            logger.warning("Inline-upload conversion had failures for: %s", ", ".join(failed))
     finally:
         db.close()
+    return ConversionResult(converted=converted, failed_models=failed)

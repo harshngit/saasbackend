@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core import workflow
 from app.core.deps import require_permission, require_unlocked_org
-from app.core.files import decode_data_url
+from app.core.files import decode_data_url, get_bytes
 from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf
 from app.models import (
     Customer,
@@ -619,7 +619,10 @@ def _resolve_file_reference(db: Session, org_id: str, reference: str | None) -> 
     stored = db.get(StoredFile, file_id)
     if stored is None or (stored.organization_id and stored.organization_id != org_id):
         return None
-    return stored.data
+    try:
+        return get_bytes(stored)  # DB-backed or R2-backed — see app/core/files.py
+    except ValueError:
+        return None
 
 
 def _branding_file(db: Session, org_id: str, settings: dict, key: str) -> bytes | None:

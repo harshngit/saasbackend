@@ -152,6 +152,11 @@ def test_supplier_brand_crud(client, test_setup, db_session: Session):
     assert b1.id in brand_ids_sup2
     assert b2.id not in brand_ids_sup2
 
+    # Create a product referencing sup1 and b1 to verify delete isolation
+    prod_test = Product(id=str(uuid.uuid4()), organization_id=org_a.id, name="Test Prod Iso", price=10.0, preferred_supplier_id=sup1.id, brand_id=b1.id)
+    db_session.add(prod_test)
+    db_session.commit()
+
     # Test Delete SupplierBrand
     del_r = client.delete(f"/suppliers/{sup1.id}/brands/{b1.id}", headers=headers_a)
     assert del_r.status_code == 204
@@ -159,6 +164,8 @@ def test_supplier_brand_crud(client, test_setup, db_session: Session):
     assert db_session.get(Brand, b1.id) is not None
     # Verify Supplier Alpha still exists
     assert db_session.get(Supplier, sup1.id) is not None
+    # Verify Product still exists
+    assert db_session.get(Product, prod_test.id) is not None
 
 
 def test_brand_category_crud(client, test_setup, db_session: Session):
@@ -205,11 +212,21 @@ def test_brand_category_crud(client, test_setup, db_session: Session):
     assert c1.id in cat_ids_b2
     assert c2.id not in cat_ids_b2
 
+    # Create Product + Variant to verify delete isolation
+    prod_bc = Product(id=str(uuid.uuid4()), organization_id=org_a.id, name="Test Prod BC", price=20.0, brand_id=b1.id, category_id=c1.id)
+    db_session.add(prod_bc)
+    db_session.commit()
+    var_bc = ProductVariant(id=str(uuid.uuid4()), product_id=prod_bc.id, name="Var 1", sku=f"SKU-{uuid.uuid4().hex[:6]}", price=20.0)
+    db_session.add(var_bc)
+    db_session.commit()
+
     # Delete BrandCategory
     del_r = client.delete(f"/brands/{b1.id}/categories/{c1.id}", headers=headers_a)
     assert del_r.status_code == 204
     assert db_session.get(Brand, b1.id) is not None
     assert db_session.get(Category, c1.id) is not None
+    assert db_session.get(Product, prod_bc.id) is not None
+    assert db_session.get(ProductVariant, var_bc.id) is not None
 
 
 def test_product_hierarchy_validation_on_create(client, test_setup, db_session: Session):
@@ -419,7 +436,45 @@ def test_historical_product_compatibility_and_patch(client, test_setup, db_sessi
     assert good_brand_patch.status_code == 200
     assert good_brand_patch.json()["brand_id"] == brand2.id
 
-    # 4. Clearing fields to null must succeed without requiring links
+    # 4. Changing preferred_supplier_id to an unlinked supplier (sup2) must fail against effective brand2
+    bad_sup_patch = client.patch(
+        f"/products/{hist_prod.id}",
+        json={"preferred_supplier_id": sup2.id},
+        headers=headers_a,
+    )
+    assert bad_sup_patch.status_code == 400
+    assert "Brand is not associated with the selected supplier" in bad_sup_patch.json()["detail"]
+
+    # Link sup2 -> brand2, then changing preferred_supplier_id succeeds
+    client.post(f"/suppliers/{sup2.id}/brands", json={"brand_id": brand2.id}, headers=headers_a)
+    good_sup_patch = client.patch(
+        f"/products/{hist_prod.id}",
+        json={"preferred_supplier_id": sup2.id},
+        headers=headers_a,
+    )
+    assert good_sup_patch.status_code == 200
+    assert good_sup_patch.json()["preferred_supplier_id"] == sup2.id
+
+    # 5. Changing category_id to an unlinked category (cat2) must fail against effective brand2
+    bad_cat_patch = client.patch(
+        f"/products/{hist_prod.id}",
+        json={"category_id": cat2.id},
+        headers=headers_a,
+    )
+    assert bad_cat_patch.status_code == 400
+    assert "Category is not associated with the selected brand" in bad_cat_patch.json()["detail"]
+
+    # Link brand2 -> cat2, then changing category_id succeeds
+    client.post(f"/brands/{brand2.id}/categories", json={"category_id": cat2.id}, headers=headers_a)
+    good_cat_patch = client.patch(
+        f"/products/{hist_prod.id}",
+        json={"category_id": cat2.id},
+        headers=headers_a,
+    )
+    assert good_cat_patch.status_code == 200
+    assert good_cat_patch.json()["category_id"] == cat2.id
+
+    # 6. Clearing fields to null must succeed without requiring links
     clear_patch = client.patch(
         f"/products/{hist_prod.id}",
         json={"preferred_supplier_id": None, "brand_id": None, "category_id": None},

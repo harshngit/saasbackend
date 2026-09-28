@@ -1,4 +1,7 @@
+import logging
+
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -6,6 +9,8 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.files import MAX_UPLOAD_BYTES, save_upload
 from app.models import StoredFile, User
+
+logger = logging.getLogger("crm.files")
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -77,8 +82,30 @@ def get_file(file_id: str, db: Session = Depends(get_db)) -> Response:
     capability-URL model a CDN or an S3 presigned link uses. If a slot ever needs
     stronger protection than that (identity proofs, bank documents), it should
     move to short-lived signed URLs rather than a token on this route.
+
+    R2-backed rows (`storage_key` set) redirect to a ~1-hour presigned URL
+    against the private bucket instead of serving bytes directly — the redirect
+    itself is short-cached (`private, max-age=300`, not the year-long
+    `public, ... immutable` used below for legacy DB-backed rows), since the
+    presigned URL it points at expires well before a year.
     """
     stored = _stored_file(db, file_id)
+
+    if stored.storage_key:
+        from app.core import r2
+
+        url = r2.presigned_get_url(
+            stored.storage_key,
+            content_type=stored.content_type,
+            content_disposition=f'inline; filename="{stored.filename}"',
+            expires_in=3600,
+        )
+        return RedirectResponse(
+            url=url,
+            status_code=status.HTTP_302_FOUND,
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+
     return Response(
         content=stored.data,
         media_type=stored.content_type,
@@ -103,10 +130,23 @@ def delete_file(
     the URL will be left pointing at nothing. To detach a file from an employee,
     use DELETE /users/{id}/files/{field} or
     DELETE /users/{id}/documents/{collection}/{document_id} instead.
+
+    For an R2-backed row, the R2 object is deleted first on a best-effort basis:
+    a failure there is logged and does NOT stop the DB row from being deleted —
+    the API's delete contract is about the reference disappearing, and we would
+    rather leak one orphaned R2 object (cleanable later) than leave a row the
+    caller believes is gone still sitting in the database.
     """
     stored = _stored_file(db, file_id)
     # Files are uploaded within a firm; only that firm can delete them.
     if stored.organization_id is not None and stored.organization_id != user.organization_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    if stored.storage_key:
+        from app.core import r2
+
+        if not r2.delete_object(stored.storage_key):
+            logger.warning("R2 object delete failed for file_id=%s — DB row deleted anyway", file_id)
+
     db.delete(stored)
     db.commit()

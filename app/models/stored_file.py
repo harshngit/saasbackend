@@ -38,6 +38,13 @@ class StoredFile(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(120), nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Exactly one of these is populated per row, never both:
+    #   storage_key set, data NULL   -> bytes live in R2 (see app/core/r2.py)
+    #   storage_key NULL, data set   -> bytes live here, exactly as before R2 existed
+    # Both nullable so existing DB-backed rows (storage_key NULL) stay valid without
+    # a data backfill, and a Phase 2 R2 migration can null out `data` once its bytes
+    # are safely uploaded and verified (app/scripts/move_files_to_r2.py).
+    storage_key: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)

@@ -10,6 +10,9 @@ venv/
 *.db
 *.sqlite3
 
+# PostgreSQL dumps (pre-backfill / rehearsal / cutover backups — never committed)
+*.dump
+
 # OS / editor
 .DS_Store
 .idea/

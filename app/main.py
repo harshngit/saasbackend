@@ -141,6 +141,14 @@ def on_startup() -> None:
         # For local dev we auto-create tables. In production, use Alembic migrations.
         Base.metadata.create_all(bind=engine)
 
+    def _convert_inline_uploads_if_enabled() -> None:
+        # Off by default (CONVERT_INLINE_UPLOADS_ON_STARTUP=false): this is a full
+        # table scan across 8 models on every boot, which is unnecessary once a
+        # firm's inline uploads have already been converted once. Run it
+        # explicitly instead: `python -m app.scripts.convert_inline_uploads`.
+        if settings.convert_inline_uploads_on_startup:
+            convert_inline_uploads()
+
     for label, step in (
         ("create_all", _create_tables),
         ("extend_pg_enum_types", extend_pg_enum_types),
@@ -156,7 +164,7 @@ def on_startup() -> None:
         ("enforce_unique_google_id", enforce_unique_google_id),
         ("backfill_missing_numbers", backfill_missing_numbers),
         ("migrate_order_statuses", migrate_order_statuses),
-        ("convert_inline_uploads", convert_inline_uploads),
+        ("convert_inline_uploads", _convert_inline_uploads_if_enabled),
         ("backfill_product_pricing", backfill_product_pricing),
     ):
         try:
