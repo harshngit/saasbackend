@@ -22,6 +22,7 @@ from app.models.notification import Notification
 from app.models.number_sequence import NumberSequence
 from app.models.stored_file import StoredFile
 from app.models.organization import Organization
+from app.models.organization_theme import OrganizationTheme
 from app.models.purchase_invoice import (
     PAYMENT_STATUSES,
     PURCHASE_STATUSES,
@@ -95,6 +96,7 @@ __all__ = [
     "NumberSequence",
     "StoredFile",
     "Organization",
+    "OrganizationTheme",
     "Plan",
     "Role",
     "Team",

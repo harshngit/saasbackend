@@ -188,6 +188,13 @@ class Organization(Base):
     requested_plan: Mapped["Plan | None"] = relationship(  # noqa: F821
         foreign_keys=[requested_plan_id], lazy="joined"
     )
+    # One row per org at most (organization_themes.organization_id is UNIQUE).
+    # May be None — a row is only created on the first PATCH/upload, not at
+    # organization creation; see app.services.theme_service.effective_theme
+    # for how GET still returns full defaults before that happens.
+    theme: Mapped["OrganizationTheme | None"] = relationship(  # noqa: F821
+        back_populates="organization", uselist=False, cascade="all, delete-orphan"
+    )
 
     @property
     def subscription_status(self) -> str:
