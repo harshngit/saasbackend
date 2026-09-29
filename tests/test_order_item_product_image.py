@@ -525,5 +525,107 @@ def test_order_customer_image_tenant_isolation():
     assert r_b.json()["customer"]["profile_image_url"] == "/files/org-b-customer.png"
 
 
+def test_customer_brief_profile_image_url_normalization():
+    """Unit tests verifying CustomerBrief serialization across all 7 normalization cases."""
+    from app.schemas.sales_order import CustomerBrief
+
+    # Case 1: Raw UUID / bare file ID
+    b1 = CustomerBrief(
+        id="c1", name="Cust 1", profile_image_id="d4825176-8f39-423e-86f9-758986f896dc"
+    )
+    assert b1.profile_image_id == "d4825176-8f39-423e-86f9-758986f896dc"
+    assert b1.profile_image_url == "/files/d4825176-8f39-423e-86f9-758986f896dc"
+
+    # Case 2: Existing /files path (must NOT double-prefix)
+    b2 = CustomerBrief(id="c2", name="Cust 2", profile_image_id="/files/abc123")
+    assert b2.profile_image_id == "/files/abc123"
+    assert b2.profile_image_url == "/files/abc123"
+
+    # Case 3: Full HTTP URL
+    b3 = CustomerBrief(
+        id="c3", name="Cust 3", profile_image_id="http://example.com/files/abc123"
+    )
+    assert b3.profile_image_id == "http://example.com/files/abc123"
+    assert b3.profile_image_url == "http://example.com/files/abc123"
+
+    # Case 4: Full HTTPS URL
+    b4 = CustomerBrief(
+        id="c4", name="Cust 4", profile_image_id="https://example.com/files/xyz789"
+    )
+    assert b4.profile_image_id == "https://example.com/files/xyz789"
+    assert b4.profile_image_url == "https://example.com/files/xyz789"
+
+    # Case 5: Data URL
+    b5 = CustomerBrief(
+        id="c5", name="Cust 5", profile_image_id="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAE"
+    )
+    assert b5.profile_image_id == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAE"
+    assert b5.profile_image_url == "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAE"
+
+    # Case 6: Null
+    b6 = CustomerBrief(id="c6", name="Cust 6", profile_image_id=None)
+    assert b6.profile_image_id is None
+    assert b6.profile_image_url is None
+
+    # Case 7: Explicit profile_image_url supplied
+    b7 = CustomerBrief(
+        id="c7",
+        name="Cust 7",
+        profile_image_id="raw-uuid-123",
+        profile_image_url="/custom/explicit-url.png",
+    )
+    assert b7.profile_image_id == "raw-uuid-123"
+    assert b7.profile_image_url == "/custom/explicit-url.png"
+
+
+def test_order_customer_raw_uuid_image_api():
+    """End-to-end API test: Customer with raw UUID profile_image_id returns /files/<UUID> on order detail/list."""
+    headers, org_id = _register_org("Order Customer Raw UUID Org")
+
+    raw_uuid = "d4825176-8f39-423e-86f9-758986f896dc"
+    db = SessionLocal()
+    try:
+        cust = Customer(
+            organization_id=org_id,
+            name="Raw UUID Customer",
+            phone="+919876543210",
+            profile_image_id=raw_uuid,
+        )
+        db.add(cust)
+        db.commit()
+        db.refresh(cust)
+
+        order = SalesOrder(
+            organization_id=org_id,
+            order_number=f"SO-RAW-{uuid.uuid4().hex[:6]}",
+            customer_id=cust.id,
+            status="confirmed",
+            fulfilment_status="not_started",
+            total=100.0,
+            subtotal=100.0,
+            source="direct",
+        )
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+        order_id = order.id
+    finally:
+        db.close()
+
+    # GET /orders/{id}
+    r = client.get(f"/orders/{order_id}", headers=headers)
+    assert r.status_code == 200, r.text
+    cust_data = r.json()["customer"]
+    assert cust_data["profile_image_id"] == raw_uuid
+    assert cust_data["profile_image_url"] == f"/files/{raw_uuid}"
+
+    # GET /orders list
+    r_list = client.get("/orders", headers=headers)
+    assert r_list.status_code == 200, r_list.text
+    matching = next(row for row in r_list.json() if row["id"] == order_id)
+    assert matching["customer"]["profile_image_id"] == raw_uuid
+    assert matching["customer"]["profile_image_url"] == f"/files/{raw_uuid}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

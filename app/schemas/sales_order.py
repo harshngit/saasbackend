@@ -83,8 +83,17 @@ class CustomerBrief(BaseModel):
 
     @model_validator(mode="after")
     def _alias_profile_image_url(self) -> "CustomerBrief":
-        if self.profile_image_url is None:
-            self.profile_image_url = self.profile_image_id
+        if self.profile_image_url is None and self.profile_image_id:
+            val = str(self.profile_image_id).strip()
+            if (
+                val.startswith("/")
+                or val.startswith("http://")
+                or val.startswith("https://")
+                or val.startswith("data:")
+            ):
+                self.profile_image_url = val
+            else:
+                self.profile_image_url = f"/files/{val}"
         return self
 
 
