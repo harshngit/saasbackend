@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     # the URL is derived from the request that uploaded the file.
     public_base_url: str = ""
 
+    # Swagger/ReDoc/OpenAPI documentation exposure.
+    # Set to true for local/development; set ENABLE_DOCS=false in production.
+    enable_docs: bool = True
+
     cors_origins: str = "https://crm-saas.asynk.in"
     cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
