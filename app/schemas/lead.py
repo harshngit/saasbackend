@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from app.schemas.choices import LeadSource
 from app.schemas.customer import CustomerOut
 
@@ -17,6 +17,13 @@ class LeadSalespersonBrief(BaseModel):
     id: str
     name: str
     email: str
+    profile_photo: str | None = None
+
+    @field_validator("profile_photo", mode="after")
+    @classmethod
+    def _normalize_profile_photo(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class LeadProductBrief(BaseModel):

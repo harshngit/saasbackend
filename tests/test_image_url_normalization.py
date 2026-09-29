@@ -267,20 +267,173 @@ def test_employee_profile_photo_null_stays_null():
     assert r.json()["basic_information"]["profile_photo"] is None
 
 
-# ----------------- person "brief" reference objects: no photo, by design ----------
-# AssigneeBrief / SalespersonBrief / DeliveryPartnerBrief / etc. are deliberately
-# narrow (id/name/email/phone only) everywhere a person is referenced FROM another
-# entity — matching AssignableStaffOut's own documented "no profile data" design.
-# This is not a bug; these assertions pin the current, verified contract so a
-# future change here is deliberate, not an accidental field addition/removal.
+# --------- person "brief" reference objects: photo where meaningfully shown -------
+# AssigneeBrief / SalespersonBrief / DeliveryPartnerBrief / etc. reference a real
+# person the app actually displays (sales officer, salesperson, driver) and now
+# carry profile_photo, normalized the same way as every other *_url-style field.
+# DeliveryHistoryActorBrief and AssignableStaffOut are deliberately excluded — see
+# the tests below pinning that decision, so a future change here is deliberate,
+# not an accidental field addition/removal.
 
 
-def test_customer_assigned_sales_officer_has_no_photo_field_by_design():
+def test_customer_assigned_sales_officer_has_photo_field():
     from app.schemas.customer import AssigneeBrief
-    assert set(AssigneeBrief.model_fields) == {"id", "name"}
+    assert set(AssigneeBrief.model_fields) == {"id", "name", "profile_photo"}
 
 
-def test_delivery_partner_brief_has_no_photo_field_by_design():
+def test_delivery_partner_brief_has_photo_field():
     from app.schemas.delivery import DeliveryPartnerBrief
-    assert "profile_photo" not in DeliveryPartnerBrief.model_fields
-    assert "photo_url" not in DeliveryPartnerBrief.model_fields
+    assert "profile_photo" in DeliveryPartnerBrief.model_fields
+
+
+def test_delivery_history_actor_brief_has_no_photo_field_by_design():
+    """Built from DeliveryHistory's own denormalized actor_id/actor_name columns,
+    never a join back to `users` (so it still reads correctly after the acting
+    user has been deleted) — there is no live User row to read a photo from."""
+    from app.schemas.delivery import DeliveryHistoryActorBrief
+    assert set(DeliveryHistoryActorBrief.model_fields) == {"id", "name"}
+
+
+def test_assignable_staff_out_has_no_photo_field_by_design():
+    """Deliberately narrow picker for a task-assignee dropdown — its own
+    docstring documents "no email, permissions, or profile data"."""
+    from app.schemas.user import AssignableStaffOut
+    assert set(AssignableStaffOut.model_fields) == {"id", "name", "role"}
+
+
+# ------------------- person profile photo: sales/delivery references --------------
+
+
+def _make_user_with_photo(headers: dict, role: str, photo: str | None) -> str:
+    r = client.post("/users", json={
+        "name": f"Person {uuid.uuid4().hex[:6]}",
+        "email": f"person_{uuid.uuid4().hex[:8]}@example.com",
+        "password": "Password123!", "role": role,
+    }, headers=headers)
+    assert r.status_code == 201, r.text
+    uid = r.json()["id"]
+    if photo is not None:
+        client.patch(f"/users/{uid}", json={"basic_information": {"profile_photo": photo}}, headers=headers)
+    return uid
+
+
+def test_customer_assigned_sales_officer_photo_normalizes_bare_id():
+    headers, _ = _register_org("cust_officer_photo")
+    officer_id = _make_user_with_photo(headers, "Sales Officer", "officer-bare-id")
+    r = client.post("/customers", json={"name": "Cust Officer", "assigned_sales_officer_id": officer_id}, headers=headers)
+    cid = r.json()["id"]
+    r2 = client.get("/customers", headers=headers, params={"search": "Cust Officer"})
+    match = next(c for c in r2.json() if c["id"] == cid)
+    assert match["assigned_sales_officer"]["profile_photo"] == "/files/officer-bare-id"
+    assert match["assigned_sales_officer_id"] == officer_id  # raw id untouched
+
+
+def test_customer_assigned_sales_officer_photo_null_when_unset():
+    headers, _ = _register_org("cust_officer_nophoto")
+    officer_id = _make_user_with_photo(headers, "Sales Officer", None)
+    r = client.post("/customers", json={"name": "Cust NoPhoto", "assigned_sales_officer_id": officer_id}, headers=headers)
+    cid = r.json()["id"]
+    r2 = client.get("/customers", headers=headers, params={"search": "Cust NoPhoto"})
+    match = next(c for c in r2.json() if c["id"] == cid)
+    assert match["assigned_sales_officer"]["profile_photo"] is None
+
+
+def test_order_salesperson_photo_normalizes_bare_id():
+    headers, _ = _register_org("order_sp_photo")
+    officer_id = _make_user_with_photo(headers, "Sales Officer", "order-sp-bare-id")
+    cust = client.post("/customers", json={"name": "Cust Order SP"}, headers=headers).json()
+    wh = client.post("/warehouses", json={"name": "WH", "code": f"WH{uuid.uuid4().hex[:4]}"}, headers=headers).json()
+    prod = client.post("/products", json={"name": "P", "sku": f"SKU{uuid.uuid4().hex[:6]}", "sale_price": 10.0}, headers=headers).json()
+    order = client.post("/orders", json={
+        "customer_id": cust["id"], "warehouse_id": wh["id"], "salesperson_id": officer_id,
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 10.0}],
+    }, headers=headers)
+    assert order.status_code == 201, order.text
+    assert order.json()["salesperson"]["profile_photo"] == "/files/order-sp-bare-id"
+
+
+def test_quotation_salesperson_photo_normalizes_bare_id():
+    headers, _ = _register_org("quote_sp_photo")
+    officer_id = _make_user_with_photo(headers, "Sales Officer", "quote-sp-bare-id")
+    cust = client.post("/customers", json={"name": "Cust Quote SP"}, headers=headers).json()
+    prod = client.post("/products", json={"name": "P", "sku": f"SKU{uuid.uuid4().hex[:6]}", "sale_price": 10.0}, headers=headers).json()
+    q = client.post("/quotations", json={
+        "customer_id": cust["id"], "salesperson_id": officer_id,
+        "items": [{"product_id": prod["id"], "quantity": 1, "unit_price": 10.0}],
+    }, headers=headers)
+    assert q.status_code == 201, q.text
+    assert q.json()["salesperson"]["profile_photo"] == "/files/quote-sp-bare-id"
+
+
+def test_delivery_partner_photo_normalizes_bare_id():
+    from app.models.delivery import Delivery
+    from app.models.customer import Customer
+
+    headers, _ = _register_org("deliv_partner_photo")
+    partner_id = _make_user_with_photo(headers, "Delivery Partner", "deliv-partner-bare-id")
+
+    db = SessionLocal()
+    try:
+        org_id = db.query(User).filter(User.organization_id.isnot(None)).order_by(User.created_at.desc()).first().organization_id
+        cust = Customer(organization_id=org_id, name="Cust Delivery Photo")
+        db.add(cust)
+        db.flush()
+        delivery = Delivery(
+            organization_id=org_id, delivery_note_number=f"DLV-{uuid.uuid4().hex[:6]}",
+            customer_id=cust.id, delivery_partner_id=partner_id, status="planned",
+        )
+        db.add(delivery)
+        db.commit()
+        did = delivery.id
+    finally:
+        db.close()
+
+    r = client.get(f"/deliveries/by-id/{did}", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["delivery_partner"]["profile_photo"] == "/files/deliv-partner-bare-id"
+
+
+def test_vehicle_delivery_partner_photo_normalizes_bare_id():
+    headers, _ = _register_org("vehicle_partner_photo")
+    partner_id = _make_user_with_photo(headers, "Delivery Partner", "vehicle-partner-bare-id")
+    r = client.post("/vehicles", json={
+        "vehicle_number": f"VEH-{uuid.uuid4().hex[:6]}", "vehicle_type": "van",
+        "default_driver_id": partner_id,
+    }, headers=headers)
+    assert r.status_code == 201, r.text
+    assert r.json()["assigned_delivery_partner"]["profile_photo"] == "/files/vehicle-partner-bare-id"
+
+
+# ------------------- schema-level regression for the remaining Briefs -------------
+# (follow-up / lead / visit / leave): full endpoint round trips for each would
+# need their own multi-step setup (a follow-up needs a customer+lead, a leave
+# needs an approval workflow, etc.) — schema-level construction proves the same
+# validator wiring is correct without duplicating that setup four more times.
+
+
+def test_follow_up_user_brief_normalizes_bare_id():
+    from app.schemas.follow_up import FollowUpUserBrief
+    out = FollowUpUserBrief(id="u1", name="Rep", email="rep@example.com", profile_photo="bare-id")
+    assert out.profile_photo == "/files/bare-id"
+
+
+def test_lead_salesperson_brief_normalizes_bare_id():
+    from app.schemas.lead import LeadSalespersonBrief
+    out = LeadSalespersonBrief(id="u1", name="Rep", email="rep@example.com", profile_photo="bare-id")
+    assert out.profile_photo == "/files/bare-id"
+
+
+def test_visit_user_brief_normalizes_bare_id():
+    from app.schemas.visit import VisitUserBrief
+    out = VisitUserBrief(id="u1", name="Rep", email="rep@example.com", profile_photo="bare-id")
+    assert out.profile_photo == "/files/bare-id"
+
+
+def test_leave_user_brief_normalizes_bare_id_and_full_url_unchanged():
+    from app.schemas.leave import LeaveUserBrief
+    out = LeaveUserBrief(id="u1", name="Rep", profile_photo="bare-id")
+    assert out.profile_photo == "/files/bare-id"
+    out2 = LeaveUserBrief(id="u1", name="Rep", profile_photo="https://cdn.example.com/photo.png")
+    assert out2.profile_photo == "https://cdn.example.com/photo.png"
+    out3 = LeaveUserBrief(id="u1", name="Rep", profile_photo=None)
+    assert out3.profile_photo is None

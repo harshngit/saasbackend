@@ -205,6 +205,13 @@ class DeliveryPartnerBrief(BaseModel):
     phone: str | None = None
     email: str | None = None
     employee_id: str | None = None
+    profile_photo: str | None = None
+
+    @field_validator("profile_photo", mode="after")
+    @classmethod
+    def _normalize_profile_photo(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class VehicleBrief(BaseModel):
