@@ -18,6 +18,8 @@ import sys
 from urllib.parse import parse_qsl, urlsplit
 
 import certifi
+import pytest
+from alembic.config import Config
 from sqlalchemy import create_engine
 
 sys.path.insert(0, os.path.abspath("."))
@@ -175,3 +177,39 @@ def test_alembic_head_is_still_single_and_linear():
     children = set(revisions.values())
     heads = [r for r in revisions if r not in children]
     assert len(heads) == 1, f"expected exactly one alembic head, found: {heads}"
+
+
+def test_alembic_config_accepts_sslrootcert_system_rewritten_url():
+    """alembic/env.py passes settings.sqlalchemy_database_url straight into
+    config.set_main_option(), which is really configparser.set() underneath —
+    and configparser treats a bare % as interpolation syntax. The certifi path
+    that sslrootcert=system gets rewritten to is urlencode()'d by
+    Settings.sqlalchemy_database_url, so it always contains %-escapes (%2F on
+    Linux, %3A%5C on Windows) — set_main_option() raises ValueError: invalid
+    interpolation syntax unless the value is escaped as %% first.
+
+    Guards the fix, not just the symptom: also asserts the escaped value reads
+    back as the exact original URL, so the fix can't silently change the
+    connection string alembic actually uses. No network access, no real
+    PlanetScale/PostgreSQL/EC2/R2 connection — set_main_option()/
+    get_main_option() are pure in-memory string operations.
+    """
+    s = Settings(
+        database_url="postgresql://user:pass@aws.connect.psdb.cloud:5432/crm_saas"
+        "?sslmode=verify-full&sslrootcert=system"
+    )
+    url = s.sqlalchemy_database_url
+    assert "%" in url  # sanity: the test is actually exercising the risky path
+
+    alembic_ini = os.path.join(os.path.dirname(__file__), "..", "alembic.ini")
+    cfg = Config(alembic_ini)
+
+    # Reproduces the reported bug: the raw rewritten URL crashes configparser.
+    with pytest.raises(ValueError, match="invalid interpolation syntax"):
+        cfg.set_main_option("sqlalchemy.url", url)
+
+    # The fix: escaping % as %% (configparser's own documented convention for
+    # set_main_option) must not raise, and must round-trip to the exact
+    # original URL when read back — not a mangled one.
+    cfg.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    assert cfg.get_main_option("sqlalchemy.url") == url

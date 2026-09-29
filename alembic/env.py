@@ -36,7 +36,23 @@ if config.config_file_name is not None:
 
 # The single source of truth for both the URL and the schema — see the
 # module docstring above.
-config.set_main_option("sqlalchemy.url", settings.sqlalchemy_database_url)
+#
+# set_main_option() hands the value to configparser, which treats a bare `%`
+# as interpolation syntax and raises ValueError: invalid interpolation syntax.
+# A PlanetScale-style URL (sslmode=verify-full&sslrootcert=system) gets its
+# sslrootcert rewritten to certifi.where() and then urlencode()'d by
+# Settings.sqlalchemy_database_url, which always percent-encodes that path
+# (%2F on Linux, %3A%5C on Windows) — so the raw value must never be passed
+# here directly. `%%` is configparser's own escape for a literal `%`; this
+# does not change the URL itself, only how this one call stores it, and
+# get_main_option() reads back the exact original value. The engine
+# (app/core/database.py) is built from settings.sqlalchemy_database_url
+# directly and never goes through configparser, so it is unaffected either
+# way.
+config.set_main_option(
+    "sqlalchemy.url",
+    settings.sqlalchemy_database_url.replace("%", "%%"),
+)
 target_metadata = Base.metadata
 
 
