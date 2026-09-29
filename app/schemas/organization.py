@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.enums import BillingCycle, OrganizationStatus, UpgradeStatus
 from app.schemas.plan import PlanOut
@@ -35,6 +35,12 @@ class OrganizationOut(BaseModel):
     upgrade_requested_at: datetime | None = None
     upgrade_reject_reason: str | None = None
     created_at: datetime
+
+    @field_validator("logo_url", mode="after")
+    @classmethod
+    def _normalize_logo_url(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class UpgradeRequest(BaseModel):

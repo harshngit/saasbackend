@@ -18,7 +18,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.schemas.user import (
     AccountStatusIn,
@@ -117,6 +117,18 @@ class BasicInformation(BaseModel):
     blood_group: str | None = Field(default=None, max_length=10)
     nationality: str | None = Field(default=None, max_length=100)
     profile_photo: str | None = Field(default=None, description="URL from POST /files/upload")
+
+    @field_validator("profile_photo", mode="after")
+    @classmethod
+    def _normalize_profile_photo(cls, v: str | None) -> str | None:
+        """Nothing validates this on write (a client can PATCH a bare file_id
+        in here instead of the /files/{id} URL POST /files/upload returns), so
+        normalize defensively — same reasoning as app.core.files.normalize_file_url,
+        applied here too since this class serves both the create/update body
+        and the response (EmployeeProfileIn/Out both type basic_information as
+        this same class)."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class ContactInformation(BaseModel):

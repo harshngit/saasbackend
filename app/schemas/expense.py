@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 
 from app.schemas.choices import ApprovalStatus, ExpensePaymentStatus, ExpenseStatus
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 class ExpenseItemIn(BaseModel):
@@ -107,6 +107,12 @@ class ExpenseOut(BaseModel):
     @property
     def net_payable(self) -> float:
         return round(max((self.amount or 0.0) - (self.tds_amount or 0.0), 0.0), 2)
+
+    @field_validator("receipt_url", "vendor_invoice_url", mode="after")
+    @classmethod
+    def _normalize_file_urls(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class ExpenseCreate(BaseModel):

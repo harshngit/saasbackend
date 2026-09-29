@@ -7,7 +7,7 @@ one card on the page.
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Column -> the label the "Missing Information" list shows for it.
 FIELD_LABELS: dict[str, str] = {
@@ -84,6 +84,12 @@ class OverviewCompany(BaseModel):
     created_at: datetime
     plan: OverviewPlan
 
+    @field_validator("logo_url", mode="after")
+    @classmethod
+    def _normalize_logo_url(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
 
 class OverviewCounts(BaseModel):
     """The stat tiles."""
@@ -127,6 +133,12 @@ class OverviewAuthorizedPerson(BaseModel):
     photo_url: str | None = None
     signature_url: str | None = None
     is_complete: bool
+
+    @field_validator("photo_url", "signature_url", mode="after")
+    @classmethod
+    def _normalize_file_urls(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class OverviewDocument(BaseModel):

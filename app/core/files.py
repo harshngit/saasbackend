@@ -47,6 +47,31 @@ def public_url(request: Request | None, file_id: str) -> str:
     return f"{base}{FILES_PATH}/{file_id}"
 
 
+def normalize_file_url(value: str | None) -> str | None:
+    """Make a `*_url` field usable no matter what shape ended up stored in it.
+
+    Every one of these columns is meant to hold a ready-to-use reference
+    (`/files/{id}`, an absolute URL, or a legacy `data:` URI), but several of
+    them accept a plain string from the client on create/update with no
+    format check — so a caller that pastes a bare `file_id` (e.g. the `file_id`
+    field of POST /files/upload's response instead of its `url` field) ends up
+    with that raw id stored verbatim. Applied at the response-schema boundary
+    so the API is correct regardless of what's already in the database, with
+    no data migration required.
+
+    Bare id -> /files/{id}; already `/...`, `http(s)://...` or `data:...` ->
+    unchanged; None/blank -> None.
+    """
+    if value is None:
+        return None
+    val = value.strip()
+    if not val:
+        return None
+    if val.startswith("/") or val.startswith("http://") or val.startswith("https://") or val.startswith("data:"):
+        return val
+    return f"{FILES_PATH}/{val}"
+
+
 def _persist(
     db: Session, org_id: str | None, filename: str, content: bytes, content_type: str,
 ) -> "StoredFile":  # noqa: F821

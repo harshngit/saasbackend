@@ -189,10 +189,12 @@ class SalesOrderItem(Base):
 
     @property
     def product_image_url(self) -> str | None:
+        from app.core.files import normalize_file_url
+
         if self.variant and self.variant.image_url:
-            return self.variant.image_url
+            return normalize_file_url(self.variant.image_url)
         if self.product and self.product.cover_image:
-            return self.product.cover_image
+            return normalize_file_url(self.product.cover_image)
         return None
 
     @property

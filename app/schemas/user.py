@@ -8,6 +8,7 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -223,6 +224,15 @@ class UserOut(BaseModel):
         if self.status is None:
             self.status = (AccountStatus.ACTIVE if self.is_active else AccountStatus.INACTIVE).value
         return self
+
+    @field_validator("profile_photo", mode="after")
+    @classmethod
+    def _normalize_profile_photo(cls, v: str | None) -> str | None:
+        """Nothing validates this on write (PATCH /users/{id}'s basic_information.
+        profile_photo accepts any string), so a bare file_id pasted here instead of
+        the /files/{id} URL POST /files/upload returns must still resolve."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class AdminResetPassword(BaseModel):

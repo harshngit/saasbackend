@@ -202,6 +202,20 @@ class CompanySettingsOut(BaseModel):
     # which only a Super Admin changes — never editable from this page.
     subscription_status: str | None = None
 
+    @field_validator(
+        "logo_url", "signature_url", "stamp_url", "letterhead_url", "banner_url", "payment_qr_url",
+        "doc_gst_url", "doc_pan_url", "doc_coi_url", "doc_trade_license_url", "doc_msme_url",
+        "doc_fssai_url", "doc_other_url", "auth_person_photo_url", "auth_person_signature_url",
+        mode="after",
+    )
+    @classmethod
+    def _normalize_file_urls(cls, v: str | None) -> str | None:
+        """A bare file_id pasted into one of these (instead of the `/files/{id}`
+        URL POST /files/upload returns) must still resolve to a usable link —
+        see app.core.files.normalize_file_url."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
     @field_validator("doc_other_files", "branch_addresses", mode="before")
     @classmethod
     def _default_documents(cls, v: object) -> object:

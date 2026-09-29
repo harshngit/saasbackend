@@ -93,6 +93,12 @@ class SupplierInvoiceOut(BaseModel):
     updated_at: datetime
     items: list[SupplierInvoiceItemOut] = []
 
+    @field_validator("attachment_url", mode="after")
+    @classmethod
+    def _normalize_attachment_url(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
 
 class BulkDelete(BaseModel):
     ids: list[str] = Field(min_length=1)

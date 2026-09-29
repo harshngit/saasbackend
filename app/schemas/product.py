@@ -36,6 +36,12 @@ class VariantOut(BaseModel):
     inventory: int
     image_url: str | None = None
 
+    @field_validator("image_url", mode="after")
+    @classmethod
+    def _normalize_image_url(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
 
 class NamedRef(BaseModel):
     """A related record resolved from its id, so callers never look up a name."""

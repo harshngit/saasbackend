@@ -169,6 +169,15 @@ class PurchaseOut(BaseModel):
     def outstanding_balance(self) -> float:
         return round(max(self.total - (self.amount_paid or 0.0), 0.0), 2)
 
+    @field_validator(
+        "attachment_url", "supplier_quotation_url", "purchase_order_url",
+        "supplier_invoice_url", "delivery_challan_url", mode="after",
+    )
+    @classmethod
+    def _normalize_file_urls(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
 
 class PurchaseCreate(BaseModel):
     invoice_number: str = Field(min_length=1, max_length=60)

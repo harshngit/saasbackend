@@ -134,12 +134,14 @@ class InvoiceItem(Base):
 
     @property
     def product_image_url(self) -> str | None:
+        from app.core.files import normalize_file_url
+
         if self.variant and self.variant.image_url:
-            return self.variant.image_url
+            return normalize_file_url(self.variant.image_url)
         if self.product:
             if self.product.cover_image:
-                return self.product.cover_image
+                return normalize_file_url(self.product.cover_image)
             if self.product.images and isinstance(self.product.images, list) and len(self.product.images) > 0:
-                return self.product.images[0]
+                return normalize_file_url(self.product.images[0])
         return None
 

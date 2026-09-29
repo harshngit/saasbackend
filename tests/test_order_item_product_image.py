@@ -627,5 +627,100 @@ def test_order_customer_raw_uuid_image_api():
     assert matching["customer"]["profile_image_url"] == f"/files/{raw_uuid}"
 
 
+def test_customer_out_profile_image_url_normalization():
+    """Unit tests for CustomerOut profile_image_url normalization."""
+    from app.schemas.customer import CustomerOut
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    base_kwargs = dict(
+        id="c1", organization_id="org1", name="Test Customer",
+        business_name=None, phone=None, email=None, gst_number=None,
+        billing_address=None, delivery_address=None,
+        assigned_sales_officer_id=None, assigned_sales_officer=None,
+        credit_limit=0.0, opening_balance=0.0, total_billed=0.0, total_received=0.0,
+        outstanding_balance=0.0, category=None, notes=None, is_active=True,
+        created_at=now, updated_at=now,
+    )
+
+    # Raw UUID
+    c1 = CustomerOut(**base_kwargs, profile_image_id="d4825176-8f39-423e-86f9-758986f896dc")
+    assert c1.profile_image_id == "d4825176-8f39-423e-86f9-758986f896dc"
+    assert c1.profile_image_url == "/files/d4825176-8f39-423e-86f9-758986f896dc"
+
+    # Existing /files path
+    c2 = CustomerOut(**base_kwargs, profile_image_id="/files/abc123")
+    assert c2.profile_image_id == "/files/abc123"
+    assert c2.profile_image_url == "/files/abc123"
+
+    # HTTP URL
+    c3 = CustomerOut(**base_kwargs, profile_image_id="http://example.com/files/123")
+    assert c3.profile_image_id == "http://example.com/files/123"
+    assert c3.profile_image_url == "http://example.com/files/123"
+
+    # HTTPS URL
+    c4 = CustomerOut(**base_kwargs, profile_image_id="https://example.com/files/123")
+    assert c4.profile_image_id == "https://example.com/files/123"
+    assert c4.profile_image_url == "https://example.com/files/123"
+
+    # None
+    c5 = CustomerOut(**base_kwargs, profile_image_id=None)
+    assert c5.profile_image_id is None
+    assert c5.profile_image_url is None
+
+
+def test_get_customers_api_profile_image_url():
+    """API test: GET /customers returns both profile_image_id and profile_image_url."""
+    headers, org_id = _register_org("Customer List Image Org")
+
+    raw_uuid = "d4825176-8f39-423e-86f9-758986f896dc"
+    db = SessionLocal()
+    try:
+        cust_with_raw_uuid = Customer(
+            organization_id=org_id,
+            name="Apex Enterprises",
+            phone="+919999999991",
+            profile_image_id=raw_uuid,
+        )
+        cust_with_path = Customer(
+            organization_id=org_id,
+            name="Path Customer",
+            phone="+919999999992",
+            profile_image_id="/files/existing-path.png",
+        )
+        cust_no_image = Customer(
+            organization_id=org_id,
+            name="No Image Customer",
+            phone="+919999999993",
+            profile_image_id=None,
+        )
+        db.add_all([cust_with_raw_uuid, cust_with_path, cust_no_image])
+        db.commit()
+        db.refresh(cust_with_raw_uuid)
+        db.refresh(cust_with_path)
+        db.refresh(cust_no_image)
+    finally:
+        db.close()
+
+    r = client.get("/customers", headers=headers)
+    assert r.status_code == 200, r.text
+    customers_by_name = {c["name"]: c for c in r.json()}
+
+    # Customer with raw UUID
+    c_raw = customers_by_name["Apex Enterprises"]
+    assert c_raw["profile_image_id"] == raw_uuid
+    assert c_raw["profile_image_url"] == f"/files/{raw_uuid}"
+
+    # Customer with existing /files path
+    c_path = customers_by_name["Path Customer"]
+    assert c_path["profile_image_id"] == "/files/existing-path.png"
+    assert c_path["profile_image_url"] == "/files/existing-path.png"
+
+    # Customer without image
+    c_none = customers_by_name["No Image Customer"]
+    assert c_none["profile_image_id"] is None
+    assert c_none["profile_image_url"] is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

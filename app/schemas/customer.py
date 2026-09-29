@@ -44,6 +44,7 @@ class CustomerOut(BaseModel):
     maps_latitude: float | None = None
     maps_longitude: float | None = None
     profile_image_id: str | None = None
+    profile_image_url: str | None = None
 
     city: str | None = None
     last_order_date: datetime | None = None
@@ -51,6 +52,21 @@ class CustomerOut(BaseModel):
 
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def _alias_profile_image_url(self) -> "CustomerOut":
+        if self.profile_image_url is None and self.profile_image_id:
+            val = str(self.profile_image_id).strip()
+            if (
+                val.startswith("/")
+                or val.startswith("http://")
+                or val.startswith("https://")
+                or val.startswith("data:")
+            ):
+                self.profile_image_url = val
+            else:
+                self.profile_image_url = f"/files/{val}"
+        return self
 
 
 class CustomerCreate(BaseModel):
