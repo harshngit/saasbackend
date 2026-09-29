@@ -75,7 +75,11 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
 
     super_admin_email: str = "superadmin@demo.com"
-    super_admin_password: str = "Admin@123"
+    # No default on purpose: a known password baked into source code would be
+    # a working production credential for anyone who reads the repo. Set
+    # SUPER_ADMIN_PASSWORD explicitly wherever a Super Admin actually needs to
+    # be created — app.seed.seed_super_admin() refuses to seed one without it.
+    super_admin_password: str = ""
     super_admin_name: str = "Ravi Malhotra"
 
     # Seed the Super Admin (and demo firm) automatically on first startup.

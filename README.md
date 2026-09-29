@@ -660,36 +660,25 @@ is filled in.
 .\.venv\Scripts\python.exe test_smoke.py   # 37 end-to-end checks, uses a throwaway DB
 ```
 
-## Deploy to Render
+## Deployment
 
-This repo ships a `render.yaml` Blueprint that provisions the **API + a free
-PostgreSQL database** together. SQLite is dev-only — Render's disk is ephemeral,
-so production uses Postgres (the app auto-switches based on `DATABASE_URL`).
+Render is no longer used for production — the `render.yaml` Blueprint that
+used to provision it has been removed, along with the Render deploy steps
+this section previously documented. Production has since moved from Render
+to EC2 to its current host, Cloudflare Workers/Containers; the Cloudflare
+deployment configuration (Dockerfile, `wrangler.jsonc`, worker entrypoint)
+lives outside this repository.
 
-**Steps:**
-1. Push this repo to GitHub (done: `harshngit/saasbackend`).
-2. In Render: **New + → Blueprint** → connect this repo → Render reads `render.yaml`.
-3. When prompted, set the values marked `sync: false`:
-   - `SUPER_ADMIN_PASSWORD` — a strong password for the platform owner.
-   - SMTP fields (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `FRONTEND_RESET_URL`) —
-     optional; leave blank to just log reset emails.
-4. **Apply** → Render builds the web service, creates the Postgres DB, injects
-   `DATABASE_URL`, generates `JWT_SECRET`, and seeds the Super Admin on first boot.
-5. Open `https://<your-service>.onrender.com/docs`.
-
-**Good to know (free tier):**
-- The web service **sleeps after ~15 min idle**; the first request then takes
-  ~50s to wake (cold start).
-- Free Postgres is **removed after 30 days** — fine for testing, upgrade for real use.
-- After the app is live, tighten `CORS_ORIGINS` from `*` to your real front-end URL,
-  and change `SEED_ON_STARTUP` to `false` once the Super Admin exists.
+SQLite remains dev-only in every case — the app auto-switches to Postgres
+based on `DATABASE_URL` (see `app/core/config.py::sqlalchemy_database_url`),
+and schema changes go through **Alembic** migrations (`alembic upgrade head`),
+not the startup `create_all` compatibility layer.
 
 ## Going to production (hardening)
 
-1. `DATABASE_URL` → managed Postgres (Render Blueprint does this automatically).
-   `postgres://` / `postgresql://` URLs are auto-rewritten to psycopg3.
-2. Strong `JWT_SECRET` (Blueprint generates one; or
-   `python -c "import secrets; print(secrets.token_hex(32))"`).
+1. `DATABASE_URL` → managed Postgres. `postgres://` / `postgresql://` URLs are
+   auto-rewritten to psycopg3.
+2. Strong `JWT_SECRET` — `python -c "import secrets; print(secrets.token_hex(32))"`.
 3. Replace startup `create_all` with **Alembic** migrations before schema changes.
 4. Restrict `CORS_ORIGINS` to your real front-end origins.
 5. Turn `SEED_ON_STARTUP` off after the first deploy.

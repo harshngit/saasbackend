@@ -1,5 +1,16 @@
-name: Deploy to production (EC2)
+name: Deploy to production (EC2) [DISABLED — see .disabled extension]
 
+# DISABLED: production has moved off EC2 to Cloudflare Workers/Containers.
+# The EC2 host this workflow deploys to is stopped, and its health check
+# (https://api.asynk.in/health) points at that same stopped host — every run
+# would fail at either the SSH-connect step or the health-check step. Renamed
+# to deploy.yml.disabled (GitHub Actions only runs files literally named
+# *.yml/*.yaml directly in .github/workflows/) rather than deleted, so the
+# EC2 deployment procedure remains available for reference and git history
+# stays intact. No Cloudflare deployment workflow has been added in its
+# place — the actual Cloudflare deployment files (worker/src/index.js,
+# wrangler.jsonc, Dockerfile) are not present in this repository.
+#
 # Deploys origin/main to the EC2 host over SSH:
 #   fetch -> fast-forward -> (pip install if needed) -> alembic upgrade head
 #   -> restart crm-backend -> verify systemd + /health (status AND database ok)

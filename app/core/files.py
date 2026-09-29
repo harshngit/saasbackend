@@ -35,16 +35,21 @@ def _check_type(
 
 
 def public_url(request: Request | None, file_id: str) -> str:
-    """Absolute URL for a stored file.
+    """Relative reference for a stored file: /files/{id}.
 
-    Uses PUBLIC_BASE_URL when it is configured (so links stay stable behind a
-    proxy or custom domain) and otherwise derives the host from the request that
-    uploaded the file.
+    Deliberately host-independent. This backend has already moved host three
+    times (Render -> EC2 -> Cloudflare Workers) — a stored/returned URL that
+    embedded one of those hosts would break the moment the app moved to the
+    next one. `GET /files/{id}` itself still works from any host that's
+    actually serving the API; callers resolve a relative reference against
+    whichever host they're already talking to (the frontend's own
+    `getFileUrl()` already does exactly this).
+
+    `request` is accepted but unused — kept so every existing call site
+    (`save_upload`, `save_bytes`, `customer_profile_service.py`) keeps
+    working unchanged.
     """
-    base = (settings.public_base_url or "").rstrip("/")
-    if not base and request is not None:
-        base = str(request.base_url).rstrip("/")
-    return f"{base}{FILES_PATH}/{file_id}"
+    return f"{FILES_PATH}/{file_id}"
 
 
 def normalize_file_url(value: str | None) -> str | None:

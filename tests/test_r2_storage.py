@@ -92,6 +92,87 @@ def test_save_bytes_without_r2_configured_stores_db_bytes():
         db.close()
 
 
+# ------------------------- new uploads return relative URLs -----------------------
+# public_url() no longer embeds a backend host — this app has moved host three
+# times (Render -> EC2 -> Cloudflare Workers), and a stored/returned URL that
+# baked one in would break at the next move. Every caller must get back
+# exactly "/files/{id}", never an absolute URL under any of those hosts.
+
+_FORBIDDEN_HOST_FRAGMENTS = ("onrender.com", "api.asynk.in", "bsmart.workers.dev", "testserver", "http://", "https://")
+
+
+def test_public_url_is_always_relative_regardless_of_request():
+    from app.core.files import public_url
+
+    assert public_url(None, "abc123") == "/files/abc123"
+
+
+def test_save_upload_returns_relative_url_with_real_request():
+    """The normal, request-based upload path (POST /files/upload) — a real
+    Request object is available, but the returned URL must still be relative."""
+    headers, org_id = _register_org("relative_upload")
+    r = client.post(
+        "/files/upload",
+        files={"file": ("a.png", io.BytesIO(b"relative-url-bytes"), "image/png")},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    url = r.json()["url"]
+    assert url.startswith("/files/")
+    for fragment in _FORBIDDEN_HOST_FRAGMENTS:
+        assert fragment not in url, f"{fragment!r} leaked into upload URL: {url}"
+
+
+def test_save_upload_direct_call_returns_relative_url():
+    """save_upload() called directly (as most routers do) with a real
+    FastAPI Request — still relative."""
+    _, org_id = _register_org("relative_upload_direct")
+    db = SessionLocal()
+    try:
+        upload = UploadFile(filename="a.png", file=io.BytesIO(b"direct-call-bytes"))
+        url, _size = files_module.save_upload(db, org_id, upload, allow_any=True)
+        assert url.startswith("/files/")
+        for fragment in _FORBIDDEN_HOST_FRAGMENTS:
+            assert fragment not in url, f"{fragment!r} leaked into upload URL: {url}"
+    finally:
+        db.close()
+
+
+def test_save_bytes_request_none_path_returns_relative_url():
+    """save_bytes() is called with request=None from customer_profile_service.py
+    (there's no HTTP request in scope when converting a legacy inline document) —
+    this is the one path that previously could produce a bare relative URL only
+    when PUBLIC_BASE_URL was unset; it must now always be relative regardless."""
+    _, org_id = _register_org("relative_bytes_no_request")
+    db = SessionLocal()
+    try:
+        url = files_module.save_bytes(
+            db, org_id, b"no-request-bytes", "doc.pdf", "application/pdf", request=None,
+        )
+        assert url == f"/files/{url.rsplit('/', 1)[-1]}"
+        for fragment in _FORBIDDEN_HOST_FRAGMENTS:
+            assert fragment not in url, f"{fragment!r} leaked into upload URL: {url}"
+    finally:
+        db.close()
+
+
+def test_relative_url_still_serves_the_file_correctly():
+    """Confirms the relative-URL change didn't break actual file retrieval —
+    GET /files/{id} still works using just the id from the relative URL."""
+    headers, org_id = _register_org("relative_url_retrieval")
+    r = client.post(
+        "/files/upload",
+        files={"file": ("a.png", io.BytesIO(b"still-retrievable"), "image/png")},
+        headers=headers,
+    )
+    file_id = r.json()["file_id"]
+    assert r.json()["url"] == f"/files/{file_id}"
+
+    r2 = client.get(f"/files/{file_id}")
+    assert r2.status_code == 200
+    assert r2.content == b"still-retrievable"
+
+
 def test_files_get_serves_db_bytes_unchanged_when_no_storage_key():
     headers, org_id = _register_org("no_r2_get")
     db = SessionLocal()
