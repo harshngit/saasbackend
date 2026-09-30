@@ -42,6 +42,7 @@ from app.models.oauth_exchange_ticket import OAuthExchangeTicket
 from app.models.oauth_registration_ticket import OAuthRegistrationTicket
 from app.models.plan import Plan
 from app.models.product import Product, ProductPricing, ProductVariant
+from app.models.subscription_payment import SubscriptionPayment
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role
 from app.models.stock_movement import STOCK_MOVEMENT_TYPES, StockMovement
@@ -98,6 +99,7 @@ __all__ = [
     "Organization",
     "OrganizationTheme",
     "Plan",
+    "SubscriptionPayment",
     "Role",
     "Team",
     "Customer",

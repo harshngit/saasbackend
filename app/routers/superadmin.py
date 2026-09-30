@@ -8,9 +8,10 @@ from app.core.security import hash_password
 from app.models import Organization, OrganizationStatus, Plan, SystemRole, UpgradeStatus, User, UserRole
 from app.schemas.organization import OrganizationOut, OrgStatusUpdate, RejectUpgrade
 from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
+from app.schemas.razorpay import SubscriptionPaymentOut
 from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
 from app.schemas.user import UserOut
-from app.services import org_service, password_service
+from app.services import billing_service, org_service, password_service
 
 # Every endpoint here is Super Admin only.
 _super_admin_guard = require_system_role(SystemRole.SUPER_ADMIN)
@@ -305,3 +306,16 @@ def delete_organization(org_id: str, db: Session = Depends(get_db)) -> None:
     org = _get_org(db, org_id)
     db.delete(org)
     db.commit()
+
+
+# ----------------------- Subscription payments (Razorpay, Phase 1) -----------------------
+
+
+@router.get("/subscription-payments", response_model=list[SubscriptionPaymentOut])
+def list_subscription_payments(
+    organization_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[SubscriptionPaymentOut]:
+    """Every Razorpay subscription payment, optionally filtered by
+    ?organization_id=. Without it, lists across every organization."""
+    return billing_service.list_payments(db, organization_id=organization_id)

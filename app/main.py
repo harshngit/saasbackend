@@ -57,6 +57,7 @@ from app.services.stock_service import migrate_order_statuses
 from app.routers import (
     attendance,
     auth,
+    billing,
     brands,
     categories,
     customers,
@@ -232,6 +233,7 @@ def health() -> dict[str, str | None]:
 
 app.include_router(files.router)
 app.include_router(auth.router)
+app.include_router(billing.router)
 app.include_router(users.router)
 app.include_router(roles.router)
 app.include_router(teams.router)

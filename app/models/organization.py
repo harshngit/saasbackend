@@ -160,6 +160,12 @@ class Organization(Base):
     billing_cycle: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When the current *paid* plan period ends (Razorpay Phase 1). None for an
+    # org that has never had a paid plan activated online. Distinct from
+    # trial_ends_at — a paid org's trial is already over; see
+    # app.services.org_service.apply_trial_expiry for how this is enforced
+    # (the same lazy-expiry function handles both cases).
+    plan_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     upgrade_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # UpgradeStatus value ("none"/"pending"/"approved"/"rejected").
     upgrade_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -204,6 +210,19 @@ class Organization(Base):
         if self.trial_ends_at is None:
             return None
         end = self.trial_ends_at
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        seconds = (end - datetime.now(timezone.utc)).total_seconds()
+        return max(0, math.ceil(seconds / 86400))
+
+    @property
+    def days_left(self) -> int | None:
+        """Whole days remaining on the current paid plan period (0 if past),
+        or None if plan_expires_at was never set (no paid plan activated
+        online yet). Same rounding rule as trial_days_left."""
+        if self.plan_expires_at is None:
+            return None
+        end = self.plan_expires_at
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
         seconds = (end - datetime.now(timezone.utc)).total_seconds()

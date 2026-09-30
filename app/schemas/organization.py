@@ -36,6 +36,12 @@ class OrganizationOut(BaseModel):
     upgrade_reject_reason: str | None = None
     created_at: datetime
 
+    # Paid-plan period (Razorpay Phase 1 — see app.models.organization.Organization.
+    # days_left). None for an org that has never had a paid plan activated online;
+    # distinct from trial_days_left, whose trial is already over once a paid plan exists.
+    plan_expires_at: datetime | None = None
+    days_left: int | None = None
+
     @field_validator("logo_url", mode="after")
     @classmethod
     def _normalize_logo_url(cls, v: str | None) -> str | None:

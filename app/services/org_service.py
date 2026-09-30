@@ -47,11 +47,30 @@ def start_trial(db: Session, org: Organization) -> None:
 
 
 def apply_trial_expiry(db: Session, org: Organization | None) -> Organization | None:
-    """Lazily flip an expired trial to `locked`. Called on login / me / gated requests."""
+    """Lazily flip an expired trial — or an expired *paid* plan period
+    (Razorpay Phase 1's `plan_expires_at`) — to `locked`. Called on login /
+    me / gated requests (including app.core.deps.require_unlocked_org, so
+    every data-mutation endpoint already gets this for free).
+
+    Reuses the same LOCKED status and upgrade-to-continue flow for both
+    cases rather than inventing a second one: an org only ever has
+    plan_expires_at set once it's had a plan activated online (see
+    app.services.billing_service.activate_subscription), so this never
+    fires for an org on the manual-approval flow, which doesn't touch that
+    column — existing trial behavior is unaffected.
+    """
     if org is None:
         return None
     if org.status == OrganizationStatus.TRIAL and org.trial_ends_at is not None:
         end = org.trial_ends_at
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if end < datetime.now(timezone.utc):
+            org.status = OrganizationStatus.LOCKED
+            db.commit()
+            db.refresh(org)
+    elif org.status == OrganizationStatus.ACTIVE and org.plan_expires_at is not None:
+        end = org.plan_expires_at
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
         if end < datetime.now(timezone.utc):

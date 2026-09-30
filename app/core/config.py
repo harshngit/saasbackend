@@ -90,6 +90,17 @@ class Settings(BaseSettings):
     # Handy on hosts like Render where you can't easily run a one-off command.
     seed_on_startup: bool = False
 
+    # --- Razorpay (SaaS plan payments, Phase 1 — TEST MODE) ---
+    # All empty by default: online payment is only offered once every one of
+    # these is set (see razorpay_configured below) — the manual Super Admin
+    # upgrade-approval flow keeps working unconditionally either way. No
+    # secret gets a real default, same reasoning as super_admin_password
+    # above — a working credential baked into source would be live the
+    # moment anyone read this file.
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_webhook_secret: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
@@ -100,6 +111,14 @@ class Settings(BaseSettings):
         return bool(
             self.r2_account_id and self.r2_access_key_id
             and self.r2_secret_access_key and self.r2_bucket_name
+        )
+
+    @property
+    def razorpay_configured(self) -> bool:
+        """Online payment is only ever offered once every one of these is set —
+        never partially. Mirrors r2_configured above."""
+        return bool(
+            self.razorpay_key_id and self.razorpay_key_secret and self.razorpay_webhook_secret
         )
 
     @property
