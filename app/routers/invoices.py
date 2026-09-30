@@ -34,6 +34,10 @@ from app.schemas.invoice import (
     InvoiceFromDelivery,
     InvoiceOut,
 )
+from app.schemas.payment_gateway import (
+    InvoicePaymentLinkCreate,
+    InvoicePaymentLinkOut,
+)
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 # "Invoice this order" reads better hanging off the order it belongs to, so the
@@ -578,7 +582,30 @@ def list_invoices(
 
 @router.get("/{id}", response_model=InvoiceOut)
 def get_invoice(id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> Invoice:
-    return _owned(db, id, _org_id(user))
+    from app.models import InvoicePaymentLink
+
+    org_id = _org_id(user)
+    invoice = _owned(db, id, org_id)
+
+    latest_link = (
+        db.query(InvoicePaymentLink)
+        .filter(
+            InvoicePaymentLink.invoice_id == invoice.id,
+            InvoicePaymentLink.organization_id == org_id,
+        )
+        .order_by(InvoicePaymentLink.created_at.desc())
+        .first()
+    )
+    if latest_link:
+        invoice.has_active_payment_link = latest_link.status in ("created", "partially_paid")
+        invoice.payment_link_url = latest_link.short_url if invoice.has_active_payment_link else None
+        invoice.payment_link_status = latest_link.status
+    else:
+        invoice.has_active_payment_link = False
+        invoice.payment_link_url = None
+        invoice.payment_link_status = None
+
+    return invoice
 
 
 def _resolve_file_reference(db: Session, org_id: str, reference: str | None) -> bytes | None:
@@ -856,4 +883,70 @@ def create_credit_note(
     db.commit()
     db.refresh(note)
     return note
+
+
+# ---------------------- Razorpay Invoice Payment Links ----------------------
+
+
+@router.post("/{id}/payment-link", response_model=InvoicePaymentLinkOut, status_code=status.HTTP_201_CREATED)
+def create_invoice_payment_link(
+    id: str,
+    payload: InvoicePaymentLinkCreate = InvoicePaymentLinkCreate(),
+    user: User = Depends(_create),
+    db: Session = Depends(get_db),
+) -> InvoicePaymentLinkOut:
+    """Create or renew a Razorpay Payment Link for an invoice."""
+    from app.services import invoice_payment_link_service
+
+    org_id = _org_id(user)
+    invoice = _owned(db, id, org_id)
+    link = invoice_payment_link_service.create_payment_link(db, org_id, user, invoice, payload)
+    return invoice_payment_link_service.to_payment_link_out(link)
+
+
+@router.get("/{id}/payment-links", response_model=list[InvoicePaymentLinkOut])
+def list_invoice_payment_links(
+    id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[InvoicePaymentLinkOut]:
+    """List payment links generated for an invoice."""
+    from app.services import invoice_payment_link_service
+
+    org_id = _org_id(user)
+    invoice = _owned(db, id, org_id)
+    links = invoice_payment_link_service.list_invoice_payment_links(db, org_id, invoice.id)
+    return [invoice_payment_link_service.to_payment_link_out(l) for l in links]
+
+
+@router.post("/{id}/payment-links/{link_id}/cancel", response_model=InvoicePaymentLinkOut)
+def cancel_invoice_payment_link(
+    id: str,
+    link_id: str,
+    user: User = Depends(_edit),
+    db: Session = Depends(get_db),
+) -> InvoicePaymentLinkOut:
+    """Cancel an unpaid active payment link."""
+    from app.services import invoice_payment_link_service
+
+    org_id = _org_id(user)
+    invoice = _owned(db, id, org_id)
+    link = invoice_payment_link_service.cancel_payment_link(db, org_id, invoice, link_id)
+    return invoice_payment_link_service.to_payment_link_out(link)
+
+
+@router.get("/{id}/payment-links/{link_id}/refresh", response_model=InvoicePaymentLinkOut)
+def refresh_invoice_payment_link(
+    id: str,
+    link_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> InvoicePaymentLinkOut:
+    """Fetch latest payment link status from Razorpay and reconcile locally."""
+    from app.services import invoice_payment_link_service
+
+    org_id = _org_id(user)
+    invoice = _owned(db, id, org_id)
+    link = invoice_payment_link_service.refresh_payment_link(db, org_id, invoice, link_id)
+    return invoice_payment_link_service.to_payment_link_out(link)
 

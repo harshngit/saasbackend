@@ -23,6 +23,8 @@ from app.models.number_sequence import NumberSequence
 from app.models.stored_file import StoredFile
 from app.models.organization import Organization
 from app.models.organization_theme import OrganizationTheme
+from app.models.org_payment_gateway import OrgPaymentGateway
+from app.models.invoice_payment_link import InvoicePaymentLink
 from app.models.purchase_invoice import (
     PAYMENT_STATUSES,
     PURCHASE_STATUSES,
@@ -98,6 +100,8 @@ __all__ = [
     "StoredFile",
     "Organization",
     "OrganizationTheme",
+    "OrgPaymentGateway",
+    "InvoicePaymentLink",
     "Plan",
     "SubscriptionPayment",
     "Role",

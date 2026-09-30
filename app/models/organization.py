@@ -197,6 +197,9 @@ class Organization(Base):
     theme: Mapped["OrganizationTheme | None"] = relationship(  # noqa: F821
         back_populates="organization", uselist=False, cascade="all, delete-orphan"
     )
+    payment_gateway: Mapped["OrgPaymentGateway | None"] = relationship(  # noqa: F821
+        back_populates="organization", uselist=False, cascade="all, delete-orphan"
+    )
 
     @property
     def subscription_status(self) -> str:

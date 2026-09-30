@@ -15,6 +15,7 @@ from app.core.deps import get_current_user, require_system_role
 from app.core.files import save_upload
 from app.models import Organization, StoredFile, SystemRole, User
 from app.schemas.theme import OrganizationThemeOut, OrganizationThemeUpdate
+from app.schemas.payment_gateway import PaymentGatewayIn, PaymentGatewayOut
 from app.schemas.workflow_settings import (
     InvoiceSettings,
     InvoiceSettingsUpdate,
@@ -237,3 +238,63 @@ def reset_organization_theme(
         db.commit()
         db.refresh(theme)
     return OrganizationThemeOut.from_theme(theme)
+
+
+# --------------------------- payment gateway ------------------------------
+
+
+@router.get("/settings/payment-gateway", response_model=PaymentGatewayOut)
+@router.get("/payment-gateway", response_model=PaymentGatewayOut, include_in_schema=False)
+def get_payment_gateway(
+    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+) -> PaymentGatewayOut:
+    """Return the organization's Razorpay payment gateway configuration.
+
+    Secrets are never exposed.
+    """
+    from app.services import invoice_payment_link_service
+
+    org = _org(admin)
+    gateway = invoice_payment_link_service.get_gateway(db, org.id)
+    return invoice_payment_link_service.format_gateway_out(gateway, org.id)
+
+
+@router.put("/settings/payment-gateway", response_model=PaymentGatewayOut)
+@router.put("/payment-gateway", response_model=PaymentGatewayOut, include_in_schema=False)
+def put_payment_gateway(
+    payload: PaymentGatewayIn,
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> PaymentGatewayOut:
+    """Configure or update the organization's Razorpay API credentials."""
+    from app.services import invoice_payment_link_service
+
+    org = _org(admin)
+    gateway = invoice_payment_link_service.upsert_gateway(db, org.id, payload)
+    return invoice_payment_link_service.format_gateway_out(gateway, org.id)
+
+
+@router.delete("/settings/payment-gateway", status_code=status.HTTP_200_OK)
+@router.delete("/payment-gateway", status_code=status.HTTP_200_OK, include_in_schema=False)
+def delete_payment_gateway(
+    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+) -> dict:
+    """Remove the organization's payment gateway credentials."""
+    from app.services import invoice_payment_link_service
+
+    org = _org(admin)
+    invoice_payment_link_service.delete_gateway(db, org.id)
+    return {"detail": "Payment gateway removed"}
+
+
+@router.post("/settings/payment-gateway/test", response_model=PaymentGatewayOut)
+@router.post("/payment-gateway/test", response_model=PaymentGatewayOut, include_in_schema=False)
+def test_payment_gateway(
+    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+) -> PaymentGatewayOut:
+    """Test the stored credentials against Razorpay and record verified_at on success."""
+    from app.services import invoice_payment_link_service
+
+    org = _org(admin)
+    gateway = invoice_payment_link_service.test_gateway(db, org.id)
+    return invoice_payment_link_service.format_gateway_out(gateway, org.id)

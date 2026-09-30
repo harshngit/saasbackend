@@ -125,6 +125,11 @@ class InvoiceOut(BaseModel):
     payment_status: str | None = None
     billing_address: str | None = None
 
+    # Razorpay Part B — Invoice Payment Link summary
+    has_active_payment_link: bool | None = None
+    payment_link_url: str | None = None
+    payment_link_status: str | None = None
+
     @computed_field(description="What is still owed on this invoice")
     @property
     def outstanding_amount(self) -> float:

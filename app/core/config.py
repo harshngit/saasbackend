@@ -101,9 +101,17 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
 
+    # --- Fernet Field-Level Encryption (Organization Payment Gateways) ---
+    field_encryption_key: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def field_encryption_configured(self) -> bool:
+        """Returns True only when FIELD_ENCRYPTION_KEY is configured."""
+        return bool(self.field_encryption_key)
 
     @property
     def r2_configured(self) -> bool:
