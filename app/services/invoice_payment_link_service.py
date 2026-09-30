@@ -11,12 +11,14 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import razorpay
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.encryption import decrypt_field, encrypt_field
 from app.models import (
     Customer,
+    CustomerPayment,
     Invoice,
     InvoicePaymentLink,
     OrgPaymentGateway,
@@ -244,6 +246,16 @@ def create_payment_link(
 
     client = get_org_razorpay_client(gateway)
 
+    # Concurrency protection: lock invoice & active links
+    inv_locked = (
+        db.query(Invoice)
+        .filter(Invoice.id == invoice.id, Invoice.organization_id == org_id)
+        .with_for_update(nowait=False)
+        .first()
+    )
+    if inv_locked is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+
     # Check for existing active link (created or partially_paid)
     active_links = (
         db.query(InvoicePaymentLink)
@@ -252,15 +264,64 @@ def create_payment_link(
             InvoicePaymentLink.organization_id == org_id,
             InvoicePaymentLink.status.in_(["created", "partially_paid"]),
         )
+        .with_for_update(nowait=False)
         .all()
     )
 
     for old_link in active_links:
         try:
             client.payment_link.cancel(old_link.razorpay_link_id)
-        except Exception as exc:
-            logger.warning("Could not cancel previous Razorpay link %s: %s", old_link.razorpay_link_id, exc)
-        old_link.status = "cancelled"
+            old_link.status = "cancelled"
+        except Exception as cancel_exc:
+            # Handle remote cancellation edge cases: probe remote status
+            try:
+                remote_data = client.payment_link.fetch(old_link.razorpay_link_id)
+                remote_status = str(remote_data.get("status", "")).lower()
+                if remote_status in ("cancelled", "expired"):
+                    old_link.status = remote_status
+                elif remote_status == "paid":
+                    # Old link was paid remotely before cancellation
+                    old_link.status = "paid"
+                    db.commit()
+                    record_online_payment(
+                        db,
+                        link_id=old_link.id,
+                        razorpay_payment_id=remote_data.get("payment_id") or f"pay_{old_link.razorpay_link_id}",
+                        captured_at=_now(),
+                        amount_inr=float(remote_data.get("amount_paid", 0)) / 100.0 or requested_amt,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Previous payment link has already been paid",
+                    )
+                else:
+                    logger.error(
+                        "Could not cancel Razorpay link %s (remote status: %s): %s",
+                        old_link.razorpay_link_id,
+                        remote_status,
+                        cancel_exc,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Failed to cancel existing active payment link on Razorpay: {cancel_exc}",
+                    )
+            except HTTPException:
+                raise
+            except Exception as fetch_exc:
+                logger.error(
+                    "Could not cancel or fetch Razorpay link %s: %s (fetch: %s)",
+                    old_link.razorpay_link_id,
+                    cancel_exc,
+                    fetch_exc,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to cancel existing active payment link on Razorpay: {cancel_exc}",
+                )
+
+    # Persist old link terminal status before attempting creation of new link
+    if active_links:
+        db.commit()
 
     amount_paise = _amount_paise(requested_amt)
     local_link_id = str(uuid.uuid4())
@@ -385,6 +446,7 @@ def record_online_payment(
     Idempotent: locks the payment link row and executes only once.
     Calls payment_service.record() to settle the invoice, update customer balance,
     generate receipt, record activity, and dispatch notifications.
+    Guarantees database-level payment ID uniqueness without race conditions.
     """
     link = (
         db.query(InvoicePaymentLink)
@@ -395,15 +457,34 @@ def record_online_payment(
     if link is None:
         raise ValueError(f"InvoicePaymentLink {link_id} not found")
 
+    captured_time = captured_at or _now()
+    amount_paid_paise = _amount_paise(amount_inr)
+
     if link.status == "paid":
         return link  # Already recorded idempotently
+
+    # Check if a CustomerPayment for this Razorpay payment ID already exists
+    existing_payment = (
+        db.query(CustomerPayment)
+        .filter(
+            CustomerPayment.reference == razorpay_payment_id,
+            CustomerPayment.payment_mode == "Online – Razorpay",
+        )
+        .first()
+    )
+    if existing_payment is not None:
+        link.status = "paid"
+        link.paid_at = captured_time
+        link.amount_paid_paise = amount_paid_paise
+        if raw_event:
+            link.raw_event = raw_event
+        db.commit()
+        db.refresh(link)
+        return link
 
     invoice = db.get(Invoice, link.invoice_id)
     if invoice is None or invoice.organization_id != link.organization_id:
         raise ValueError(f"Invoice {link.invoice_id} not found")
-
-    captured_time = captured_at or _now()
-    amount_paid_paise = _amount_paise(amount_inr)
 
     # 1. Update link state
     link.status = "paid"
@@ -412,41 +493,60 @@ def record_online_payment(
     if raw_event:
         link.raw_event = raw_event
 
-    # 2. Record through canonical payment pipeline
-    payment_service.record(
-        db,
-        org_id=link.organization_id,
-        customer=invoice.customer,
-        invoice=invoice,
-        amount=amount_inr,
-        payment_mode="Online – Razorpay",
-        reference=razorpay_payment_id,
-        received_on=captured_time,
-    )
+    try:
+        # 2. Record through canonical payment pipeline
+        payment_service.record(
+            db,
+            org_id=link.organization_id,
+            customer=invoice.customer,
+            invoice=invoice,
+            amount=amount_inr,
+            payment_mode="Online – Razorpay",
+            reference=razorpay_payment_id,
+            received_on=captured_time,
+        )
 
-    # 3. Activity Feed Entry
-    activity_service.record(
-        db,
-        organization_id=link.organization_id,
-        actor=None,
-        type="payment",
-        title=f"₹{amount_inr:,.2f} received for Invoice #{invoice.invoice_number} via Razorpay",
-        description=f"Online payment of ₹{amount_inr:,.2f} captured via Razorpay (Payment ID: {razorpay_payment_id})",
-    )
+        # 3. Activity Feed Entry
+        activity_service.record(
+            db,
+            organization_id=link.organization_id,
+            actor=None,
+            type="payment",
+            title=f"₹{amount_inr:,.2f} received for Invoice #{invoice.invoice_number} via Razorpay",
+            description=f"Online payment of ₹{amount_inr:,.2f} captured via Razorpay (Payment ID: {razorpay_payment_id})",
+        )
 
-    # 4. In-App Notification to Org Admins
-    notification_service.notify_org_admins(
-        db,
-        organization_id=link.organization_id,
-        title=f"₹{amount_inr:,.2f} received for Invoice #{invoice.invoice_number} via Razorpay",
-        body=f"Payment ID: {razorpay_payment_id}",
-        type="success",
-        link=f"/invoices/{invoice.id}",
-    )
+        # 4. In-App Notification to Org Admins
+        notification_service.notify_org_admins(
+            db,
+            organization_id=link.organization_id,
+            title=f"₹{amount_inr:,.2f} received for Invoice #{invoice.invoice_number} via Razorpay",
+            body=f"Payment ID: {razorpay_payment_id}",
+            type="success",
+            link=f"/invoices/{invoice.id}",
+        )
 
-    db.commit()
-    db.refresh(link)
-    return link
+        db.commit()
+        db.refresh(link)
+        return link
+    except IntegrityError as ie:
+        db.rollback()
+        logger.info(
+            "IntegrityError during online payment recording for %s (likely concurrent race): %s",
+            razorpay_payment_id,
+            ie,
+        )
+        # Re-fetch link and reconcile
+        link = db.get(InvoicePaymentLink, link_id)
+        if link is not None:
+            if link.status != "paid":
+                link.status = "paid"
+                link.paid_at = captured_time
+                link.amount_paid_paise = amount_paid_paise
+                db.commit()
+                db.refresh(link)
+            return link
+        raise
 
 
 def refresh_payment_link(db: Session, org_id: str, invoice: Invoice, link_id: str) -> InvoicePaymentLink:

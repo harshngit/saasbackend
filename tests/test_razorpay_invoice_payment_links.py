@@ -444,6 +444,7 @@ def test_04_webhook_and_idempotent_payment_recording(monkeypatch):
     rzp_link_id = link_data["razorpay_link_id"]
 
     # 41. Send payment_link.paid webhook
+    pay_payment_id = f"pay_test_{uuid.uuid4().hex[:10]}"
     event_payload = {
         "event": "payment_link.paid",
         "payload": {
@@ -457,7 +458,7 @@ def test_04_webhook_and_idempotent_payment_recording(monkeypatch):
             },
             "payment": {
                 "entity": {
-                    "id": "pay_test_payment_999",
+                    "id": pay_payment_id,
                     "amount": 100000,
                     "created_at": int(datetime.now(timezone.utc).timestamp()),
                     "method": "upi",
@@ -497,7 +498,7 @@ def test_04_webhook_and_idempotent_payment_recording(monkeypatch):
         assert pay is not None
         assert pay.amount == 1000.0
         assert pay.payment_mode == "Online – Razorpay"
-        assert pay.reference == "pay_test_payment_999"
+        assert pay.reference == pay_payment_id
         assert pay.receipt_number.startswith("RCPT-")
     finally:
         db.close()
@@ -569,10 +570,11 @@ def test_05_refresh_fallback_and_tenant_isolation(monkeypatch):
     assert r_cross_create.status_code == 404
 
     # 36-39. Refresh fallback marks paid
+    pay_refresh_id = f"pay_ref_{uuid.uuid4().hex[:10]}"
     fake_client_org1.payment_link.fetched_links[l1_rzp_id]["status"] = "paid"
     fake_client_org1.payment_link.fetched_links[l1_rzp_id]["amount_paid"] = 80000
     fake_client_org1.payment_link.fetched_links[l1_rzp_id]["payments"] = [
-        {"id": "pay_refresh_123", "created_at": int(datetime.now(timezone.utc).timestamp())}
+        {"id": pay_refresh_id, "created_at": int(datetime.now(timezone.utc).timestamp())}
     ]
 
     r_refresh = client.get(f"/invoices/{inv1_id}/payment-links/{l1_id}/refresh", headers=auth1)
@@ -584,5 +586,137 @@ def test_05_refresh_fallback_and_tenant_isolation(monkeypatch):
         inv = db.get(Invoice, inv1_id)
         assert inv.amount_paid == 800.0
         assert inv.status == "paid"
+    finally:
+        db.close()
+
+
+def test_06_hardened_idempotency_and_link_replacement_safety(monkeypatch):
+    """Specific tests for Payment ID DB uniqueness and link replacement safety edge cases."""
+    monkeypatch.setattr(settings, "field_encryption_key", _TEST_FERNET_KEY)
+
+    def _test_now():
+        return datetime.now(timezone.utc)
+
+    fake_client = _FakeOrgRazorpayClient()
+    from app.services import invoice_payment_link_service
+    monkeypatch.setattr(invoice_payment_link_service, "get_org_razorpay_client", lambda gw: fake_client)
+
+    auth, org_id, _ = _register_org("Safety Test Org")
+    cust_id, inv_id = _create_customer_and_invoice(auth, org_id, total=1500.0)
+
+    # Configure gateway
+    client.put(
+        "/settings/payment-gateway",
+        json={"key_id": "rzp_test_safe", "key_secret": "sec", "webhook_secret": "whsec"},
+        headers=auth,
+    )
+
+    # 1. DB uniqueness: Verify manual payments with same or NULL reference work fine
+    db = SessionLocal()
+    try:
+        cust = db.get(Customer, cust_id)
+        inv = db.get(Invoice, inv_id)
+        # Manual payment with string reference
+        p1 = payment_service.record(
+            db, org_id=org_id, customer=cust, invoice=None, amount=10.0, payment_mode="cash", reference="MANUAL-REF-1"
+        )
+        # Another manual payment with SAME reference (permitted for non-Razorpay)
+        p2 = payment_service.record(
+            db, org_id=org_id, customer=cust, invoice=None, amount=10.0, payment_mode="cash", reference="MANUAL-REF-1"
+        )
+        # Manual payment with NULL reference
+        p3 = payment_service.record(
+            db, org_id=org_id, customer=cust, invoice=None, amount=10.0, payment_mode="cash", reference=None
+        )
+        db.commit()
+        assert p1.id != p2.id
+        assert p3.reference is None
+    finally:
+        db.close()
+
+    # Create link 1
+    r_l1 = client.post(f"/invoices/{inv_id}/payment-link", json={"amount": 500.0}, headers=auth)
+    assert r_l1.status_code == 201
+    l1 = r_l1.json()
+
+    # 2. Test link replacement when Razorpay cancellation throws an error but link is already remotely cancelled
+    def _cancel_fails_but_fetch_cancelled(payment_link_id):
+        raise Exception("Payment link already cancelled")
+
+    orig_cancel = fake_client.payment_link.cancel
+    fake_client.payment_link.cancel = _cancel_fails_but_fetch_cancelled
+    fake_client.payment_link.fetched_links[l1["razorpay_link_id"]]["status"] = "cancelled"
+
+    r_rep1 = client.post(f"/invoices/{inv_id}/payment-link", json={"amount": 400.0}, headers=auth)
+    assert r_rep1.status_code == 201
+    l2 = r_rep1.json()
+    assert l2["id"] != l1["id"]
+
+    # 3. Test link replacement when Razorpay cancellation completely fails (network/auth error)
+    def _cancel_and_fetch_fail(payment_link_id):
+        raise Exception("Network timeout")
+
+    fake_client.payment_link.cancel = _cancel_and_fetch_fail
+    fake_client.payment_link.fetch = _cancel_and_fetch_fail
+
+    r_rep_fail = client.post(f"/invoices/{inv_id}/payment-link", json={"amount": 300.0}, headers=auth)
+    assert r_rep_fail.status_code == 400
+    assert "Failed to cancel existing active payment link on Razorpay" in r_rep_fail.text
+
+    # Verify old link l2 is NOT falsely marked cancelled in DB
+    db = SessionLocal()
+    try:
+        l2_db = db.get(InvoicePaymentLink, l2["id"])
+        assert l2_db.status == "created"
+    finally:
+        db.close()
+
+    # Restore normal cancel & fetch
+    fake_client.payment_link.cancel = orig_cancel
+    fake_client.payment_link.fetch = _FakePaymentLinkResource().fetch
+
+    # 4. Test link replacement when cancellation succeeds but new link creation fails
+    def _create_fails(data=None):
+        raise Exception("Razorpay API error 500")
+
+    fake_client.payment_link.create = _create_fails
+    r_create_fail = client.post(f"/invoices/{inv_id}/payment-link", json={"amount": 300.0}, headers=auth)
+    assert r_create_fail.status_code == 400
+    assert "Razorpay link creation failed" in r_create_fail.text
+
+    # Verify l2 was persisted as cancelled (since remote cancellation succeeded) and no new link was added
+    db = SessionLocal()
+    try:
+        l2_db = db.get(InvoicePaymentLink, l2["id"])
+        assert l2_db.status == "cancelled"
+        links = db.query(InvoicePaymentLink).filter(InvoicePaymentLink.invoice_id == inv_id).all()
+        assert not any(l.status in ("created", "partially_paid") for l in links)
+    finally:
+        db.close()
+
+    # 5. Restore create and generate a fresh live link
+    fake_client.payment_link.create = _FakePaymentLinkResource().create
+    r_live = client.post(f"/invoices/{inv_id}/payment-link", json={"amount": 500.0}, headers=auth)
+    assert r_live.status_code == 201
+    live_link = r_live.json()
+
+    # 6. Webhook and refresh concurrent race / duplicate payment ID protection
+    pay_id = f"pay_unique_{uuid.uuid4().hex[:8]}"
+    db = SessionLocal()
+    try:
+        # First call records payment
+        rec1 = invoice_payment_link_service.record_online_payment(
+            db, link_id=live_link["id"], razorpay_payment_id=pay_id, captured_at=_test_now(), amount_inr=500.0
+        )
+        assert rec1.status == "paid"
+
+        # Second call with same payment ID resolves idempotently without error or duplicate payment
+        rec2 = invoice_payment_link_service.record_online_payment(
+            db, link_id=live_link["id"], razorpay_payment_id=pay_id, captured_at=_test_now(), amount_inr=500.0
+        )
+        assert rec2.status == "paid"
+
+        pmts = db.query(CustomerPayment).filter(CustomerPayment.reference == pay_id).all()
+        assert len(pmts) == 1, "Only one CustomerPayment must exist for the Razorpay payment ID"
     finally:
         db.close()

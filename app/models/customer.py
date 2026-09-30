@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from app.core.database import Base
@@ -152,6 +152,15 @@ class CustomerPayment(Base):
     """
 
     __tablename__ = "customer_payments"
+    __table_args__ = (
+        Index(
+            "ix_customer_payments_razorpay_reference",
+            "reference",
+            unique=True,
+            postgresql_where=text("payment_mode = 'Online – Razorpay' AND reference IS NOT NULL"),
+            sqlite_where=text("payment_mode = 'Online – Razorpay' AND reference IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     # Null for an anonymous walk-in sale: cash over the counter with no ledger behind it.
