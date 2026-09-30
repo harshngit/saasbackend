@@ -377,6 +377,138 @@ res_del = client.delete(f"/expenses/{del_target['id']}", headers=headers)
 check("Delete expense (HTTP 204)", res_del.status_code == 204)
 check("Deleted expense cannot be retrieved (HTTP 404)", client.get(f"/expenses/{del_target['id']}", headers=headers).status_code == 404)
 
+# --- TEST 12: ROLE-BASED ORGANIZATION-WIDE EXPENSE SUBMISSION & SCOPING ---
+print("\n--- TEST 12: Role-Based Organization-Wide Expense Submission & Scoping ---")
+# Get roles for Org 1
+r_roles = client.get("/roles", headers=headers).json()
+roles_by_name = {r["name"]: r["id"] for r in r_roles}
+
+# 12A: Create Delivery Partner user
+dp_email = f"dp_{uuid.uuid4().hex[:6]}@example.com"
+r_dp = client.post("/users", headers=headers, json={
+    "name": "Delivery Partner User",
+    "email": dp_email,
+    "username": f"dp_{uuid.uuid4().hex[:6]}",
+    "password": "Password123!",
+    "role_id": roles_by_name["Delivery Partner"],
+})
+check("Create Delivery Partner user (HTTP 201)", r_dp.status_code == 201)
+dp_user_id = r_dp.json()["id"]
+dp_token = client.post("/auth/login", json={"email": dp_email, "password": "Password123!"}).json()["tokens"]["access_token"]
+dp_headers = {"Authorization": f"Bearer {dp_token}"}
+
+# 12B: Create Sales Officer user
+so_email = f"so_{uuid.uuid4().hex[:6]}@example.com"
+r_so = client.post("/users", headers=headers, json={
+    "name": "Sales Officer User",
+    "email": so_email,
+    "username": f"so_{uuid.uuid4().hex[:6]}",
+    "password": "Password123!",
+    "role_id": roles_by_name["Sales Officer"],
+})
+check("Create Sales Officer user (HTTP 201)", r_so.status_code == 201)
+so_user_id = r_so.json()["id"]
+so_token = client.post("/auth/login", json={"email": so_email, "password": "Password123!"}).json()["tokens"]["access_token"]
+so_headers = {"Authorization": f"Bearer {so_token}"}
+
+# 12C: Create Accountant user
+acc_email = f"acc_{uuid.uuid4().hex[:6]}@example.com"
+r_acc = client.post("/users", headers=headers, json={
+    "name": "Accountant User",
+    "email": acc_email,
+    "username": f"acc_{uuid.uuid4().hex[:6]}",
+    "password": "Password123!",
+    "role_id": roles_by_name["Accountant"],
+})
+check("Create Accountant user (HTTP 201)", r_acc.status_code == 201)
+acc_token = client.post("/auth/login", json={"email": acc_email, "password": "Password123!"}).json()["tokens"]["access_token"]
+acc_headers = {"Authorization": f"Bearer {acc_token}"}
+
+# 12D: Delivery Partner creates delivery-related expenses (Petrol, Toll, Parking) without delivery_id
+dp_exp1 = client.post("/expenses", headers=dp_headers, json={
+    "category": "Petrol/Diesel",
+    "amount": 450.0,
+    "description": "Fuel refill for route van",
+    "payment_mode": "UPI",
+})
+check("Delivery Partner submits Petrol expense (HTTP 201)", dp_exp1.status_code == 201)
+check("Petrol expense submitted_by matches DP user", dp_exp1.json()["submitted_by"] == dp_user_id)
+
+dp_exp2 = client.post("/expenses", headers=dp_headers, json={
+    "category": "Toll",
+    "amount": 120.0,
+    "description": "Highway toll receipt",
+    "payment_mode": "Fastag",
+})
+check("Delivery Partner submits Toll expense (HTTP 201)", dp_exp2.status_code == 201)
+
+# 12E: Sales Officer creates sales-related expenses (Travel, Client visit, Meals, Conveyance) without delivery_id
+so_exp1 = client.post("/expenses", headers=so_headers, json={
+    "category": "Food and Travel",
+    "amount": 650.0,
+    "description": "Client lunch meeting with Apex Electronics",
+    "payment_mode": "Credit Card",
+})
+check("Sales Officer submits Client visit meal expense (HTTP 201)", so_exp1.status_code == 201)
+check("Client visit meal expense submitted_by matches SO user", so_exp1.json()["submitted_by"] == so_user_id)
+
+so_exp2 = client.post("/expenses", headers=so_headers, json={
+    "category": "Other",
+    "amount": 350.0,
+    "description": "Metro conveyance for client pitch",
+    "tags": ["travel", "client-visit"],
+})
+check("Sales Officer submits Conveyance expense (HTTP 201)", so_exp2.status_code == 201)
+
+# 12F: Admin creates general office/admin expenses (Rent, Electricity, Software subscriptions)
+admin_exp1 = client.post("/expenses", headers=headers, json={
+    "category": "Rent",
+    "amount": 25000.0,
+    "description": "Monthly Office Headquarters Rent",
+    "payment_mode": "Bank Transfer",
+})
+check("Admin submits Office Rent expense (HTTP 201)", admin_exp1.status_code == 201)
+
+admin_exp2 = client.post("/expenses", headers=headers, json={
+    "category": "Office Expenses",
+    "amount": 1200.0,
+    "description": "Cloud software subscription",
+    "tags": ["saas", "software"],
+})
+check("Admin submits Software subscription expense (HTTP 201)", admin_exp2.status_code == 201)
+
+# 12G: Data Scoping verification
+# Delivery partner only sees their own 2 expenses
+dp_list = client.get("/expenses", headers=dp_headers).json()
+check("Delivery Partner sees only their own expenses", len(dp_list) == 2 and all(e["submitted_by"] == dp_user_id for e in dp_list))
+
+# Sales officer only sees their own 2 expenses
+so_list = client.get("/expenses", headers=so_headers).json()
+check("Sales Officer sees only their own expenses", len(so_list) == 2 and all(e["submitted_by"] == so_user_id for e in so_list))
+
+# Accountant sees all expenses across the organization
+acc_list = client.get("/expenses", headers=acc_headers).json()
+check("Accountant sees all org expenses", len(acc_list) >= 6)
+
+# 12H: Approval / Rejection permissions
+# Delivery partner cannot approve expenses (HTTP 403)
+r_dp_appr = client.patch(f"/expenses/{dp_exp1.json()['id']}/approve", headers=dp_headers)
+check("Delivery Partner cannot approve expenses (HTTP 403)", r_dp_appr.status_code == 403)
+
+# Sales officer cannot approve expenses (HTTP 403)
+r_so_appr = client.patch(f"/expenses/{so_exp1.json()['id']}/approve", headers=so_headers)
+check("Sales Officer cannot approve expenses (HTTP 403)", r_so_appr.status_code == 403)
+
+# Accountant approves DP's petrol expense
+r_acc_appr = client.patch(f"/expenses/{dp_exp1.json()['id']}/approve", headers=acc_headers)
+check("Accountant approves DP petrol expense (HTTP 200)", r_acc_appr.status_code == 200)
+check("DP expense status is approved", r_acc_appr.json()["status"] == "approved")
+
+# Accountant approves SO's client meal expense
+r_acc_appr_so = client.patch(f"/expenses/{so_exp1.json()['id']}/approve", headers=acc_headers)
+check("Accountant approves SO client meal expense (HTTP 200)", r_acc_appr_so.status_code == 200)
+check("SO expense status is approved", r_acc_appr_so.json()["status"] == "approved")
+
 print("\n=======================================================")
 print(f"RESULTS: {passed_count} passed, {failed_count} failed")
 print("=======================================================\n")

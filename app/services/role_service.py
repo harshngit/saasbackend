@@ -42,6 +42,14 @@ def seed_default_roles(db: Session, organization_id: str) -> None:
         if role.data_scope is None:
             role.data_scope = settings.get("data_scope", "all")
             changed = True
+        if role.is_default and role.permissions:
+            current_perms = dict(role.permissions)
+            normalized_matrix = normalize_permissions(matrix)
+            for mod, acts in normalized_matrix.items():
+                if mod not in current_perms:
+                    current_perms[mod] = acts
+                    role.permissions = current_perms
+                    changed = True
     if changed:
         db.commit()
 

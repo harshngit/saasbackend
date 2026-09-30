@@ -185,6 +185,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "visits": _full(),
             "follow_ups": _full(),
             "leaves": _perm(view=True, create=True, edit=True, delete=True),
+            "expenses": _perm(view=True, create=True, edit=True),
         },
         "Delivery Partner": {
             "dashboard": _view_only(),
@@ -196,6 +197,7 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "products": _view_only(),
             "inventory": _view_only(),
             "leaves": _perm(view=True, create=True, edit=True, delete=True),
+            "expenses": _perm(view=True, create=True, edit=True),
         },
         "Accountant": {
             "dashboard": _view_only(),
