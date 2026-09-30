@@ -4,14 +4,16 @@ Both always belong to the authenticated user's firm — there is no organization
 any path or body, so one firm's settings can never reach another's.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.core import workflow
 from app.core.database import get_db
-from app.core.deps import require_system_role
+from app.core.deps import get_current_user, require_system_role
 from app.core.files import save_upload
-from app.models import Organization, SystemRole, User
+from app.models import Organization, StoredFile, SystemRole, User
 from app.schemas.theme import OrganizationThemeOut, OrganizationThemeUpdate
 from app.schemas.workflow_settings import (
     InvoiceSettings,
@@ -20,6 +22,8 @@ from app.schemas.workflow_settings import (
     SalesWorkflowSettingsUpdate,
 )
 from app.services import activity_service, theme_service
+
+logger = logging.getLogger("crm.settings")
 
 router = APIRouter(tags=["settings"])
 
@@ -73,7 +77,11 @@ def update_sales_workflow_settings(
     if changes:
         org.sales_workflow_settings = _apply(org.sales_workflow_settings, changes)
         activity_service.record(
-            db, org.id, admin, "company_profile", "Sales workflow settings updated",
+            db,
+            org.id,
+            admin,
+            "company_profile",
+            "Sales workflow settings updated",
             ", ".join(sorted(changes)),
         )
         db.commit()
@@ -111,7 +119,12 @@ def update_invoice_settings(
     if changes:
         org.invoice_template_settings = _apply(org.invoice_template_settings, changes)
         activity_service.record(
-            db, org.id, admin, "branding", "Invoice template updated", ", ".join(sorted(changes))
+            db,
+            org.id,
+            admin,
+            "branding",
+            "Invoice template updated",
+            ", ".join(sorted(changes)),
         )
         db.commit()
         db.refresh(org)
@@ -140,17 +153,39 @@ def _check_theme_image_type(file: UploadFile) -> None:
         )
 
 
+def _delete_background_file(db: Session, org_id: str, background_url: str | None) -> None:
+    """Safely delete the StoredFile row and R2 object for a background image URL."""
+    if not background_url:
+        return
+    file_id = background_url.rsplit("/", 1)[-1]
+    stored = db.get(StoredFile, file_id)
+    if stored is None:
+        return
+    # Guard: only delete if the file belongs to this org or is unassigned
+    if stored.organization_id is not None and stored.organization_id != org_id:
+        return
+    if stored.storage_key:
+        from app.core import r2
+
+        if not r2.delete_object(stored.storage_key):
+            logger.warning(
+                "R2 delete_object failed for background file_id=%s — deleting DB row anyway",
+                file_id,
+            )
+    db.delete(stored)
+
+
 @router.get("/organization/theme", response_model=OrganizationThemeOut)
 def get_organization_theme(
-    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> OrganizationThemeOut:
-    """The firm's complete appearance configuration. Returns the documented
-    defaults if the firm has never customized its theme — `custom_enabled`
-    is false in that case, and the frontend should keep using the existing
-    CRM look regardless of the rest of this response."""
-    org = _org(admin)
-    theme = theme_service.get_theme(db, org)
-    return OrganizationThemeOut.from_theme_dict(theme_service.theme_dict(theme))
+    """The firm's appearance configuration. Accessible to all active users in the firm.
+    Super Admin (no org context) and firms without a customized theme receive the
+    documented defaults (custom_enabled=false)."""
+    if not user.organization_id or not user.organization:
+        return OrganizationThemeOut.from_theme(None)
+    theme = theme_service.get_theme(db, user.organization)
+    return OrganizationThemeOut.from_theme(theme)
 
 
 @router.patch("/organization/theme", response_model=OrganizationThemeOut)
@@ -159,8 +194,8 @@ def update_organization_theme(
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> OrganizationThemeOut:
-    """Change one or more theme fields. Omitted fields are left exactly as
-    they were — this is the only place `custom_enabled` is ever flipped."""
+    """Change one or more theme fields (custom_enabled, mode, primary_color, overlay_opacity).
+    Omitted fields are left exactly as they were. Unknown fields return 422."""
     org = _org(admin)
     changes = payload.model_dump(exclude_unset=True)
     theme = theme_service.get_theme(db, org)
@@ -173,7 +208,7 @@ def update_organization_theme(
         )
         db.commit()
         db.refresh(theme)
-    return OrganizationThemeOut.from_theme_dict(theme_service.theme_dict(theme))
+    return OrganizationThemeOut.from_theme(theme)
 
 
 @router.post("/organization/theme/background", response_model=OrganizationThemeOut)
@@ -184,46 +219,64 @@ def upload_theme_background(
     db: Session = Depends(get_db),
 ) -> OrganizationThemeOut:
     """Upload the theme's background image (PNG/JPEG/WebP, up to 5 MB).
-
-    Stored as an ordinary /files/{id} reference via the existing upload
-    pipeline — never a signed R2 URL, never a hardcoded host. Replacing an
-    existing background does not delete the previous StoredFile row (same
-    convention as Organization's own logo/signature upload endpoints) —
-    only the theme's own reference is updated.
-    """
+    Replacing an existing background deletes the old StoredFile record and R2 object."""
     org = _org(admin)
     _check_theme_image_type(file)
-    url, _size = save_upload(db, org.id, file, request, allow_any=True, max_bytes=_THEME_MAX_UPLOAD_BYTES)
 
     theme = theme_service.get_or_create_theme(db, org)
+    old_bg_url = theme.background_image_url
+
+    url, _size = save_upload(
+        db, org.id, file, request, allow_any=True, max_bytes=_THEME_MAX_UPLOAD_BYTES
+    )
+
+    # Delete previous background file now that the new one is successfully saved
+    if old_bg_url and old_bg_url != url:
+        _delete_background_file(db, org.id, old_bg_url)
+
     theme.background_image_url = url
     activity_service.record(db, org.id, admin, "branding", "Background uploaded")
     db.commit()
     db.refresh(theme)
-    return OrganizationThemeOut.from_theme_dict(theme_service.theme_dict(theme))
+    return OrganizationThemeOut.from_theme(theme)
 
 
-@router.post("/organization/theme/logo", response_model=OrganizationThemeOut)
-def upload_theme_logo(
-    request: Request,
-    file: UploadFile = File(...),
+@router.delete("/organization/theme/background", response_model=OrganizationThemeOut)
+def delete_theme_background(
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> OrganizationThemeOut:
-    """Upload the theme's own logo (PNG/JPEG/WebP, up to 5 MB).
-
-    Deliberately separate from Organization.logo_url (invoices/company
-    branding/documents) — this never reads or writes that field in either
-    direction, so changing one can never surprise the other.
-    """
+    """Delete the theme's background image, setting background_image_url to null
+    and removing the associated StoredFile and R2 object. Preserves all other theme settings."""
     org = _org(admin)
-    _check_theme_image_type(file)
-    url, _size = save_upload(db, org.id, file, request, allow_any=True, max_bytes=_THEME_MAX_UPLOAD_BYTES)
+    theme = theme_service.get_theme(db, org)
+    if theme and theme.background_image_url:
+        _delete_background_file(db, org.id, theme.background_image_url)
+        theme.background_image_url = None
+        activity_service.record(db, org.id, admin, "branding", "Background removed")
+        db.commit()
+        db.refresh(theme)
+    return OrganizationThemeOut.from_theme(theme)
 
-    theme = theme_service.get_or_create_theme(db, org)
-    theme.logo_url = url
-    activity_service.record(db, org.id, admin, "branding", "Logo changed")
-    db.commit()
-    db.refresh(theme)
-    return OrganizationThemeOut.from_theme_dict(theme_service.theme_dict(theme))
 
+@router.post("/organization/theme/reset", response_model=OrganizationThemeOut)
+def reset_organization_theme(
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> OrganizationThemeOut:
+    """Reset the theme to documented defaults: custom_enabled=false, mode=light,
+    primary_color=null, overlay_opacity=0.45, and delete the associated background file."""
+    org = _org(admin)
+    theme = theme_service.get_theme(db, org)
+    if theme is not None:
+        if theme.background_image_url:
+            _delete_background_file(db, org.id, theme.background_image_url)
+        theme.custom_enabled = False
+        theme.mode = "light"
+        theme.primary_color = None
+        theme.background_image_url = None
+        theme.overlay_opacity = 0.45
+        activity_service.record(db, org.id, admin, "branding", "Theme reset to defaults")
+        db.commit()
+        db.refresh(theme)
+    return OrganizationThemeOut.from_theme(theme)

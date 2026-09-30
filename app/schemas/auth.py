@@ -3,6 +3,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from app.models.enums import UserRole
 from app.schemas.organization import OrganizationOut
 from app.schemas.role import RoleBriefOut
+from app.schemas.theme import OrganizationThemeOut
 from app.schemas.user import UserOut
 
 
@@ -145,6 +146,7 @@ class MeResponse(BaseModel):
 
     user: UserOut
     organization: OrganizationOut | None
+    theme: OrganizationThemeOut | None = None
 
 
 class RefreshRequest(BaseModel):

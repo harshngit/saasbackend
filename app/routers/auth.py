@@ -32,6 +32,7 @@ from app.schemas.auth import (
     ResetPasswordRequest,
     TokenPair,
 )
+from app.schemas.theme import OrganizationThemeOut
 from app.schemas.user import UserOut
 from app.services import auth_service, google_auth_service, org_service, password_service, role_service
 from app.services.email_service import send_password_reset
@@ -375,6 +376,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
     """
     org = org_service.apply_trial_expiry(db, user.organization)
     role = role_service.role_for(db, user)
+    theme_out = OrganizationThemeOut.from_theme(org.theme if org else None)
     return MeResponse(
         id=user.id,
         organization_id=user.organization_id,
@@ -385,6 +387,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
         data_scope=role_service.data_scope(db, user),
         user=user,
         organization=org,
+        theme=theme_out,
     )
 
 

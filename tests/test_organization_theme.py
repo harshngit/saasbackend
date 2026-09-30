@@ -2,12 +2,19 @@
 /organization/theme endpoints, app/services/theme_service.py,
 app/models/organization_theme.py).
 
-Covers: default-theme-without-a-row behavior, PATCH merge semantics, the
-Admin-only permission matrix (Business Owner and Admin are the same
-system_role="admin" tier in this codebase — see the "business owner" test
-below), tenant isolation, field validation, background/logo uploads
-(type/size limits, /files/{id} URLs, never touching Organization.logo_url),
-and activity logging. Runs only against the local test database.
+Covers:
+- Simplified canonical theme model (custom_enabled, mode, primary_color, background)
+- Default behavior when no row exists yet (custom_enabled=false, mode=light, overlay_opacity=0.45)
+- Permission matrix: any active org user & staff can GET (200); only Admin/Business Owner can PATCH, POST/DELETE background, and POST reset.
+- Super Admin GET returns defaults without error.
+- Strict validation (6-digit hex only, lowercase normalization, #fff rejected, overlay_opacity 0.0-0.9 with 1.0 rejected).
+- Pydantic extra="forbid" (unknown/removed fields return 422).
+- Background file lifecycle (PNG/JPEG/WebP uploads, 5MB limit, replacing deletes old StoredFile & R2 object, DELETE background, POST reset).
+- Endpoint removal (POST /organization/theme/logo is removed/404).
+- Tenant isolation across organizations A and B.
+- Activity logging on all mutations.
+- PUBLIC_BASE_URL response normalization.
+- /auth/me theme inclusion.
 """
 
 import io
@@ -21,24 +28,28 @@ from fastapi.testclient import TestClient
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.security import create_access_token
 from app.main import app
-from app.models import ActivityLog, Organization, OrganizationTheme, User
+from app.models import ActivityLog, Organization, OrganizationTheme, StoredFile, SystemRole, User, UserRole
+from app.seed import main as seed_main
 
+seed_main()
 client = TestClient(app)
 
 
 def _register_org(name_prefix: str) -> tuple[dict, str]:
-    """Registers a brand-new organization; the registering user is the
-    "Business Owner" — created with system_role="admin" directly, exactly
-    like any other Admin (see app/services/auth_service.py)."""
+    """Registers a brand-new organization; registering user has system_role="admin"."""
     email = f"{name_prefix}_{uuid.uuid4().hex[:8]}@example.com"
-    r = client.post("/auth/register", json={
-        "organization_name": f"{name_prefix} {uuid.uuid4().hex[:6]}",
-        "admin_name": "Owner",
-        "email": email,
-        "password": "Password123!",
-        "role": "admin",
-    })
+    r = client.post(
+        "/auth/register",
+        json={
+            "organization_name": f"{name_prefix} {uuid.uuid4().hex[:6]}",
+            "admin_name": "Owner",
+            "email": email,
+            "password": "Password123!",
+            "role": "admin",
+        },
+    )
     assert r.status_code == 201, r.text
     token = r.json()["tokens"]["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
@@ -51,26 +62,51 @@ def _register_org(name_prefix: str) -> tuple[dict, str]:
 
 
 def _make_staff(owner_headers: dict, role: str) -> dict:
-    """Creates a staff user with a real seeded role and logs in as them."""
+    """Creates a staff user with a seeded role and logs in."""
     email = f"staff_{uuid.uuid4().hex[:8]}@example.com"
-    r = client.post("/users", json={
-        "name": "Staff", "email": email, "password": "Password123!", "role": role,
-    }, headers=owner_headers)
+    r = client.post(
+        "/users",
+        json={
+            "name": "Staff",
+            "email": email,
+            "password": "Password123!",
+            "role": role,
+        },
+        headers=owner_headers,
+    )
     assert r.status_code == 201, r.text
     r2 = client.post("/auth/login", json={"email": email, "password": "Password123!"})
     assert r2.status_code == 200, r2.text
     return {"Authorization": f"Bearer {r2.json()['tokens']['access_token']}"}
 
 
+def _make_super_admin() -> dict:
+    """Creates a Super Admin user directly in DB and returns auth headers."""
+    db = SessionLocal()
+    try:
+        email = f"superadmin_{uuid.uuid4().hex[:8]}@example.com"
+        user = User(
+            name="Super Admin",
+            email=email,
+            password_hash="hash",
+            role=UserRole.SUPER_ADMIN,
+            system_role=SystemRole.SUPER_ADMIN.value,
+            organization_id=None,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        token = create_access_token(user.id, role="super_admin", organization_id=None)
+        return {"Authorization": f"Bearer {token}"}
+    finally:
+        db.close()
+
+
 def _png_bytes() -> bytes:
-    # Nothing in this upload path decodes image bytes (see _check_theme_image_type
-    # and app.core.files._check_type, both content_type-header-only checks) —
-    # arbitrary bytes with the right declared content_type is sufficient and
-    # matches how every other upload test in this suite already works.
     return b"fake-png-bytes"
 
 
-# ------------------------------- 1-2. defaults / no row yet -----------------------
+# ------------------------------- 1. Defaults & Canonical Response Shape -----------------------
 
 
 def test_default_theme_behavior():
@@ -78,13 +114,23 @@ def test_default_theme_behavior():
     r = client.get("/organization/theme", headers=headers)
     assert r.status_code == 200, r.text
     body = r.json()
+
+    # Canonical top-level fields
     assert body["custom_enabled"] is False
-    assert body["theme"]["theme_name"] == "default"
-    assert body["theme"]["mode"] == "light"
-    assert body["theme"]["fonts"]["heading"] == "DM Sans"
-    assert body["theme"]["fonts"]["body"] == "Open Sans"
-    assert body["theme"]["colors"]["primary"] is None
-    assert body["theme"]["background"]["url"] is None
+    assert body["mode"] == "light"
+    assert body["primary_color"] is None
+    assert body["background"] == {"url": None, "overlay_opacity": 0.45}
+    assert body["updated_at"] is None
+
+    # Assert deprecated fields are NOT present
+    assert "theme" not in body
+    assert "theme_name" not in body
+    assert "fonts" not in body
+    assert "colors" not in body
+    assert "card_style" not in body
+    assert "border_radius" not in body
+    assert "background_image_url" not in body
+    assert "overlay" not in body.get("background", {})
 
 
 def test_get_theme_when_no_row_exists_does_not_create_one():
@@ -92,19 +138,81 @@ def test_get_theme_when_no_row_exists_does_not_create_one():
     client.get("/organization/theme", headers=headers)
     db = SessionLocal()
     try:
-        assert db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first() is None
+        assert (
+            db.query(OrganizationTheme)
+            .filter(OrganizationTheme.organization_id == org_id)
+            .first()
+            is None
+        )
     finally:
         db.close()
 
 
-# ------------------------------- 3-6. PATCH semantics ------------------------------
+# ------------------------------- 2. Permissions ----------------------------------------------
 
 
-def test_get_theme_for_existing_organization_after_patch():
-    headers, _ = _register_org("theme_existing")
-    client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
+def test_admin_and_business_owner_can_get_and_patch_theme():
+    headers, _ = _register_org("theme_admin_bo")
+    # GET
     r = client.get("/organization/theme", headers=headers)
-    assert r.json()["theme"]["mode"] == "dark"
+    assert r.status_code == 200
+    # PATCH
+    r2 = client.patch(
+        "/organization/theme",
+        json={"mode": "dark", "primary_color": "#22c55e", "custom_enabled": True},
+        headers=headers,
+    )
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["custom_enabled"] is True
+    assert body["mode"] == "dark"
+    assert body["primary_color"] == "#22c55e"
+
+
+def test_staff_role_can_get_theme_but_cannot_mutate():
+    owner_headers, _ = _register_org("theme_staff_perm")
+    for role in ("Sales Officer", "Delivery Partner", "Accountant"):
+        staff_headers = _make_staff(owner_headers, role)
+
+        # Staff can GET theme (200 OK)
+        r_get = client.get("/organization/theme", headers=staff_headers)
+        assert r_get.status_code == 200, f"{role} should be able to GET theme, got {r_get.status_code}"
+
+        # Staff gets 403 on PATCH
+        r_patch = client.patch("/organization/theme", json={"mode": "dark"}, headers=staff_headers)
+        assert r_patch.status_code == 403, f"{role} PATCH should be 403"
+
+        # Staff gets 403 on background upload
+        r_bg = client.post(
+            "/organization/theme/background",
+            files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
+            headers=staff_headers,
+        )
+        assert r_bg.status_code == 403, f"{role} background upload should be 403"
+
+        # Staff gets 403 on background DELETE
+        r_del = client.delete("/organization/theme/background", headers=staff_headers)
+        assert r_del.status_code == 403, f"{role} background delete should be 403"
+
+        # Staff gets 403 on reset
+        r_reset = client.post("/organization/theme/reset", headers=staff_headers)
+        assert r_reset.status_code == 403, f"{role} reset should be 403"
+
+
+def test_super_admin_get_returns_defaults_without_error():
+    sa_headers = _make_super_admin()
+    r = client.get("/organization/theme", headers=sa_headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["custom_enabled"] is False
+    assert body["mode"] == "light"
+    assert body["primary_color"] is None
+    assert body["background"]["url"] is None
+    assert body["background"]["overlay_opacity"] == 0.45
+    assert body["updated_at"] is None
+
+
+# ------------------------------- 3. PATCH Semantics & Field Validation -----------------------
 
 
 def test_patch_creates_theme_row_when_missing():
@@ -113,298 +221,386 @@ def test_patch_creates_theme_row_when_missing():
     assert r.status_code == 200, r.text
     db = SessionLocal()
     try:
-        assert db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first() is not None
+        row = (
+            db.query(OrganizationTheme)
+            .filter(OrganizationTheme.organization_id == org_id)
+            .first()
+        )
+        assert row is not None
+        assert row.custom_enabled is True
+        assert row.mode == "light"
+        assert row.overlay_opacity == 0.45
     finally:
         db.close()
 
 
-def test_patch_updates_only_supplied_fields():
+def test_patch_partial_updates():
     headers, _ = _register_org("theme_partial")
-    client.patch("/organization/theme", json={"mode": "dark", "primary_color": "#22c55e"}, headers=headers)
-    r = client.patch("/organization/theme", json={"card_style": "glass"}, headers=headers)
-    body = r.json()
-    assert body["theme"]["card_style"] == "glass"
-    assert body["theme"]["mode"] == "dark"  # untouched by the second PATCH
-    assert body["theme"]["colors"]["primary"] == "#22c55e"  # untouched
-
-
-def test_patch_preserves_omitted_fields_across_multiple_updates():
-    headers, _ = _register_org("theme_preserve")
-    client.patch("/organization/theme", json={"heading_font": "Roboto"}, headers=headers)
-    client.patch("/organization/theme", json={"body_font": "Lato"}, headers=headers)
-    r = client.get("/organization/theme", headers=headers)
-    assert r.json()["theme"]["fonts"]["heading"] == "Roboto"
-    assert r.json()["theme"]["fonts"]["body"] == "Lato"
-
-
-# ------------------------------- 7-8. custom_enabled -------------------------------
-
-
-def test_custom_enabled_false_still_returns_effective_configuration():
-    headers, _ = _register_org("theme_disabled")
-    client.patch("/organization/theme", json={"mode": "dark", "custom_enabled": False}, headers=headers)
-    r = client.get("/organization/theme", headers=headers)
-    body = r.json()
-    assert body["custom_enabled"] is False
-    assert body["theme"]["mode"] == "dark"  # stored value still returned; frontend decides not to apply it
-
-
-def test_custom_enabled_true_returns_the_customization():
-    headers, _ = _register_org("theme_enabled")
-    client.patch("/organization/theme", json={"mode": "dark", "custom_enabled": True}, headers=headers)
-    r = client.get("/organization/theme", headers=headers)
-    body = r.json()
-    assert body["custom_enabled"] is True
-    assert body["theme"]["mode"] == "dark"
-
-
-# ------------------------------- 9-13. permissions / isolation ---------------------
-
-
-def test_admin_can_access_theme():
-    """The self-registering owner has system_role="admin" — the same tier
-    every Admin gets, whether they're the original owner or invited later
-    (app/routers/users.py creates staff at system_role="staff", never
-    "admin", so there is no separate "invite another Admin" flow to exercise
-    here beyond the owner's own account)."""
-    headers, _ = _register_org("theme_perm_admin")
-    r = client.get("/organization/theme", headers=headers)
-    assert r.status_code == 200
-
-
-def test_business_owner_can_access_theme():
-    """The self-registering user IS the Business Owner — system_role="admin",
-    same tier as any other Admin (see app/services/auth_service.py)."""
-    headers, _ = _register_org("theme_perm_bo")
-    r = client.get("/organization/theme", headers=headers)
-    assert r.status_code == 200
-    r2 = client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
-    assert r2.status_code == 200
-
-
-def test_staff_cannot_access_theme():
-    owner_headers, _ = _register_org("theme_perm_staff")
-    for role in ("Sales Officer", "Delivery Partner", "Accountant"):
-        staff_headers = _make_staff(owner_headers, role)
-        r = client.get("/organization/theme", headers=staff_headers)
-        assert r.status_code == 403, f"{role} should be denied, got {r.status_code}"
-        r2 = client.patch("/organization/theme", json={"mode": "dark"}, headers=staff_headers)
-        assert r2.status_code == 403, f"{role} PATCH should be denied, got {r2.status_code}"
-
-
-def test_organization_a_cannot_access_organization_b_theme():
-    headers_a, _ = _register_org("theme_iso_a")
-    headers_b, _ = _register_org("theme_iso_b")
-    client.patch("/organization/theme", json={"mode": "dark", "primary_color": "#111111"}, headers=headers_a)
-
-    r_b = client.get("/organization/theme", headers=headers_b)
-    assert r_b.json()["theme"]["mode"] == "light"  # B sees its own default, not A's dark theme
-    assert r_b.json()["theme"]["colors"]["primary"] is None
-
-
-def test_organization_id_cannot_be_supplied_to_bypass_isolation():
-    headers_a, org_id_a = _register_org("theme_bypass_a")
-    headers_b, org_id_b = _register_org("theme_bypass_b")
-    client.patch("/organization/theme", json={"mode": "dark"}, headers=headers_a)
-
-    # Even if a client sends organization_id in the body, there is no field
-    # for it in OrganizationThemeUpdate — Pydantic silently ignores unknown
-    # keys by default, and the server always derives the org from the token.
+    # Set mode and primary_color
+    client.patch(
+        "/organization/theme",
+        json={"mode": "dark", "primary_color": "#22C55E"},
+        headers=headers,
+    )
+    # Update only overlay_opacity
     r = client.patch(
         "/organization/theme",
-        json={"organization_id": org_id_a, "mode": "dark"},
-        headers=headers_b,
+        json={"overlay_opacity": 0.65},
+        headers=headers,
     )
-    assert r.status_code == 200
-    db = SessionLocal()
-    try:
-        theme_b = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id_b).first()
-        assert theme_b is not None  # the write landed on B's own org, not A's
-        theme_a = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id_a).first()
-        assert theme_a.mode == "dark" and theme_a.organization_id == org_id_a  # A's row untouched by B's request
-    finally:
-        db.close()
+    body = r.json()
+    assert body["mode"] == "dark"
+    assert body["primary_color"] == "#22c55e"  # Lowercase normalized
+    assert body["background"]["overlay_opacity"] == 0.65
 
 
-# ------------------------------- 14-20. field validation ---------------------------
-
-
-def test_valid_hex_colors_accepted():
-    headers, _ = _register_org("theme_hex_ok")
-    for color in ("#fff", "#ffffff", "#22c55e"):
-        r = client.patch("/organization/theme", json={"primary_color": color}, headers=headers)
-        assert r.status_code == 200, (color, r.text)
-        assert r.json()["theme"]["colors"]["primary"] == color
-
-
-def test_invalid_color_values_rejected():
-    headers, _ = _register_org("theme_hex_bad")
-    for color in ("red", "rgb(1,2,3)", "rgba(1,2,3,0.5)", "javascript:alert(1)", "#gggggg"):
-        r = client.patch("/organization/theme", json={"primary_color": color}, headers=headers)
-        assert r.status_code == 422, (color, r.text)
-
-
-def test_valid_mode_accepted():
-    headers, _ = _register_org("theme_mode_ok")
+def test_mode_validation():
+    headers, _ = _register_org("theme_mode_val")
     for mode in ("light", "dark"):
         r = client.patch("/organization/theme", json={"mode": mode}, headers=headers)
         assert r.status_code == 200
+        assert r.json()["mode"] == mode
+
+    for bad in ("blue", "dim", "custom", "DARK", ""):
+        r = client.patch("/organization/theme", json={"mode": bad}, headers=headers)
+        assert r.status_code == 422
 
 
-def test_invalid_mode_rejected():
-    headers, _ = _register_org("theme_mode_bad")
-    r = client.patch("/organization/theme", json={"mode": "blue"}, headers=headers)
-    assert r.status_code == 422
+def test_primary_color_validation_and_normalization():
+    headers, _ = _register_org("theme_color_val")
 
+    # 6-digit hex uppercase normalized to lowercase
+    r = client.patch("/organization/theme", json={"primary_color": "#22C55E"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["primary_color"] == "#22c55e"
 
-def test_valid_theme_name_accepted():
-    headers, _ = _register_org("theme_name_ok")
-    for name in ("default", "professional", "dark", "custom"):
-        r = client.patch("/organization/theme", json={"theme_name": name}, headers=headers)
-        assert r.status_code == 200
+    # null accepted
+    r2 = client.patch("/organization/theme", json={"primary_color": None}, headers=headers)
+    assert r2.status_code == 200
+    assert r2.json()["primary_color"] is None
 
+    # Shorthand #fff MUST be rejected (422)
+    r3 = client.patch("/organization/theme", json={"primary_color": "#fff"}, headers=headers)
+    assert r3.status_code == 422
 
-def test_invalid_theme_name_rejected():
-    headers, _ = _register_org("theme_name_bad")
-    r = client.patch("/organization/theme", json={"theme_name": "hacked"}, headers=headers)
-    assert r.status_code == 422
+    # Invalid colors rejected
+    for bad in ("red", "rgb(0,0,0)", "rgba(0,0,0,0)", "#12345", "#1234567", "javascript:alert(1)"):
+        r_bad = client.patch("/organization/theme", json={"primary_color": bad}, headers=headers)
+        assert r_bad.status_code == 422
 
 
 def test_overlay_opacity_validation():
-    headers, _ = _register_org("theme_overlay")
+    headers, _ = _register_org("theme_overlay_val")
+
+    # 0.0 allowed
     assert client.patch("/organization/theme", json={"overlay_opacity": 0.0}, headers=headers).status_code == 200
-    assert client.patch("/organization/theme", json={"overlay_opacity": 1.0}, headers=headers).status_code == 200
-    assert client.patch("/organization/theme", json={"overlay_opacity": 0.65}, headers=headers).status_code == 200
-    assert client.patch("/organization/theme", json={"overlay_opacity": 1.5}, headers=headers).status_code == 422
+    # 0.9 allowed
+    assert client.patch("/organization/theme", json={"overlay_opacity": 0.9}, headers=headers).status_code == 200
+    # 0.55 allowed
+    assert client.patch("/organization/theme", json={"overlay_opacity": 0.55}, headers=headers).status_code == 200
+
+    # 1.0 MUST be rejected (422)
+    assert client.patch("/organization/theme", json={"overlay_opacity": 1.0}, headers=headers).status_code == 422
+    # >0.9 rejected
+    assert client.patch("/organization/theme", json={"overlay_opacity": 0.91}, headers=headers).status_code == 422
+    # <0.0 rejected
     assert client.patch("/organization/theme", json={"overlay_opacity": -0.1}, headers=headers).status_code == 422
 
 
-# ------------------------------- 21-28. uploads -------------------------------------
+# ------------------------------- 4. Unknown & Removed Fields (HTTP 422) -----------------------
 
 
-def test_png_upload_accepted():
-    headers, _ = _register_org("theme_png")
-    r = client.post(
+def test_removed_and_unknown_fields_return_422():
+    headers, _ = _register_org("theme_unknown_fields")
+    for payload in (
+        {"heading_font": "DM Sans"},
+        {"body_font": "Open Sans"},
+        {"theme_name": "custom"},
+        {"theme_name": "professional"},
+        {"card_style": "glass"},
+        {"border_radius": "12px"},
+        {"secondary_color": "#16a34a"},
+        {"logo_url": "/files/some-id"},
+        {"custom_config": {}},
+        {"organization_id": "other-id"},
+        {"arbitrary_field": "val"},
+    ):
+        r = client.patch("/organization/theme", json=payload, headers=headers)
+        assert r.status_code == 422, f"Expected 422 for payload {payload}, got {r.status_code}: {r.text}"
+
+
+# ------------------------------- 5. Background File Lifecycle & Cleanups ----------------------
+
+
+def test_background_upload_png_jpeg_webp():
+    headers, _ = _register_org("theme_bg_types")
+
+    # PNG
+    r_png = client.post(
         "/organization/theme/background",
         files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
         headers=headers,
     )
-    assert r.status_code == 200, r.text
-    assert r.json()["theme"]["background"]["url"].startswith("/files/")
+    assert r_png.status_code == 200
+    assert r_png.json()["background"]["url"].startswith("/files/")
+    assert r_png.json()["background"]["overlay_opacity"] == 0.45
 
-
-def test_jpeg_upload_accepted():
-    headers, _ = _register_org("theme_jpeg")
-    r = client.post(
+    # JPEG
+    r_jpg = client.post(
         "/organization/theme/background",
         files={"file": ("bg.jpg", io.BytesIO(b"fake-jpeg-bytes"), "image/jpeg")},
         headers=headers,
     )
-    assert r.status_code == 200, r.text
+    assert r_jpg.status_code == 200
+    assert r_jpg.json()["background"]["url"].startswith("/files/")
 
-
-def test_webp_upload_accepted():
-    headers, _ = _register_org("theme_webp")
-    r = client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.webp", io.BytesIO(b"fake-webp-bytes"), "image/webp")},
+    # WebP
+    r_webp = client.post(
+        "/organization/theme/background",
+        files={"file": ("bg.webp", io.BytesIO(b"fake-webp-bytes"), "image/webp")},
         headers=headers,
     )
-    assert r.status_code == 200, r.text
+    assert r_webp.status_code == 200
+    assert r_webp.json()["background"]["url"].startswith("/files/")
 
 
-def test_unsupported_file_type_rejected():
-    headers, _ = _register_org("theme_bad_type")
-    for content_type, name in [("image/gif", "a.gif"), ("application/pdf", "a.pdf"), ("image/svg+xml", "a.svg")]:
-        r = client.post(
-            "/organization/theme/background",
-            files={"file": (name, io.BytesIO(b"data"), content_type)},
-            headers=headers,
-        )
-        assert r.status_code == 400, (content_type, r.text)
+def test_background_upload_size_and_mime_validation():
+    headers, _ = _register_org("theme_bg_invalid")
 
-
-def test_file_over_5mb_rejected():
-    headers, _ = _register_org("theme_too_big")
+    # >5 MB rejected
     oversized = b"\x00" * (5 * 1024 * 1024 + 1)
-    r = client.post(
+    r_size = client.post(
         "/organization/theme/background",
         files={"file": ("big.png", io.BytesIO(oversized), "image/png")},
         headers=headers,
     )
-    assert r.status_code == 413, r.text
+    assert r_size.status_code == 413
+
+    # Disallowed MIME types rejected (400)
+    for mime, name in (("image/gif", "a.gif"), ("application/pdf", "a.pdf"), ("image/svg+xml", "a.svg")):
+        r_mime = client.post(
+            "/organization/theme/background",
+            files={"file": (name, io.BytesIO(b"data"), mime)},
+            headers=headers,
+        )
+        assert r_mime.status_code == 400
 
 
-def test_background_upload_stores_files_id_url():
-    headers, _ = _register_org("theme_bg_url")
-    r = client.post(
+def test_background_replacement_deletes_old_stored_file():
+    headers, org_id = _register_org("theme_bg_replace")
+
+    # Upload 1
+    r1 = client.post(
+        "/organization/theme/background",
+        files={"file": ("bg1.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+    url1 = r1.json()["background"]["url"]
+    file_id1 = url1.rsplit("/", 1)[-1]
+
+    db = SessionLocal()
+    try:
+        assert db.get(StoredFile, file_id1) is not None
+    finally:
+        db.close()
+
+    # Upload 2 (Replacement)
+    r2 = client.post(
+        "/organization/theme/background",
+        files={"file": ("bg2.png", io.BytesIO(b"new-png-bytes"), "image/png")},
+        headers=headers,
+    )
+    url2 = r2.json()["background"]["url"]
+    file_id2 = url2.rsplit("/", 1)[-1]
+    assert file_id1 != file_id2
+
+    db = SessionLocal()
+    try:
+        # Old StoredFile row must be DELETED
+        assert db.get(StoredFile, file_id1) is None
+        # New StoredFile row must EXIST
+        assert db.get(StoredFile, file_id2) is not None
+        # DB theme background points to new file
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.background_image_url == f"/files/{file_id2}"
+    finally:
+        db.close()
+
+
+def test_delete_background_endpoint():
+    headers, org_id = _register_org("theme_bg_delete")
+
+    # Configure theme with color and background
+    client.patch(
+        "/organization/theme",
+        json={"mode": "dark", "primary_color": "#22c55e", "overlay_opacity": 0.7},
+        headers=headers,
+    )
+    r_up = client.post(
         "/organization/theme/background",
         files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
         headers=headers,
     )
-    url = r.json()["theme"]["background"]["url"]
-    assert url.startswith("/files/")
-    for fragment in ("http://", "https://", "onrender.com", "asynk.in", "workers.dev"):
-        assert fragment not in url
+    file_id = r_up.json()["background"]["url"].rsplit("/", 1)[-1]
+
+    # DELETE /organization/theme/background
+    r_del = client.delete("/organization/theme/background", headers=headers)
+    assert r_del.status_code == 200
+    body = r_del.json()
+    assert body["background"]["url"] is None
+    assert body["background"]["overlay_opacity"] == 0.7  # Preserved
+    assert body["mode"] == "dark"  # Preserved
+    assert body["primary_color"] == "#22c55e"  # Preserved
+
+    db = SessionLocal()
+    try:
+        assert db.get(StoredFile, file_id) is None  # StoredFile deleted
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.background_image_url is None
+    finally:
+        db.close()
+
+    # Idempotent DELETE when no background exists
+    r_del_again = client.delete("/organization/theme/background", headers=headers)
+    assert r_del_again.status_code == 200
+    assert r_del_again.json()["background"]["url"] is None
 
 
-def test_logo_upload_stores_files_id_url():
-    headers, _ = _register_org("theme_logo_url")
+def test_reset_organization_theme_endpoint():
+    headers, org_id = _register_org("theme_reset")
+
+    # Set custom settings + upload background
+    client.patch(
+        "/organization/theme",
+        json={"custom_enabled": True, "mode": "dark", "primary_color": "#123456", "overlay_opacity": 0.8},
+        headers=headers,
+    )
+    r_up = client.post(
+        "/organization/theme/background",
+        files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+    file_id = r_up.json()["background"]["url"].rsplit("/", 1)[-1]
+
+    # POST /organization/theme/reset
+    r_reset = client.post("/organization/theme/reset", headers=headers)
+    assert r_reset.status_code == 200
+    body = r_reset.json()
+    assert body["custom_enabled"] is False
+    assert body["mode"] == "light"
+    assert body["primary_color"] is None
+    assert body["background"] == {"url": None, "overlay_opacity": 0.45}
+    assert body["updated_at"] is not None
+
+    db = SessionLocal()
+    try:
+        assert db.get(StoredFile, file_id) is None  # Background file deleted
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.custom_enabled is False
+        assert theme.mode == "light"
+        assert theme.primary_color is None
+        assert theme.background_image_url is None
+        assert theme.overlay_opacity == 0.45
+    finally:
+        db.close()
+
+
+# ------------------------------- 6. Tenant Isolation -----------------------------------------
+
+
+def test_tenant_isolation():
+    headers_a, org_id_a = _register_org("theme_iso_a")
+    headers_b, org_id_b = _register_org("theme_iso_b")
+
+    # A sets theme
+    client.patch(
+        "/organization/theme",
+        json={"custom_enabled": True, "mode": "dark", "primary_color": "#112233"},
+        headers=headers_a,
+    )
+    client.post(
+        "/organization/theme/background",
+        files={"file": ("bg_a.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers_a,
+    )
+
+    # B gets theme — sees its own defaults
+    r_b = client.get("/organization/theme", headers=headers_b)
+    assert r_b.json()["custom_enabled"] is False
+    assert r_b.json()["mode"] == "light"
+    assert r_b.json()["primary_color"] is None
+    assert r_b.json()["background"]["url"] is None
+
+    # B deletes background — does not affect A
+    client.delete("/organization/theme/background", headers=headers_b)
+    r_a = client.get("/organization/theme", headers=headers_a)
+    assert r_a.json()["custom_enabled"] is True
+    assert r_a.json()["mode"] == "dark"
+    assert r_a.json()["background"]["url"] is not None
+
+
+# ------------------------------- 7. Removed Endpoint & Logo Independence ----------------------
+
+
+def test_removed_theme_logo_endpoint_returns_404():
+    headers, _ = _register_org("theme_no_logo_ep")
     r = client.post(
         "/organization/theme/logo",
         files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
         headers=headers,
     )
-    url = r.json()["theme"]["logo_url"]
-    assert url.startswith("/files/")
+    assert r.status_code in (404, 405), f"Expected 404/405 for removed endpoint, got {r.status_code}"
 
 
-def test_theme_logo_does_not_modify_organization_logo_url():
-    headers, org_id = _register_org("theme_logo_isolated")
+def test_company_logo_behavior_remains_unaffected():
+    headers, org_id = _register_org("theme_org_logo_intact")
     db = SessionLocal()
     try:
         org = db.get(Organization, org_id)
-        org.logo_url = "/files/existing-company-logo"
+        org.logo_url = "/files/company-logo-123"
         db.commit()
     finally:
         db.close()
 
+    # Theme operations
+    client.patch(
+        "/organization/theme",
+        json={"mode": "dark", "custom_enabled": True},
+        headers=headers,
+    )
     client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
+        "/organization/theme/background",
+        files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
         headers=headers,
     )
 
     db = SessionLocal()
     try:
         org = db.get(Organization, org_id)
-        assert org.logo_url == "/files/existing-company-logo"  # completely untouched
-        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
-        assert theme.logo_url != org.logo_url
-        assert theme.logo_url.startswith("/files/")
+        assert org.logo_url == "/files/company-logo-123"
     finally:
         db.close()
 
 
-# ---------------------- PUBLIC_BASE_URL: absolute responses, relative DB ----------
-# organization_themes.background_image_url / logo_url must stay relative in the
-# database regardless of PUBLIC_BASE_URL — only the API response is affected.
+# ------------------------------- 8. PUBLIC_BASE_URL Normalization ----------------------------
 
 _PUBLIC_BASE_URL = "https://crm-saas-backend.bsmart.workers.dev"
 
 
-def test_background_upload_response_absolute_when_public_base_url_configured(monkeypatch):
+def test_background_url_absolute_when_public_base_url_set(monkeypatch):
     monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
-    headers, org_id = _register_org("theme_bg_absolute")
+    headers, org_id = _register_org("theme_pub_base")
+
     r = client.post(
         "/organization/theme/background",
         files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
         headers=headers,
     )
-    assert r.status_code == 200, r.text
-    url = r.json()["theme"]["background"]["url"]
+    assert r.status_code == 200
+    url = r.json()["background"]["url"]
     assert url.startswith(_PUBLIC_BASE_URL + "/files/")
 
+    # In DB, it must still be relative
     db = SessionLocal()
     try:
         theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
@@ -414,190 +610,55 @@ def test_background_upload_response_absolute_when_public_base_url_configured(mon
         db.close()
 
 
-def test_theme_logo_upload_response_absolute_when_public_base_url_configured(monkeypatch):
-    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
-    headers, org_id = _register_org("theme_logo_absolute")
-    r = client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
-        headers=headers,
-    )
-    assert r.status_code == 200, r.text
-    url = r.json()["theme"]["logo_url"]
-    assert url.startswith(_PUBLIC_BASE_URL + "/files/")
-
-    db = SessionLocal()
-    try:
-        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
-        assert theme.logo_url.startswith("/files/")
-        assert _PUBLIC_BASE_URL not in theme.logo_url
-    finally:
-        db.close()
+# ------------------------------- 9. Activity Logging -----------------------------------------
 
 
-def test_get_theme_response_absolute_when_public_base_url_configured(monkeypatch):
-    headers, org_id = _register_org("theme_get_absolute")
-    client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
-        headers=headers,
-    )
+def test_activity_logging_on_theme_mutations():
+    headers, org_id = _register_org("theme_act_log")
 
-    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
-    r = client.get("/organization/theme", headers=headers)
-    assert r.status_code == 200, r.text
-    assert r.json()["theme"]["logo_url"].startswith(_PUBLIC_BASE_URL + "/files/")
-
-    db = SessionLocal()
-    try:
-        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
-        assert theme.logo_url.startswith("/files/")  # GET never mutated the stored value
-    finally:
-        db.close()
-
-
-def test_patch_theme_response_absolute_when_public_base_url_configured(monkeypatch):
-    headers, org_id = _register_org("theme_patch_absolute")
+    # PATCH
+    client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
+    # Background upload
     client.post(
         "/organization/theme/background",
         files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
         headers=headers,
     )
-
-    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
-    r = client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
-    assert r.status_code == 200, r.text
-    assert r.json()["theme"]["background"]["url"].startswith(_PUBLIC_BASE_URL + "/files/")
+    # Background delete
+    client.delete("/organization/theme/background", headers=headers)
+    # Reset
+    client.post("/organization/theme/reset", headers=headers)
 
     db = SessionLocal()
     try:
-        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
-        assert theme.background_image_url.startswith("/files/")
+        titles = {
+            log.title
+            for log in db.query(ActivityLog).filter(ActivityLog.organization_id == org_id).all()
+        }
+        assert "Theme updated" in titles
+        assert "Background uploaded" in titles
+        assert "Background removed" in titles
+        assert "Theme reset to defaults" in titles
     finally:
         db.close()
 
 
-def test_theme_response_relative_when_public_base_url_unset():
-    assert settings.public_base_url == ""  # sanity
-    headers, _ = _register_org("theme_relative_default")
-    client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
-        headers=headers,
-    )
-    r = client.get("/organization/theme", headers=headers)
-    assert r.json()["theme"]["logo_url"].startswith("/files/")
+# ------------------------------- 10. /auth/me Theme Inclusion -------------------------------
 
 
-# ------------------------------- 29-31. activity logging ---------------------------
-
-
-def test_activity_log_created_for_theme_update():
-    headers, org_id = _register_org("theme_log_update")
-    client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
-    db = SessionLocal()
-    try:
-        entry = (
-            db.query(ActivityLog)
-            .filter(ActivityLog.organization_id == org_id, ActivityLog.title == "Theme updated")
-            .first()
-        )
-        assert entry is not None
-    finally:
-        db.close()
-
-
-def test_activity_log_created_for_background_upload():
-    headers, org_id = _register_org("theme_log_bg")
-    client.post(
-        "/organization/theme/background",
-        files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
-        headers=headers,
-    )
-    db = SessionLocal()
-    try:
-        entry = (
-            db.query(ActivityLog)
-            .filter(ActivityLog.organization_id == org_id, ActivityLog.title == "Background uploaded")
-            .first()
-        )
-        assert entry is not None
-    finally:
-        db.close()
-
-
-def test_activity_log_created_for_logo_change():
-    headers, org_id = _register_org("theme_log_logo")
-    client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
-        headers=headers,
-    )
-    db = SessionLocal()
-    try:
-        entry = (
-            db.query(ActivityLog)
-            .filter(ActivityLog.organization_id == org_id, ActivityLog.title == "Logo changed")
-            .first()
-        )
-        assert entry is not None
-    finally:
-        db.close()
-
-
-# ------------------------------- 32-34. persistence / regression -------------------
-
-
-def test_custom_config_persists_correctly():
-    headers, _ = _register_org("theme_custom_config")
-    payload = {"custom_config": {"nav_style": "sidebar", "extra": {"nested": 1}}}
-    client.patch("/organization/theme", json=payload, headers=headers)
-    r = client.get("/organization/theme", headers=headers)
-    assert r.json()["theme"]["custom_config"] == payload["custom_config"]
-
-
-def test_existing_organization_records_remain_unaffected():
-    """Registering, using unrelated org fields, and touching the theme must
-    not disturb any of Organization's own pre-existing branding columns."""
-    headers, org_id = _register_org("theme_no_side_effects")
-    db = SessionLocal()
-    try:
-        org = db.get(Organization, org_id)
-        org.logo_url = "/files/original-logo"
-        org.signature_url = "/files/original-signature"
-        db.commit()
-    finally:
-        db.close()
-
-    client.patch("/organization/theme", json={"mode": "dark", "custom_enabled": True}, headers=headers)
-    client.post(
-        "/organization/theme/logo",
-        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
+def test_auth_me_includes_canonical_theme():
+    headers, _ = _register_org("theme_auth_me")
+    client.patch(
+        "/organization/theme",
+        json={"custom_enabled": True, "mode": "dark", "primary_color": "#22c55e"},
         headers=headers,
     )
 
-    db = SessionLocal()
-    try:
-        org = db.get(Organization, org_id)
-        assert org.logo_url == "/files/original-logo"
-        assert org.signature_url == "/files/original-signature"
-    finally:
-        db.close()
-
-
-def test_theme_deleted_when_organization_deleted():
-    """FK ondelete=CASCADE: deleting the organization row must not leave an
-    orphaned organization_themes row behind."""
-    headers, org_id = _register_org("theme_cascade")
-    client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
-
-    db = SessionLocal()
-    try:
-        assert db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first() is not None
-        org = db.get(Organization, org_id)
-        db.delete(org)
-        db.commit()
-
-        assert db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first() is None
-    finally:
-        db.close()
+    r = client.get("/auth/me", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert "theme" in body
+    assert body["theme"]["custom_enabled"] is True
+    assert body["theme"]["mode"] == "dark"
+    assert body["theme"]["primary_color"] == "#22c55e"
+    assert body["theme"]["background"]["overlay_opacity"] == 0.45
