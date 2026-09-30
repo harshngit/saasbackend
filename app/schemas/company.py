@@ -94,6 +94,14 @@ class OtherDocument(BaseModel):
     size: int | None = None
     uploaded_at: datetime | None = None
 
+    @field_validator("url", mode="after")
+    @classmethod
+    def _normalize_url(cls, v: str) -> str:
+        """Response-only: absolutize against PUBLIC_BASE_URL. The JSON list
+        stored on the organization row keeps holding the relative value."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
 
 class CompanySettingsOut(BaseModel):
     """Full company profile shown/edited on the Company Settings page."""

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.files import save_upload
+from app.core.files import normalize_file_url, save_upload
 from app.core.deps import require_system_role
 from app.core import reference_data as R
 from app.core.reference_data import (
@@ -246,7 +246,7 @@ def upload_logo(
     org.logo_url = _store_image(db, org.id, file, request)
     activity_service.record(db, org.id, admin, "branding", "Company logo updated")
     db.commit()
-    return UploadResponse(url=org.logo_url)
+    return UploadResponse(url=normalize_file_url(org.logo_url))
 
 
 @router.post("/settings/signature", response_model=UploadResponse)
@@ -260,7 +260,7 @@ def upload_signature(
     org.signature_url = _store_image(db, org.id, file, request)
     activity_service.record(db, org.id, admin, "branding", "Authorized signature updated")
     db.commit()
-    return UploadResponse(url=org.signature_url)
+    return UploadResponse(url=normalize_file_url(org.signature_url))
 
 
 def _is_document(content_type: str) -> bool:
@@ -300,7 +300,7 @@ def upload_settings_file(
     org = _admin_org(admin, db)
     url, _ = _store_document(db, org.id, file, request)
     db.commit()
-    return UploadResponse(url=url)
+    return UploadResponse(url=normalize_file_url(url))
 
 
 

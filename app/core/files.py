@@ -52,8 +52,23 @@ def public_url(request: Request | None, file_id: str) -> str:
     return f"{FILES_PATH}/{file_id}"
 
 
+def _with_public_base(path: str) -> str:
+    """Join PUBLIC_BASE_URL with a `/files/...`-style path, trailing-slash safe.
+
+    Response-layer only: the database always keeps storing `path` as-is
+    (relative). When PUBLIC_BASE_URL is unset, returns `path` unchanged —
+    that is the existing, expected behavior for every environment that
+    hasn't configured it (e.g. local dev, tests).
+    """
+    base = settings.public_base_url.strip()
+    if not base:
+        return path
+    return f"{base.rstrip('/')}{path}"
+
+
 def normalize_file_url(value: str | None) -> str | None:
-    """Make a `*_url` field usable no matter what shape ended up stored in it.
+    """Make a `*_url` field usable no matter what shape ended up stored in it,
+    and make it absolute for the API response when PUBLIC_BASE_URL is configured.
 
     Every one of these columns is meant to hold a ready-to-use reference
     (`/files/{id}`, an absolute URL, or a legacy `data:` URI), but several of
@@ -64,17 +79,25 @@ def normalize_file_url(value: str | None) -> str | None:
     so the API is correct regardless of what's already in the database, with
     no data migration required.
 
-    Bare id -> /files/{id}; already `/...`, `http(s)://...` or `data:...` ->
-    unchanged; None/blank -> None.
+    Bare id -> {PUBLIC_BASE_URL}/files/{id} (or /files/{id} if unset); already
+    relative `/...` -> prefixed with PUBLIC_BASE_URL the same way; already
+    `http(s)://...` or `data:...` -> unchanged (never rewrites an
+    already-absolute URL, whatever host it names); None/blank -> None.
+
+    The database itself never sees this function's output — it only runs
+    when building a response, so DB rows stay host-independent regardless of
+    what PUBLIC_BASE_URL is set to.
     """
     if value is None:
         return None
     val = value.strip()
     if not val:
         return None
-    if val.startswith("/") or val.startswith("http://") or val.startswith("https://") or val.startswith("data:"):
+    if val.startswith("http://") or val.startswith("https://") or val.startswith("data:"):
         return val
-    return f"{FILES_PATH}/{val}"
+    if val.startswith("/"):
+        return _with_public_base(val)
+    return _with_public_base(f"{FILES_PATH}/{val}")
 
 
 def _persist(

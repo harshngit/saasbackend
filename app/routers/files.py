@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.files import MAX_UPLOAD_BYTES, save_upload
+from app.core.files import MAX_UPLOAD_BYTES, normalize_file_url, save_upload
 from app.models import StoredFile, User
 
 logger = logging.getLogger("crm.files")
@@ -64,7 +64,7 @@ def upload_file(
     db.commit()
     name = file.filename or "upload"
     return FileUploadOut(
-        url=url,
+        url=normalize_file_url(url),
         file_id=stored_id,
         name=name,
         filename=name,

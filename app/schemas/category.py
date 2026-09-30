@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class CategoryOut(BaseModel):
@@ -15,6 +15,15 @@ class CategoryOut(BaseModel):
     parent_id: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("image", mode="after")
+    @classmethod
+    def _normalize_image(cls, v: str | None) -> str | None:
+        """Response-only: absolutize against PUBLIC_BASE_URL — see
+        app.core.files.normalize_file_url. The database keeps holding
+        whatever was stored (relative /files/{id}, or a pasted external URL)."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class CategoryCreate(BaseModel):

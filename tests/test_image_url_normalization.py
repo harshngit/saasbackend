@@ -17,17 +17,20 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.files import normalize_file_url
 from app.main import app
 from app.models.product import Product, ProductVariant
 from app.models.quotation import Quotation, QuotationItem
 from app.models.user import User
-from app.schemas.company import CompanySettingsOut
+from app.schemas.category import CategoryOut
+from app.schemas.company import CompanySettingsOut, OtherDocument
 from app.schemas.expense import ExpenseOut
 from app.schemas.product import VariantOut
 from app.schemas.purchase import PurchaseOut
 from app.schemas.supplier_invoice import SupplierInvoiceOut
+from app.schemas.user import EmployeeDocument
 
 client = TestClient(app)
 
@@ -68,6 +71,113 @@ def test_no_double_files_prefix():
     # Confirms the normalizer never produces /files//files/abc123.
     once = normalize_file_url("abc123")
     assert normalize_file_url(once) == once == "/files/abc123"
+
+
+# ------------------------- unit tests: PUBLIC_BASE_URL (response layer) -----------
+# Database storage is untouched by any of this — normalize_file_url() only ever
+# runs when building a response. See app.core.files._with_public_base.
+
+
+def test_relative_url_becomes_absolute_when_public_base_url_configured(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    assert normalize_file_url("/files/123") == "https://crm-saas-backend.bsmart.workers.dev/files/123"
+
+
+def test_bare_id_becomes_absolute_when_public_base_url_configured(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    assert normalize_file_url("abc123") == "https://crm-saas-backend.bsmart.workers.dev/files/abc123"
+
+
+def test_relative_url_stays_relative_when_public_base_url_unset():
+    assert settings.public_base_url == ""  # sanity: default test settings have it unset
+    assert normalize_file_url("/files/123") == "/files/123"
+
+
+def test_relative_url_stays_relative_when_public_base_url_blank(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "   ")
+    assert normalize_file_url("/files/123") == "/files/123"
+
+
+def test_already_absolute_url_unchanged_even_with_public_base_url_configured(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    old = "https://old-host.com/files/123"
+    assert normalize_file_url(old) == old
+    same_host = "https://crm-saas-backend.bsmart.workers.dev/files/123"
+    assert normalize_file_url(same_host) == same_host
+
+
+def test_data_url_unchanged_even_with_public_base_url_configured(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    val = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+    assert normalize_file_url(val) == val
+
+
+def test_none_and_blank_unaffected_by_public_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    assert normalize_file_url(None) is None
+    assert normalize_file_url("   ") is None
+
+
+def test_public_base_url_trailing_slash_does_not_double_up(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev/")
+    result = normalize_file_url("/files/123")
+    assert result == "https://crm-saas-backend.bsmart.workers.dev/files/123"
+    assert "//files" not in result.split("://", 1)[1]
+
+
+def test_public_base_url_without_trailing_slash_matches_with_trailing_slash(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    no_slash = normalize_file_url("/files/123")
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev/")
+    with_slash = normalize_file_url("/files/123")
+    assert no_slash == with_slash == "https://crm-saas-backend.bsmart.workers.dev/files/123"
+
+
+def test_changing_public_base_url_changes_response_only(monkeypatch):
+    """Host independence: swapping PUBLIC_BASE_URL changes only what
+    normalize_file_url() returns — nothing about the underlying relative
+    value it was given changes or needs to."""
+    stored = "/files/123"
+    monkeypatch.setattr(settings, "public_base_url", "https://host-one.example.com")
+    first = normalize_file_url(stored)
+    monkeypatch.setattr(settings, "public_base_url", "https://host-two.example.com")
+    second = normalize_file_url(stored)
+    assert first == "https://host-one.example.com/files/123"
+    assert second == "https://host-two.example.com/files/123"
+    assert stored == "/files/123"  # the input/DB-shaped value never mutates
+
+
+# --------------------- nested document lists: OtherDocument / EmployeeDocument -----
+
+
+def test_other_document_url_normalizes_relative_with_public_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    doc = OtherDocument(id="d1", name="document.pdf", url="/files/123")
+    assert doc.url == "https://crm-saas-backend.bsmart.workers.dev/files/123"
+    assert doc.name == "document.pdf"  # only the URL field is transformed
+
+
+def test_other_document_url_stays_relative_without_public_base_url():
+    doc = OtherDocument(id="d1", name="document.pdf", url="/files/123")
+    assert doc.url == "/files/123"
+
+
+def test_employee_document_url_normalizes_relative_with_public_base_url(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    doc = EmployeeDocument(id="d1", name="cert.pdf", url="/files/456")
+    assert doc.url == "https://crm-saas-backend.bsmart.workers.dev/files/456"
+
+
+def test_category_out_image_normalizes_relative_with_public_base_url(monkeypatch):
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    cat = CategoryOut(
+        id="c1", organization_id="o1", name="Widgets", image="/files/789",
+        description=None, is_active=True,
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+    )
+    assert cat.image == "https://crm-saas-backend.bsmart.workers.dev/files/789"
 
 
 # ------------------------------ schema-level regression tests ---------------------

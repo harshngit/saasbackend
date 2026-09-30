@@ -38,6 +38,15 @@ class ThemeBackground(BaseModel):
     url: str | None = Field(default=None, description="/files/{id} — never a raw file id or a signed R2 URL")
     overlay: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    @field_validator("url", mode="after")
+    @classmethod
+    def _normalize_url(cls, v: str | None) -> str | None:
+        """Response-only: absolutize against PUBLIC_BASE_URL — see
+        app.core.files.normalize_file_url. organization_themes.background_image_url
+        keeps holding the relative value in the database."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
 
 class ThemeColors(BaseModel):
     primary: HexColor | None = None
@@ -62,6 +71,15 @@ class ThemeConfig(BaseModel):
     card_style: CardStyle = "solid"
     border_radius: BorderRadius = "12px"
     custom_config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("logo_url", mode="after")
+    @classmethod
+    def _normalize_logo_url(cls, v: str | None) -> str | None:
+        """Response-only: absolutize against PUBLIC_BASE_URL — see
+        app.core.files.normalize_file_url. organization_themes.logo_url keeps
+        holding the relative value in the database."""
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class OrganizationThemeOut(BaseModel):

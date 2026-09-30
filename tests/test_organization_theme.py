@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.core.database import SessionLocal
 from app.main import app
 from app.models import ActivityLog, Organization, OrganizationTheme, User
@@ -383,6 +384,109 @@ def test_theme_logo_does_not_modify_organization_logo_url():
         assert theme.logo_url.startswith("/files/")
     finally:
         db.close()
+
+
+# ---------------------- PUBLIC_BASE_URL: absolute responses, relative DB ----------
+# organization_themes.background_image_url / logo_url must stay relative in the
+# database regardless of PUBLIC_BASE_URL — only the API response is affected.
+
+_PUBLIC_BASE_URL = "https://crm-saas-backend.bsmart.workers.dev"
+
+
+def test_background_upload_response_absolute_when_public_base_url_configured(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("theme_bg_absolute")
+    r = client.post(
+        "/organization/theme/background",
+        files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    url = r.json()["theme"]["background"]["url"]
+    assert url.startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.background_image_url.startswith("/files/")
+        assert _PUBLIC_BASE_URL not in theme.background_image_url
+    finally:
+        db.close()
+
+
+def test_theme_logo_upload_response_absolute_when_public_base_url_configured(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("theme_logo_absolute")
+    r = client.post(
+        "/organization/theme/logo",
+        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    url = r.json()["theme"]["logo_url"]
+    assert url.startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.logo_url.startswith("/files/")
+        assert _PUBLIC_BASE_URL not in theme.logo_url
+    finally:
+        db.close()
+
+
+def test_get_theme_response_absolute_when_public_base_url_configured(monkeypatch):
+    headers, org_id = _register_org("theme_get_absolute")
+    client.post(
+        "/organization/theme/logo",
+        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    r = client.get("/organization/theme", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["theme"]["logo_url"].startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.logo_url.startswith("/files/")  # GET never mutated the stored value
+    finally:
+        db.close()
+
+
+def test_patch_theme_response_absolute_when_public_base_url_configured(monkeypatch):
+    headers, org_id = _register_org("theme_patch_absolute")
+    client.post(
+        "/organization/theme/background",
+        files={"file": ("bg.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    r = client.patch("/organization/theme", json={"mode": "dark"}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["theme"]["background"]["url"].startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        theme = db.query(OrganizationTheme).filter(OrganizationTheme.organization_id == org_id).first()
+        assert theme.background_image_url.startswith("/files/")
+    finally:
+        db.close()
+
+
+def test_theme_response_relative_when_public_base_url_unset():
+    assert settings.public_base_url == ""  # sanity
+    headers, _ = _register_org("theme_relative_default")
+    client.post(
+        "/organization/theme/logo",
+        files={"file": ("logo.png", io.BytesIO(_png_bytes()), "image/png")},
+        headers=headers,
+    )
+    r = client.get("/organization/theme", headers=headers)
+    assert r.json()["theme"]["logo_url"].startswith("/files/")
 
 
 # ------------------------------- 29-31. activity logging ---------------------------

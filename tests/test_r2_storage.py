@@ -23,7 +23,7 @@ from app.core import r2
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.main import app
-from app.models import StoredFile, User
+from app.models import Organization, StoredFile, User
 
 client = TestClient(app)
 
@@ -152,6 +152,177 @@ def test_save_bytes_request_none_path_returns_relative_url():
         assert url == f"/files/{url.rsplit('/', 1)[-1]}"
         for fragment in _FORBIDDEN_HOST_FRAGMENTS:
             assert fragment not in url, f"{fragment!r} leaked into upload URL: {url}"
+    finally:
+        db.close()
+
+
+# ------------------- upload responses become absolute with PUBLIC_BASE_URL --------
+# public_url()/save_upload()/save_bytes() (tested above) still only ever produce
+# and store the relative form — that's what keeps the DB host-independent. These
+# cover the separate, response-only layer: normalize_file_url() applied to the
+# same upload responses before they're returned to the caller.
+
+_PUBLIC_BASE_URL = "https://crm-saas-backend.bsmart.workers.dev"
+
+
+def test_files_upload_response_absolute_but_db_row_relative(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("absolute_upload")
+    r = client.post(
+        "/files/upload",
+        files={"file": ("a.png", io.BytesIO(b"absolute-url-bytes"), "image/png")},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    file_id = body["file_id"]
+    assert body["url"] == f"{_PUBLIC_BASE_URL}/files/{file_id}"
+
+    db = SessionLocal()
+    try:
+        stored = db.get(StoredFile, file_id)
+        # StoredFile itself carries no URL column — the id is the only
+        # reference, so "the DB value" for this endpoint is verified via the
+        # organization-logo test below, which round-trips an actual *_url column.
+        assert stored is not None
+    finally:
+        db.close()
+
+
+def test_files_upload_response_relative_when_public_base_url_unset():
+    assert settings.public_base_url == ""  # sanity
+    headers, org_id = _register_org("relative_upload_default")
+    r = client.post(
+        "/files/upload",
+        files={"file": ("a.png", io.BytesIO(b"default-bytes"), "image/png")},
+        headers=headers,
+    )
+    assert r.json()["url"].startswith("/files/")
+
+
+def test_organization_logo_upload_response_absolute_db_row_relative(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("absolute_logo")
+    r = client.post(
+        "/organizations/settings/logo",
+        files={"file": ("logo.png", io.BytesIO(b"logo-bytes"), "image/png")},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    url = r.json()["url"]
+    assert url.startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        org = db.get(Organization, org_id)
+        # The database column keeps the relative form — the response-layer
+        # PUBLIC_BASE_URL prefix was never written back to it.
+        assert org.logo_url.startswith("/files/")
+        assert _PUBLIC_BASE_URL not in org.logo_url
+        stored_id = org.logo_url.rsplit("/", 1)[-1]
+        assert url == f"{_PUBLIC_BASE_URL}/files/{stored_id}"
+    finally:
+        db.close()
+
+
+def test_organization_signature_upload_response_absolute_db_row_relative(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("absolute_signature")
+    r = client.post(
+        "/organizations/settings/signature",
+        files={"file": ("sig.png", io.BytesIO(b"sig-bytes"), "image/png")},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    url = r.json()["url"]
+    assert url.startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        org = db.get(Organization, org_id)
+        assert org.signature_url.startswith("/files/")
+        assert _PUBLIC_BASE_URL not in org.signature_url
+    finally:
+        db.close()
+
+
+def test_organization_upload_file_response_absolute_db_stays_untouched(monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("absolute_upload_file")
+    r = client.post(
+        "/organizations/settings/upload-file",
+        files={"file": ("doc.pdf", io.BytesIO(b"doc-bytes"), "application/pdf")},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+    url = r.json()["url"]
+    assert url.startswith(_PUBLIC_BASE_URL + "/files/")
+    file_id = url.rsplit("/", 1)[-1]
+
+    db = SessionLocal()
+    try:
+        stored = db.get(StoredFile, file_id)
+        assert stored is not None  # this endpoint doesn't set any *_url column itself
+    finally:
+        db.close()
+
+
+def test_upload_response_host_independent_swapping_public_base_url(monkeypatch):
+    """Changing PUBLIC_BASE_URL changes the response host only — no DB row is
+    touched by the swap, and no second upload/migration is needed."""
+    monkeypatch.setattr(settings, "public_base_url", "https://host-one.example.com")
+    headers, org_id = _register_org("host_swap_logo")
+    r1 = client.post(
+        "/organizations/settings/logo",
+        files={"file": ("logo.png", io.BytesIO(b"logo-bytes"), "image/png")},
+        headers=headers,
+    )
+    assert r1.json()["url"].startswith("https://host-one.example.com/files/")
+
+    db = SessionLocal()
+    try:
+        org = db.get(Organization, org_id)
+        relative_value = org.logo_url
+        assert relative_value.startswith("/files/")
+    finally:
+        db.close()
+
+    monkeypatch.setattr(settings, "public_base_url", "https://host-two.example.com")
+    r2 = client.get("/organizations/me", headers=headers)
+    assert r2.status_code == 200
+
+    db = SessionLocal()
+    try:
+        org = db.get(Organization, org_id)
+        # Same relative DB value as before — swapping the setting alone
+        # never rewrote it.
+        assert org.logo_url == relative_value
+    finally:
+        db.close()
+
+
+def test_other_documents_list_response_absolute_db_stays_relative(monkeypatch):
+    """doc_other_files (nested list, OtherDocument.url) — each item's url must
+    be absolute in the response while the organization row's JSON list keeps
+    the relative form."""
+    monkeypatch.setattr(settings, "public_base_url", _PUBLIC_BASE_URL)
+    headers, org_id = _register_org("absolute_other_docs")
+    r = client.post(
+        "/organizations/settings/documents/other",
+        files=[("files", ("doc.pdf", io.BytesIO(b"doc-bytes"), "application/pdf"))],
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    docs = r.json()
+    assert len(docs) == 1
+    assert docs[0]["url"].startswith(_PUBLIC_BASE_URL + "/files/")
+
+    db = SessionLocal()
+    try:
+        org = db.get(Organization, org_id)
+        assert len(org.doc_other_files) == 1
+        assert org.doc_other_files[0]["url"].startswith("/files/")
+        assert _PUBLIC_BASE_URL not in org.doc_other_files[0]["url"]
     finally:
         db.close()
 

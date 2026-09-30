@@ -39,8 +39,12 @@ class Settings(BaseSettings):
     # Free-trial length (days) applied at registration.
     trial_days: int = 7
 
-    # Absolute base for uploaded-file links (https://api.example.com). Left blank,
-    # the URL is derived from the request that uploaded the file.
+    # Absolute base used to make *_url fields absolute in API responses
+    # (https://api.example.com — no trailing slash needed either way, see
+    # app.core.files.normalize_file_url). The database always keeps storing
+    # the relative /files/{id} form regardless of this setting; only response
+    # serialization reads it. Left blank, responses stay relative too (today's
+    # behavior) — set it once the API is served from a stable public host.
     public_base_url: str = ""
 
     # Swagger/ReDoc/OpenAPI documentation exposure.
