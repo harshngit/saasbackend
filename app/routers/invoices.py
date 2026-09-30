@@ -146,15 +146,14 @@ def generate_from_order(
     Send no body to bill the whole order as ordered, which is what an order with no
     delivery behind it needs.
 
-    For a part-delivered order the firm's `partial_delivery_invoice_mode` decides:
-    `per_delivery` bills each delivery as it happens (several invoices per order),
-    `after_full_order` waits until everything has been delivered and bills once.
+    For a delivered or part-delivered order: specify `delivery_id` to bill a specific
+    delivery, or omit `delivery_id` once the order is fully delivered / collected to
+    bill the aggregated order total.
 
     Tax comes from the snapshot on the order line — the line's own rate, else the
     product's. Nothing is hardcoded.
     """
     org_id = _org_id(user)
-    settings = workflow.sales_settings(user.organization)
     order = db.get(SalesOrder, order_id)
     if order is None or order.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
@@ -199,15 +198,6 @@ def generate_from_order(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Invoice already exists for this delivery (Invoice ID: {existing_del.id})",
             )
-        if (
-            settings.get("partial_delivery_invoice_mode") == "after_full_order"
-            and order.fulfilment_status != "delivered"
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This firm bills once the whole order has been delivered "
-                       "(partial_delivery_invoice_mode = after_full_order)",
-            )
     else:
         # No delivery_id provided. Check if an invoice already exists for this order.
         existing_ord = (
@@ -232,18 +222,7 @@ def generate_from_order(
                 detail="No delivered quantity is available for invoicing",
             )
 
-        mode = settings.get("partial_delivery_invoice_mode", "per_delivery")
-        if mode == "per_delivery" and order.fulfilment_method != "pickup" and not allow_upfront:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This organization bills per delivery. Please specify delivery_id.",
-            )
-        elif (mode == "after_full_order" or order.fulfilment_method == "pickup") and not allow_upfront:
-            if order.fulfilment_status != "delivered":
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Order still has pending delivery quantity" if order.fulfilment_method != "pickup" else "Pickup order must be collected before invoicing",
-                )
+        if (order.fulfilment_status == "delivered" or order.fulfilment_method == "pickup") and not allow_upfront:
             # Aggregate delivered qty across order items, subtract already invoiced qty
             agg_lines: list[dict] = []
             for item in order.items:

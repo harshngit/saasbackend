@@ -223,7 +223,6 @@ def test_5_uom_preservation_on_quotation_conversion():
     print("\n--- TEST 5: UOM Preservation on Quotation Conversion ---")
     auth, wh_id, prod_id, cust_id = _setup_org("uom_conv")
 
-    client.patch("/sales-workflow-settings", json={"draft_orders_enabled": False}, headers=auth)
     q_res = client.post("/quotations", json={
         "customer_id": cust_id,
         "items": [
@@ -237,7 +236,7 @@ def test_5_uom_preservation_on_quotation_conversion():
         ],
     }, headers=auth)
     q_id = q_res.json()["id"]
-
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to order")

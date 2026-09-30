@@ -1,10 +1,9 @@
 """Focused test suite for Quotation -> Draft Order -> Confirm workflow.
 
 Covers:
-  TEST 1: draft_orders_enabled=true  -> conversion creates a draft order with no
-          stock reservation; confirming it reserves stock exactly once.
-  TEST 2: draft_orders_enabled=false -> conversion keeps the existing direct-
-          placement behaviour (placed immediately, stock reserved on conversion).
+  TEST 1: Quotation conversion creates a draft order with no stock reservation;
+          confirming it reserves stock exactly once.
+  TEST 2: Direct placement / confirmation reserves stock on confirmation.
   TEST 3: No double reservation across convert + confirm.
   TEST 4: A quotation alone (draft/sent/accepted) never touches stock.
 """
@@ -114,11 +113,8 @@ def _create_send_accept_quotation(auth, cust_id, prod_id, quantity=20):
 
 
 def test_1_draft_enabled():
-    print("\n--- TEST 1: draft_orders_enabled = true ---")
+    print("\n--- TEST 1: Converted order starts as Draft and reserves on confirm ---")
     auth, wh_id, prod_id, cust_id = _setup_org("draftco")
-    client.patch("/sales-workflow-settings", json={
-        "draft_orders_enabled": True, "reserve_stock_on_order": True,
-    }, headers=auth)
 
     q_id = _create_send_accept_quotation(auth, cust_id, prod_id, quantity=20)
 
@@ -153,9 +149,8 @@ def test_1_draft_enabled():
 
 
 def test_2_draft_disabled():
-    print("\n--- TEST 2: draft_orders_enabled = false (now vestigial -- every conversion still starts Draft) ---")
+    print("\n--- TEST 2: Every conversion starts as unreserved Draft ---")
     auth, wh_id, prod_id, cust_id = _setup_org("directco")
-    client.patch("/sales-workflow-settings", json={"draft_orders_enabled": False}, headers=auth)
 
     q_id = _create_send_accept_quotation(auth, cust_id, prod_id, quantity=15)
 
@@ -163,10 +158,8 @@ def test_2_draft_disabled():
     assert_eq(conv_res.status_code, 201, "Convert-to-order succeeds")
     conv = conv_res.json()
     order_id = conv["order"]["id"]
-    # Finalized business rule: draft_orders_enabled no longer gates this --
-    # every conversion starts as an unreserved Draft regardless of the
-    # (now vestigial) setting.
-    assert_eq(conv["order"]["status"], "draft", "Converted order still starts as Draft even with the setting off")
+    # Finalized business rule: every conversion starts as an unreserved Draft
+    assert_eq(conv["order"]["status"], "draft", "Converted order starts as Draft")
     assert_eq(conv["order"]["fulfilment_status"], "not_started", "Draft order is not reserved")
 
     on_hand, reserved, available = _stock(auth, wh_id, prod_id)
@@ -189,9 +182,6 @@ def test_2_draft_disabled():
 def test_3_no_double_reservation():
     print("\n--- TEST 3: No double reservation across convert + confirm ---")
     auth, wh_id, prod_id, cust_id = _setup_org("noduplico")
-    client.patch("/sales-workflow-settings", json={
-        "draft_orders_enabled": True, "reserve_stock_on_order": True,
-    }, headers=auth)
 
     q_id = _create_send_accept_quotation(auth, cust_id, prod_id, quantity=20)
     conv = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth).json()

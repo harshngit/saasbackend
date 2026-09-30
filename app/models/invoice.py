@@ -41,8 +41,7 @@ class Invoice(Base):
     walk_in_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     walk_in_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # Which delivery this bills. A partial delivery is billed for what was actually
-    # handed over, so one order can carry several invoices — see
-    # `partial_delivery_invoice_mode` in the firm's workflow settings.
+    # handed over, so one order can carry several invoices.
     delivery_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("deliveries.id", ondelete="SET NULL"), nullable=True, index=True
     )

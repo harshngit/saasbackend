@@ -71,10 +71,10 @@ def next_order_number(db: Session, org_id: str) -> str:
 
 
 def credit_warning(
-    db: Session, customer: Customer, order_total: float, action: str
+    db: Session, customer: Customer, order_total: float, action: str = "warn"
 ) -> str | None:
-    """Whether this order takes the customer past their credit limit, and what the
-    firm's `credit_limit_action` says to do about it."""
+    """Whether this order takes the customer past their credit limit.
+    Returns a warning string when limit is exceeded (standard non-blocking behavior)."""
     limit = customer.credit_limit or 0
     if action == "ignore" or limit <= 0:
         return None
@@ -126,7 +126,6 @@ def place_order(
     mark it converted in the same one.
     """
     org_id = customer.organization_id
-    settings = workflow.sales_settings(user.organization)
 
     warehouse = stock_service.owned_warehouse(db, warehouse_id, org_id)
     if warehouse is None:
@@ -244,8 +243,6 @@ def place_order(
     # check; it will run at confirm time.
     if not create_as_draft and warehouse.id and wanted:
         stock_service.lock_stock_items(db, org_id, warehouse.id, wanted)
-
-    if not create_as_draft and not settings["allow_backorder"]:
         short = stock_service.shortages(db, warehouse.id, wanted)
         if short:
             raise HTTPException(
@@ -262,7 +259,7 @@ def place_order(
     warnings = []
     # Credit warnings are deferred for drafts until confirm time.
     if not create_as_draft:
-        credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
+        credit = credit_warning(db, customer, order.total)
         if credit:
             warnings.append(credit)
 
@@ -270,7 +267,7 @@ def place_order(
     db.flush()
 
     # Hold the stock. For drafts we skip reservation until confirm time.
-    if not create_as_draft and settings["reserve_stock_on_order"]:
+    if not create_as_draft and warehouse.id:
         for reservation in stock_service.reserve_for_order(db, order, warehouse.id):
             item = db.get(SalesOrderItem, reservation.order_item_id)
             if item is not None:
@@ -308,7 +305,6 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
     Does not commit.
     """
     org_id = order.organization_id
-    settings = workflow.sales_settings(user.organization)
     if order.status != "draft":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -351,13 +347,12 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
         stock_service.lock_stock_items(db, org_id, order.warehouse_id, wanted)
 
     # Stock shortages
-    if not settings["allow_backorder"]:
-        short = stock_service.shortages(db, order.warehouse_id, wanted)
-        if short:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "INSUFFICIENT_STOCK", "shortages": short}
-            )
+    short = stock_service.shortages(db, order.warehouse_id, wanted)
+    if short:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "INSUFFICIENT_STOCK", "shortages": short}
+        )
 
     # Reserve required warehouse stock for every confirmed normal Sales Order
     if order.warehouse_id:
@@ -372,7 +367,7 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
 
     # Credit warnings
     warnings: list[str] = []
-    credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
+    credit = credit_warning(db, customer, order.total)
     if credit:
         warnings.append(credit)
 
@@ -407,7 +402,6 @@ def update_order(
     Does not commit — caller owns the transaction.
     """
     org_id = order.organization_id
-    settings = workflow.sales_settings(user.organization)
 
     # 1. Status / workflow restrictions
     if order.status in ("completed", "cancelled", "rejected"):
@@ -617,8 +611,8 @@ def update_order(
                 }
             )
 
-        # Check stock shortages if order is already active (not draft) and no backorders
-        if order.status != "draft" and not settings["allow_backorder"] and order.warehouse_id:
+        # Check stock shortages if order is already active (not draft)
+        if order.status != "draft" and order.warehouse_id:
             short = stock_service.shortages(db, order.warehouse_id, wanted)
             if short:
                 raise HTTPException(
@@ -638,7 +632,7 @@ def update_order(
         db.flush()
 
         # Re-reserve stock if order is active
-        if order.status != "draft" and settings["reserve_stock_on_order"] and order.warehouse_id:
+        if order.status != "draft" and order.warehouse_id:
             for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
                 item = db.get(SalesOrderItem, reservation.order_item_id)
                 if item is not None:
@@ -670,25 +664,23 @@ def update_order(
             ]
             stock_service.lock_stock_items(db, org_id, order.warehouse_id, wanted)
             stock_service.release_for_order(db, order.id)
-            if not settings["allow_backorder"]:
-                short = stock_service.shortages(db, order.warehouse_id, wanted)
-                if short:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail={"error": "INSUFFICIENT_STOCK", "shortages": short},
-                    )
-            if settings["reserve_stock_on_order"]:
-                for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
-                    item = db.get(SalesOrderItem, reservation.order_item_id)
-                    if item is not None:
-                        item.reserved_quantity = reservation.reserved_quantity
-                order.fulfilment_status = "reserved"
+            short = stock_service.shortages(db, order.warehouse_id, wanted)
+            if short:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": "INSUFFICIENT_STOCK", "shortages": short},
+                )
+            for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
+                item = db.get(SalesOrderItem, reservation.order_item_id)
+                if item is not None:
+                    item.reserved_quantity = reservation.reserved_quantity
+            order.fulfilment_status = "reserved"
 
     order.updated_at = datetime.now(timezone.utc)
 
     warnings = []
     if order.status != "draft" and customer:
-        credit = credit_warning(db, customer, order.total, settings["credit_limit_action"])
+        credit = credit_warning(db, customer, order.total)
         if credit:
             warnings.append(credit)
 

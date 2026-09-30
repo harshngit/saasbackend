@@ -200,9 +200,6 @@ def run_tests():
     # PART B: SELF PICKUP / TAKEAWAY ORDERS
     # =========================================================================
     print("\n--- TEST 4: Pickup Stock Flow ---")
-    # Enable draft orders
-    patch_res = client.patch("/sales-workflow-settings", json={"draft_orders_enabled": True, "reserve_stock_on_order": True}, headers=auth1)
-    assert patch_res.status_code == 200, patch_res.text
 
     pickup_prod = _create_product(auth1, "Pickup Widget", price=100.0, stock=100, tax_rate=18.0)
     prod_id = pickup_prod["id"]

@@ -355,8 +355,6 @@ def test_10_stock_reservation_integrity_on_conversion():
     print("\n--- TEST 10: Stock Reservation Integrity on Conversion ---")
     auth, wh_id, prod_id, cust_id = _setup_org("stock_conv")
 
-    # When draft_orders_enabled is False, conversion reserves stock immediately
-    client.patch("/sales-workflow-settings", json={"draft_orders_enabled": False}, headers=auth)
     q_res = client.post("/quotations", json={
         "customer_id": cust_id,
         "items": [{"product_id": prod_id, "quantity": 25, "unit_price": 250.0}],
@@ -365,14 +363,19 @@ def test_10_stock_reservation_integrity_on_conversion():
     client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
 
-    stock_before = client.get(f"/products/{prod_id}", headers=auth).json()
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
-    assert_eq(conv_res.status_code, 201, "Direct conversion succeeds")
+    assert_eq(conv_res.status_code, 201, "Conversion succeeds")
     order_id = conv_res.json()["order"]["id"]
 
     order = client.get(f"/orders/{order_id}", headers=auth).json()
-    assert_eq(order["status"], "placed", "Direct conversion order is placed directly")
-    assert_eq(order["fulfilment_status"], "reserved", "Direct conversion order is reserved immediately")
+    assert_eq(order["status"], "draft", "Converted order starts as draft")
+    assert_eq(order["fulfilment_status"], "not_started", "Draft order is not reserved")
+
+    confirm_res = client.post(f"/orders/{order_id}/confirm", headers=auth)
+    assert_eq(confirm_res.status_code, 200, "Confirming draft order succeeds")
+    confirmed_order = client.get(f"/orders/{order_id}", headers=auth).json()
+    assert_eq(confirmed_order["status"], "confirmed", "Confirmed order status is 'confirmed'")
+    assert_eq(confirmed_order["fulfilment_status"], "reserved", "Confirmed order is reserved")
 
 
 def run_all_tests():

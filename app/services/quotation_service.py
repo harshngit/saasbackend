@@ -355,7 +355,6 @@ def convert_to_order(
             detail="This quotation has no customer to raise an order for",
         )
 
-    settings = workflow.sales_settings(user.organization)
     resolved_billing = payload.billing_address or quotation.billing_address or customer.billing_address
     resolved_shipping = (
         payload.shipping_address

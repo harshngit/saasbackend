@@ -98,12 +98,6 @@ def _create_staff(auth: dict, name: str, role_name: str):
 
 def _setup_org(label: str, order_requires_approval: bool = False):
     auth = _register_org(label)
-    
-    # Configure sales workflow setting
-    client.patch("/settings/sales-workflow", json={
-        "order_requires_approval": order_requires_approval,
-        "draft_orders_enabled": True,
-    }, headers=auth)
 
     wh_res = client.post("/warehouses", json={"name": "Central WH", "code": f"WH-{uuid.uuid4().hex[:6]}"}, headers=auth)
     wh_id = wh_res.json()["id"]
@@ -140,8 +134,8 @@ def _setup_org(label: str, order_requires_approval: bool = False):
 def test_1_order_approval_removal():
     print("\n--- TEST 1: Order Approval Removal (order_requires_approval true vs false) ---")
     
-    # Case A: order_requires_approval = True
-    auth_a, wh_a, prod_a, cust_a, dp_data_a, dp_auth_a, acc_data_a, acc_auth_a = _setup_org("appr_true", order_requires_approval=True)
+    # Case A: Order confirmation flow
+    auth_a, wh_a, prod_a, cust_a, dp_data_a, dp_auth_a, acc_data_a, acc_auth_a = _setup_org("appr_true")
 
     create_res_a = client.post("/orders", json={
         "customer_id": cust_a,
@@ -156,7 +150,7 @@ def test_1_order_approval_removal():
     confirm_res_a = client.post(f"/orders/{order_a['id']}/confirm", headers=auth_a)
     assert_eq(confirm_res_a.status_code, 200, "Draft order confirmed (A)")
     confirmed_a = confirm_res_a.json()
-    assert_eq(confirmed_a["status"], "confirmed", "Confirmed order public status is confirmed even with order_requires_approval=True")
+    assert_eq(confirmed_a["status"], "confirmed", "Confirmed order public status is confirmed")
 
     # Verify operationally usable: assign delivery partner immediately
     assign_res_a = client.patch(f"/orders/{order_a['id']}/assign-delivery-partner", json={
@@ -164,8 +158,8 @@ def test_1_order_approval_removal():
     }, headers=auth_a)
     assert_eq(assign_res_a.status_code, 200, "Delivery partner assigned without approval gate")
 
-    # Case B: order_requires_approval = False
-    auth_b, wh_b, prod_b, cust_b, dp_data_b, dp_auth_b, acc_data_b, acc_auth_b = _setup_org("appr_false", order_requires_approval=False)
+    # Case B: Standard confirmation flow
+    auth_b, wh_b, prod_b, cust_b, dp_data_b, dp_auth_b, acc_data_b, acc_auth_b = _setup_org("appr_false")
 
     create_res_b = client.post("/orders", json={
         "customer_id": cust_b,
@@ -486,9 +480,80 @@ def test_10_reconciliation_accounting_handoff_and_idempotency():
     assert_eq(void_attempt.status_code, 400, "Reconciled collection cannot be voided")
 
 
+def test_11_attendance_logout_optional_departure_and_return():
+    print("\n--- TEST 11: Attendance Logout with Optional Departure and Return to Office ---")
+    auth = _register_org("att_test")
+
+    # Create 4 staff users for 4 distinct test cases
+    _, s1_auth = _create_staff(auth, "Staff User 1", "Sales Officer")
+    _, s2_auth = _create_staff(auth, "Staff User 2", "Sales Officer")
+    _, s3_auth = _create_staff(auth, "Staff User 3", "Sales Officer")
+    _, s4_auth = _create_staff(auth, "Staff User 4", "Sales Officer")
+
+    # Guard: Logout (final_check_out) without office_check_in -> 400 Bad Request
+    r_no_in = client.post("/attendance/check-in", headers=s1_auth, json={"type": "final_check_out"})
+    assert_eq(r_no_in.status_code, 400, "Logout without office_check_in rejected with 400")
+
+    # Case 1: All provided -> office_check_in -> departure -> return_to_office -> final_check_out
+    r1_in = client.post("/attendance/check-in", headers=s1_auth, json={"type": "office_check_in"})
+    assert_eq(r1_in.status_code, 201, "Case 1: office_check_in -> 201")
+    r1_dep = client.post("/attendance/check-in", headers=s1_auth, json={"type": "departure"})
+    assert_eq(r1_dep.status_code, 201, "Case 1: departure -> 201")
+    r1_ret = client.post("/attendance/check-in", headers=s1_auth, json={"type": "return_to_office"})
+    assert_eq(r1_ret.status_code, 201, "Case 1: return_to_office -> 201")
+    r1_out = client.post("/attendance/check-in", headers=s1_auth, json={"type": "final_check_out"})
+    assert_eq(r1_out.status_code, 201, "Case 1: final_check_out -> 201")
+    s1_data = r1_out.json()
+    assert s1_data["office_check_in"] is not None, "office_check_in saved"
+    assert s1_data["departure"] is not None, "departure saved"
+    assert s1_data["return_to_office"] is not None, "return_to_office saved"
+    assert s1_data["final_check_out"] is not None, "final_check_out saved"
+
+    # Case 2: Departure missing, Return to Office provided -> logout succeeds
+    r2_in = client.post("/attendance/check-in", headers=s2_auth, json={"type": "office_check_in"})
+    assert_eq(r2_in.status_code, 201, "Case 2: office_check_in -> 201")
+    r2_ret = client.post("/attendance/check-in", headers=s2_auth, json={"type": "return_to_office"})
+    assert_eq(r2_ret.status_code, 201, "Case 2: return_to_office without departure -> 201")
+    r2_out = client.post("/attendance/check-in", headers=s2_auth, json={"type": "final_check_out"})
+    assert_eq(r2_out.status_code, 201, "Case 2: final_check_out without departure -> 201")
+    s2_data = r2_out.json()
+    assert s2_data["office_check_in"] is not None, "office_check_in saved"
+    assert s2_data["departure"] is None, "departure is None"
+    assert s2_data["return_to_office"] is not None, "return_to_office saved"
+    assert s2_data["final_check_out"] is not None, "final_check_out saved"
+
+    # Case 3: Departure provided, Return to Office missing -> logout succeeds
+    r3_in = client.post("/attendance/check-in", headers=s3_auth, json={"type": "office_check_in"})
+    assert_eq(r3_in.status_code, 201, "Case 3: office_check_in -> 201")
+    r3_dep = client.post("/attendance/check-in", headers=s3_auth, json={"type": "departure"})
+    assert_eq(r3_dep.status_code, 201, "Case 3: departure -> 201")
+    r3_out = client.post("/attendance/check-in", headers=s3_auth, json={"type": "final_check_out"})
+    assert_eq(r3_out.status_code, 201, "Case 3: final_check_out without return_to_office -> 201")
+    s3_data = r3_out.json()
+    assert s3_data["office_check_in"] is not None, "office_check_in saved"
+    assert s3_data["departure"] is not None, "departure saved"
+    assert s3_data["return_to_office"] is None, "return_to_office is None"
+    assert s3_data["final_check_out"] is not None, "final_check_out saved"
+
+    # Case 4: Departure missing, Return to Office missing -> logout succeeds directly
+    r4_in = client.post("/attendance/check-in", headers=s4_auth, json={"type": "office_check_in"})
+    assert_eq(r4_in.status_code, 201, "Case 4: office_check_in -> 201")
+    r4_out = client.post("/attendance/check-in", headers=s4_auth, json={"type": "final_check_out"})
+    assert_eq(r4_out.status_code, 201, "Case 4: final_check_out directly after check-in -> 201")
+    s4_data = r4_out.json()
+    assert s4_data["office_check_in"] is not None, "office_check_in saved"
+    assert s4_data["departure"] is None, "departure is None"
+    assert s4_data["return_to_office"] is None, "return_to_office is None"
+    assert s4_data["final_check_out"] is not None, "final_check_out saved"
+
+    # Guard: Duplicate final_check_out -> 400 Bad Request
+    r4_dup = client.post("/attendance/check-in", headers=s4_auth, json={"type": "final_check_out"})
+    assert_eq(r4_dup.status_code, 400, "Duplicate final_check_out rejected with 400")
+
+
 def run_all_tests():
     print("\n=======================================================")
-    print("TEST SUITE: Targeted Backend Implementation (Final Two Gaps)")
+    print("TEST SUITE: Targeted Backend Implementation (Final Gaps & Attendance)")
     print("=======================================================")
     test_1_order_approval_removal()
     test_2_delivery_collection_recording_and_audit_trail()
@@ -500,6 +565,7 @@ def run_all_tests():
     test_8_stock_reservation_rules()
     test_9_public_order_status_and_pickup_progress()
     test_10_reconciliation_accounting_handoff_and_idempotency()
+    test_11_attendance_logout_optional_departure_and_return()
 
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")

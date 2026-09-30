@@ -134,9 +134,6 @@ def run_tests():
 
     print("\n--- PART 1: ORDER -> INVOICE FLOW (SIMPLIFIED FIXED RULES) ---")
 
-    # Set workflow settings to partial_delivery_invoice_mode = "after_full_order"
-    client.patch("/sales-workflow-settings", json={"partial_delivery_invoice_mode": "after_full_order"}, headers=auth1)
-
     # Place Sales Order for Customer 1 (20 wafers @ 30 = 600 + 12% tax = 72 => total 672)
     so1_res = client.post("/orders", json={
         "customer_id": cust1_id,
@@ -274,9 +271,6 @@ def run_tests():
 
     # TEST C: per_delivery Partial Delivery Invoicing Mode
     print("\n--- TEST C: PER-DELIVERY INVOICING MODE ---")
-    client.patch("/sales-workflow-settings", json={
-        "partial_delivery_invoice_mode": "per_delivery",
-    }, headers=auth1)
 
     # Place new order for Customer 2 (Ordered: 20 units @ 30 = 672)
     so2_res = client.post("/orders", json={

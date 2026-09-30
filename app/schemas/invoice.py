@@ -134,15 +134,9 @@ class InvoiceOut(BaseModel):
 class InvoiceFromDelivery(BaseModel):
     """Bill an order for what a delivery actually handed over.
 
-    Send `delivery_id` and the invoice is built from that delivery's **delivered**
-    quantities, at the rates and taxes the order line agreed. Send nothing to bill the
-    whole order as ordered — the older behaviour, still there for an order with no
-    delivery behind it.
-
-    Which of those a firm wants for a part-delivered order is its
-    `partial_delivery_invoice_mode` setting: `per_delivery` bills each delivery as it
-    happens, `after_full_order` waits until everything has been delivered and bills
-    once.
+    Send `delivery_id` to bill that specific delivery's **delivered** quantities.
+    Omit `delivery_id` once the order is fully delivered / collected to bill the aggregated
+    order total.
     """
 
     delivery_id: str | None = None

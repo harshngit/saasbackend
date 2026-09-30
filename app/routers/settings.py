@@ -18,8 +18,6 @@ from app.schemas.theme import OrganizationThemeOut, OrganizationThemeUpdate
 from app.schemas.workflow_settings import (
     InvoiceSettings,
     InvoiceSettingsUpdate,
-    SalesWorkflowSettings,
-    SalesWorkflowSettingsUpdate,
 )
 from app.services import activity_service, theme_service
 
@@ -46,47 +44,6 @@ def _apply(stored: dict | None, changes: dict) -> dict:
         else:
             result[key] = value
     return result
-
-
-# --------------------------- sales workflow -------------------------------
-
-
-@router.get("/sales-workflow-settings", response_model=SalesWorkflowSettings)
-def get_sales_workflow_settings(
-    admin: User = Depends(_ADMIN), db: Session = Depends(get_db)
-) -> SalesWorkflowSettings:
-    """How this firm's sales flow behaves, with every default filled in.
-
-    The one worth knowing: `order_requires_approval` is **false** by default, so an
-    order is validated, reserved and placed on creation. An Admin is for
-    organization control and exceptions, not a step in every sale.
-    """
-    return SalesWorkflowSettings(**workflow.sales_settings(_org(admin)))
-
-
-@router.patch("/sales-workflow-settings", response_model=SalesWorkflowSettings)
-def update_sales_workflow_settings(
-    payload: SalesWorkflowSettingsUpdate,
-    admin: User = Depends(_ADMIN),
-    db: Session = Depends(get_db),
-) -> SalesWorkflowSettings:
-    """Change one or more settings. Takes effect on the next order — nothing is
-    copied onto existing records."""
-    org = _org(admin)
-    changes = payload.model_dump(exclude_unset=True, exclude_none=True)
-    if changes:
-        org.sales_workflow_settings = _apply(org.sales_workflow_settings, changes)
-        activity_service.record(
-            db,
-            org.id,
-            admin,
-            "company_profile",
-            "Sales workflow settings updated",
-            ", ".join(sorted(changes)),
-        )
-        db.commit()
-        db.refresh(org)
-    return SalesWorkflowSettings(**workflow.sales_settings(org))
 
 
 # --------------------------- invoice template ------------------------------

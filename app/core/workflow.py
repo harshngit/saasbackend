@@ -106,37 +106,6 @@ def public_order_status(value: str | None) -> str | None:
 DISPATCHED_FULFILMENT = ("loaded", "in_transit", "partially_delivered", "delivered")
 
 
-# --------------------------- workflow settings ----------------------------
-
-SALES_WORKFLOW_DEFAULTS: dict[str, object] = {
-    # Orders are placed straight away. Turn this on and an order lands in
-    # awaiting_approval and the /approve and /reject routes come into play.
-    "order_requires_approval": False,
-    # Reserve stock when the order is placed rather than deducting it. On-hand is
-    # only reduced when goods are actually loaded onto a vehicle.
-    "reserve_stock_on_order": True,
-    "allow_partial_delivery": True,
-    # Refuse to place an order the warehouse cannot cover.
-    "allow_backorder": False,
-    "allow_direct_invoice": True,
-    # What to do when an order would take a customer past their credit limit.
-    "credit_limit_action": "warn",             # warn | block | ignore
-    "delivery_collection_allowed": True,
-    # Whether each delivery is billed as it happens, or the whole order once.
-    "partial_delivery_invoice_mode": "per_delivery",  # per_delivery | after_full_order
-}
-
-# When True, `POST /orders` creates a `draft` order that does not reserve stock.
-# A separate `POST /orders/{id}/confirm` call performs stock checks and reservation.
-# Default False for backward compatibility.
-SALES_WORKFLOW_DEFAULTS["draft_orders_enabled"] = False
-
-SALES_WORKFLOW_CHOICES: dict[str, tuple[str, ...]] = {
-    "credit_limit_action": ("warn", "block", "ignore"),
-    "partial_delivery_invoice_mode": ("per_delivery", "after_full_order"),
-}
-
-
 # ----------------------------- invoice settings ----------------------------
 
 INVOICE_TEMPLATES = ("classic", "modern", "compact", "thermal")
@@ -306,11 +275,6 @@ def _merged(stored: object, defaults: dict) -> dict:
             else:
                 result[k] = v
     return result
-
-
-def sales_settings(org) -> dict:  # noqa: ANN001
-    """The firm's sales workflow settings, defaults filled in."""
-    return _merged(getattr(org, "sales_workflow_settings", None), SALES_WORKFLOW_DEFAULTS)
 
 
 def invoice_settings(org) -> dict:  # noqa: ANN001

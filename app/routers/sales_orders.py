@@ -425,7 +425,6 @@ def create_order(
     - Automatic Payment Recording
     """
     org_id = _org_id(user)
-    settings = workflow.sales_settings(user.organization)
     customer = db.get(Customer, payload.customer_id)
     if customer is None or customer.organization_id != org_id:
         raise HTTPException(

@@ -340,12 +340,16 @@ def test_full_integration_quotation_to_delivery():
     assert_eq(q_res.status_code, 201, "Quotation created")
     q_id = q_res.json()["id"]
 
-    # 2. Accept and convert to Sales Order
+    # 2. Accept and convert to Sales Order (starts as Draft)
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
     client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
     conv_res = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
     assert_eq(conv_res.status_code, 201, "Quotation converted to Sales Order")
     so = conv_res.json()["order"]
     so_id = so["id"]
+
+    # Confirm order
+    client.post(f"/orders/{so_id}/confirm", headers=auth)
 
     # Verify commercial fields preserved
     assert_eq(so["billing_address"], "HQ Tower 12, Floor 8", "Billing address preserved")

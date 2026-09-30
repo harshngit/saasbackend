@@ -166,10 +166,6 @@ class Organization(Base):
     upgrade_reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     field_settings: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True)
-    # How this firm wants the sales flow to behave (approval, reservation, invoice
-    # timing, credit-limit policy). Read through app.core.workflow.sales_settings so
-    # a missing key falls back to the documented default rather than to None.
-    sales_workflow_settings: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True)
     # Invoice template, branding and which fields to print — served by
     # GET/PATCH /invoice-settings. Deliberately NOT called `invoice_settings`: that
     # name is already taken above by the Company Master's numbering/config panel,

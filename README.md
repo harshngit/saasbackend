@@ -311,30 +311,15 @@ Permissions are enforced on the API, not just hidden in the UI: `customers.delet
 = false` makes `DELETE /customers/{id}` return `403` regardless of what the
 frontend renders.
 
-## Sales flow: settings, warehouse stock, reservations
+## Sales flow: warehouse stock, reservations, and invoice settings
 
-**Phase 0 of the transaction-flow rework.** The flow is driven by per-organization
-settings, never by role names, and an Admin is not a step in every sale.
+The sales flow features standard canonical ERP rules: draft order creation, confirmation with stock reservation, shortage prevention, delivery collections, and flexible invoicing (per-delivery, full-order, and direct POS).
 
-### Workflow settings
+### Invoice settings
 
 ```
-GET   /sales-workflow-settings      PATCH /sales-workflow-settings     (Admin)
 GET   /invoice-settings             PATCH /invoice-settings            (Admin)
 ```
-
-Partial updates; anything never set reads back as the documented default, so a
-setting added later needs no migration. Both always belong to the caller's firm.
-
-| Setting | Default | Effect |
-|---|---|---|
-| `order_requires_approval` | **false** | Off: an order is validated, reserved and **placed** on creation. On: it lands in `awaiting_approval` and `/approve` + `/reject` apply — for that firm only |
-| `reserve_stock_on_order` | true | Hold stock when placed; on-hand only drops when a vehicle is loaded |
-| `allow_backorder` | false | Refuse an order the warehouse cannot cover |
-| `credit_limit_action` | `warn` | `warn` returns a `warnings[]` entry, `block` refuses with 400, `ignore` says nothing |
-| `invoice_timing` | `after_delivery` | `after_delivery` \| `on_order` |
-| `partial_delivery_invoice_mode` | `per_delivery` | `per_delivery` \| `after_full_order` |
-| `allow_partial_delivery`, `allow_direct_invoice`, `delivery_collection_allowed` | true | — |
 
 `/invoice-settings` holds `template` (classic / modern / compact / thermal),
 `paper_size`, `branding` (`logo_file_id` from `POST /files/upload`, `primary_color`),

@@ -87,9 +87,6 @@ def _register_staff(auth: dict, role: str) -> tuple[dict, str]:
 def _setup_environment(label: str) -> tuple[dict, str, str, str, str]:
     auth, org_id = _register_org(label)
 
-    # Enable draft orders setting for predictable testing
-    client.patch("/sales-workflow-settings", json={"draft_orders_enabled": True}, headers=auth)
-
     # Get default warehouse
     wh_res = client.get("/warehouses", headers=auth).json()
     wh_id = wh_res[0]["id"]

@@ -43,11 +43,13 @@ def check_in(payload: CheckInBody, user: User = Depends(_mark), db: Session = De
     if getattr(row, payload.type) is not None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"'{payload.type}' already recorded today")
 
-    # Enforce order: each checkpoint needs the previous one done first.
-    idx = ATTENDANCE_TYPES.index(payload.type)
-    for prior in ATTENDANCE_TYPES[:idx]:
-        if getattr(row, prior) is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Record '{prior}' before '{payload.type}'")
+    # Enforce order: office_check_in is required before any subsequent checkpoint.
+    # departure and return_to_office are optional for subsequent checkpoints / logout.
+    if payload.type != "office_check_in" and row.office_check_in is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Record 'office_check_in' before '{payload.type}'",
+        )
 
     setattr(row, payload.type, datetime.now(timezone.utc))
     db.commit()
