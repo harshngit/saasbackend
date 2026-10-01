@@ -8,8 +8,15 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Any
 
-import razorpay
+try:
+    import razorpay
+    _SignatureVerificationError = razorpay.errors.SignatureVerificationError
+except (ImportError, AttributeError):
+    razorpay = None
+    class _SignatureVerificationError(Exception):
+        pass
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -143,8 +150,10 @@ def delete_gateway(db: Session, org_id: str) -> None:
         db.commit()
 
 
-def get_org_razorpay_client(gateway: OrgPaymentGateway) -> razorpay.Client:
+def get_org_razorpay_client(gateway: OrgPaymentGateway) -> Any:
     """Initialize a Razorpay SDK client using the organization's decrypted credentials."""
+    if razorpay is None:
+        raise RuntimeError("razorpay package is not installed")
     decrypted_key_secret = decrypt_field(gateway.key_secret_encrypted)
     return razorpay.Client(auth=(gateway.key_id, decrypted_key_secret))
 
@@ -612,7 +621,7 @@ def verify_org_webhook_signature(raw_body: bytes, signature: str, webhook_secret
         client = razorpay.Client(auth=("test", "test"))
         client.utility.verify_webhook_signature(raw_body.decode("utf-8"), signature, webhook_secret)
         return True
-    except razorpay.errors.SignatureVerificationError:
+    except _SignatureVerificationError:
         return False
 
 

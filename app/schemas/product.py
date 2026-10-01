@@ -62,6 +62,12 @@ class ProductAttachment(BaseModel):
     size: int | None = None
     uploaded_at: datetime | None = None
 
+    @field_validator("url", mode="after")
+    @classmethod
+    def _normalize_url(cls, v: str) -> str:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v) or v
+
 
 class ProductFileField(str, Enum):
     """The single-file slots on a product, uploadable via POST /products/{id}/files/{field}."""
@@ -273,6 +279,30 @@ class ProductOut(ProductProfileIn):
     other_attachments: AttachmentList = Field(default_factory=list)
     has_variants: bool = False
 
+    @field_validator(
+        "cover_image",
+        "product_video",
+        "product_catalog_brochure",
+        "product_manual",
+        "download_file",
+        "product_datasheet",
+        "compliance_certificate",
+        "warranty_document",
+        mode="after",
+    )
+    @classmethod
+    def _normalize_file_urls(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
+
+    @field_validator("images", mode="after")
+    @classmethod
+    def _normalize_images(cls, v: list[str]) -> list[str]:
+        if not v:
+            return v
+        from app.core.files import normalize_file_url
+        return [normalize_file_url(img) or img for img in v]
+
 
 class ProductListItem(BaseModel):
     """Lighter product shape for list responses. Omits images and file slot details
@@ -326,6 +356,12 @@ class ProductListItem(BaseModel):
     physical_size: str | None = None
     country_of_origin: str | None = None
     product_tags: StringList = Field(default_factory=list)
+
+    @field_validator("cover_image", mode="after")
+    @classmethod
+    def _normalize_cover_image(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class ProductCreate(ProductProfileIn):

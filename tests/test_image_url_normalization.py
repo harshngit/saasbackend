@@ -547,3 +547,213 @@ def test_leave_user_brief_normalizes_bare_id_and_full_url_unchanged():
     assert out2.profile_photo == "https://cdn.example.com/photo.png"
     out3 = LeaveUserBrief(id="u1", name="Rep", profile_photo=None)
     assert out3.profile_photo is None
+
+
+# ------------------- Task 3: Product, Customer, Purchase URL Normalization --------
+
+
+def test_product_out_and_list_item_url_normalization(monkeypatch):
+    from datetime import datetime, timezone
+    from app.schemas.product import ProductOut, ProductListItem
+
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+
+    now = datetime.now(timezone.utc)
+    prod = ProductOut(
+        id="p1", organization_id="org1", name="Widget", price=100.0,
+        description=None, product_type=None, vendor=None, brand=None, sku=None, category_id=None,
+        cover_image="/files/cover123",
+        images=["/files/img1", "https://cdn.example.com/img2.png", "img_bare_3"],
+        product_video="/files/video1",
+        product_catalog_brochure="/files/brochure1",
+        product_manual="bare_manual_id",
+        download_file="/files/dl1",
+        product_datasheet="/files/ds1",
+        compliance_certificate="https://cdn.example.com/cert.pdf",
+        warranty_document=None,
+        total_inventory=10, total_stock=10, is_active=True, variations=[],
+        created_at=now, updated_at=now,
+    )
+    assert prod.cover_image == "https://crm-saas-backend.bsmart.workers.dev/files/cover123"
+    assert prod.images == [
+        "https://crm-saas-backend.bsmart.workers.dev/files/img1",
+        "https://cdn.example.com/img2.png",
+        "https://crm-saas-backend.bsmart.workers.dev/files/img_bare_3",
+    ]
+    assert prod.product_video == "https://crm-saas-backend.bsmart.workers.dev/files/video1"
+    assert prod.product_catalog_brochure == "https://crm-saas-backend.bsmart.workers.dev/files/brochure1"
+    assert prod.product_manual == "https://crm-saas-backend.bsmart.workers.dev/files/bare_manual_id"
+    assert prod.download_file == "https://crm-saas-backend.bsmart.workers.dev/files/dl1"
+    assert prod.product_datasheet == "https://crm-saas-backend.bsmart.workers.dev/files/ds1"
+    assert prod.compliance_certificate == "https://cdn.example.com/cert.pdf"
+    assert prod.warranty_document is None
+
+    list_item = ProductListItem(
+        id="p1", organization_id="org1", name="Widget", price=100.0,
+        description=None, product_type=None, vendor=None, brand=None, sku=None, category_id=None,
+        cover_image="/files/cover123",
+        total_inventory=10, total_stock=10, is_active=True, variations=[],
+        created_at=now,
+    )
+    assert list_item.cover_image == "https://crm-saas-backend.bsmart.workers.dev/files/cover123"
+
+
+def test_product_attachment_url_normalization(monkeypatch):
+    from app.schemas.product import ProductAttachment
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+
+    att_rel = ProductAttachment(id="a1", name="spec.pdf", url="/files/spec123")
+    assert att_rel.url == "https://crm-saas-backend.bsmart.workers.dev/files/spec123"
+
+    att_abs = ProductAttachment(id="a2", name="spec2.pdf", url="https://example.com/files/spec456")
+    assert att_abs.url == "https://example.com/files/spec456"
+
+    att_bare = ProductAttachment(id="a3", name="spec3.pdf", url="bare_spec_id")
+    assert att_bare.url == "https://crm-saas-backend.bsmart.workers.dev/files/bare_spec_id"
+
+
+def test_customer_document_out_normalization(monkeypatch):
+    from datetime import datetime, timezone
+    from app.schemas.customer import CustomerDocumentOut, CustomerOut
+
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    now = datetime.now(timezone.utc)
+
+    doc_rel = CustomerDocumentOut(
+        id="d1", document_type="gst_certificate", name="gst.pdf",
+        content_type="application/pdf", size=1024, url="/files/gst123",
+        uploaded_at=now,
+    )
+    assert doc_rel.url == "https://crm-saas-backend.bsmart.workers.dev/files/gst123"
+
+    doc_abs = CustomerDocumentOut(
+        id="d2", document_type="pan_card", name="pan.pdf",
+        content_type="application/pdf", size=1024, url="https://example.com/files/pan123",
+        uploaded_at=now,
+    )
+    assert doc_abs.url == "https://example.com/files/pan123"
+
+    # CustomerOut profile_image_url
+    cust = CustomerOut(
+        id="c1", organization_id="o1", name="Test Customer",
+        business_name=None, phone=None, email=None, gst_number=None,
+        billing_address=None, delivery_address=None,
+        assigned_sales_officer_id=None, assigned_sales_officer=None,
+        credit_limit=0, opening_balance=0, total_billed=0, total_received=0,
+        outstanding_balance=0, category=None, notes=None, is_active=True,
+        profile_image_id="bare-profile-id",
+        created_at=now, updated_at=now,
+    )
+    assert cust.profile_image_url == "https://crm-saas-backend.bsmart.workers.dev/files/bare-profile-id"
+
+
+def test_purchase_supporting_documents_normalization(monkeypatch):
+    from datetime import datetime, timezone
+    from app.schemas.purchase import PurchaseOut
+
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+    now = datetime.now(timezone.utc)
+
+    pur = PurchaseOut(
+        id="p1", organization_id="o1", invoice_number="INV-001", supplier_id=None,
+        invoice_date=now, status="draft", payment_status="unpaid",
+        subtotal=100.0, discount=0.0, tax=0.0, total=100.0, amount_paid=0.0, notes=None,
+        attachment_url="/files/main_attach",
+        supporting_documents=[
+            {"name": "cert.pdf", "url": "/files/cert123"},
+            {"name": "external.pdf", "url": "https://cdn.example.com/external.pdf"},
+            {"name": "bare.pdf", "url": "bare_file_id_789"},
+        ],
+        created_at=now, updated_at=now,
+    )
+    assert pur.attachment_url == "https://crm-saas-backend.bsmart.workers.dev/files/main_attach"
+    assert pur.supporting_documents[0]["url"] == "https://crm-saas-backend.bsmart.workers.dev/files/cert123"
+    assert pur.supporting_documents[0]["name"] == "cert.pdf"
+    assert pur.supporting_documents[1]["url"] == "https://cdn.example.com/external.pdf"
+    assert pur.supporting_documents[2]["url"] == "https://crm-saas-backend.bsmart.workers.dev/files/bare_file_id_789"
+
+
+def test_product_file_upload_endpoint_public_base_url(monkeypatch):
+    headers, _ = _register_org("prod_file_upload")
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+
+    p_res = client.post("/products", json={"name": "Prod File Test", "price": 10.0}, headers=headers)
+    assert p_res.status_code == 201, p_res.text
+    pid = p_res.json()["id"]
+
+    # Upload single file
+    import io
+    file_bytes = b"fake pdf content"
+    res = client.post(
+        f"/products/{pid}/files/product_manual",
+        files={"file": ("manual.pdf", io.BytesIO(file_bytes), "application/pdf")},
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["product_manual"].startswith("https://crm-saas-backend.bsmart.workers.dev/files/")
+
+
+def test_product_attachment_upload_endpoint_public_base_url(monkeypatch):
+    headers, _ = _register_org("prod_att_upload")
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+
+    p_res = client.post("/products", json={"name": "Prod Att Test", "price": 10.0}, headers=headers)
+    assert p_res.status_code == 201, p_res.text
+    pid = p_res.json()["id"]
+
+    import io
+    res = client.post(
+        f"/products/{pid}/attachments",
+        files=[("files", ("sheet.pdf", io.BytesIO(b"dummy sheet"), "application/pdf"))],
+        headers=headers,
+    )
+    assert res.status_code == 201, res.text
+    data = res.json()
+    assert len(data) == 1
+    assert data[0]["url"].startswith("https://crm-saas-backend.bsmart.workers.dev/files/")
+
+    # GET /products/{id}/attachments
+    get_res = client.get(f"/products/{pid}/attachments", headers=headers)
+    assert get_res.status_code == 200
+    assert get_res.json()[0]["url"].startswith("https://crm-saas-backend.bsmart.workers.dev/files/")
+
+
+def test_customer_document_upload_endpoint_public_base_url(monkeypatch):
+    headers, _ = _register_org("cust_doc_upload")
+    monkeypatch.setattr(settings, "public_base_url", "https://crm-saas-backend.bsmart.workers.dev")
+
+    c_res = client.post("/customers", json={"name": "Cust Doc Test"}, headers=headers)
+    assert c_res.status_code == 201, c_res.text
+    cid = c_res.json()["id"]
+
+    import io
+    res = client.post(
+        f"/customers/{cid}/documents",
+        data={"document_type": "gst_certificate"},
+        files={"file": ("gst_cert.pdf", io.BytesIO(b"dummy gst content"), "application/pdf")},
+        headers=headers,
+    )
+    assert res.status_code == 201, res.text
+    data = res.json()
+    assert data["url"].startswith("https://crm-saas-backend.bsmart.workers.dev/files/")
+    assert data["name"] == "gst_cert.pdf"
+    assert data["document_type"] == "gst_certificate"
+
+    # Other documents
+    res_other = client.post(
+        f"/customers/{cid}/documents/other",
+        files=[("files", ("extra.pdf", io.BytesIO(b"extra content"), "application/pdf"))],
+        headers=headers,
+    )
+    assert res_other.status_code == 201, res_other.text
+    data_other = res_other.json()
+    assert len(data_other) == 1
+    assert data_other[0]["url"].startswith("https://crm-saas-backend.bsmart.workers.dev/files/")
+
+    # List documents
+    res_list = client.get(f"/customers/{cid}/documents", headers=headers)
+    assert res_list.status_code == 200
+    for d in res_list.json():
+        assert d["url"].startswith("https://crm-saas-backend.bsmart.workers.dev/files/")
+

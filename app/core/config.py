@@ -1,7 +1,52 @@
+import logging
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import certifi
+from pydantic import ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("crm.config")
+
+_TRUE_VALUES = {"true", "1", "yes"}
+_FALSE_VALUES = {"false", "0", "no"}
+
+_BOOLEAN_DEFAULTS = {
+    "convert_inline_uploads_on_startup": False,
+    "enable_docs": False,
+    "expose_reset_token": False,
+    "smtp_use_tls": True,
+    "seed_on_startup": False,
+}
+
+
+def parse_bool_env(val: object, field_name: str, default: bool) -> bool:
+    """Parse boolean environment variables case-insensitively with surrounding
+    whitespace ignored. Returns `default` and logs a concise one-line error on invalid values."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        if val == 1:
+            return True
+        if val == 0:
+            return False
+        env_var = field_name.upper()
+        logger.error("Invalid boolean value for environment variable %s; falling back to %s", env_var, default)
+        return default
+    if isinstance(val, str):
+        cleaned = val.strip().lower()
+        if cleaned in _TRUE_VALUES:
+            return True
+        if cleaned in _FALSE_VALUES:
+            return False
+        env_var = field_name.upper()
+        logger.error("Invalid boolean value for environment variable %s; falling back to %s", env_var, default)
+        return default
+
+    env_var = field_name.upper()
+    logger.error("Invalid boolean value for environment variable %s; falling back to %s", env_var, default)
+    return default
 
 
 class Settings(BaseSettings):
@@ -48,8 +93,8 @@ class Settings(BaseSettings):
     public_base_url: str = ""
 
     # Swagger/ReDoc/OpenAPI documentation exposure.
-    # Set to true for local/development; set ENABLE_DOCS=false in production.
-    enable_docs: bool = True
+    # Set to true for local/development via .env (ENABLE_DOCS=true); false by default.
+    enable_docs: bool = False
 
     cors_origins: str = "https://crm-saas.asynk.in"
     cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
@@ -86,6 +131,10 @@ class Settings(BaseSettings):
     super_admin_password: str = ""
     super_admin_name: str = "Ravi Malhotra"
 
+    # Optional seed passwords — if unset, secure random passwords are generated at runtime.
+    demo_admin_password: str = ""
+    testing_user_password: str = ""
+
     # Seed the Super Admin (and demo firm) automatically on first startup.
     # Handy on hosts like Render where you can't easily run a one-off command.
     seed_on_startup: bool = False
@@ -103,6 +152,20 @@ class Settings(BaseSettings):
 
     # --- Fernet Field-Level Encryption (Organization Payment Gateways) ---
     field_encryption_key: str = ""
+
+    @field_validator(
+        "convert_inline_uploads_on_startup",
+        "enable_docs",
+        "expose_reset_token",
+        "smtp_use_tls",
+        "seed_on_startup",
+        mode="before",
+    )
+    @classmethod
+    def _validate_booleans(cls, v: object, info: ValidationInfo) -> bool:
+        field_name = info.field_name or ""
+        default = _BOOLEAN_DEFAULTS.get(field_name, False)
+        return parse_bool_env(v, field_name, default)
 
     @property
     def cors_origin_list(self) -> list[str]:

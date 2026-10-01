@@ -190,6 +190,11 @@ TARGET_REGISTRY: list[tuple[str, list[str], list[str]]] = [
         ["pod_signature_file_id"],
         ["pod_photo_file_ids"],
     ),
+    (
+        "OrganizationTheme",
+        ["background_image_url"],
+        [],
+    ),
 ]
 
 
@@ -281,6 +286,9 @@ class AuditResult(NamedTuple):
     rows_modified: int
     # {(model, column, host_category): {"count": int, "ids": set[str], "valid_ids": set[str], "missing_ids": set[str]}}
     column_breakdown: dict[tuple[str, str, str], dict]
+    total_records_inspected: int = 0
+    rewritten_count: int = 0
+    errors: list[str] = []
 
 
 def validate_stored_files(db: Session, file_ids: set[str]) -> tuple[set[str], set[str]]:
@@ -320,6 +328,7 @@ def audit_and_migrate(db: Session, *, apply: bool = False) -> AuditResult:
     unique_ids: set[str] = set()
     column_breakdown: dict[tuple[str, str, str], dict] = {}
     total = render = asynk = workers = other = relative = 0
+    errors: list[str] = []
 
     # Phase 1: Discovery & Collection
     model_instances: list[tuple[str, Any, list[str], list[str], list[Any]]] = []
@@ -328,19 +337,25 @@ def audit_and_migrate(db: Session, *, apply: bool = False) -> AuditResult:
         model_cls = getattr(models, model_name, None)
         if model_cls is None:
             logger.warning("Model %s not found in app.models, skipping", model_name)
+            errors.append(f"Model {model_name} not found in app.models")
             continue
 
         try:
             rows = db.query(model_cls).all()
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to query rows for model %s", model_name)
+            errors.append(f"Failed to query model {model_name}: {exc}")
             continue
 
         model_instances.append((model_name, model_cls, scalar_cols, json_cols, rows))
 
         for row in rows:
             for col in scalar_cols + json_cols:
-                val = getattr(row, col, None)
+                try:
+                    val = getattr(row, col, None)
+                except Exception as exc:
+                    errors.append(f"Error reading {model_name}.{col}: {exc}")
+                    continue
                 if not val:
                     continue
                 refs = extract_file_references(val)
@@ -364,6 +379,8 @@ def audit_and_migrate(db: Session, *, apply: bool = False) -> AuditResult:
                     entry = column_breakdown.setdefault(key, {"count": 0, "ids": set()})
                     entry["count"] += 1
                     entry["ids"].add(fid)
+
+    total_records_inspected = sum(len(rows) for _, _, _, _, rows in model_instances)
 
     # Phase 2: Validate against stored_files
     valid_file_ids, missing_file_ids = validate_stored_files(db, unique_ids)
@@ -414,6 +431,8 @@ def audit_and_migrate(db: Session, *, apply: bool = False) -> AuditResult:
     if apply:
         db.commit()
 
+    rewritten_count = eligible_rewrites if apply else 0
+
     return AuditResult(
         total_references=total,
         render_references=render,
@@ -428,6 +447,9 @@ def audit_and_migrate(db: Session, *, apply: bool = False) -> AuditResult:
         skipped_rewrites=skipped_rewrites,
         rows_modified=rows_modified,
         column_breakdown=column_breakdown,
+        total_records_inspected=total_records_inspected,
+        rewritten_count=rewritten_count,
+        errors=errors,
     )
 
 
@@ -437,16 +459,18 @@ def print_report(result: AuditResult, *, apply: bool) -> None:
     print(f"  BACKEND FILE URL MIGRATION REPORT — {mode_header}")
     print("  Absolute backend file URLs -> relative /files/<id>")
     print("=" * 72)
-    print(f"Total file URL references:            {result.total_references}")
+    print(f"Total database records inspected:     {result.total_records_inspected}")
+    print(f"Total file URL references found:       {result.total_references}")
     print(f"  Render (*.onrender.com):             {result.render_references}")
     print(f"  api.asynk.in:                        {result.asynk_references}")
     print(f"  Cloudflare Worker:                   {result.workers_references}")
     print(f"  Other supported absolute hosts:      {result.other_references}")
-    print(f"  Already relative (/files/<id>):      {result.relative_references}")
+    print(f"  Already canonical (/files/<id>):     {result.relative_references}")
     print(f"Unique file IDs found:                 {len(result.unique_file_ids)}")
     print(f"Valid StoredFile references:           {len(result.valid_file_ids)}")
     print(f"Missing/invalid StoredFile references: {len(result.missing_file_ids)}")
     print(f"References eligible for rewrite:       {result.eligible_rewrites}")
+    print(f"References rewritten (actual):         {result.rewritten_count if apply else 0}")
     print(f"References skipped (missing/invalid):  {result.skipped_rewrites}")
     print(f"Rows {'modified' if apply else 'that would be modified'}: {result.rows_modified}")
 
@@ -466,6 +490,12 @@ def print_report(result: AuditResult, *, apply: bool) -> None:
         for mid in sorted(result.missing_file_ids):
             print(f"  - {mid}")
         print("These references will NOT be rewritten, to avoid creating broken links.")
+
+    if result.errors:
+        print("\nErrors encountered during audit/migration:")
+        print("-" * 72)
+        for err in result.errors:
+            print(f"  - {err}")
 
     print("=" * 72)
     if not apply:

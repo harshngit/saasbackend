@@ -6,6 +6,22 @@ from app.models.enums import BillingCycle, OrganizationStatus, UpgradeStatus
 from app.schemas.plan import PlanOut
 
 
+class OrganizationInventoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    created_at: datetime
+    plan_id: str | None = None
+    status: OrganizationStatus | str
+    user_count: int = 0
+    customer_count: int = 0
+    order_count: int = 0
+    invoice_count: int = 0
+    last_activity_date: datetime | None = None
+    created_by_seed: bool = False
+
+
 class OrganizationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

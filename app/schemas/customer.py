@@ -62,17 +62,12 @@ class CustomerOut(BaseModel):
 
     @model_validator(mode="after")
     def _alias_profile_image_url(self) -> "CustomerOut":
+        from app.core.files import normalize_file_url
         if self.profile_image_url is None and self.profile_image_id:
             val = str(self.profile_image_id).strip()
-            if (
-                val.startswith("/")
-                or val.startswith("http://")
-                or val.startswith("https://")
-                or val.startswith("data:")
-            ):
-                self.profile_image_url = val
-            else:
-                self.profile_image_url = f"/files/{val}"
+            self.profile_image_url = normalize_file_url(val)
+        elif self.profile_image_url:
+            self.profile_image_url = normalize_file_url(self.profile_image_url)
         return self
 
 
@@ -344,6 +339,12 @@ class CustomerDocumentOut(BaseModel):
     size: int
     url: str
     uploaded_at: datetime
+
+    @field_validator("url", mode="after")
+    @classmethod
+    def _normalize_url(cls, v: str) -> str:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v) or v
 
 
 class BulkDelete(BaseModel):

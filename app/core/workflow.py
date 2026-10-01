@@ -128,6 +128,16 @@ ALLOWED_ITEM_COLUMNS = (
     "amount",
 )
 THERMAL_PAPER_WIDTHS = ("58mm", "80mm", "110mm")
+THERMAL_LAYOUTS = (
+    "thermal-compact",
+    "thermal-advanced",
+    "thermal-simple",
+    "thermal-classic",
+    "thermal-theme-1",
+    "thermal-theme-2",
+    "thermal-theme-3",
+    "thermal-theme-4",
+)
 
 TYPOGRAPHY_DEFAULTS: dict[str, object] = {
     "font_family": "Helvetica",
@@ -201,8 +211,7 @@ REGULAR_PRINT_DEFAULTS: dict[str, object] = {
 }
 
 THERMAL_PRINT_DEFAULTS: dict[str, object] = {
-    "layout": "standard",
-    "thermal_template_variant": None,
+    "layout": "thermal-compact",
     "paper_width": "80mm",
     "printing_type": "text",
     "bold_text": True,

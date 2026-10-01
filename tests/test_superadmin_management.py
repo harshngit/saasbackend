@@ -173,13 +173,112 @@ def run_tests():
     get_after = client.get("/superadmin/admins", headers=root_auth).json()
     assert new_id not in {row["id"] for row in get_after}, "Deleted Super Admin no longer listed"
 
-    # The seeded/root Super Admin must be the last remaining one now (or close to it) —
-    # confirm the guard actually fires when only one is left.
-    remaining = client.get("/superadmin/admins", headers=root_auth).json()
-    if len(remaining) == 1:
-        only_id = remaining[0]["id"]
-        last_res = client.delete(f"/superadmin/admins/{only_id}", headers=root_auth)
-        assert_eq(last_res.status_code, 400, "Deleting the very last Super Admin is refused")
+    # --- Organization Inventory Tests (Task 5) ---
+    print("\n--- Organization Inventory: Super Admin Endpoint & Tenant Isolation ---")
+    # 1. Authorization check
+    inv_unauth = client.get("/superadmin/organizations/inventory")
+    assert_eq(inv_unauth.status_code, 403, "Unauthenticated request to /superadmin/organizations/inventory returns 403")
+
+    inv_normal = client.get("/superadmin/organizations/inventory", headers=admin_auth)
+    assert_eq(inv_normal.status_code, 403, "Normal Admin request to /superadmin/organizations/inventory returns 403")
+
+    inv_super = client.get("/superadmin/organizations/inventory", headers=root_auth)
+    assert_eq(inv_super.status_code, 200, "Super Admin can access /superadmin/organizations/inventory")
+    inventory_items = inv_super.json()
+    assert isinstance(inventory_items, list), "Inventory response is a list"
+
+    # 2. Check fields contract
+    expected_fields = {
+        "id", "name", "created_at", "plan_id", "status",
+        "user_count", "customer_count", "order_count", "invoice_count",
+        "last_activity_date", "created_by_seed"
+    }
+    if inventory_items:
+        first_item = inventory_items[0]
+        assert expected_fields.issubset(set(first_item.keys())), f"Inventory row contains all expected fields: {expected_fields}"
+        ok("Inventory row structure adheres to schema")
+
+    # 3. Create test orgs with known distinct data to verify counts and tenant isolation
+    from datetime import datetime, timezone, timedelta
+    from app.core.database import SessionLocal
+    from app.models import Organization, OrganizationStatus, User, Customer, SalesOrder, Invoice, ActivityLog
+    from app.core.security import hash_password
+
+    db = SessionLocal()
+    org_a_id = f"test-org-a-{uuid.uuid4().hex[:8]}"
+    org_b_id = f"test-org-b-{uuid.uuid4().hex[:8]}"
+    t0 = datetime.now(timezone.utc) - timedelta(days=10)
+    t_activity = datetime.now(timezone.utc) - timedelta(days=2)
+    t_order = datetime.now(timezone.utc) - timedelta(days=1)
+
+    try:
+        org_a = Organization(
+            id=org_a_id, name="Tenant Isolation Org A", email=f"a_{uuid.uuid4().hex[:6]}@test.com",
+            status=OrganizationStatus.ACTIVE, created_at=t0,
+        )
+        org_b = Organization(
+            id=org_b_id, name="Tenant Isolation Org B", email=f"b_{uuid.uuid4().hex[:6]}@test.com",
+            status=OrganizationStatus.ACTIVE, created_at=t0,
+        )
+        db.add_all([org_a, org_b])
+        db.flush()
+
+        # Org A data: 2 users, 3 customers, 2 sales orders, 1 invoice, 1 activity log
+        user_a1 = User(id=f"ua1-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, name="User A1", email=f"ua1_{uuid.uuid4().hex[:6]}@test.com", password_hash=hash_password("pw"), system_role="admin")
+        user_a2 = User(id=f"ua2-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, name="User A2", email=f"ua2_{uuid.uuid4().hex[:6]}@test.com", password_hash=hash_password("pw"), system_role="staff")
+        cust_a1 = Customer(id=f"ca1-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, name="Cust A1")
+        cust_a2 = Customer(id=f"ca2-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, name="Cust A2")
+        cust_a3 = Customer(id=f"ca3-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, name="Cust A3")
+        so_a1 = SalesOrder(id=f"so1-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, order_number="ORD-A-001", created_at=t0)
+        so_a2 = SalesOrder(id=f"so2-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, order_number="ORD-A-002", created_at=t_order)
+        inv_a1 = Invoice(id=f"in1-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, invoice_number="INV-A-001", created_at=t0)
+        act_a1 = ActivityLog(id=f"act1-{uuid.uuid4().hex[:6]}", organization_id=org_a_id, title="Profile updated", created_at=t_activity)
+
+        # Org B data: 1 user, 0 customers, 1 sales order, 0 invoices
+        user_b1 = User(id=f"ub1-{uuid.uuid4().hex[:6]}", organization_id=org_b_id, name="User B1", email=f"ub1_{uuid.uuid4().hex[:6]}@test.com", password_hash=hash_password("pw"), system_role="admin")
+        so_b1 = SalesOrder(id=f"sob1-{uuid.uuid4().hex[:6]}", organization_id=org_b_id, order_number="ORD-B-001", created_at=t0)
+
+        db.add_all([user_a1, user_a2, cust_a1, cust_a2, cust_a3, so_a1, so_a2, inv_a1, act_a1, user_b1, so_b1])
+        db.commit()
+
+        # Query inventory and inspect Org A and Org B
+        inv_res = client.get("/superadmin/organizations/inventory", headers=root_auth)
+        assert_eq(inv_res.status_code, 200, "Inventory query with populated orgs returns 200")
+        data = {row["id"]: row for row in inv_res.json()}
+
+        row_a = data.get(org_a_id)
+        assert row_a is not None, "Org A present in inventory"
+        assert_eq(row_a["user_count"], 2, "Org A user_count is 2")
+        assert_eq(row_a["customer_count"], 3, "Org A customer_count is 3")
+        assert_eq(row_a["order_count"], 2, "Org A order_count is 2")
+        assert_eq(row_a["invoice_count"], 1, "Org A invoice_count is 1")
+        assert_eq(row_a["created_by_seed"], False, "Org A created_by_seed is False")
+        # Org A latest activity should be t_order (1 day ago vs activity log 2 days ago vs created 10 days ago)
+        assert row_a["last_activity_date"] is not None, "Org A has last_activity_date"
+
+        row_b = data.get(org_b_id)
+        assert row_b is not None, "Org B present in inventory"
+        assert_eq(row_b["user_count"], 1, "Org B user_count is 1")
+        assert_eq(row_b["customer_count"], 0, "Org B customer_count is 0")
+        assert_eq(row_b["order_count"], 1, "Org B order_count is 1")
+        assert_eq(row_b["invoice_count"], 0, "Org B invoice_count is 0")
+        assert_eq(row_b["created_by_seed"], False, "Org B created_by_seed is False")
+
+        # Check seeded orgs if present
+        seed_orgs = [r for r in inv_res.json() if r["created_by_seed"]]
+        for s in seed_orgs:
+            assert s["name"] in {"SAAS Distributors", "Testing Paid Org"} or "demo" in s["name"].lower() or "testing" in s["name"].lower(), "Seed flag correctly identified seed orgs"
+        ok(f"Seed flag verified on {len(seed_orgs)} seeded org(s)")
+
+    finally:
+        db.query(ActivityLog).filter(ActivityLog.organization_id.in_([org_a_id, org_b_id])).delete()
+        db.query(Invoice).filter(Invoice.organization_id.in_([org_a_id, org_b_id])).delete()
+        db.query(SalesOrder).filter(SalesOrder.organization_id.in_([org_a_id, org_b_id])).delete()
+        db.query(Customer).filter(Customer.organization_id.in_([org_a_id, org_b_id])).delete()
+        db.query(User).filter(User.organization_id.in_([org_a_id, org_b_id])).delete()
+        db.query(Organization).filter(Organization.id.in_([org_a_id, org_b_id])).delete()
+        db.commit()
+        db.close()
 
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")

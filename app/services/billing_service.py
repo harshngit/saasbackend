@@ -12,8 +12,15 @@ never be duplicated between the two.
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
-import razorpay
+try:
+    import razorpay
+    _SignatureVerificationError = razorpay.errors.SignatureVerificationError
+except (ImportError, AttributeError):
+    razorpay = None
+    class _SignatureVerificationError(Exception):
+        pass
 from sqlalchemy.orm import Session, lazyload
 
 from app.core.config import settings
@@ -42,10 +49,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _client() -> razorpay.Client:
+def _client() -> Any:
     """Only ever constructed after the caller has checked
     settings.razorpay_configured — this reads whatever key id/secret is
     currently set without validating them itself."""
+    if razorpay is None:
+        raise RuntimeError("razorpay package is not installed")
     return razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
 
 
@@ -131,7 +140,7 @@ def verify_payment_signature(payload: RazorpayVerifyRequest) -> bool:
             }
         )
         return True
-    except razorpay.errors.SignatureVerificationError:
+    except _SignatureVerificationError:
         return False
 
 
@@ -145,7 +154,7 @@ def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
             raw_body.decode("utf-8"), signature, settings.razorpay_webhook_secret
         )
         return True
-    except razorpay.errors.SignatureVerificationError:
+    except _SignatureVerificationError:
         return False
 
 

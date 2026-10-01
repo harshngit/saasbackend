@@ -114,6 +114,27 @@ class ExpenseOut(BaseModel):
         from app.core.files import normalize_file_url
         return normalize_file_url(v)
 
+    @field_validator("supporting_documents", mode="after")
+    @classmethod
+    def _normalize_supporting_documents(cls, v: list[dict | str] | None) -> list[dict | str] | None:
+        if not v:
+            return v
+        from app.core.files import normalize_file_url
+        result = []
+        for doc in v:
+            if isinstance(doc, dict):
+                d = dict(doc)
+                if "url" in d and isinstance(d["url"], str):
+                    d["url"] = normalize_file_url(d["url"]) or d["url"]
+                if "file_url" in d and isinstance(d["file_url"], str):
+                    d["file_url"] = normalize_file_url(d["file_url"]) or d["file_url"]
+                result.append(d)
+            elif isinstance(doc, str):
+                result.append(normalize_file_url(doc) or doc)
+            else:
+                result.append(doc)
+        return result
+
 
 class ExpenseCreate(BaseModel):
     category: str = Field(min_length=1, max_length=100)

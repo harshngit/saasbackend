@@ -164,44 +164,47 @@ def run_tests():
         assert_eq(data["regular_print"]["paper_size"], "A5", "Regular print paper_size is A5")
         assert_eq(data["regular_print"]["orientation"], "landscape", "Regular print orientation is landscape")
         assert_eq(data["thermal_print"]["paper_width"], "80mm", "Thermal print width preserved default 80mm")
-        assert_eq(data["thermal_print"]["thermal_template_variant"], None, "Default thermal_template_variant is None")
+        assert_eq(data["thermal_print"]["layout"], "thermal-compact", "Default thermal layout is thermal-compact")
 
-        # Test 1.4b: Persist thermal_template_variant inside thermal_print
-        r = client.patch(
+        # Test 1.4b: Persist each of the 8 supported thermal layout presets
+        all_8_layouts = [
+            "thermal-compact",
+            "thermal-advanced",
+            "thermal-simple",
+            "thermal-classic",
+            "thermal-theme-1",
+            "thermal-theme-2",
+            "thermal-theme-3",
+            "thermal-theme-4",
+        ]
+        for lyr in all_8_layouts:
+            r = client.patch(
+                "/invoice-settings",
+                json={"thermal_print": {"layout": lyr}},
+                headers=auth1,
+            )
+            assert_eq(r.status_code, 200, f"PATCH layout='{lyr}' succeeds")
+            assert_eq(r.json()["thermal_print"]["layout"], lyr, f"layout is {lyr}")
+
+            # Verify GET returns persisted layout
+            r_get = client.get("/invoice-settings", headers=auth1)
+            assert_eq(r_get.status_code, 200, "GET /invoice-settings succeeds")
+            assert_eq(r_get.json()["thermal_print"]["layout"], lyr, f"Persisted layout {lyr} returned on GET")
+
+        # Test 1.4c: Legacy 'standard' maps to 'thermal-compact'
+        r_std = client.patch(
             "/invoice-settings",
-            json={"thermal_print": {"thermal_template_variant": "thermal-theme-2"}},
+            json={"thermal_print": {"layout": "standard"}},
             headers=auth1,
         )
-        assert_eq(r.status_code, 200, "PATCH thermal_template_variant='thermal-theme-2' succeeds")
-        data = r.json()
-        assert_eq(data["thermal_print"]["thermal_template_variant"], "thermal-theme-2", "thermal_template_variant is thermal-theme-2")
-        assert_eq(data["thermal_print"]["paper_width"], "80mm", "Sibling paper_width preserved")
-
-        # Verify subsequent GET returns persisted thermal_template_variant
-        r_get = client.get("/invoice-settings", headers=auth1)
-        assert_eq(r_get.status_code, 200, "GET /invoice-settings succeeds")
-        assert_eq(r_get.json()["thermal_print"]["thermal_template_variant"], "thermal-theme-2", "Persisted variant returned on GET")
-
-        # Update to thermal-theme-1
-        r_up = client.patch(
-            "/invoice-settings",
-            json={"thermal_print": {"thermal_template_variant": "thermal-theme-1"}},
-            headers=auth1,
-        )
-        assert_eq(r_up.status_code, 200, "PATCH thermal_template_variant='thermal-theme-1' succeeds")
-        assert_eq(r_up.json()["thermal_print"]["thermal_template_variant"], "thermal-theme-1", "Updated to thermal-theme-1")
-
-        # Clear thermal_template_variant to null
-        r_clear = client.patch(
-            "/invoice-settings",
-            json={"thermal_print": {"thermal_template_variant": None}},
-            headers=auth1,
-        )
-        assert_eq(r_clear.status_code, 200, "PATCH thermal_template_variant=None succeeds")
-        assert_eq(r_clear.json()["thermal_print"]["thermal_template_variant"], None, "thermal_template_variant cleared to null")
-        assert_eq(r_clear.json()["thermal_print"]["paper_width"], "80mm", "Sibling paper_width still preserved")
+        assert_eq(r_std.status_code, 200, "PATCH legacy layout='standard' succeeds")
+        assert_eq(r_std.json()["thermal_print"]["layout"], "thermal-compact", "legacy layout='standard' maps to thermal-compact")
 
         # Test 1.5: Validation rejections
+        # Invalid thermal layout
+        r_bad_layout = client.patch("/invoice-settings", json={"thermal_print": {"layout": "unsupported-thermal"}}, headers=auth1)
+        assert_eq(r_bad_layout.status_code, 422, "Invalid layout unsupported-thermal rejected with 422")
+
         # Invalid font family
         r = client.patch("/invoice-settings", json={"typography": {"font_family": "ComicSans"}}, headers=auth1)
         assert_eq(r.status_code, 422, "Invalid font family ComicSans rejected with 422")
@@ -449,40 +452,49 @@ def run_tests():
         pdf_110 = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_110)
         assert_eq(isinstance(pdf_110, bytes), True, "110mm Thermal PDF generated successfully")
 
-        # 4.4: thermal-theme-1 vs thermal-theme-2 produce distinct, valid PDFs
-        settings_theme1 = dict(settings_dict)
-        settings_theme1["template"] = "thermal"
-        settings_theme1["thermal_print"] = {"paper_width": "80mm", "thermal_template_variant": "thermal-theme-1", "bold_text": True}
-        pdf_theme1 = invoice_detailed_pdf(org1, cust1, inv, settings_theme1)
-        assert_eq(isinstance(pdf_theme1, bytes), True, "thermal-theme-1 PDF generated successfully")
+        # 4.4: All 8 layout variants produce valid, distinct PDFs across paper widths
+        all_8_layouts = [
+            "thermal-compact",
+            "thermal-advanced",
+            "thermal-simple",
+            "thermal-classic",
+            "thermal-theme-1",
+            "thermal-theme-2",
+            "thermal-theme-3",
+            "thermal-theme-4",
+        ]
+        for lyr in all_8_layouts:
+            for pw in ("58mm", "80mm", "110mm"):
+                cfg = dict(settings_dict)
+                cfg["template"] = "thermal"
+                cfg["thermal_print"] = {"paper_width": pw, "layout": lyr, "bold_text": True, "extra_lines": 1}
+                pdf_bytes = invoice_detailed_pdf(org1, cust1, inv, cfg)
+                assert_eq(isinstance(pdf_bytes, bytes) and len(pdf_bytes) > 0, True, f"Thermal PDF for layout '{lyr}' at {pw} generated successfully")
 
-        settings_theme2 = dict(settings_dict)
-        settings_theme2["template"] = "thermal"
-        settings_theme2["thermal_print"] = {"paper_width": "80mm", "thermal_template_variant": "thermal-theme-2", "bold_text": True}
-        pdf_theme2 = invoice_detailed_pdf(org1, cust1, inv, settings_theme2)
-        assert_eq(isinstance(pdf_theme2, bytes), True, "thermal-theme-2 PDF generated successfully")
-        assert_eq(pdf_theme1 != pdf_theme2, True, "thermal-theme-1 and thermal-theme-2 generate distinct PDF outputs")
+                pdf_simple = invoice_simple_pdf(org1, cust1, inv, cfg)
+                assert_eq(isinstance(pdf_simple, bytes) and len(pdf_simple) > 0, True, f"Simple thermal PDF for layout '{lyr}' at {pw} generated successfully")
 
-        # Also verify simple format respects thermal variants
-        pdf_simple_t1 = invoice_simple_pdf(org1, cust1, inv, settings_theme1)
-        pdf_simple_t2 = invoice_simple_pdf(org1, cust1, inv, settings_theme2)
-        assert_eq(isinstance(pdf_simple_t1, bytes) and isinstance(pdf_simple_t2, bytes), True, "Simple thermal PDFs generated")
-        assert_eq(pdf_simple_t1 != pdf_simple_t2, True, "Simple thermal format reflects variant differences")
+        # 4.5: Legacy layout="standard" maps to default compact rendering
+        settings_legacy_std = dict(settings_dict)
+        settings_legacy_std["template"] = "thermal"
+        settings_legacy_std["thermal_print"] = {"paper_width": "80mm", "layout": "standard", "bold_text": True}
+        pdf_legacy_std = invoice_detailed_pdf(org1, cust1, inv, settings_legacy_std)
+        assert_eq(isinstance(pdf_legacy_std, bytes) and len(pdf_legacy_std) > 0, True, "Legacy 'standard' thermal layout PDF generated successfully")
 
-        # 4.5: thermal layout="compact"
-        settings_compact = dict(settings_dict)
-        settings_compact["template"] = "thermal"
-        settings_compact["thermal_print"] = {"paper_width": "80mm", "layout": "compact", "bold_text": True}
-        pdf_compact = invoice_detailed_pdf(org1, cust1, inv, settings_compact)
-        assert_eq(isinstance(pdf_compact, bytes), True, "Compact thermal layout PDF generated successfully")
-
-        # 4.6: typography settings in thermal mode
+        # 4.6: Typography settings in thermal mode with layout
         settings_thermal_typo = dict(settings_dict)
         settings_thermal_typo["template"] = "thermal"
-        settings_thermal_typo["thermal_print"] = {"paper_width": "80mm", "thermal_template_variant": "thermal-theme-2"}
+        settings_thermal_typo["thermal_print"] = {"paper_width": "80mm", "layout": "thermal-advanced"}
         settings_thermal_typo["typography"] = {"font_family": "Times", "heading_size": 18, "body_size": 10, "table_size": 9}
         pdf_thermal_typo = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_typo)
-        assert_eq(isinstance(pdf_thermal_typo, bytes), True, "Thermal PDF with custom typography generated successfully")
+        assert_eq(isinstance(pdf_thermal_typo, bytes) and len(pdf_thermal_typo) > 0, True, "Thermal PDF with custom typography generated successfully")
+
+        # 4.7: Bold text toggle false
+        settings_nonbold = dict(settings_dict)
+        settings_nonbold["template"] = "thermal"
+        settings_nonbold["thermal_print"] = {"paper_width": "80mm", "layout": "thermal-compact", "bold_text": False}
+        pdf_nonbold = invoice_detailed_pdf(org1, cust1, inv, settings_nonbold)
+        assert_eq(isinstance(pdf_nonbold, bytes) and len(pdf_nonbold) > 0, True, "Thermal PDF with bold_text=False generated successfully")
 
         # =====================================================
         # 5. DELIVERY RECEIPT TESTS

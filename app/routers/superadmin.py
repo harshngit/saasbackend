@@ -1,12 +1,29 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_system_role
 from app.core.security import hash_password
-from app.models import Organization, OrganizationStatus, Plan, SystemRole, UpgradeStatus, User, UserRole
-from app.schemas.organization import OrganizationOut, OrgStatusUpdate, RejectUpgrade
+from app.models import (
+    ActivityLog,
+    Customer,
+    Invoice,
+    Organization,
+    OrganizationStatus,
+    Plan,
+    SalesOrder,
+    SystemRole,
+    UpgradeStatus,
+    User,
+    UserRole,
+)
+from app.schemas.organization import (
+    OrganizationInventoryOut,
+    OrganizationOut,
+    OrgStatusUpdate,
+    RejectUpgrade,
+)
 from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
 from app.schemas.razorpay import SubscriptionPaymentOut
 from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
@@ -180,6 +197,105 @@ def list_organizations(
     if upgrade_status is not None:
         query = query.filter(Organization.upgrade_status == upgrade_status.value)
     return query.order_by(Organization.created_at.desc()).all()
+
+
+@router.get("/organizations/inventory", response_model=list[OrganizationInventoryOut])
+def get_organizations_inventory(
+    db: Session = Depends(get_db),
+) -> list[OrganizationInventoryOut]:
+    """Super Admin organization inventory with aggregate counts and activity metrics."""
+    orgs = db.query(Organization).order_by(Organization.created_at.desc()).all()
+    if not orgs:
+        return []
+
+    # Aggregate counts across all organizations in single queries to prevent N+1.
+    user_counts = dict(
+        db.query(User.organization_id, func.count(User.id))
+        .filter(User.organization_id.isnot(None))
+        .group_by(User.organization_id)
+        .all()
+    )
+    customer_counts = dict(
+        db.query(Customer.organization_id, func.count(Customer.id))
+        .group_by(Customer.organization_id)
+        .all()
+    )
+    order_counts = dict(
+        db.query(SalesOrder.organization_id, func.count(SalesOrder.id))
+        .group_by(SalesOrder.organization_id)
+        .all()
+    )
+    invoice_counts = dict(
+        db.query(Invoice.organization_id, func.count(Invoice.id))
+        .group_by(Invoice.organization_id)
+        .all()
+    )
+
+    # Activity timestamps
+    activity_dates = dict(
+        db.query(ActivityLog.organization_id, func.max(ActivityLog.created_at))
+        .filter(ActivityLog.organization_id.isnot(None))
+        .group_by(ActivityLog.organization_id)
+        .all()
+    )
+    invoice_dates = dict(
+        db.query(Invoice.organization_id, func.max(Invoice.created_at))
+        .group_by(Invoice.organization_id)
+        .all()
+    )
+    order_dates = dict(
+        db.query(SalesOrder.organization_id, func.max(SalesOrder.created_at))
+        .group_by(SalesOrder.organization_id)
+        .all()
+    )
+
+    # Deterministic seed detection
+    seed_emails = {"admin@demo.com", "testing@gmail.com"}
+    seed_names = {"SAAS Distributors", "Testing Paid Org"}
+    seed_user_org_ids = set(
+        r[0]
+        for r in db.query(User.organization_id)
+        .filter(User.email.in_(seed_emails), User.organization_id.isnot(None))
+        .all()
+    )
+
+    inventory_list = []
+    for org in orgs:
+        timestamps = [
+            t
+            for t in [
+                activity_dates.get(org.id),
+                invoice_dates.get(org.id),
+                order_dates.get(org.id),
+                org.created_at,
+            ]
+            if t is not None
+        ]
+        last_activity = max(timestamps) if timestamps else org.created_at
+
+        is_seed = (
+            org.id in seed_user_org_ids
+            or (org.email in seed_emails if org.email else False)
+            or org.name in seed_names
+        )
+
+        inventory_list.append(
+            OrganizationInventoryOut(
+                id=org.id,
+                name=org.name,
+                created_at=org.created_at,
+                plan_id=org.plan_id,
+                status=org.status,
+                user_count=user_counts.get(org.id, 0),
+                customer_count=customer_counts.get(org.id, 0),
+                order_count=order_counts.get(org.id, 0),
+                invoice_count=invoice_counts.get(org.id, 0),
+                last_activity_date=last_activity,
+                created_by_seed=is_seed,
+            )
+        )
+
+    return inventory_list
 
 
 # ----------------------------- Plan catalog management -----------------------------

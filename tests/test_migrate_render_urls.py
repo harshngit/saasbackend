@@ -7,9 +7,13 @@ dry-run/--apply CLI contract. Runs only against the local SQLite test
 database — never production.
 """
 
+import os
+import sys
 import uuid
 import pytest
 from sqlalchemy.orm import Session
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.core.database import SessionLocal
 from app.models import (
@@ -420,3 +424,71 @@ def test_report_distinguishes_host_categories(db: Session):
     key = ("Organization", "logo_url", "render")
     assert key in result.column_breakdown
     assert render_id in result.column_breakdown[key]["valid_ids"]
+
+
+def test_organization_theme_background_image_url_migration(db: Session):
+    from app.models import OrganizationTheme
+
+    org = Organization(name=f"Theme Org {uuid.uuid4().hex[:6]}")
+    db.add(org)
+    db.commit()
+
+    fid = _create_stored_file(db, org_id=org.id)
+    render_url = f"https://saasbackend-1-f6v3.onrender.com/files/{fid}"
+
+    theme = OrganizationTheme(
+        organization_id=org.id,
+        custom_enabled=True,
+        background_image_url=render_url,
+    )
+    db.add(theme)
+    db.commit()
+
+    # 1. Dry run
+    res_dry = audit_and_migrate(db, apply=False)
+    assert fid in res_dry.unique_file_ids
+    assert fid in res_dry.valid_file_ids
+    assert res_dry.eligible_rewrites >= 1
+    assert res_dry.rewritten_count == 0
+
+    db.expire_all()
+    assert db.get(OrganizationTheme, theme.id).background_image_url == render_url
+
+    # 2. Apply mode
+    res_apply = audit_and_migrate(db, apply=True)
+    assert res_apply.rewritten_count >= 1
+    assert ("OrganizationTheme", "background_image_url", "render") in res_apply.column_breakdown
+
+    db.expire_all()
+    fresh_theme = db.get(OrganizationTheme, theme.id)
+    assert fresh_theme.background_image_url == f"/files/{fid}"
+
+    # 3. Idempotency
+    res_idem = audit_and_migrate(db, apply=True)
+    assert res_idem.eligible_rewrites == 0
+    assert res_idem.rewritten_count == 0
+    db.expire_all()
+    assert db.get(OrganizationTheme, theme.id).background_image_url == f"/files/{fid}"
+
+
+def test_audit_statistics_and_report(db: Session, capsys):
+    from app.scripts.migrate_render_urls import print_report
+
+    org = Organization(name=f"Stats Org {uuid.uuid4().hex[:6]}")
+    db.add(org)
+    db.commit()
+
+    fid = _create_stored_file(db, org_id=org.id)
+    org.logo_url = f"https://api.asynk.in/files/{fid}"
+    db.commit()
+
+    res = audit_and_migrate(db, apply=True)
+    assert res.total_records_inspected > 0
+    assert res.rewritten_count >= 1
+
+    print_report(res, apply=True)
+    captured = capsys.readouterr().out
+    assert "Total database records inspected:" in captured
+    assert "References rewritten (actual):" in captured
+    assert "Already canonical (/files/<id>):" in captured
+

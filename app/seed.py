@@ -4,12 +4,22 @@ Run with:  python -m app.seed
 Idempotent — safe to run multiple times.
 """
 
+import secrets
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import Base, SessionLocal, engine
 from app.core.security import hash_password
 from app.models import Organization, OrganizationStatus, Plan, UpgradeStatus, User, UserRole
+
+
+def _resolve_seed_password(configured_password: str | None) -> str:
+    """Return configured password if provided, otherwise generate a secure random one.
+    Never logs or exposes the password."""
+    if configured_password and configured_password.strip():
+        return configured_password.strip()
+    return secrets.token_urlsafe(16)
+
 
 # Starter catalog. The Super Admin can edit / deactivate / add more via the API.
 _DEFAULT_PLANS = [
@@ -97,12 +107,13 @@ def seed_demo_firm(db: Session, default_plan: Plan | None) -> None:
     db.add(org)
     db.flush()
 
+    password = _resolve_seed_password(settings.demo_admin_password)
     db.add(
         User(
             organization_id=org.id,
             name="Anita Sharma",
             email="admin@demo.com",
-            password_hash=hash_password("Admin@123"),
+            password_hash=hash_password(password),
             role=UserRole.ADMIN,
             system_role="admin",
         )
@@ -141,11 +152,12 @@ def seed_testing_paid_user(db: Session) -> None:
     db.add(org)
     db.flush()
 
+    password = _resolve_seed_password(settings.testing_user_password)
     user = User(
         organization_id=org.id,
         name="Testing User",
         email=testing_email,
-        password_hash=hash_password("12345678"),
+        password_hash=hash_password(password),
         role=UserRole.ADMIN,
         system_role="admin",
     )

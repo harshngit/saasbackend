@@ -418,14 +418,40 @@ _TEMPLATE_STYLES = {
     },
 }
 
-_THERMAL_VARIANT_STYLES = {
+_THERMAL_LAYOUT_STYLES = {
+    # Minimalist / compact styles:
+    "thermal-compact": {
+        "title_size": 11, "body_size": 7, "table_size": 6.5, "row_height": 4,
+        "header_band": False, "border": "B", "gap": 2, "margin": 3,
+    },
+    "thermal-simple": {
+        "title_size": 10, "body_size": 6.5, "table_size": 6, "row_height": 3.8,
+        "header_band": False, "border": "B", "gap": 2, "margin": 3,
+    },
     "thermal-theme-1": {
         "title_size": 11, "body_size": 7, "table_size": 6.5, "row_height": 4,
         "header_band": False, "border": "B", "gap": 2, "margin": 4,
     },
+    # Structured / framed styles:
+    "thermal-advanced": {
+        "title_size": 12, "body_size": 7.5, "table_size": 7, "row_height": 5,
+        "header_band": True, "border": 1, "gap": 3, "margin": 4,
+    },
+    "thermal-classic": {
+        "title_size": 12, "body_size": 7.5, "table_size": 7, "row_height": 5,
+        "header_band": False, "border": 1, "gap": 3, "margin": 4,
+    },
     "thermal-theme-2": {
         "title_size": 12, "body_size": 7.5, "table_size": 7, "row_height": 5,
         "header_band": True, "border": 1, "gap": 3, "margin": 4,
+    },
+    "thermal-theme-3": {
+        "title_size": 12, "body_size": 7.5, "table_size": 7, "row_height": 5,
+        "header_band": True, "border": "B", "gap": 3, "margin": 4,
+    },
+    "thermal-theme-4": {
+        "title_size": 11.5, "body_size": 7, "table_size": 6.5, "row_height": 4.5,
+        "header_band": False, "border": 1, "gap": 2.5, "margin": 4,
     },
 }
 
@@ -481,21 +507,24 @@ COLUMN_ALIGNS = {
 }
 
 
+def _normalize_thermal_layout(layout_name: str | None) -> str:
+    """Resolve a thermal layout key, treating legacy 'standard' and unknown/unset
+    as 'thermal-compact'."""
+    val = str(layout_name or "").strip().lower()
+    if not val or val == "standard":
+        return "thermal-compact"
+    if val in _THERMAL_LAYOUT_STYLES:
+        return val
+    return "thermal-compact"
+
+
 def _style(settings: dict) -> dict:
     """The look this firm has chosen, defaulting to classic."""
     name = str(settings.get("template") or "classic").strip().lower()
     if name == "thermal":
         thermal_cfg = settings.get("thermal_print") or {}
-        variant = str(thermal_cfg.get("thermal_template_variant") or "").strip().lower()
-        if variant in _THERMAL_VARIANT_STYLES:
-            base = dict(_THERMAL_VARIANT_STYLES[variant])
-        else:
-            base = dict(_TEMPLATE_STYLES["thermal"])
-        layout = str(thermal_cfg.get("layout") or "standard").strip().lower()
-        if layout == "compact":
-            base["row_height"] = max(base["row_height"] - 1, 3.5)
-            base["gap"] = max(base["gap"] - 1, 1)
-        return base
+        layout = _normalize_thermal_layout(thermal_cfg.get("layout"))
+        return dict(_THERMAL_LAYOUT_STYLES[layout])
     return _TEMPLATE_STYLES.get(name, _TEMPLATE_STYLES["classic"])
 
 
@@ -555,8 +584,9 @@ def _invoice_pdf_page(settings: dict) -> FPDF:
         thermal_cfg = settings.get("thermal_print") or {}
         paper_width_key = str(thermal_cfg.get("paper_width") or "80mm").lower()
         size = _THERMAL_WIDTHS.get(paper_width_key, _THERMAL_WIDTHS["80mm"])
-        layout = str(thermal_cfg.get("layout") or "standard").strip().lower()
-        margin = 3 if layout == "compact" else 4
+        layout = _normalize_thermal_layout(thermal_cfg.get("layout"))
+        style_cfg = _THERMAL_LAYOUT_STYLES[layout]
+        margin = style_cfg.get("margin", 4)
         pdf = FPDF(format=size)
         pdf.set_margins(margin, margin, margin)
         pdf.set_auto_page_break(True, margin=margin)

@@ -14,6 +14,7 @@ from app.core.workflow import (
     FONT_FAMILIES,
     INVOICE_TEMPLATES,
     PAPER_SIZES,
+    THERMAL_LAYOUTS,
     THERMAL_PAPER_WIDTHS,
 )
 
@@ -25,6 +26,15 @@ def _lower(value: object) -> object:
 def _font_title(value: object) -> object:
     if isinstance(value, str):
         v = value.strip().title()
+        return v
+    return value
+
+
+def _thermal_layout(value: object) -> object:
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == "standard":
+            return "thermal-compact"
         return v
     return value
 
@@ -45,6 +55,11 @@ ThermalPaperWidth = Annotated[
     str,
     BeforeValidator(_lower),
     Field(pattern=f"^({'|'.join(THERMAL_PAPER_WIDTHS)})$"),
+]
+ThermalLayout = Annotated[
+    str,
+    BeforeValidator(_thermal_layout),
+    Field(pattern=f"^({'|'.join(THERMAL_LAYOUTS)})$"),
 ]
 
 
@@ -331,12 +346,7 @@ class RegularPrintSettingsUpdate(BaseModel):
 class ThermalPrintSettings(BaseModel):
     """Thermal printer configuration settings."""
 
-    layout: str = "standard"
-    thermal_template_variant: str | None = Field(
-        default=None,
-        max_length=50,
-        description="Exact thermal theme variant/preset ID (e.g. 'thermal-theme-1', 'thermal-theme-2')",
-    )
+    layout: ThermalLayout = "thermal-compact"
     paper_width: ThermalPaperWidth = "80mm"
     printing_type: str = "text"
     bold_text: bool = True
@@ -349,12 +359,7 @@ class ThermalPrintSettings(BaseModel):
 class ThermalPrintSettingsUpdate(BaseModel):
     """Partial update for thermal print settings."""
 
-    layout: str | None = None
-    thermal_template_variant: str | None = Field(
-        default=None,
-        max_length=50,
-        description="Exact thermal theme variant/preset ID (e.g. 'thermal-theme-1', 'thermal-theme-2')",
-    )
+    layout: ThermalLayout | None = None
     paper_width: ThermalPaperWidth | None = None
     printing_type: str | None = None
     bold_text: bool | None = None
