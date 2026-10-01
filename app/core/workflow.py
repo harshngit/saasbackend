@@ -202,6 +202,7 @@ REGULAR_PRINT_DEFAULTS: dict[str, object] = {
 
 THERMAL_PRINT_DEFAULTS: dict[str, object] = {
     "layout": "standard",
+    "thermal_template_variant": None,
     "paper_width": "80mm",
     "printing_type": "text",
     "bold_text": True,

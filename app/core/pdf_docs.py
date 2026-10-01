@@ -418,6 +418,17 @@ _TEMPLATE_STYLES = {
     },
 }
 
+_THERMAL_VARIANT_STYLES = {
+    "thermal-theme-1": {
+        "title_size": 11, "body_size": 7, "table_size": 6.5, "row_height": 4,
+        "header_band": False, "border": "B", "gap": 2, "margin": 4,
+    },
+    "thermal-theme-2": {
+        "title_size": 12, "body_size": 7.5, "table_size": 7, "row_height": 5,
+        "header_band": True, "border": 1, "gap": 3, "margin": 4,
+    },
+}
+
 COLUMN_WEIGHTS = {
     "product": 42.0,
     "description": 30.0,
@@ -473,6 +484,18 @@ COLUMN_ALIGNS = {
 def _style(settings: dict) -> dict:
     """The look this firm has chosen, defaulting to classic."""
     name = str(settings.get("template") or "classic").strip().lower()
+    if name == "thermal":
+        thermal_cfg = settings.get("thermal_print") or {}
+        variant = str(thermal_cfg.get("thermal_template_variant") or "").strip().lower()
+        if variant in _THERMAL_VARIANT_STYLES:
+            base = dict(_THERMAL_VARIANT_STYLES[variant])
+        else:
+            base = dict(_TEMPLATE_STYLES["thermal"])
+        layout = str(thermal_cfg.get("layout") or "standard").strip().lower()
+        if layout == "compact":
+            base["row_height"] = max(base["row_height"] - 1, 3.5)
+            base["gap"] = max(base["gap"] - 1, 1)
+        return base
     return _TEMPLATE_STYLES.get(name, _TEMPLATE_STYLES["classic"])
 
 
@@ -532,9 +555,11 @@ def _invoice_pdf_page(settings: dict) -> FPDF:
         thermal_cfg = settings.get("thermal_print") or {}
         paper_width_key = str(thermal_cfg.get("paper_width") or "80mm").lower()
         size = _THERMAL_WIDTHS.get(paper_width_key, _THERMAL_WIDTHS["80mm"])
+        layout = str(thermal_cfg.get("layout") or "standard").strip().lower()
+        margin = 3 if layout == "compact" else 4
         pdf = FPDF(format=size)
-        pdf.set_margins(4, 4, 4)
-        pdf.set_auto_page_break(True, margin=4)
+        pdf.set_margins(margin, margin, margin)
+        pdf.set_auto_page_break(True, margin=margin)
         pdf.add_page()
         return pdf
 
@@ -828,14 +853,16 @@ def invoice_simple_pdf(
     combined_rows = list(zip(left_rows, right_rows))
 
     _two_column_rows(pdf, combined_rows, column, settings=settings, style=style)
-    pdf.ln(4)
+    pdf.ln(style.get("gap", 4))
 
     shares = [0.52, 0.12, 0.16, 0.20]
     widths = [round(width * share, 2) for share in shares]
+    row_h = style.get("row_height", 6)
+    table_border = style.get("border", 1)
     _font(pdf, settings, "B", "table")
     for w, header, align in zip(widths, ["Item", "Qty", "Rate", "Amount"], "LRRR"):
-        pdf.cell(w, 7, header, border=1, align=align)
-    pdf.ln(7)
+        pdf.cell(w, row_h + 1, header, border=table_border, align=align)
+    pdf.ln(row_h + 1)
 
     _font(pdf, settings, "", "table")
     for item in invoice.items:
@@ -846,8 +873,8 @@ def invoice_simple_pdf(
             _money(item.line_total),
         ]
         for w, text, align in zip(widths, cells, "LRRR"):
-            pdf.cell(w, 6, text, border=1, align=align)
-        pdf.ln(6)
+            pdf.cell(w, row_h, text, border=table_border, align=align)
+        pdf.ln(row_h)
 
     brand_rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
     pdf.ln(2)

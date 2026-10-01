@@ -332,6 +332,11 @@ class ThermalPrintSettings(BaseModel):
     """Thermal printer configuration settings."""
 
     layout: str = "standard"
+    thermal_template_variant: str | None = Field(
+        default=None,
+        max_length=50,
+        description="Exact thermal theme variant/preset ID (e.g. 'thermal-theme-1', 'thermal-theme-2')",
+    )
     paper_width: ThermalPaperWidth = "80mm"
     printing_type: str = "text"
     bold_text: bool = True
@@ -345,6 +350,11 @@ class ThermalPrintSettingsUpdate(BaseModel):
     """Partial update for thermal print settings."""
 
     layout: str | None = None
+    thermal_template_variant: str | None = Field(
+        default=None,
+        max_length=50,
+        description="Exact thermal theme variant/preset ID (e.g. 'thermal-theme-1', 'thermal-theme-2')",
+    )
     paper_width: ThermalPaperWidth | None = None
     printing_type: str | None = None
     bold_text: bool | None = None

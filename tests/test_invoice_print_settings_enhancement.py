@@ -164,6 +164,42 @@ def run_tests():
         assert_eq(data["regular_print"]["paper_size"], "A5", "Regular print paper_size is A5")
         assert_eq(data["regular_print"]["orientation"], "landscape", "Regular print orientation is landscape")
         assert_eq(data["thermal_print"]["paper_width"], "80mm", "Thermal print width preserved default 80mm")
+        assert_eq(data["thermal_print"]["thermal_template_variant"], None, "Default thermal_template_variant is None")
+
+        # Test 1.4b: Persist thermal_template_variant inside thermal_print
+        r = client.patch(
+            "/invoice-settings",
+            json={"thermal_print": {"thermal_template_variant": "thermal-theme-2"}},
+            headers=auth1,
+        )
+        assert_eq(r.status_code, 200, "PATCH thermal_template_variant='thermal-theme-2' succeeds")
+        data = r.json()
+        assert_eq(data["thermal_print"]["thermal_template_variant"], "thermal-theme-2", "thermal_template_variant is thermal-theme-2")
+        assert_eq(data["thermal_print"]["paper_width"], "80mm", "Sibling paper_width preserved")
+
+        # Verify subsequent GET returns persisted thermal_template_variant
+        r_get = client.get("/invoice-settings", headers=auth1)
+        assert_eq(r_get.status_code, 200, "GET /invoice-settings succeeds")
+        assert_eq(r_get.json()["thermal_print"]["thermal_template_variant"], "thermal-theme-2", "Persisted variant returned on GET")
+
+        # Update to thermal-theme-1
+        r_up = client.patch(
+            "/invoice-settings",
+            json={"thermal_print": {"thermal_template_variant": "thermal-theme-1"}},
+            headers=auth1,
+        )
+        assert_eq(r_up.status_code, 200, "PATCH thermal_template_variant='thermal-theme-1' succeeds")
+        assert_eq(r_up.json()["thermal_print"]["thermal_template_variant"], "thermal-theme-1", "Updated to thermal-theme-1")
+
+        # Clear thermal_template_variant to null
+        r_clear = client.patch(
+            "/invoice-settings",
+            json={"thermal_print": {"thermal_template_variant": None}},
+            headers=auth1,
+        )
+        assert_eq(r_clear.status_code, 200, "PATCH thermal_template_variant=None succeeds")
+        assert_eq(r_clear.json()["thermal_print"]["thermal_template_variant"], None, "thermal_template_variant cleared to null")
+        assert_eq(r_clear.json()["thermal_print"]["paper_width"], "80mm", "Sibling paper_width still preserved")
 
         # Test 1.5: Validation rejections
         # Invalid font family
@@ -412,6 +448,41 @@ def run_tests():
         settings_thermal_110["thermal_print"] = {"paper_width": "110mm", "extra_lines": 1, "copies": 1, "bold_text": True}
         pdf_110 = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_110)
         assert_eq(isinstance(pdf_110, bytes), True, "110mm Thermal PDF generated successfully")
+
+        # 4.4: thermal-theme-1 vs thermal-theme-2 produce distinct, valid PDFs
+        settings_theme1 = dict(settings_dict)
+        settings_theme1["template"] = "thermal"
+        settings_theme1["thermal_print"] = {"paper_width": "80mm", "thermal_template_variant": "thermal-theme-1", "bold_text": True}
+        pdf_theme1 = invoice_detailed_pdf(org1, cust1, inv, settings_theme1)
+        assert_eq(isinstance(pdf_theme1, bytes), True, "thermal-theme-1 PDF generated successfully")
+
+        settings_theme2 = dict(settings_dict)
+        settings_theme2["template"] = "thermal"
+        settings_theme2["thermal_print"] = {"paper_width": "80mm", "thermal_template_variant": "thermal-theme-2", "bold_text": True}
+        pdf_theme2 = invoice_detailed_pdf(org1, cust1, inv, settings_theme2)
+        assert_eq(isinstance(pdf_theme2, bytes), True, "thermal-theme-2 PDF generated successfully")
+        assert_eq(pdf_theme1 != pdf_theme2, True, "thermal-theme-1 and thermal-theme-2 generate distinct PDF outputs")
+
+        # Also verify simple format respects thermal variants
+        pdf_simple_t1 = invoice_simple_pdf(org1, cust1, inv, settings_theme1)
+        pdf_simple_t2 = invoice_simple_pdf(org1, cust1, inv, settings_theme2)
+        assert_eq(isinstance(pdf_simple_t1, bytes) and isinstance(pdf_simple_t2, bytes), True, "Simple thermal PDFs generated")
+        assert_eq(pdf_simple_t1 != pdf_simple_t2, True, "Simple thermal format reflects variant differences")
+
+        # 4.5: thermal layout="compact"
+        settings_compact = dict(settings_dict)
+        settings_compact["template"] = "thermal"
+        settings_compact["thermal_print"] = {"paper_width": "80mm", "layout": "compact", "bold_text": True}
+        pdf_compact = invoice_detailed_pdf(org1, cust1, inv, settings_compact)
+        assert_eq(isinstance(pdf_compact, bytes), True, "Compact thermal layout PDF generated successfully")
+
+        # 4.6: typography settings in thermal mode
+        settings_thermal_typo = dict(settings_dict)
+        settings_thermal_typo["template"] = "thermal"
+        settings_thermal_typo["thermal_print"] = {"paper_width": "80mm", "thermal_template_variant": "thermal-theme-2"}
+        settings_thermal_typo["typography"] = {"font_family": "Times", "heading_size": 18, "body_size": 10, "table_size": 9}
+        pdf_thermal_typo = invoice_detailed_pdf(org1, cust1, inv, settings_thermal_typo)
+        assert_eq(isinstance(pdf_thermal_typo, bytes), True, "Thermal PDF with custom typography generated successfully")
 
         # =====================================================
         # 5. DELIVERY RECEIPT TESTS
