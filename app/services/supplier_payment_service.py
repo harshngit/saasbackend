@@ -3,6 +3,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.models.purchase_invoice import PurchaseInvoice
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.supplier_invoice import SupplierInvoice
 from app.models.supplier_payment_allocation import SupplierPaymentAllocation
@@ -27,7 +28,7 @@ def _aware(dt: datetime | None) -> datetime | None:
 
 
 def recalculate_supplier_invoice(db: Session, invoice: SupplierInvoice) -> None:
-    """Recalculate SupplierInvoice.amount_paid and payment_status from active allocations."""
+    """Recalculate SupplierInvoice.amount_paid and payment_status from active allocations and returns."""
     allocations = (
         db.query(SupplierPaymentAllocation)
         .join(SupplierPayment, SupplierPayment.id == SupplierPaymentAllocation.supplier_payment_id)
@@ -40,12 +41,25 @@ def recalculate_supplier_invoice(db: Session, invoice: SupplierInvoice) -> None:
     total_paid = round(sum(alloc.amount for alloc in allocations), 2)
     invoice.amount_paid = total_paid
 
-    if total_paid <= 0:
+    total_settled = round(total_paid + (invoice.return_amount or 0.0), 2)
+    if total_settled <= 0:
         invoice.payment_status = "unpaid"
-    elif total_paid + 0.01 >= invoice.grand_total:
+    elif total_settled + 0.01 >= invoice.grand_total and invoice.grand_total > 0:
         invoice.payment_status = "paid"
     else:
         invoice.payment_status = "partially_paid"
+
+    if invoice.purchase_id:
+        purchase = db.get(PurchaseInvoice, invoice.purchase_id)
+        if purchase:
+            purchase.amount_paid = total_paid
+            p_settled = round(total_paid + (purchase.return_amount or 0.0), 2)
+            if p_settled <= 0:
+                purchase.payment_status = "unpaid"
+            elif p_settled + 0.01 >= (purchase.total or 0.0) and (purchase.total or 0.0) > 0:
+                purchase.payment_status = "paid"
+            else:
+                purchase.payment_status = "partially_paid"
 
 
 def recalculate_supplier_total_paid(db: Session, supplier: Supplier) -> None:

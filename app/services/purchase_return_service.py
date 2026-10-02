@@ -17,6 +17,7 @@ from app.models import (
     PurchaseReturnItem,
     StockMovement,
     Supplier,
+    SupplierInvoice,
     User,
     Warehouse,
     WarehouseStock,
@@ -55,6 +56,69 @@ def get_previously_returned_quantity(
     if exclude_return_id:
         q = q.filter(PurchaseReturn.id != exclude_return_id)
     return int(q.scalar() or 0)
+
+
+def get_previously_returned_amount(
+    db: Session,
+    purchase_id: str,
+    exclude_return_id: str | None = None,
+) -> float:
+    """Calculate the cumulative return value across all active (non-cancelled) Purchase Returns for a purchase."""
+    q = (
+        db.query(func.coalesce(func.sum(PurchaseReturnItem.line_total), 0.0))
+        .join(PurchaseReturn, PurchaseReturn.id == PurchaseReturnItem.purchase_return_id)
+        .filter(
+            PurchaseReturn.purchase_id == purchase_id,
+            PurchaseReturn.status != "cancelled",
+        )
+    )
+    if exclude_return_id:
+        q = q.filter(PurchaseReturn.id != exclude_return_id)
+    return round(float(q.scalar() or 0.0), 2)
+
+
+def recalculate_purchase_and_supplier_invoice_returns(
+    db: Session,
+    purchase_id: str | None,
+) -> None:
+    """Recalculate and synchronize return_amount and payment_status on both PurchaseInvoice
+    and SupplierInvoice for all active (non-cancelled, non-draft) purchase returns."""
+    if not purchase_id:
+        return
+
+    total_return_val = (
+        db.query(func.coalesce(func.sum(PurchaseReturnItem.line_total), 0.0))
+        .join(PurchaseReturn, PurchaseReturn.id == PurchaseReturnItem.purchase_return_id)
+        .filter(
+            PurchaseReturn.purchase_id == purchase_id,
+            PurchaseReturn.status.notin_(["draft", "cancelled"]),
+        )
+        .scalar()
+    ) or 0.0
+    total_return_val = round(float(total_return_val), 2)
+
+    # 1. Update PurchaseInvoice
+    purchase = db.get(PurchaseInvoice, purchase_id)
+    if purchase:
+        purchase.return_amount = total_return_val
+        total_settled = round((purchase.amount_paid or 0.0) + purchase.return_amount, 2)
+        if total_settled >= (purchase.total or 0.0) and (purchase.total or 0.0) > 0:
+            purchase.payment_status = "paid"
+        elif total_settled > 0:
+            purchase.payment_status = "partially_paid"
+        else:
+            purchase.payment_status = "unpaid"
+
+    # 2. Update linked SupplierInvoices
+    supplier_invoices = (
+        db.query(SupplierInvoice)
+        .filter(SupplierInvoice.purchase_id == purchase_id)
+        .all()
+    )
+    from app.services import supplier_payment_service
+    for sinv in supplier_invoices:
+        sinv.return_amount = total_return_val
+        supplier_payment_service.recalculate_supplier_invoice(db, sinv)
 
 
 def validate_and_build_return_items(
@@ -147,6 +211,33 @@ def validate_and_build_return_items(
             expiry_date=item_in.expiry_date or match_item.expiry_date,
         )
         built_items.append(return_item)
+
+    proposed_return_total = sum(item.line_total for item in built_items)
+    prev_returned_amount = get_previously_returned_amount(
+        db, purchase.id, exclude_return_id=exclude_return_id
+    )
+    sinv_paid = (
+        db.query(func.coalesce(func.sum(SupplierInvoice.amount_paid), 0.0))
+        .filter(
+            SupplierInvoice.purchase_id == purchase.id,
+            SupplierInvoice.status != "cancelled",
+        )
+        .scalar()
+    ) or 0.0
+    effective_paid = max(purchase.amount_paid or 0.0, float(sinv_paid))
+    max_return_allowed = max(
+        round((purchase.total or 0.0) - prev_returned_amount - effective_paid, 2),
+        0.0,
+    )
+    if proposed_return_total > max_return_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Total return value ({proposed_return_total:.2f}) exceeds remaining eligible unpaid balance "
+                f"({max_return_allowed:.2f}) for purchase '{purchase.invoice_number}'. "
+                f"Return cannot exceed remaining unpaid balance."
+            ),
+        )
 
     return built_items
 
@@ -448,6 +539,8 @@ def confirm_purchase_return(
     purchase_return.status = "confirmed"
     purchase_return.confirmed_at = _now()
     purchase_return.confirmed_by = user_id
+    db.flush()
+    recalculate_purchase_and_supplier_invoice_returns(db, purchase_return.purchase_id)
 
     db.commit()
     db.refresh(purchase_return)
@@ -483,6 +576,8 @@ def dispatch_purchase_return(
     purchase_return.status = "dispatched"
     purchase_return.dispatched_at = _now()
     purchase_return.dispatched_by = user_id
+    db.flush()
+    recalculate_purchase_and_supplier_invoice_returns(db, purchase_return.purchase_id)
 
     db.commit()
     db.refresh(purchase_return)
@@ -515,6 +610,8 @@ def complete_purchase_return(
     purchase_return.status = "completed"
     purchase_return.completed_at = _now()
     purchase_return.completed_by = user_id
+    db.flush()
+    recalculate_purchase_and_supplier_invoice_returns(db, purchase_return.purchase_id)
 
     db.commit()
     db.refresh(purchase_return)
@@ -549,6 +646,8 @@ def cancel_purchase_return(
     purchase_return.cancel_reason = cancel_reason
     purchase_return.cancelled_at = _now()
     purchase_return.cancelled_by = user_id
+    db.flush()
+    recalculate_purchase_and_supplier_invoice_returns(db, purchase_return.purchase_id)
 
     db.commit()
     db.refresh(purchase_return)

@@ -50,6 +50,7 @@ class SupplierInvoice(Base):
     grand_total: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
     amount_paid: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    return_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     attachment_url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -71,7 +72,7 @@ class SupplierInvoice(Base):
 
     @property
     def outstanding_amount(self) -> float:
-        return round(max(self.grand_total - (self.amount_paid or 0.0), 0.0), 2)
+        return round(max(self.grand_total - (self.return_amount or 0.0) - (self.amount_paid or 0.0), 0.0), 2)
 
 
 class SupplierInvoiceItem(Base):

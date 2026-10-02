@@ -62,6 +62,7 @@ def build_ap_item(invoice: SupplierInvoice, now: datetime) -> APItemOut:
         invoice_date=invoice.supplier_invoice_date,
         due_date=invoice.due_date,
         grand_total=invoice.grand_total,
+        return_amount=invoice.return_amount or 0.0,
         amount_paid=invoice.amount_paid,
         outstanding_amount=invoice.outstanding_amount,
         payment_status=invoice.payment_status,
@@ -90,7 +91,7 @@ def query_open_payables(
         .filter(
             SupplierInvoice.organization_id == org_id,
             SupplierInvoice.status == "recorded",
-            SupplierInvoice.grand_total > SupplierInvoice.amount_paid,
+            (SupplierInvoice.grand_total - SupplierInvoice.return_amount) > SupplierInvoice.amount_paid,
         )
     )
 

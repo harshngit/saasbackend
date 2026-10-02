@@ -97,6 +97,7 @@ class PurchaseOut(BaseModel):
     tax: float
     total: float
     amount_paid: float
+    return_amount: float = 0.0
     notes: str | None
     attachment_url: str | None
     items: list[PurchaseItemOut] = []
@@ -167,7 +168,7 @@ class PurchaseOut(BaseModel):
 
     @computed_field
     def outstanding_balance(self) -> float:
-        return round(max(self.total - (self.amount_paid or 0.0), 0.0), 2)
+        return round(max(self.total - (getattr(self, "return_amount", 0.0) or 0.0) - (self.amount_paid or 0.0), 0.0), 2)
 
     @field_validator(
         "attachment_url", "supplier_quotation_url", "purchase_order_url",

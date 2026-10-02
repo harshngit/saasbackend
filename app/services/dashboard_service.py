@@ -293,7 +293,7 @@ def _receivables_payables(
         if issued.tzinfo is None:
             issued = issued.replace(tzinfo=timezone.utc)
         if (now - issued).days > DEFAULT_DUE_DAYS:
-            overdue_payables += max((invoice.total or 0) - (invoice.amount_paid or 0), 0)
+            overdue_payables += invoice.outstanding_balance
 
     return ReceivablesPayables(
         receivables=receivables,

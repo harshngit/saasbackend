@@ -82,6 +82,7 @@ class SupplierInvoiceOut(BaseModel):
     tax_amount: float
     discount_amount: float
     grand_total: float
+    return_amount: float = 0.0
     amount_paid: float
     outstanding_amount: float
     notes: str | None = None

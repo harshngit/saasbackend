@@ -12,6 +12,7 @@ class APItemOut(BaseModel):
     invoice_date: datetime
     due_date: datetime | None = None
     grand_total: float
+    return_amount: float = 0.0
     amount_paid: float
     outstanding_amount: float
     payment_status: str
