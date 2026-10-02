@@ -152,12 +152,62 @@ def _sales_return(db, org_id, df, dt):
 
 
 def _purchase_return(db, org_id, df, dt):
-    q = _between(db.query(PurchaseInvoice).filter(PurchaseInvoice.organization_id == org_id, PurchaseInvoice.status == "cancelled"),
-                 PurchaseInvoice.updated_at, df, dt).order_by(PurchaseInvoice.updated_at)
-    invs = q.all()
-    rows = [{"date": i.updated_at.date().isoformat(), "invoice_number": i.invoice_number,
-             "supplier": i.supplier.name if i.supplier else None, "amount": i.total} for i in invs]
-    return {"summary": {"total_returns": round(sum(i.total for i in invs), 2), "count": len(invs)}, "rows": rows}
+    from app.models.purchase_return import PurchaseReturn
+
+    q = _between(
+        db.query(PurchaseReturn).filter(
+            PurchaseReturn.organization_id == org_id,
+            PurchaseReturn.status.in_(("confirmed", "dispatched", "completed")),
+        ),
+        PurchaseReturn.return_date,
+        df,
+        dt,
+    ).order_by(PurchaseReturn.return_date.desc())
+    returns = q.all()
+
+    if returns:
+        rows = [
+            {
+                "date": r.return_date.date().isoformat() if hasattr(r.return_date, "date") else str(r.return_date)[:10],
+                "return_number": r.return_number,
+                "invoice_number": r.purchase.invoice_number if r.purchase else None,
+                "supplier": r.supplier.name if r.supplier else None,
+                "quantity": r.total_return_qty,
+                "amount": r.total_amount,
+                "status": r.status,
+            }
+            for r in returns
+        ]
+        return {
+            "summary": {
+                "total_returns": round(sum(r.total_amount for r in returns), 2),
+                "count": len(returns),
+            },
+            "rows": rows,
+        }
+
+    q_legacy = _between(
+        db.query(PurchaseInvoice).filter(
+            PurchaseInvoice.organization_id == org_id, PurchaseInvoice.status == "cancelled"
+        ),
+        PurchaseInvoice.updated_at,
+        df,
+        dt,
+    ).order_by(PurchaseInvoice.updated_at)
+    invs = q_legacy.all()
+    rows = [
+        {
+            "date": i.updated_at.date().isoformat(),
+            "invoice_number": i.invoice_number,
+            "supplier": i.supplier.name if i.supplier else None,
+            "amount": i.total,
+        }
+        for i in invs
+    ]
+    return {
+        "summary": {"total_returns": round(sum(i.total for i in invs), 2), "count": len(invs)},
+        "rows": rows,
+    }
 
 
 def _profit_loss(db, org_id, df, dt):

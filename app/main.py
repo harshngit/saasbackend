@@ -94,6 +94,7 @@ from app.routers import (
     quotations,
     payment_receipts,
     sales_returns,
+    purchase_returns,
     transfers,
     companies,
     websocket,
@@ -271,6 +272,7 @@ app.include_router(leads.router)
 app.include_router(quotations.router)
 app.include_router(payment_receipts.router)
 app.include_router(sales_returns.router)
+app.include_router(purchase_returns.router)
 app.include_router(visits.router)
 app.include_router(follow_ups.router)
 app.include_router(leaves.router)

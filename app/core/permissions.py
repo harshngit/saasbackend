@@ -44,6 +44,7 @@ MODULES: list[str] = [
     "supplier_invoices",
     "supplier_payments",
     "accounts_payable",
+    "purchase_returns",
 ]
 
 # Friendlier names callers may send for a module, mapped to its canonical key. The
@@ -63,6 +64,7 @@ MODULE_ALIASES: dict[str, str] = {
     "expense": "expenses",
     "delivery": "deliveries",
     "purchase": "purchases",
+    "purchase_return": "purchase_returns",
     "goods_receipt": "grn",
     "goods_receipt_note": "grn",
     "returns": "sales_returns",
@@ -93,6 +95,7 @@ MODULE_LABELS: dict[str, str] = {
     "sales_orders": "Sales Orders",
     "sales_returns": "Sales Returns",
     "purchases": "Purchases",
+    "purchase_returns": "Purchase Returns",
     "grn": "Goods Receipts (GRN)",
     "deliveries": "Deliveries",
     "invoices": "Invoices",

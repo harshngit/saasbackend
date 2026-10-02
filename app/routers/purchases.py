@@ -19,7 +19,7 @@ from app.models import (
     User,
     Warehouse,
 )
-from app.services import numbering_service, lookup_service, purchase_service, stock_service, supplier_invoice_service
+from app.services import numbering_service, lookup_service, purchase_return_service, purchase_service, stock_service, supplier_invoice_service
 from app.schemas.purchase import (
     BulkDelete,
     BulkDeleteResult,
@@ -563,53 +563,19 @@ def purchase_return(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
-    """Return items to the supplier: removes stock and reduces the supplier's payable."""
+    """Return items to the supplier: creates a canonical PurchaseReturn, removes stock, and reduces the supplier's payable."""
     org_id = _org_id(user)
     inv = _owned(db, id, org_id)
     if inv.status not in ("approved", "confirmed"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only confirmed purchases can be returned")
 
-    reversed_value = 0.0
-    for ri in payload.items:
-        match = next((i for i in inv.items if i.product_id == ri.product_id and i.variant_id == ri.variant_id), None)
-        price = match.purchase_price if match else 0
-        if ri.variant_id:
-            variant = db.get(ProductVariant, ri.variant_id)
-            if variant is None:
-                continue
-            new_bal = (variant.inventory or 0) - ri.quantity
-            if new_bal < 0:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot return more than in stock")
-            variant.inventory = new_bal
-        else:
-            product = db.get(Product, ri.product_id) if ri.product_id else None
-            if product is None:
-                continue
-            new_bal = (product.total_inventory or 0) - ri.quantity
-            if new_bal < 0:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot return more than in stock")
-            product.total_inventory = new_bal
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                product_id=ri.product_id,
-                variant_id=ri.variant_id,
-                movement_type="purchase_return",
-                quantity=-ri.quantity,
-                balance_after=new_bal,
-                note=f"Return on {inv.invoice_number}" + (f" — {payload.reason}" if payload.reason else ""),
-                created_by=user.id,
-            )
-        )
-        reversed_value += price * ri.quantity
-
-    if inv.supplier_id and reversed_value:
-        supplier = db.get(Supplier, inv.supplier_id)
-        if supplier:
-            supplier.total_purchases = round((supplier.total_purchases or 0) - reversed_value, 2)
-
-    db.commit()
+    items_data = [
+        {"product_id": ri.product_id, "variant_id": ri.variant_id, "quantity": ri.quantity}
+        for ri in payload.items
+    ]
+    purchase_return_service.process_legacy_purchase_return(
+        db, org_id, inv, items_data, payload.reason, user
+    )
     db.refresh(inv)
     return inv
 
