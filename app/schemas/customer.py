@@ -227,7 +227,14 @@ class CustomerPaymentOut(BaseModel):
     card_type: str | None = None
     card_last_four: str | None = None
     collection_instructions: str | None = None
+    payment_proof_url: str | None = None
     splits: list[PaymentSplitOut] = Field(default_factory=list)
+
+    @field_validator("payment_proof_url", mode="after")
+    @classmethod
+    def _normalize_payment_proof(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
     @model_validator(mode="before")
     @classmethod
@@ -281,6 +288,7 @@ class CustomerPaymentOut(BaseModel):
                 "card_type": getattr(data, "card_type", None),
                 "card_last_four": getattr(data, "card_last_four", None),
                 "collection_instructions": getattr(data, "collection_instructions", None),
+                "payment_proof_url": getattr(data, "payment_proof_url", None),
                 "splits": getattr(data, "splits", []),
             }
         return data

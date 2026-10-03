@@ -117,6 +117,20 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             out.delivery_id = latest_del.id
             out.delivery_number = latest_del.delivery_note_number
 
+    # Populate Delivery Proof URL
+    from app.core.files import normalize_file_url
+    if order.delivery_proof_url:
+        out.delivery_proof_url = normalize_file_url(order.delivery_proof_url)
+    elif out.delivery_id:
+        deliv = db.get(Delivery, out.delivery_id)
+        if deliv and deliv.pod_photo_file_ids:
+            first_pod = deliv.pod_photo_file_ids[0]
+            out.delivery_proof_url = normalize_file_url(str(first_pod))
+        else:
+            out.delivery_proof_url = None
+    else:
+        out.delivery_proof_url = None
+
     if not out.invoice_id:
         latest_inv = (
             db.query(Invoice)
@@ -622,6 +636,7 @@ def create_order(
                     order_id=order.id,
                     note=f"Payment recorded during order creation ({order.order_number})",
                     collected_by_user_id=user.id,
+                    payment_proof_url=payload.payment_proof_url,
                 )
             except ValueError as err:
                 raise HTTPException(
@@ -651,6 +666,8 @@ def create_order(
         order.pickup_status = "collected"
         order.collected_by = payload.notes or (customer.name if customer else None)
         order.collected_at = datetime.now(timezone.utc)
+        if payload.delivery_proof_url:
+            order.delivery_proof_url = payload.delivery_proof_url
         order.status = "completed"
         order.fulfilment_status = "delivered"
 
@@ -1086,6 +1103,8 @@ def confirm_order_pickup(
             order.collected_by = payload.collected_by
         if payload.notes:
             order.pickup_notes = payload.notes
+        if payload.delivery_proof_url:
+            order.delivery_proof_url = payload.delivery_proof_url
     order.collected_at = datetime.now(timezone.utc)
     order.stock_deducted = True
 
@@ -1201,8 +1220,9 @@ def record_order_payment(
 
     pay_mode = payload.payment_method or payload.payment_mode or "cash"
 
+    payment = None
     try:
-        payment_service.record(
+        payment = payment_service.record(
             db,
             org_id,
             customer=customer,
@@ -1213,6 +1233,7 @@ def record_order_payment(
             note=payload.notes or f"Payment for order {order.order_number}",
             order_id=order.id,
             received_on=received_on or datetime.now(timezone.utc),
+            payment_proof_url=payload.payment_proof_url,
         )
     except ValueError as err:
         raise HTTPException(
@@ -1235,5 +1256,6 @@ def record_order_payment(
         paid_amount=paid_amount,
         remaining_amount=remaining_amount,
         payment_status=pay_status,
+        payment_proof_url=payment.payment_proof_url if payment else None,
     )
 

@@ -93,6 +93,9 @@ class PaymentReceiptCreate(BaseModel):
     collection_instructions: str | None = Field(
         default=None, description="For payment_method='cod' — where/how to collect"
     )
+    payment_proof_url: str | None = Field(
+        default=None, description="Proof of payment screenshot URL or file_id"
+    )
 
     @field_validator("card_last_four")
     @classmethod
@@ -120,6 +123,7 @@ class PaymentReceiptUpdate(BaseModel):
     card_type: str | None = Field(default=None, max_length=30)
     card_last_four: str | None = Field(default=None, max_length=4)
     collection_instructions: str | None = None
+    payment_proof_url: str | None = None
 
     @field_validator("card_last_four")
     @classmethod
@@ -144,6 +148,7 @@ class PaymentReceiptOut(BaseModel):
     payment_method: str | None
     transaction_reference: str | None
     note: str | None = None
+    payment_proof_url: str | None = None
 
     # Method-specific details, persisted alongside the payment.
     upi_id: str | None = None
@@ -170,6 +175,12 @@ class PaymentReceiptOut(BaseModel):
     collected_by_user_id: str | None = None
     collector: dict | None = None
     splits: list[PaymentSplitOut] = Field(default_factory=list)
+
+    @field_validator("payment_proof_url", mode="after")
+    @classmethod
+    def _normalize_payment_proof(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
     @model_validator(mode="after")
     def _populate_aliases(self) -> "PaymentReceiptOut":

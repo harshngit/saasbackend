@@ -200,6 +200,11 @@ class OrderOut(BaseModel):
     invoice_id: str | None = None
     invoice_number: str | None = None
 
+    # Proof Screenshots
+    delivery_proof_url: str | None = Field(
+        default=None, description="Unified delivery proof screenshot URL (Home delivery POD photo or pickup proof)"
+    )
+
     # Individual payment history for this order
     payments: list[CustomerPaymentOut] = Field(default_factory=list)
 
@@ -258,6 +263,8 @@ class OrderCreate(BaseModel):
     payment_status: str | None = Field(default=None, description="paid | partial | pending")
     paid_amount: float | None = Field(default=None, ge=0)
     payment_method: str | None = Field(default=None, description="cash | credit | upi | card | bank_transfer | …")
+    payment_proof_url: str | None = Field(default=None, description="Proof of payment screenshot URL or file_id")
+    delivery_proof_url: str | None = Field(default=None, description="Proof of delivery screenshot URL or file_id")
     delivery_partner_id: str | None = Field(default=None)
     vehicle_id: str | None = Field(default=None)
 
@@ -389,6 +396,9 @@ class PickupConfirmRequest(BaseModel):
     items: list[PickupItemConfirm] | None = None
     collected_by: str | None = Field(default=None, max_length=150)
     notes: str | None = Field(default=None, max_length=500)
+    delivery_proof_url: str | None = Field(
+        default=None, description="Proof of delivery / pickup screenshot URL or file_id"
+    )
 
 
 class OrderPaymentCreate(BaseModel):
@@ -398,6 +408,9 @@ class OrderPaymentCreate(BaseModel):
     reference: str | None = Field(default=None, max_length=150)
     notes: str | None = Field(default=None, max_length=1000)
     payment_date: datetime | str | None = Field(default=None, description="Date/time when payment was received")
+    payment_proof_url: str | None = Field(
+        default=None, description="File URL or ID of payment proof screenshot"
+    )
 
     @field_validator("amount")
     @classmethod
@@ -415,6 +428,13 @@ class OrderPaymentSummary(BaseModel):
     paid_amount: float
     remaining_amount: float
     payment_status: str
+    payment_proof_url: str | None = None
+
+    @field_validator("payment_proof_url", mode="after")
+    @classmethod
+    def _normalize_proof(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class BulkDelete(BaseModel):

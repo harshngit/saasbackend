@@ -371,6 +371,9 @@ class DeliveryConfirm(BaseModel):
     items: list[DeliveryConfirmItem] = Field(default_factory=list)
     pod_photo_file_ids: list[str] = Field(
         default_factory=list, description="file_ids from POST /files/upload")
+    delivery_proof_url: str | None = Field(
+        default=None, description="Single delivery proof screenshot / photo URL or file_id"
+    )
     signature_file_id: str | None = None
     receiver_name: str | None = Field(
         default=None, max_length=150, description="Who physically accepted the goods"
@@ -389,6 +392,8 @@ class DeliveryConfirm(BaseModel):
             raise ValueError("failure_reason is required when failed is true")
         if not self.failed and not self.items:
             raise ValueError("Send the delivered quantities, or set failed with a reason")
+        if self.delivery_proof_url and self.delivery_proof_url not in self.pod_photo_file_ids:
+            self.pod_photo_file_ids.append(self.delivery_proof_url)
         return self
 
 

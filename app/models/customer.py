@@ -205,6 +205,8 @@ class CustomerPayment(Base):
     collected_by_user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Proof of payment screenshot / image URL (e.g. /files/{id} from POST /files/upload)
+    payment_proof_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # Loaded with the payment so history rows carry the invoice number, not just its id.
     invoice: Mapped["Invoice | None"] = relationship(lazy="selectin")  # noqa: F821

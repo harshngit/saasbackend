@@ -67,6 +67,8 @@ class SalesOrder(Base):
     collected_by: Mapped[str | None] = mapped_column(String(150), nullable=True)
     collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pickup_notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Proof of delivery / pickup screenshot URL for pickup/takeaway orders (e.g. /files/{id})
+    delivery_proof_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     payment_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     payment_terms_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quotation_id: Mapped[str | None] = mapped_column(
