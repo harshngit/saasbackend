@@ -466,12 +466,182 @@ def run_stock_concurrency_test():
     log_test("No overselling: available stock is 0 after the race", stock_after["available"] == 0, stock_after)
 
 
+def run_delivery_partner_assignment_notification_tests(ctx):
+    print("\n--- Running Delivery Partner Assignment Notification Tests ---")
+    admin_auth = ctx["admin_auth"]
+
+    # Create two dedicated delivery partners for notification tests
+    partner_a_id, partner_a_auth = _create_staff(admin_auth, "Partner A", "Delivery Partner")
+    partner_b_id, partner_b_auth = _create_staff(admin_auth, "Partner B", "Delivery Partner")
+
+    # Initial state: 0 notifications for both
+    r_a = client.get("/notifications", headers=partner_a_auth)
+    assert r_a.status_code == 200, r_a.text
+    log_test("Partner A initial notification count is 0", len(r_a.json()) == 0)
+
+    # 1. Create a confirmed order and plan delivery via POST /deliveries assigned to Partner A
+    order_res = client.post(
+        "/orders",
+        json={"customer_id": ctx["cust_id"], "warehouse_id": ctx["wh_id"],
+              "items": [{"product_id": ctx["prod_id"], "quantity": 2, "unit_price": 100.0}]},
+        headers=admin_auth,
+    )
+    assert order_res.status_code == 201, order_res.text
+    order_id = order_res.json()["id"]
+    client.post(f"/orders/{order_id}/confirm", headers=admin_auth)
+
+    plan_res = client.post(
+        "/deliveries",
+        json={"order_id": order_id, "delivery_partner_id": partner_a_id},
+        headers=admin_auth,
+    )
+    assert plan_res.status_code == 201, plan_res.text
+    delivery = plan_res.json()
+    delivery_id = delivery["id"]
+    delivery_num = delivery["delivery_number"]
+
+    # 1a. Verify Partner A received exactly 1 notification
+    notifs_a = client.get("/notifications", headers=partner_a_auth).json()
+    unread_a = client.get("/notifications/unread-count", headers=partner_a_auth).json()
+    log_test("POST /deliveries: Partner A gets exactly 1 Notification", len(notifs_a) == 1)
+    log_test("Partner A unread count is 1", unread_a.get("unread") == 1)
+    if notifs_a:
+        n = notifs_a[0]
+        log_test("Notification title is 'New delivery assigned'", n["title"] == "New delivery assigned")
+        log_test("Notification body matches initial assignment format", n["body"] == f"Delivery {delivery_num} has been assigned to you")
+        log_test("Notification type is 'delivery'", n["type"] == "delivery")
+        log_test("Notification link is delivery.id", n["link"] == delivery_id)
+        from app.core.database import SessionLocal
+        from app.models import Notification
+        with SessionLocal() as db_sess:
+            notif_row = db_sess.get(Notification, n["id"])
+            log_test("Notification user_id in DB is Partner A", notif_row.user_id == partner_a_id)
+            log_test("Notification organization_id in DB is correct", notif_row.organization_id is not None)
+
+    # 2. Verify Partner B received 0 notifications
+    notifs_b = client.get("/notifications", headers=partner_b_auth).json()
+    log_test("Partner B receives 0 notifications on Partner A initial assignment", len(notifs_b) == 0)
+
+    # 3. Normal Reassignment via PATCH /deliveries/by-id/{id}: A -> B
+    reassign_res = client.patch(
+        f"/deliveries/by-id/{delivery_id}",
+        json={"delivery_partner_id": partner_b_id},
+        headers=admin_auth,
+    )
+    assert reassign_res.status_code == 200, reassign_res.text
+
+    # 3a. Partner B gets exactly 1 new notification
+    notifs_b = client.get("/notifications", headers=partner_b_auth).json()
+    unread_b = client.get("/notifications/unread-count", headers=partner_b_auth).json()
+    log_test("PATCH /deliveries: Partner B gets exactly 1 new Notification on reassignment", len(notifs_b) == 1)
+    log_test("Partner B unread count is 1", unread_b.get("unread") == 1)
+    if notifs_b:
+        n_b = notifs_b[0]
+        log_test("Reassignment notification title is 'New delivery assigned'", n_b["title"] == "New delivery assigned")
+        log_test("Reassignment body format is correct", n_b["body"] == f"Delivery {delivery_num} has been reassigned to you")
+        log_test("Reassignment link is delivery.id", n_b["link"] == delivery_id)
+        with SessionLocal() as db_sess:
+            notif_row_b = db_sess.get(Notification, n_b["id"])
+            log_test("Reassignment user_id in DB is Partner B", notif_row_b.user_id == partner_b_id)
+
+    # 4. Old Partner A receives NO new notification
+    notifs_a_after = client.get("/notifications", headers=partner_a_auth).json()
+    log_test("Old Partner A gets no new notification on reassignment to B", len(notifs_a_after) == 1)
+
+    # 5. PATCH /deliveries no-op: B -> B
+    noop_res = client.patch(
+        f"/deliveries/by-id/{delivery_id}",
+        json={"delivery_partner_id": partner_b_id, "notes": "some new notes"},
+        headers=admin_auth,
+    )
+    assert noop_res.status_code == 200, noop_res.text
+    notifs_b_noop = client.get("/notifications", headers=partner_b_auth).json()
+    log_test("PATCH /deliveries no-op (B -> B) produces no duplicate notification", len(notifs_b_noop) == 1)
+
+    # 8. Rejected -> Planned reassignment test (Single notification guarantee)
+    # Partner B rejects the delivery
+    reject_res = client.post(f"/deliveries/{delivery_id}/reject", json={"reason": "Cannot deliver today"}, headers=partner_b_auth)
+    assert reject_res.status_code == 200, reject_res.text
+
+    # Dispatcher reassigns to Partner A from rejected state
+    replan_res = client.patch(
+        f"/deliveries/by-id/{delivery_id}",
+        json={"status": "planned", "delivery_partner_id": partner_a_id},
+        headers=admin_auth,
+    )
+    assert replan_res.status_code == 200, replan_res.text
+
+    # Verify Partner A received exactly 1 new notification (total 2 now, exactly 1 from this action)
+    notifs_a_replan = client.get("/notifications", headers=partner_a_auth).json()
+    log_test("Rejected -> planned reassignment creates exactly ONE new notification for Partner A (total 2)", len(notifs_a_replan) == 2)
+    newest_notif_a = notifs_a_replan[0] if notifs_a_replan[0]["id"] != notifs_a[0]["id"] else notifs_a_replan[1]
+    log_test("Rejected -> planned notification body is 'reassigned'", "has been reassigned to you" in newest_notif_a["body"])
+
+    # 6 & 7. Order-side assign-delivery-partner tests
+    order2_res = client.post(
+        "/orders",
+        json={"customer_id": ctx["cust_id"], "warehouse_id": ctx["wh_id"],
+              "items": [{"product_id": ctx["prod_id"], "quantity": 1, "unit_price": 100.0}]},
+        headers=admin_auth,
+    )
+    assert order2_res.status_code == 201, order2_res.text
+    order2_id = order2_res.json()["id"]
+    client.post(f"/orders/{order2_id}/confirm", headers=admin_auth)
+
+    # Order-side initial assignment (creates new delivery and notifies partner A)
+    count_a_before = len(client.get("/notifications", headers=partner_a_auth).json())
+    order_assign_res = client.patch(
+        f"/orders/{order2_id}/assign-delivery-partner",
+        json={"delivery_partner_id": partner_a_id},
+        headers=admin_auth,
+    )
+    assert order_assign_res.status_code == 200, order_assign_res.text
+    notifs_a_order = client.get("/notifications", headers=partner_a_auth).json()
+    log_test("Order-side assign-delivery-partner: Partner A gets exactly 1 new notification", len(notifs_a_order) == count_a_before + 1)
+
+    # Order-side reassignment: A -> B
+    count_b_before = len(client.get("/notifications", headers=partner_b_auth).json())
+    order_reassign_res = client.patch(
+        f"/orders/{order2_id}/assign-delivery-partner",
+        json={"delivery_partner_id": partner_b_id},
+        headers=admin_auth,
+    )
+    assert order_reassign_res.status_code == 200, order_reassign_res.text
+    notifs_b_order = client.get("/notifications", headers=partner_b_auth).json()
+    notifs_a_after_order_reassign = client.get("/notifications", headers=partner_a_auth).json()
+    log_test("Order-side reassignment: Partner B gets exactly 1 new notification", len(notifs_b_order) == count_b_before + 1)
+    log_test("Order-side reassignment: Old Partner A gets no new notification", len(notifs_a_after_order_reassign) == len(notifs_a_order))
+
+    # Order-side no-op: B -> B
+    client.patch(
+        f"/orders/{order2_id}/assign-delivery-partner",
+        json={"delivery_partner_id": partner_b_id},
+        headers=admin_auth,
+    )
+    notifs_b_noop_order = client.get("/notifications", headers=partner_b_auth).json()
+    log_test("Order-side no-op (B -> B) produces no new notification", len(notifs_b_noop_order) == len(notifs_b_order))
+
+    # 11. Cross-organization assignment safety
+    org2_auth = _register_org("CrossOrg")
+    partner_c_id, partner_c_auth = _create_staff(org2_auth, "Partner C", "Delivery Partner")
+
+    cross_assign_res = client.patch(
+        f"/deliveries/by-id/{delivery_id}",
+        json={"delivery_partner_id": partner_c_id},
+        headers=admin_auth,
+    )
+    log_test("Cross-organization delivery assignment is rejected (HTTP 400)", cross_assign_res.status_code == 400)
+    notifs_c = client.get("/notifications", headers=partner_c_auth).json()
+    log_test("Cross-org Partner C receives 0 notifications", len(notifs_c) == 0)
+
+
 if __name__ == "__main__":
     ctx = run_lifecycle_tests()
     run_invalid_transition_tests(ctx)
     run_legacy_endpoint_tests(ctx)
     run_permission_matrix_tests(ctx)
     run_stock_concurrency_test()
+    run_delivery_partner_assignment_notification_tests(ctx)
 
     print("\n=======================================================")
     print(f"RESULTS: {PASSED} passed, {FAILED} failed")

@@ -39,7 +39,7 @@ from app.models import (
     VehicleLoadingItem,
 )
 from app.services.tracking_service import TrackingError
-from app.services import numbering_service, stock_service
+from app.services import notification_service, numbering_service, stock_service
 
 
 def _require_transition(current: str, new: str) -> None:
@@ -118,6 +118,35 @@ def record_history(
     )
     db.add(entry)
     return entry
+
+
+def notify_delivery_assignment(
+    db: Session,
+    delivery: Delivery,
+    new_partner_id: str | None,
+    previous_partner_id: str | None = None,
+    is_reassignment: bool | None = None,
+) -> None:
+    """Send an assignment or reassignment notification to the new delivery partner."""
+    if not new_partner_id or (previous_partner_id and previous_partner_id == new_partner_id):
+        return
+
+    delivery_num = delivery.delivery_number or delivery.delivery_note_number or "assigned"
+    reassigned = is_reassignment if is_reassignment is not None else bool(previous_partner_id)
+    if reassigned:
+        body = f"Delivery {delivery_num} has been reassigned to you"
+    else:
+        body = f"Delivery {delivery_num} has been assigned to you"
+
+    return notification_service.notify(
+        db,
+        user_id=new_partner_id,
+        title="New delivery assigned",
+        body=body,
+        type="delivery",
+        link=delivery.id,
+        organization_id=delivery.organization_id,
+    )
 
 
 def _approved_leave_on(db: Session, org_id: str, partner_id: str, on_date) -> Leave | None:

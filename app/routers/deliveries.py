@@ -281,18 +281,12 @@ def plan_delivery(
         ),
     )
     if partner is not None:
-        try:
-            notification_service.notify(
-                db,
-                user_id=partner.id,
-                title="New delivery assigned",
-                body=f"Delivery {delivery.delivery_number} needs your acceptance",
-                type="delivery",
-                link=delivery.id,
-                organization_id=org_id,
-            )
-        except Exception:
-            pass
+        delivery_service.notify_delivery_assignment(
+            db,
+            delivery=delivery,
+            new_partner_id=partner.id,
+            previous_partner_id=None,
+        )
     db.commit()
     db.refresh(delivery)
     return _delivery_out(db, delivery)
@@ -480,6 +474,7 @@ def update_delivery(
             )
 
     new_status = data.pop("status", None)
+    was_rejected = (delivery.status == "rejected")
     previous_partner_id = delivery.delivery_partner_id
     for field, value in data.items():
         setattr(delivery, field, value)
@@ -492,6 +487,14 @@ def update_delivery(
                 "delivery_partner_id": delivery.delivery_partner_id,
             },
         )
+        if delivery.delivery_partner_id:
+            delivery_service.notify_delivery_assignment(
+                db,
+                delivery=delivery,
+                new_partner_id=delivery.delivery_partner_id,
+                previous_partner_id=previous_partner_id,
+                is_reassignment=was_rejected or bool(previous_partner_id),
+            )
 
     if new_status == "in_transit":
         delivery_service.dispatch(db, user, delivery)
@@ -509,20 +512,6 @@ def update_delivery(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="A new delivery partner is required to reassign a rejected delivery",
                 )
-            new_partner = db.get(User, partner_id)
-            if new_partner:
-                try:
-                    notification_service.notify(
-                        db,
-                        user_id=new_partner.id,
-                        title="New delivery assigned",
-                        body=f"Delivery {delivery.delivery_number} has been reassigned to you",
-                        type="delivery",
-                        link=delivery.id,
-                        organization_id=org_id,
-                    )
-                except Exception:
-                    pass
         delivery.status = "planned"
 
     db.commit()

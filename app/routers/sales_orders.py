@@ -595,7 +595,7 @@ def create_order(
     # Home Delivery creation
     if fulfilment_method == "delivery":
         partner_obj = db.get(User, payload.delivery_partner_id) if payload.delivery_partner_id else None
-        delivery_service.plan(
+        created_delivery = delivery_service.plan(
             db,
             user,
             order,
@@ -607,6 +607,13 @@ def create_order(
             notes=payload.notes,
             wanted=None,
         )
+        if partner_obj is not None:
+            delivery_service.notify_delivery_assignment(
+                db,
+                delivery=created_delivery,
+                new_partner_id=partner_obj.id,
+                previous_partner_id=None,
+            )
 
     # Automatic Invoice Generation
     from app.routers.invoices import generate_from_order
@@ -834,12 +841,24 @@ def assign_delivery_partner(
                     db, delivery, "reassigned" if previous_partner_id else "assigned", actor=user,
                     metadata={"previous_delivery_partner_id": previous_partner_id, "delivery_partner_id": partner.id},
                 )
+                delivery_service.notify_delivery_assignment(
+                    db,
+                    delivery=delivery,
+                    new_partner_id=partner.id,
+                    previous_partner_id=previous_partner_id,
+                )
     else:
         try:
-            delivery_service.plan(
+            created_delivery = delivery_service.plan(
                 db, user, order, partner,
                 vehicle_id=None, warehouse_id=None, scheduled_date=None,
                 delivery_address=None, notes=None, wanted=None,
+            )
+            delivery_service.notify_delivery_assignment(
+                db,
+                delivery=created_delivery,
+                new_partner_id=partner.id,
+                previous_partner_id=None,
             )
         except HTTPException:
             # Nothing outstanding to plan (already delivered, or fully planned
