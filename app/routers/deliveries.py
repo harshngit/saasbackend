@@ -214,12 +214,14 @@ def _delivery_out(db: Session, delivery: Delivery, include_timeline: bool = Fals
         line_out.uom = prod.uom if prod and prod.uom else None
         line_out.weight_kg = delivery_service.compute_weight_kg(prod, var)
         if resolved_wh and line_out.product_id:
-            try:
-                line_out.warehouse_available = stock_service.available(
-                    db, resolved_wh.id, line_out.product_id, line_out.variant_id
-                )
-            except Exception:
-                line_out.warehouse_available = None
+            line_out.warehouse_available = delivery_service.available_for_delivery_line(
+                db,
+                resolved_wh.id,
+                delivery,
+                orm_item,
+                line_out.product_id,
+                line_out.variant_id,
+            )
         else:
             line_out.warehouse_available = None
 

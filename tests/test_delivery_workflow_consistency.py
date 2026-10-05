@@ -638,7 +638,8 @@ def run_delivery_partner_assignment_notification_tests(ctx):
 def run_vehicle_loading_production_fix_tests():
     print("\n--- Running Vehicle Loading Production Fix Tests ---")
     from app.core.database import SessionLocal
-    from app.models import Delivery, DeliveryItem, SalesOrder, Product, Warehouse, Vehicle
+    from app.models import Delivery, DeliveryItem, SalesOrder, Product, Warehouse, Vehicle, VehicleLoading, VehicleLoadingItem
+    from app.services import stock_service
     from sqlalchemy.orm import lazyload
 
     admin_auth = _register_org("VehLoad")
@@ -740,11 +741,60 @@ def run_vehicle_loading_production_fix_tests():
     loaded_data = load_res.json()
     log_test("Single load response contains warehouse object", loaded_data.get("warehouse") is not None and loaded_data["warehouse"]["name"] == "Central Depot")
 
-    # 4. Repeated Single Load Idempotency
+    # 4. Repeated Single Load Idempotency & Non-Destructive Invariants
+    # Record baseline state before repeat call
+    db_chk = SessionLocal()
+    try:
+        wh_stock_before = stock_service.on_hand(db_chk, wh_id, prod_id, None)
+        veh_loadings_before = db_chk.query(VehicleLoading).filter(VehicleLoading.organization_id == del1_data["organization_id"]).count()
+        veh_loading_items_before = db_chk.query(VehicleLoadingItem).count()
+        del_item_before = db_chk.get(DeliveryItem, del1_data["items"][0]["id"])
+        loaded_qty_before = del_item_before.loaded_quantity
+    finally:
+        db_chk.close()
+
     repeat_res = client.post(f"/deliveries/{del1_id}/load", headers=admin_auth)
     log_test("Repeated single load on fully loaded delivery returns HTTP 400", repeat_res.status_code == 400)
+    log_test("Repeated single load returns readable error message", "cannot transition from loaded to loaded" in repeat_res.json().get("detail", "") or "already loaded" in repeat_res.json().get("detail", ""))
 
-    # 5. Delivery Warehouse Fallback Hierarchy: delivery.warehouse_id -> order.warehouse_id -> org default warehouse
+    db_chk2 = SessionLocal()
+    try:
+        wh_stock_after = stock_service.on_hand(db_chk2, wh_id, prod_id, None)
+        veh_loadings_after = db_chk2.query(VehicleLoading).filter(VehicleLoading.organization_id == del1_data["organization_id"]).count()
+        veh_loading_items_after = db_chk2.query(VehicleLoadingItem).count()
+        del_item_after = db_chk2.get(DeliveryItem, del1_data["items"][0]["id"])
+        loaded_qty_after = del_item_after.loaded_quantity
+    finally:
+        db_chk2.close()
+
+    log_test("Repeated single load leaves warehouse stock unchanged", wh_stock_before == wh_stock_after)
+    log_test("Repeated single load creates no duplicate vehicle loadings", veh_loadings_before == veh_loadings_after)
+    log_test("Repeated single load creates no duplicate vehicle loading items", veh_loading_items_before == veh_loading_items_after)
+    log_test("Repeated single load leaves loaded_quantity unchanged", loaded_qty_before == loaded_qty_after)
+
+    # 5. Delivery Warehouse Hierarchy & Fallback Rules:
+    # Rule 1: Delivery warehouse wins over order warehouse
+    wh2_res = client.post("/warehouses", json={"name": "Secondary Depot"}, headers=admin_auth)
+    wh2_id = wh2_res.json()["id"]
+    client.post(f"/warehouses/{wh2_id}/stock/adjust", json={"product_id": prod_id, "quantity": 50}, headers=admin_auth)
+
+    order_wh_test = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order_wh_test_id = order_wh_test.json()["id"]
+    client.post(f"/orders/{order_wh_test_id}/confirm", headers=admin_auth)
+
+    del_explicit_wh = client.post(
+        "/deliveries",
+        json={"order_id": order_wh_test_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id, "warehouse_id": wh2_id},
+        headers=admin_auth,
+    ).json()
+    del_explicit_data = client.get(f"/deliveries/by-id/{del_explicit_wh['id']}", headers=admin_auth).json()
+    log_test("Explicit delivery.warehouse_id wins over order.warehouse_id", del_explicit_data.get("warehouse") is not None and del_explicit_data["warehouse"]["id"] == wh2_id)
+
+    # Rule 2: Delivery warehouse NULL + order warehouse exists -> order warehouse used
     order2 = client.post(
         "/orders",
         json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 50.0}]},
@@ -753,7 +803,6 @@ def run_vehicle_loading_production_fix_tests():
     order2_id = order2.json()["id"]
     client.post(f"/orders/{order2_id}/confirm", headers=admin_auth)
 
-    # Plan delivery with explicit warehouse_id = None
     del2 = client.post(
         "/deliveries",
         json={"order_id": order2_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id, "warehouse_id": None},
@@ -763,7 +812,218 @@ def run_vehicle_loading_production_fix_tests():
     del2_data = client.get(f"/deliveries/by-id/{del2_id}", headers=admin_auth).json()
     log_test("Warehouse fallback resolves warehouse from order when delivery.warehouse_id is null", del2_data.get("warehouse") is not None and del2_data["warehouse"]["id"] == wh_id)
 
-    # 6. Insufficient Stock Readable HTTP 400
+    # Rule 3 & 4: Delivery warehouse NULL + order warehouse NULL -> HTTP 400 (Org default MUST NOT rescue)
+    db_no_wh = SessionLocal()
+    try:
+        # Create an order with warehouse_id = None
+        ord_no_wh = SalesOrder(
+            organization_id=del1_data["organization_id"],
+            customer_id=cust_id,
+            warehouse_id=None,
+            status="confirmed",
+            fulfilment_status="planned",
+            order_number=f"ORD-NOWH-{uuid.uuid4().hex[:4]}",
+        )
+        db_no_wh.add(ord_no_wh)
+        db_no_wh.flush()
+
+        del_no_wh = Delivery(
+            organization_id=del1_data["organization_id"],
+            sales_order_id=ord_no_wh.id,
+            delivery_partner_id=dp_id,
+            vehicle_id=veh_id,
+            warehouse_id=None,
+            status="ready",
+            delivery_note_number=f"DN-NOWH-{uuid.uuid4().hex[:4]}",
+        )
+        db_no_wh.add(del_no_wh)
+        db_no_wh.flush()
+
+        del_item_no_wh = DeliveryItem(
+            delivery_id=del_no_wh.id,
+            product_id=prod_id,
+            product_name="Heavy Box",
+            planned_quantity=1.0,
+            loaded_quantity=0.0,
+        )
+        db_no_wh.add(del_item_no_wh)
+        db_no_wh.commit()
+        del_no_wh_id = del_no_wh.id
+    finally:
+        db_no_wh.close()
+
+    # Verify serialization reports warehouse: null
+    del_nowh_view = client.get(f"/deliveries/by-id/{del_no_wh_id}", headers=admin_auth).json()
+    log_test("Delivery serialization does NOT fall back to org default warehouse when both are null", del_nowh_view.get("warehouse") is None)
+
+    # Attempt to load delivery with no warehouse
+    no_wh_load_res = client.post(f"/deliveries/{del_no_wh_id}/load", headers=admin_auth)
+    log_test("Loading delivery with no delivery/order warehouse returns HTTP 400", no_wh_load_res.status_code == 400)
+    log_test("No warehouse load error returns exact required detail", no_wh_load_res.json().get("detail") == "Unable to determine a warehouse for this delivery. Please assign a warehouse to the delivery or order.")
+
+    # Rule 5: Verify backfill logic rules (NULL delivery warehouse + order warehouse -> eligible; NULL order warehouse -> skipped)
+    db_bf = SessionLocal()
+    try:
+        # Candidate 1: order has warehouse
+        d_cand1 = Delivery(
+            organization_id=del1_data["organization_id"],
+            sales_order_id=order2_id,
+            warehouse_id=None,
+            status="planned",
+            delivery_note_number=f"DN-BF1-{uuid.uuid4().hex[:4]}",
+        )
+        # Candidate 2: order has NO warehouse
+        d_cand2 = Delivery(
+            organization_id=del1_data["organization_id"],
+            sales_order_id=ord_no_wh.id,
+            warehouse_id=None,
+            status="planned",
+            delivery_note_number=f"DN-BF2-{uuid.uuid4().hex[:4]}",
+        )
+        db_bf.add_all([d_cand1, d_cand2])
+        db_bf.commit()
+
+        # Simulate backfill resolution logic
+        res1 = None
+        ord1_lookup = db_bf.get(SalesOrder, d_cand1.sales_order_id)
+        if ord1_lookup and ord1_lookup.warehouse_id:
+            res1 = stock_service.owned_warehouse(db_bf, ord1_lookup.warehouse_id, d_cand1.organization_id)
+
+        res2 = None
+        ord2_lookup = db_bf.get(SalesOrder, d_cand2.sales_order_id)
+        if ord2_lookup and ord2_lookup.warehouse_id:
+            res2 = stock_service.owned_warehouse(db_bf, ord2_lookup.warehouse_id, d_cand2.organization_id)
+
+        log_test("Backfill logic resolves delivery warehouse when order warehouse is present", res1 is not None and res1.id == wh_id)
+        log_test("Backfill logic skips delivery warehouse when order warehouse is null (no org default fallback)", res2 is None)
+    finally:
+        db_bf.close()
+
+    # 6. warehouse_available Reservation Semantics Tests
+    # Case A: on_hand = 10, this order reservation = 8, other reservation = 0
+    # Expected: warehouse_available == 10 (or 8+), NOT 2! And load() loads 8 successfully.
+    prod_resA = client.post(
+        "/products",
+        json={"name": "Reservation Test Item A", "sku": f"RESA-{uuid.uuid4().hex[:4]}", "price": 100.0, "weight": 1.0, "weight_unit": "kg"},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": prod_resA, "quantity": 10}, headers=admin_auth)
+
+    ord_resA = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_resA, "quantity": 8, "unit_price": 100.0}]},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/orders/{ord_resA}/confirm", headers=admin_auth)
+
+    del_resA = client.post(
+        "/deliveries",
+        json={"order_id": ord_resA, "delivery_partner_id": dp_id, "vehicle_id": veh_id},
+        headers=admin_auth,
+    ).json()
+    del_resA_id = del_resA["id"]
+
+    del_resA_view = client.get(f"/deliveries/by-id/{del_resA_id}", headers=admin_auth).json()
+    availA = del_resA_view["items"][0]["warehouse_available"]
+    log_test("warehouse_available respects this delivery's own reservation (shows 10, not 2)", availA == 10.0)
+
+    _make_delivery_ready(del_resA)
+    load_resA = client.post(f"/deliveries/{del_resA_id}/load", headers=admin_auth)
+    log_test("Delivery successfully loads its 8 reserved units", load_resA.status_code == 200)
+
+    # Case B: on_hand = 10, other order reservation = 8, this order reservation = 0
+    # Expected: warehouse_available == 2 (other order's reservation is protected).
+    prod_resB = client.post(
+        "/products",
+        json={"name": "Reservation Test Item B", "sku": f"RESB-{uuid.uuid4().hex[:4]}", "price": 100.0, "weight": 1.0, "weight_unit": "kg"},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": prod_resB, "quantity": 10}, headers=admin_auth)
+
+    # Other order reserves 8
+    ord_other = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_resB, "quantity": 8, "unit_price": 100.0}]},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/orders/{ord_other}/confirm", headers=admin_auth)
+
+    # Delivery for a direct/unreserved delivery wanting 8 units
+    db_unres = SessionLocal()
+    try:
+        ord_unres = SalesOrder(
+            organization_id=del1_data["organization_id"],
+            customer_id=cust_id,
+            warehouse_id=wh_id,
+            status="confirmed",
+            fulfilment_status="planned",
+            order_number=f"ORD-UNRES-{uuid.uuid4().hex[:4]}",
+        )
+        db_unres.add(ord_unres)
+        db_unres.flush()
+
+        del_unres = Delivery(
+            organization_id=del1_data["organization_id"],
+            sales_order_id=ord_unres.id,
+            delivery_partner_id=dp_id,
+            vehicle_id=veh_id,
+            warehouse_id=wh_id,
+            status="ready",
+            delivery_note_number=f"DN-UNRES-{uuid.uuid4().hex[:4]}",
+        )
+        db_unres.add(del_unres)
+        db_unres.flush()
+
+        del_unres_item = DeliveryItem(
+            delivery_id=del_unres.id,
+            product_id=prod_resB,
+            product_name="Reservation Test Item B",
+            planned_quantity=8.0,
+            loaded_quantity=0.0,
+        )
+        db_unres.add(del_unres_item)
+        db_unres.commit()
+        del_unres_id = del_unres.id
+    finally:
+        db_unres.close()
+
+    del_unres_view = client.get(f"/deliveries/by-id/{del_unres_id}", headers=admin_auth).json()
+    availB = del_unres_view["items"][0]["warehouse_available"]
+    log_test("warehouse_available excludes other orders' reservations (shows 2, protecting the 8 reserved)", availB == 2.0)
+
+    # Case C: on_hand = 10, this order reservation = 6, other order reservation = 4
+    # Expected: warehouse_available == 6
+    prod_resC = client.post(
+        "/products",
+        json={"name": "Reservation Test Item C", "sku": f"RESC-{uuid.uuid4().hex[:4]}", "price": 100.0, "weight": 1.0, "weight_unit": "kg"},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": prod_resC, "quantity": 10}, headers=admin_auth)
+
+    ord_otherC = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_resC, "quantity": 4, "unit_price": 100.0}]},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/orders/{ord_otherC}/confirm", headers=admin_auth)
+
+    ord_thisC = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_resC, "quantity": 6, "unit_price": 100.0}]},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/orders/{ord_thisC}/confirm", headers=admin_auth)
+
+    del_thisC = client.post(
+        "/deliveries",
+        json={"order_id": ord_thisC, "delivery_partner_id": dp_id, "vehicle_id": veh_id},
+        headers=admin_auth,
+    ).json()
+    del_thisC_view = client.get(f"/deliveries/by-id/{del_thisC['id']}", headers=admin_auth).json()
+    availC = del_thisC_view["items"][0]["warehouse_available"]
+    log_test("warehouse_available accurately gives 6 for own reservation while protecting other 4", availC == 6.0)
+
+    # 6b. Insufficient Stock Readable HTTP 400
     prod_low = client.post(
         "/products",
         json={"name": "Rare Item", "sku": f"RARE-{uuid.uuid4().hex[:4]}", "price": 100.0, "weight": 1.0, "weight_unit": "kg"},

@@ -89,10 +89,10 @@ def is_delivery_partner(db: Session, partner: User) -> bool:
 
 
 def resolve_delivery_warehouse(db: Session, delivery: Delivery) -> Warehouse | None:
-    """Resolve warehouse for a delivery using the canonical hierarchy:
+    """Resolve warehouse for an existing delivery using the canonical hierarchy:
     1. delivery.warehouse_id
     2. delivery.sales_order.warehouse_id
-    3. organization's default warehouse
+    3. None (no org-default fallback during loading/serialization)
     """
     org_id = delivery.organization_id
     # 1. delivery.warehouse_id
@@ -115,16 +115,50 @@ def resolve_delivery_warehouse(db: Session, delivery: Delivery) -> Warehouse | N
         if wh is not None:
             return wh
 
-    # 3. organization's default warehouse
-    if org_id:
-        try:
-            wh = stock_service.default_warehouse(db, org_id)
-            if wh is not None:
-                return wh
-        except Exception:
-            pass
-
     return None
+
+
+def available_for_delivery_line(
+    db: Session,
+    warehouse_id: str,
+    delivery: Delivery,
+    item: DeliveryItem | None,
+    product_id: str | None,
+    variant_id: str | None = None,
+) -> float | None:
+    """Compute how much stock is legitimately available for a specific delivery line.
+
+    Answers: 'How much stock can THIS delivery load from this warehouse?'
+    - Accounts for warehouse physical on-hand stock.
+    - Subtracts active reservations belonging to OTHER orders/lines.
+    - Does NOT penalize this delivery's own active reservation on the associated sales order.
+    """
+    if not warehouse_id or not product_id:
+        return None
+    try:
+        on_hand_qty = stock_service.on_hand(db, warehouse_id, product_id, variant_id)
+        generic_avail = stock_service.available(db, warehouse_id, product_id, variant_id)
+
+        this_res_qty = 0.0
+        if delivery.sales_order_id:
+            q = db.query(StockReservation).filter(
+                StockReservation.organization_id == delivery.organization_id,
+                StockReservation.warehouse_id == warehouse_id,
+                StockReservation.order_id == delivery.sales_order_id,
+                StockReservation.product_id == product_id,
+                StockReservation.variant_id == variant_id,
+                StockReservation.status == "active",
+            )
+            if item and item.order_item_id:
+                q = q.filter(StockReservation.order_item_id == item.order_item_id)
+
+            holds = q.all()
+            this_res_qty = sum(h.outstanding_quantity or 0.0 for h in holds)
+
+        avail_for_line = min(on_hand_qty, max(0.0, generic_avail + this_res_qty))
+        return round(avail_for_line, 3)
+    except Exception:
+        return None
 
 
 def compute_weight_kg(product: Product | None, variant: ProductVariant | None = None) -> float | None:

@@ -30,13 +30,6 @@ def backfill_delivery_warehouses() -> int:
                 if order and order.warehouse_id:
                     resolved_wh = stock_service.owned_warehouse(db, order.warehouse_id, org_id)
 
-            # 2. Org default warehouse
-            if not resolved_wh and org_id:
-                try:
-                    resolved_wh = stock_service.default_warehouse(db, org_id)
-                except Exception:
-                    pass
-
             if resolved_wh:
                 d.warehouse_id = resolved_wh.id
                 updated += 1
