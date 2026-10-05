@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import update as sa_update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.core.realtime import queue_event
 from app.core.workflow import DeliveryTransitionError, public_order_status, validate_delivery_transition
@@ -28,6 +28,8 @@ from app.models import (
     DeliveryItem,
     Invoice,
     Leave,
+    Product,
+    ProductVariant,
     Role,
     SalesOrder,
     SalesOrderItem,
@@ -37,6 +39,7 @@ from app.models import (
     Vehicle,
     VehicleLoading,
     VehicleLoadingItem,
+    Warehouse,
 )
 from app.services.tracking_service import TrackingError
 from app.services import notification_service, numbering_service, stock_service
@@ -83,6 +86,86 @@ def is_delivery_partner(db: Session, partner: User) -> bool:
             if role.name and role.name.strip().lower().replace("_", " ").replace("-", " ") == "delivery partner":
                 return True
     return False
+
+
+def resolve_delivery_warehouse(db: Session, delivery: Delivery) -> Warehouse | None:
+    """Resolve warehouse for a delivery using the canonical hierarchy:
+    1. delivery.warehouse_id
+    2. delivery.sales_order.warehouse_id
+    3. organization's default warehouse
+    """
+    org_id = delivery.organization_id
+    # 1. delivery.warehouse_id
+    if delivery.warehouse_id:
+        wh = stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
+        if wh is not None:
+            return wh
+
+    # 2. delivery.sales_order.warehouse_id
+    order_wh_id = None
+    if delivery.sales_order_id:
+        if delivery.sales_order and delivery.sales_order.warehouse_id:
+            order_wh_id = delivery.sales_order.warehouse_id
+        else:
+            order = db.get(SalesOrder, delivery.sales_order_id)
+            if order and order.warehouse_id:
+                order_wh_id = order.warehouse_id
+    if order_wh_id:
+        wh = stock_service.owned_warehouse(db, order_wh_id, org_id)
+        if wh is not None:
+            return wh
+
+    # 3. organization's default warehouse
+    if org_id:
+        try:
+            wh = stock_service.default_warehouse(db, org_id)
+            if wh is not None:
+                return wh
+        except Exception:
+            pass
+
+    return None
+
+
+def compute_weight_kg(product: Product | None, variant: ProductVariant | None = None) -> float | None:
+    """Compute per-unit weight in kilograms.
+
+    Converts per-unit weight based on product.weight_unit:
+      kg -> x1
+      g  -> /1000
+      lb -> *0.453592
+      oz -> *0.0283495
+      ton/tonne -> *1000
+
+    Returns None if product, weight, or weight_unit is missing/unknown.
+    """
+    if product is None:
+        return None
+    raw_weight = None
+    if variant is not None and variant.weight is not None:
+        raw_weight = variant.weight
+    elif product.weight is not None:
+        raw_weight = product.weight
+
+    if raw_weight is None:
+        return None
+
+    if not product.weight_unit:
+        return None
+
+    unit = product.weight_unit.strip().lower()
+    if unit in ("kg", "kgs", "kilogram", "kilograms"):
+        return round(float(raw_weight), 4)
+    elif unit in ("g", "gm", "gms", "gram", "grams"):
+        return round(float(raw_weight) / 1000.0, 4)
+    elif unit in ("lb", "lbs", "pound", "pounds"):
+        return round(float(raw_weight) * 0.453592, 4)
+    elif unit in ("oz", "ounce", "ounces"):
+        return round(float(raw_weight) * 0.0283495, 4)
+    elif unit in ("ton", "tonne", "t", "metric ton"):
+        return round(float(raw_weight) * 1000.0, 4)
+    else:
+        return None
 
 
 def next_delivery_number(db: Session, org_id: str) -> str:
@@ -587,6 +670,10 @@ def load(
     db.refresh(delivery)
     locked_items = (
         db.query(DeliveryItem)
+        .options(
+            lazyload(DeliveryItem.product),
+            lazyload(DeliveryItem.variant),
+        )
         .filter(DeliveryItem.delivery_id == delivery.id)
         .with_for_update(nowait=False)
         .populate_existing()
@@ -618,15 +705,14 @@ def load(
                 detail="No active vehicle is assigned to this delivery partner. Please contact the administrator.",
             )
         delivery.vehicle_id = active_vehicle.id
-    warehouse = (
-        stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
-        if delivery.warehouse_id
-        else None
-    )
+    warehouse = resolve_delivery_warehouse(db, delivery)
     if warehouse is None:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="This delivery has no valid warehouse"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unable to determine a warehouse for this delivery. Please assign a warehouse to the delivery or order.",
         )
+    if not delivery.warehouse_id:
+        delivery.warehouse_id = warehouse.id
 
     by_id = {item.id: item for item in locked_items}
     if wanted is None:

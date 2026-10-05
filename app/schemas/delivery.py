@@ -86,6 +86,12 @@ class DeliveryOrderBrief(BaseModel):
         return public_order_status(v)
 
 
+class DeliveryWarehouseBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+
+
 class DeliveryNoteOut(DeliveryNoteBase):
     model_config = ConfigDict(from_attributes=True)
 
@@ -181,6 +187,9 @@ class DeliveryLineOut(BaseModel):
     expiry_date: datetime | None = None
     serial_numbers: list | None = None
     product_image_url: str | None = None
+    uom: str | None = None
+    warehouse_available: float | None = None
+    weight_kg: float | None = None
 
     @model_validator(mode="after")
     def _fill_remaining(self) -> "DeliveryLineOut":
@@ -294,6 +303,7 @@ class DeliveryOut(BaseModel):
     vehicle_id: str | None = None
     vehicle: VehicleBrief | None = None
     warehouse_id: str | None = None
+    warehouse: DeliveryWarehouseBrief | None = None
     delivery_address: str | None = None
     scheduled_date: datetime | None = None
     status: str = Field(
@@ -483,5 +493,20 @@ class DeliveryCollectionOut(BaseModel):
             self.allocated_amount = self.amount
             self.unallocated_amount = 0.0
         return self
+
+
+class DeliveryBatchLoadRequest(BaseModel):
+    delivery_ids: list[str] = Field(min_length=1)
+
+
+class DeliveryBatchLoadItemOut(BaseModel):
+    delivery_id: str
+    ok: bool
+    detail: str
+    delivery: DeliveryOut | None = None
+
+
+class DeliveryBatchLoadResponse(BaseModel):
+    results: list[DeliveryBatchLoadItemOut]
 
 

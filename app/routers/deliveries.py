@@ -27,11 +27,21 @@ from app.models import (
     DeliveryHistory,
     DeliveryItem,
 )
-from app.services import delivery_service, notification_service, numbering_service, order_service, payment_service
+from app.services import (
+    delivery_service,
+    notification_service,
+    numbering_service,
+    order_service,
+    payment_service,
+    stock_service,
+)
 from app.schemas.delivery import (
     CollectionAllocationIn,
     CollectionAllocationOut,
     CustomerCollectionCreate,
+    DeliveryBatchLoadItemOut,
+    DeliveryBatchLoadRequest,
+    DeliveryBatchLoadResponse,
     DeliveryCollectionCreate,
     DeliveryCollectionOut,
     DeliveryConfirm,
@@ -45,6 +55,7 @@ from app.schemas.delivery import (
     DeliveryPlanUpdate,
     DeliveryRejectBody,
     DeliveryStatusUpdate,
+    DeliveryWarehouseBrief,
     VehicleBrief,
 )
 from app.schemas.sales_order import OrderItemOut, OrderOut
@@ -186,6 +197,31 @@ def _delivery_out(db: Session, delivery: Delivery, include_timeline: bool = Fals
         db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
     )
     out.delivery_partner = DeliveryPartnerBrief.model_validate(partner) if partner else None
+
+    resolved_wh = delivery_service.resolve_delivery_warehouse(db, delivery)
+    if resolved_wh:
+        out.warehouse = DeliveryWarehouseBrief.model_validate(resolved_wh)
+        if not out.warehouse_id:
+            out.warehouse_id = resolved_wh.id
+    else:
+        out.warehouse = None
+
+    items_by_id = {item.id: item for item in (delivery.items or [])}
+    for line_out in out.items:
+        orm_item = items_by_id.get(line_out.id)
+        prod = orm_item.product if orm_item else None
+        var = orm_item.variant if orm_item else None
+        line_out.uom = prod.uom if prod and prod.uom else None
+        line_out.weight_kg = delivery_service.compute_weight_kg(prod, var)
+        if resolved_wh and line_out.product_id:
+            try:
+                line_out.warehouse_available = stock_service.available(
+                    db, resolved_wh.id, line_out.product_id, line_out.variant_id
+                )
+            except Exception:
+                line_out.warehouse_available = None
+        else:
+            line_out.warehouse_available = None
 
     # Only the detail endpoint asks for this — see the docstring on
     # DeliveryOut.timeline. No join to `users`: DeliveryHistory carries its
@@ -560,6 +596,131 @@ def reject_delivery(
     except Exception:
         pass
     return _delivery_out(db, delivery)
+
+
+@router.post("/load-batch", response_model=DeliveryBatchLoadResponse)
+def load_deliveries_batch(
+    payload: DeliveryBatchLoadRequest,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> DeliveryBatchLoadResponse:
+    """Load multiple deliveries onto vehicles in a single batch.
+
+    Each delivery is loaded independently: failure of one delivery does not rollback
+    other successful deliveries. If a delivery is already loaded, ok=true is returned
+    without double-deducting stock. If vehicle capacity is exceeded (when all weights are known),
+    the batch is rejected before loading.
+    """
+    org_id = _org_id(user)
+    if not payload.delivery_ids:
+        return DeliveryBatchLoadResponse(results=[])
+
+    # 1. First, validate access and gather deliveries to evaluate capacity
+    deliveries_map = {}
+    for d_id in payload.delivery_ids:
+        try:
+            d = _owned_delivery(db, d_id, user)
+            deliveries_map[d_id] = d
+        except Exception:
+            # Will be handled during execution
+            pass
+
+    # 2. Check capacity across vehicle(s) for all deliveries in the batch that are not yet loaded
+    deliveries_by_vehicle: dict[str, list[Delivery]] = {}
+    for d_id, d in deliveries_map.items():
+        if d.status in ("loaded", "in_transit", "partially_delivered", "delivered") or (
+            d.planned_total > 0 and d.loaded_total >= d.planned_total
+        ):
+            continue
+
+        veh_id = d.vehicle_id
+        if not veh_id and d.delivery_partner_id:
+            driver_veh = delivery_service.get_driver_active_vehicle(db, org_id, d.delivery_partner_id)
+            if driver_veh:
+                veh_id = driver_veh.id
+
+        if veh_id:
+            deliveries_by_vehicle.setdefault(veh_id, []).append(d)
+
+    for veh_id, v_deliveries in deliveries_by_vehicle.items():
+        veh = db.get(Vehicle, veh_id)
+        if veh and veh.capacity_kg and veh.capacity_kg > 0:
+            total_batch_weight = 0.0
+            all_weights_known = True
+            for d in v_deliveries:
+                for item in (d.items or []):
+                    per_unit_w = delivery_service.compute_weight_kg(item.product, item.variant)
+                    qty = (item.planned_quantity or 0) - (item.loaded_quantity or 0)
+                    if qty > 0:
+                        if per_unit_w is None:
+                            all_weights_known = False
+                            break
+                        total_batch_weight += qty * per_unit_w
+                if not all_weights_known:
+                    break
+
+            if all_weights_known and round(total_batch_weight, 4) > round(veh.capacity_kg, 4):
+                total_str = f"{round(total_batch_weight, 2):g}"
+                cap_str = f"{round(veh.capacity_kg, 2):g}"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Total batch weight ({total_str} kg) exceeds vehicle capacity ({cap_str} kg)",
+                )
+
+    # 3. Process each delivery in its own savepoint/transaction
+    results: list[DeliveryBatchLoadItemOut] = []
+    for d_id in payload.delivery_ids:
+        try:
+            with db.begin_nested():
+                delivery = _owned_delivery(db, d_id, user)
+
+                # Check if already loaded
+                if delivery.status in ("loaded", "in_transit", "partially_delivered", "delivered") or (
+                    delivery.planned_total > 0 and delivery.loaded_total >= delivery.planned_total
+                ):
+                    results.append(
+                        DeliveryBatchLoadItemOut(
+                            delivery_id=d_id,
+                            ok=True,
+                            detail="Delivery is already loaded",
+                            delivery=_delivery_out(db, delivery),
+                        )
+                    )
+                    continue
+
+                delivery_service.load(db, user, delivery, wanted=None)
+                db.flush()
+                db.refresh(delivery)
+                results.append(
+                    DeliveryBatchLoadItemOut(
+                        delivery_id=d_id,
+                        ok=True,
+                        detail="Loaded successfully",
+                        delivery=_delivery_out(db, delivery),
+                    )
+                )
+        except HTTPException as exc:
+            results.append(
+                DeliveryBatchLoadItemOut(
+                    delivery_id=d_id,
+                    ok=False,
+                    detail=str(exc.detail),
+                    delivery=None,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                DeliveryBatchLoadItemOut(
+                    delivery_id=d_id,
+                    ok=False,
+                    detail=str(exc) if str(exc) else "An unexpected error occurred while loading this delivery",
+                    delivery=None,
+                )
+            )
+
+    db.commit()
+    return DeliveryBatchLoadResponse(results=results)
 
 
 @router.post("/{delivery_id}/load", response_model=DeliveryOut)

@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy import text as sa_text
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -128,6 +129,45 @@ else:
 import logging
 
 _log = logging.getLogger("crm.startup")
+_error_log = logging.getLogger("crm.errors")
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    path = request.url.path
+    method = request.method
+
+    delivery_id = None
+    if "deliveries" in path:
+        parts = path.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] == "deliveries":
+            if parts[1] not in ("load-batch", "assigned", "partners", "history", "stats", "by-id"):
+                delivery_id = parts[1]
+            elif parts[1] == "by-id" and len(parts) >= 3:
+                delivery_id = parts[2]
+
+    delivery_context = f" [delivery_id: {delivery_id}]" if delivery_id else ""
+    _error_log.exception(
+        "Unhandled exception processing %s %s%s: %s",
+        method,
+        path,
+        delivery_context,
+        exc,
+    )
+
+    origin = request.headers.get("origin")
+    headers = {}
+    if origin:
+        headers["access-control-allow-origin"] = origin
+        headers["access-control-allow-credentials"] = "true"
+        headers["vary"] = "Origin"
+
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected server error occurred. Please try again later or contact support."},
+        headers=headers if headers else None,
+    )
+
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
 BUILD_TAG = "health-names-the-database-host"

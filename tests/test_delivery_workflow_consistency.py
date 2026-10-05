@@ -635,6 +635,332 @@ def run_delivery_partner_assignment_notification_tests(ctx):
     log_test("Cross-org Partner C receives 0 notifications", len(notifs_c) == 0)
 
 
+def run_vehicle_loading_production_fix_tests():
+    print("\n--- Running Vehicle Loading Production Fix Tests ---")
+    from app.core.database import SessionLocal
+    from app.models import Delivery, DeliveryItem, SalesOrder, Product, Warehouse, Vehicle
+    from sqlalchemy.orm import lazyload
+
+    admin_auth = _register_org("VehLoad")
+    dp_id, dp_auth = _create_staff(admin_auth, "Driver Dan", "Delivery Partner")
+
+    # 1. Setup Warehouse, Product with UOM & Weight, Vehicle with Capacity
+    wh_res = client.post("/warehouses", json={"name": "Central Depot", "is_default": True}, headers=admin_auth)
+    assert wh_res.status_code == 201, wh_res.text
+    wh_id = wh_res.json()["id"]
+
+    veh_res = client.post(
+        "/vehicles",
+        json={"vehicle_number": f"TRK-{uuid.uuid4().hex[:4].upper()}", "capacity_kg": 100.0, "default_driver_id": dp_id},
+        headers=admin_auth,
+    )
+    assert veh_res.status_code == 201, veh_res.text
+    veh_id = veh_res.json()["id"]
+
+    prod_res = client.post(
+        "/products",
+        json={
+            "name": "Heavy Box",
+            "sku": f"BOX-{uuid.uuid4().hex[:4]}",
+            "price": 50.0,
+            "uom": "box",
+            "weight": 10.0,
+            "weight_unit": "kg",
+        },
+        headers=admin_auth,
+    )
+    assert prod_res.status_code == 201, prod_res.text
+    prod_id = prod_res.json()["id"]
+
+    # Adjust stock to 100
+    adj = client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": prod_id, "quantity": 100}, headers=admin_auth)
+    assert adj.status_code == 200, adj.text
+
+    cust_res = client.post("/customers", json={"name": "Load Customer"}, headers=admin_auth)
+    assert cust_res.status_code == 201, cust_res.text
+    cust_id = cust_res.json()["id"]
+
+    # 2. Test Single Load Success, DeliveryOut.warehouse, and DeliveryLineOut fields
+    order1 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 5, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    assert order1.status_code == 201, order1.text
+    order1_id = order1.json()["id"]
+    client.post(f"/orders/{order1_id}/confirm", headers=admin_auth)
+
+    del1 = client.post(
+        "/deliveries",
+        json={"order_id": order1_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id},
+        headers=admin_auth,
+    )
+    assert del1.status_code == 201, del1.text
+    del1_id = del1.json()["id"]
+    del1_data = del1.json()
+
+    # Verify DeliveryOut warehouse object & DeliveryLineOut fields
+    log_test("DeliveryOut contains warehouse object with id and name", del1_data.get("warehouse") is not None and del1_data["warehouse"]["id"] == wh_id and del1_data["warehouse"]["name"] == "Central Depot")
+    log_test("DeliveryLineOut contains uom", len(del1_data["items"]) > 0 and del1_data["items"][0]["uom"] == "box")
+    log_test("DeliveryLineOut contains per-unit weight_kg", len(del1_data["items"]) > 0 and del1_data["items"][0]["weight_kg"] == 10.0)
+    log_test("DeliveryLineOut contains warehouse_available", len(del1_data["items"]) > 0 and del1_data["items"][0]["warehouse_available"] is not None)
+
+    # 3. Test PostgreSQL-compatible lock query (ensuring lazyload on joined product/variant)
+    db = SessionLocal()
+    try:
+        locked_query = (
+            db.query(DeliveryItem)
+            .options(lazyload(DeliveryItem.product), lazyload(DeliveryItem.variant))
+            .filter(DeliveryItem.delivery_id == del1_id)
+            .with_for_update(nowait=False)
+        )
+        sql_str = str(locked_query.statement.compile(compile_kwargs={"literal_binds": True}))
+        # Verify no LEFT OUTER JOIN is generated in the locked query statement
+        log_test("DeliveryItem lock query suppresses outer joins for PostgreSQL safety", "LEFT OUTER JOIN" not in sql_str.upper())
+        items = locked_query.all()
+        log_test("DeliveryItem lock query successfully returns rows", len(items) == 1)
+    finally:
+        db.close()
+
+    def _make_delivery_ready(d_data, custom_auth=None):
+        d_id = d_data["id"]
+        client.post(f"/deliveries/{d_id}/accept", headers=custom_auth or dp_auth)
+        items = d_data.get("items", [])
+        if items:
+            pick_items = [{"delivery_item_id": i["id"], "picked_quantity": i["planned_quantity"]} for i in items]
+            client.post(f"/deliveries/{d_id}/pick", json={"items": pick_items}, headers=admin_auth)
+        res = client.post(f"/deliveries/{d_id}/ready", headers=admin_auth)
+        assert res.status_code == 200, res.text
+
+    # Move to ready and execute single load
+    _make_delivery_ready(del1_data)
+
+    load_res = client.post(f"/deliveries/{del1_id}/load", headers=admin_auth)
+    log_test("Single load succeeds (HTTP 200)", load_res.status_code == 200, load_res.text)
+    loaded_data = load_res.json()
+    log_test("Single load response contains warehouse object", loaded_data.get("warehouse") is not None and loaded_data["warehouse"]["name"] == "Central Depot")
+
+    # 4. Repeated Single Load Idempotency
+    repeat_res = client.post(f"/deliveries/{del1_id}/load", headers=admin_auth)
+    log_test("Repeated single load on fully loaded delivery returns HTTP 400", repeat_res.status_code == 400)
+
+    # 5. Delivery Warehouse Fallback Hierarchy: delivery.warehouse_id -> order.warehouse_id -> org default warehouse
+    order2 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 2, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order2_id = order2.json()["id"]
+    client.post(f"/orders/{order2_id}/confirm", headers=admin_auth)
+
+    # Plan delivery with explicit warehouse_id = None
+    del2 = client.post(
+        "/deliveries",
+        json={"order_id": order2_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id, "warehouse_id": None},
+        headers=admin_auth,
+    )
+    del2_id = del2.json()["id"]
+    del2_data = client.get(f"/deliveries/by-id/{del2_id}", headers=admin_auth).json()
+    log_test("Warehouse fallback resolves warehouse from order when delivery.warehouse_id is null", del2_data.get("warehouse") is not None and del2_data["warehouse"]["id"] == wh_id)
+
+    # 6. Insufficient Stock Readable HTTP 400
+    prod_low = client.post(
+        "/products",
+        json={"name": "Rare Item", "sku": f"RARE-{uuid.uuid4().hex[:4]}", "price": 100.0, "weight": 1.0, "weight_unit": "kg"},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": prod_low, "quantity": 10}, headers=admin_auth)
+
+    order3 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_low, "quantity": 10, "unit_price": 100.0}]},
+        headers=admin_auth,
+    )
+    order3_id = order3.json()["id"]
+    client.post(f"/orders/{order3_id}/confirm", headers=admin_auth)
+
+    del3 = client.post(
+        "/deliveries",
+        json={"order_id": order3_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id},
+        headers=admin_auth,
+    )
+    del3_data = del3.json()
+    del3_id = del3_data["id"]
+    _make_delivery_ready(del3_data)
+
+    # Directly adjust physical stock on hand in DB to 2 to simulate physical stock shortfall
+    from app.models import WarehouseStock
+    db_s = SessionLocal()
+    try:
+        ws = db_s.query(WarehouseStock).filter(WarehouseStock.warehouse_id == wh_id, WarehouseStock.product_id == prod_low).first()
+        if ws:
+            ws.on_hand_quantity = 2
+            db_s.commit()
+    finally:
+        db_s.close()
+
+    insufficient_res = client.post(f"/deliveries/{del3_id}/load", headers=admin_auth)
+    log_test("Insufficient stock load returns HTTP 400", insufficient_res.status_code == 400)
+    log_test("Insufficient stock error message is human-readable", "only 2 on hand in" in insufficient_res.json().get("detail", ""))
+
+    # 7. Batch Loading: All-Success
+    order4 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order4_id = order4.json()["id"]
+    client.post(f"/orders/{order4_id}/confirm", headers=admin_auth)
+    del4 = client.post("/deliveries", json={"order_id": order4_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id}, headers=admin_auth).json()
+    del4_id = del4["id"]
+    _make_delivery_ready(del4)
+
+    order5 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order5_id = order5.json()["id"]
+    client.post(f"/orders/{order5_id}/confirm", headers=admin_auth)
+    del5 = client.post("/deliveries", json={"order_id": order5_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id}, headers=admin_auth).json()
+    del5_id = del5["id"]
+    _make_delivery_ready(del5)
+
+    batch_all_res = client.post(
+        "/deliveries/load-batch",
+        json={"delivery_ids": [del4_id, del5_id]},
+        headers=admin_auth,
+    )
+    log_test("Batch load all-success returns HTTP 200", batch_all_res.status_code == 200)
+    batch_results = batch_all_res.json().get("results", [])
+    log_test("Batch load returns 2 results, both ok=True", len(batch_results) == 2 and all(r["ok"] for r in batch_results))
+
+    # 8. Batch Loading: Already-Loaded Idempotency
+    batch_repeat_res = client.post(
+        "/deliveries/load-batch",
+        json={"delivery_ids": [del4_id, del5_id]},
+        headers=admin_auth,
+    )
+    log_test("Batch load already-loaded returns ok=True", batch_repeat_res.status_code == 200 and all(r["ok"] and "already loaded" in r["detail"].lower() for r in batch_repeat_res.json()["results"]))
+
+    # 9. Batch Loading: Partial Failure Isolation (A succeeds, B fails, C succeeds)
+    order6 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order6_id = order6.json()["id"]
+    client.post(f"/orders/{order6_id}/confirm", headers=admin_auth)
+    del6 = client.post("/deliveries", json={"order_id": order6_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id}, headers=admin_auth).json()
+    del6_id = del6["id"]
+    _make_delivery_ready(del6)
+
+    order7 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order7_id = order7.json()["id"]
+    client.post(f"/orders/{order7_id}/confirm", headers=admin_auth)
+    del7 = client.post("/deliveries", json={"order_id": order7_id, "delivery_partner_id": dp_id, "vehicle_id": veh_id}, headers=admin_auth).json()
+    del7_id = del7["id"]
+    _make_delivery_ready(del7)
+
+    # del3 is the one with insufficient stock
+    batch_partial_res = client.post(
+        "/deliveries/load-batch",
+        json={"delivery_ids": [del6_id, del3_id, del7_id]},
+        headers=admin_auth,
+    )
+    log_test("Batch load partial failure returns HTTP 200 with isolated results", batch_partial_res.status_code == 200)
+    p_results = batch_partial_res.json().get("results", [])
+    log_test("Batch results: del6 succeeds", len(p_results) == 3 and p_results[0]["delivery_id"] == del6_id and p_results[0]["ok"] is True)
+    log_test("Batch results: del3 fails with readable detail", len(p_results) == 3 and p_results[1]["delivery_id"] == del3_id and p_results[1]["ok"] is False and "only 2 on hand" in p_results[1]["detail"])
+    log_test("Batch results: del7 succeeds despite del3 failure", len(p_results) == 3 and p_results[2]["delivery_id"] == del7_id and p_results[2]["ok"] is True)
+
+    # 10. Vehicle Capacity Exceeded Check
+    dp2_id, dp2_auth = _create_staff(admin_auth, "Driver Dave", "Delivery Partner")
+    small_veh = client.post(
+        "/vehicles",
+        json={"vehicle_number": f"SCOOTER-{uuid.uuid4().hex[:4]}", "capacity_kg": 15.0, "default_driver_id": dp2_id},
+        headers=admin_auth,
+    ).json()["id"]
+
+    order8 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order8_id = order8.json()["id"]
+    client.post(f"/orders/{order8_id}/confirm", headers=admin_auth)
+    del8 = client.post("/deliveries", json={"order_id": order8_id, "delivery_partner_id": dp2_id, "vehicle_id": small_veh}, headers=admin_auth).json()
+    del8_id = del8["id"]
+    _make_delivery_ready(del8, custom_auth=dp2_auth)
+
+    order9 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 50.0}]},
+        headers=admin_auth,
+    )
+    order9_id = order9.json()["id"]
+    client.post(f"/orders/{order9_id}/confirm", headers=admin_auth)
+    del9 = client.post("/deliveries", json={"order_id": order9_id, "delivery_partner_id": dp2_id, "vehicle_id": small_veh}, headers=admin_auth).json()
+    del9_id = del9["id"]
+    _make_delivery_ready(del9, custom_auth=dp2_auth)
+
+    # del8 (10kg) + del9 (10kg) = 20kg > 15kg capacity
+    cap_res = client.post(
+        "/deliveries/load-batch",
+        json={"delivery_ids": [del8_id, del9_id]},
+        headers=admin_auth,
+    )
+    log_test("Batch load exceeding vehicle capacity returns HTTP 400", cap_res.status_code == 400)
+    log_test("Capacity exceeded detail is clearly formatted", "Total batch weight (20 kg) exceeds vehicle capacity (15 kg)" in cap_res.json().get("detail", ""))
+
+    # 11. Batch Loading with Unknown Weight (Does NOT fail solely due to unknown weight)
+    dp3_id, dp3_auth = _create_staff(admin_auth, "Driver Dan 3", "Delivery Partner")
+    veh3 = client.post(
+        "/vehicles",
+        json={"vehicle_number": f"VAN-{uuid.uuid4().hex[:4]}", "capacity_kg": 50.0, "default_driver_id": dp3_id},
+        headers=admin_auth,
+    ).json()["id"]
+    prod_noweight = client.post(
+        "/products",
+        json={"name": "Unknown Weight Item", "sku": f"UNKW-{uuid.uuid4().hex[:4]}", "price": 10.0},
+        headers=admin_auth,
+    ).json()["id"]
+    client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": prod_noweight, "quantity": 20}, headers=admin_auth)
+
+    order10 = client.post(
+        "/orders",
+        json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [{"product_id": prod_noweight, "quantity": 2, "unit_price": 10.0}]},
+        headers=admin_auth,
+    )
+    order10_id = order10.json()["id"]
+    client.post(f"/orders/{order10_id}/confirm", headers=admin_auth)
+    del10 = client.post("/deliveries", json={"order_id": order10_id, "delivery_partner_id": dp3_id, "vehicle_id": veh3}, headers=admin_auth).json()
+    del10_id = del10["id"]
+    _make_delivery_ready(del10, custom_auth=dp3_auth)
+
+    batch_unk_res = client.post(
+        "/deliveries/load-batch",
+        json={"delivery_ids": [del10_id]},
+        headers=admin_auth,
+    )
+    log_test("Batch load with unknown product weight succeeds without false capacity rejection", batch_unk_res.status_code == 200 and batch_unk_res.json()["results"][0]["ok"] is True)
+
+    # 12. Global 500 Handler Verification
+    @app.get("/test-unexpected-error-trigger")
+    def _test_unexpected():
+        raise RuntimeError("Simulated internal explosion")
+
+    client_err = TestClient(app, raise_server_exceptions=False)
+    err_res = client_err.get("/test-unexpected-error-trigger", headers={"Origin": "https://crm-saas.asynk.in"})
+    log_test("Global exception handler catches unexpected error and returns HTTP 500", err_res.status_code == 500)
+    log_test("Global exception response contains sanitized JSON detail", err_res.json() == {"detail": "An unexpected server error occurred. Please try again later or contact support."})
+    log_test("Global exception response preserves CORS headers", "access-control-allow-origin" in [h.lower() for h in err_res.headers.keys()])
+
+
 if __name__ == "__main__":
     ctx = run_lifecycle_tests()
     run_invalid_transition_tests(ctx)
@@ -642,9 +968,11 @@ if __name__ == "__main__":
     run_permission_matrix_tests(ctx)
     run_stock_concurrency_test()
     run_delivery_partner_assignment_notification_tests(ctx)
+    run_vehicle_loading_production_fix_tests()
 
     print("\n=======================================================")
     print(f"RESULTS: {PASSED} passed, {FAILED} failed")
     print("=======================================================\n")
     if FAILED > 0:
         sys.exit(1)
+
