@@ -15,7 +15,7 @@ def get_default_plan(db: Session) -> Plan | None:
     return db.query(Plan).filter(Plan.is_default.is_(True)).first()
 
 
-def ensure_company_code(db: Session, org: Organization) -> str:
+def ensure_company_code(db: Session, org: Organization, auto_commit: bool = True) -> str:
     """The firm's human-facing code (`CMP-10001`), issued on first use.
 
     Assigned lazily rather than at registration so firms created before the column
@@ -31,8 +31,11 @@ def ensure_company_code(db: Session, org: Organization) -> str:
     numbers = [int(c[len(COMPANY_CODE_PREFIX):]) for c in codes
                if c.startswith(COMPANY_CODE_PREFIX) and c[len(COMPANY_CODE_PREFIX):].isdigit()]
     org.company_code = f"{COMPANY_CODE_PREFIX}{max(numbers, default=_FIRST_COMPANY_NUMBER - 1) + 1}"
-    db.commit()
-    db.refresh(org)
+    if auto_commit:
+        db.commit()
+        db.refresh(org)
+    else:
+        db.flush()
     return org.company_code
 
 

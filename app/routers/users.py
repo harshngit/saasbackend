@@ -24,6 +24,7 @@ from app.schemas.user import (
 from app.services import (
     activity_service,
     employee_profile_service,
+    numbering_service,
     password_service,
     role_service,
     staff_overview_service,
@@ -201,10 +202,9 @@ def create_staff(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already taken")
 
     _check_columns(db, admin, data)
-    if data.get("employee_id") is None:
-        data["employee_id"] = _next_employee_id(
-            _employee_ids_in_org(db, admin.organization_id), _employee_id_prefix(admin)
-        )
+    data["employee_id"] = numbering_service.next_transactional_number(
+        db, admin.organization_id, User.employee_id, "EMP"
+    )
     data["name"] = _composed_name(data, email)
     # A new employee is on the payroll and able to log in unless told otherwise.
     data.setdefault("employee_status", EmployeeStatus.ACTIVE.value)
@@ -426,6 +426,7 @@ def update_user(
     """
     target = _owned_user(db, user_id, admin)
     data = payload.to_columns()
+    data.pop("employee_id", None)
     # The label and the login identifier are the two columns that cannot be empty,
     # so an explicit null for them means "leave it alone", not "erase it".
     for required in ("name", "email"):

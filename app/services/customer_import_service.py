@@ -135,7 +135,7 @@ def import_customers_from_file(
 
         try:
             data["customer_id"] = numbering_service.next_number(
-                db, org_id, Customer.customer_id, "CUST"
+                db, org_id, Customer.customer_id, "CS"
             )
             if not data.get("assigned_sales_officer_id") and scoping.scope_to_own(db, user):
                 data["assigned_sales_officer_id"] = user.id

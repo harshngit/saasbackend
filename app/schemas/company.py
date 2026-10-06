@@ -354,8 +354,8 @@ class CompanySettingsUpdate(BaseModel):
     )
     number_prefixes: dict[str, str] | None = Field(
         default=None,
-        description='Per-series prefix overrides, e.g. {"QT": "EST", "INV": "BILL"}. '
-                    "Series: CUST, PROD, LEAD, QT, SO, INV, SALE, RCPT, RET, DN, EXP, EXPID, PUR, PURID.",
+        description='Per-series prefix overrides, e.g. {"QT": "EST", "IN": "BILL"}. '
+                    "Canonical series: CS, IN, SO, DO, PO, EMP, L, QT, SUP, PRD, CMP.",
     )
 
     # Documents (Ext)

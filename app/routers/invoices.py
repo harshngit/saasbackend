@@ -76,7 +76,7 @@ def _hsn_for(db: Session, product_id: str | None) -> str | None:
 
 def _next_invoice_number(db: Session, org_id: str) -> str:
     # max+1, not count+1: counting reissues a number after any deletion.
-    return numbering_service.next_number(db, org_id, Invoice.invoice_number, "INV")
+    return numbering_service.next_number(db, org_id, Invoice.invoice_number, "IN")
 
 
 def _due_date(order: SalesOrder | None, issued: datetime) -> datetime | None:

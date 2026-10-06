@@ -108,6 +108,12 @@ def import_suppliers_from_file(
             elif data.get("category") and not data.get("categories"):
                 data["categories"] = [data["category"]]
 
+            if not data.get("supplier_code"):
+                from app.services import numbering_service
+                data["supplier_code"] = numbering_service.next_master_number(
+                    db, org_id, Supplier.supplier_code, "SUP"
+                )
+
             supplier = Supplier(organization_id=org_id, **data)
             db.add(supplier)
             db.flush()

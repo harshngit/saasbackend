@@ -143,7 +143,7 @@ def create_customer(
             detail="basic_information.customer_name is required",
         )
     data["customer_id"] = numbering_service.next_number(
-        db, org_id, Customer.customer_id, "CUST"
+        db, org_id, Customer.customer_id, "CS"
     )
     # A field role only sees its own customers, so default the sales rep to whoever
     # is creating it — otherwise they could not see the customer they just added.
@@ -289,6 +289,7 @@ def update_customer(
     org_id = _org_id(user)
     customer = _owned_customer(db, customer_id, user)
     data = payload.to_columns()
+    data.pop("customer_id", None)
     if "assigned_sales_officer_id" in data:
         _validate_assignee(db, org_id, data["assigned_sales_officer_id"])
     for field, value in data.items():

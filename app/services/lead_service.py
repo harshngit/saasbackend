@@ -154,7 +154,7 @@ def create_lead(db: Session, org_id: str, user: User, payload: LeadCreate) -> Le
 
     lead = Lead(
         organization_id=org_id,
-        lead_id=payload.lead_id or numbering_service.next_number(db, org_id, Lead.lead_id, "LEAD"),
+        lead_id=payload.lead_id or numbering_service.next_number(db, org_id, Lead.lead_id, "L"),
         name=payload.name,
         contact_person=payload.contact_person,
         mobile_number=payload.mobile_number,
@@ -398,7 +398,7 @@ def convert_lead_to_customer(
         _validate_assignee(db, org_id, cust_assignee)
 
     # 3. Create customer.
-    new_cust_code = numbering_service.next_number(db, org_id, Customer.customer_id, "CUST")
+    new_cust_code = numbering_service.next_number(db, org_id, Customer.customer_id, "CS")
     b_name = data.get("business_name") or data.get("legal_business_name")
     customer = Customer(
         organization_id=org_id,

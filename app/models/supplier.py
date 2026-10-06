@@ -19,11 +19,15 @@ class Supplier(Base):
     """A vendor/supplier for an organization, with running payable balances."""
 
     __tablename__ = "suppliers"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "supplier_code", name="uq_suppliers_org_supplier_code"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    supplier_code: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
 
     name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     company_name: Mapped[str | None] = mapped_column(String(200), nullable=True)

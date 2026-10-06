@@ -203,7 +203,7 @@ def compute_weight_kg(product: Product | None, variant: ProductVariant | None = 
 
 
 def next_delivery_number(db: Session, org_id: str) -> str:
-    return numbering_service.next_number(db, org_id, Delivery.delivery_note_number, "DLV")
+    return numbering_service.next_number(db, org_id, Delivery.delivery_note_number, "DO")
 
 
 def record_history(

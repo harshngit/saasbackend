@@ -117,9 +117,7 @@ def create_product(
         org = db.get(Organization, org_id)
         pricing_data["currency"] = (org.currency if org and org.currency else "INR")
 
-    data.setdefault("product_id", None)
-    if not data.get("product_id"):
-        data["product_id"] = numbering_service.next_number(db, org_id, Product.product_id, "PROD")
+    data["product_id"] = numbering_service.next_master_number(db, org_id, Product.product_id, "PRD")
 
     # Sync price on Product model with selling_price for backward compatibility
     selling_p = pricing_data.get("selling_price", 0.0)
@@ -338,6 +336,7 @@ def update_product(
 
     variations = data.pop("variations", None)
     pricing_data = data.pop("pricing", None)
+    data.pop("product_id", None)
     if data.get("has_variants") is None:
         data.pop("has_variants", None)  # NOT NULL column — never write a null into it
     if "status" in data:

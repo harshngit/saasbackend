@@ -848,7 +848,7 @@ def create_delivery_note(
     delivery = Delivery(
         organization_id=org_id,
         delivery_note_number=payload.delivery_note_number or numbering_service.next_number(
-            db, org_id, Delivery.delivery_note_number, "DN"
+            db, org_id, Delivery.delivery_note_number, "DO"
         ),
         delivery_date=payload.delivery_date or datetime.now(timezone.utc),
         sales_order_id=payload.sales_order_id,

@@ -164,8 +164,8 @@ def create_purchase(
         attachment_url=payload.attachment_url,
         created_by=user.id,
         # 1. Basic Information
-        purchase_id=numbering_service.next_number(db, org_id, PurchaseInvoice.purchase_id, "PURID"),
-        purchase_number=numbering_service.next_number(db, org_id, PurchaseInvoice.purchase_number, "PUR"),
+        purchase_id=numbering_service.next_number(db, org_id, PurchaseInvoice.purchase_id, "PO"),
+        purchase_number=numbering_service.next_number(db, org_id, PurchaseInvoice.purchase_number, "PO"),
         purchase_type=payload.purchase_type or "Direct Purchase",
         purchase_date=payload.purchase_date or payload.invoice_date or datetime.now(timezone.utc),
         financial_year=payload.financial_year,

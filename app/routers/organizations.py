@@ -188,8 +188,7 @@ def company_options(
         company_statuses=[s.value for s in CompanyStatus],
         number_series={
             series: numbering_service.prefix_for(db, admin.organization_id, series)
-            for series in ("CUST", "PROD", "LEAD", "QT", "SO", "INV", "SALE",
-                           "RCPT", "RET", "DN", "EXP", "EXPID", "PUR", "PURID")
+            for series in ("CS", "IN", "SO", "DO", "PO", "EMP", "L", "QT", "SUP", "PRD", "CMP")
         },
         customer_statuses=R.CUSTOMER_STATUSES,
         customer_types=R.CUSTOMER_TYPES,

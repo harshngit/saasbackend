@@ -8,6 +8,7 @@ class SupplierOut(BaseModel):
 
     id: str
     organization_id: str
+    supplier_code: str | None = None
     name: str
     company_name: str | None = None
     contact_person: str | None = None
@@ -36,6 +37,7 @@ class SupplierOut(BaseModel):
 
 
 class SupplierCreate(BaseModel):
+    supplier_code: str | None = Field(default=None, max_length=50)
     name: str = Field(min_length=1, max_length=200)
     company_name: str | None = Field(default=None, max_length=200)
     contact_person: str | None = Field(default=None, max_length=150)

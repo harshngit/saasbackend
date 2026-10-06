@@ -22,7 +22,7 @@ from app.schemas.supplier import (
     SupplierStatusUpdate,
     SupplierUpdate,
 )
-from app.services import catalog_hierarchy_service
+from app.services import catalog_hierarchy_service, numbering_service
 from app.services.supplier_import_service import get_supplier_template, import_suppliers_from_file
 
 router = APIRouter(prefix="/suppliers", tags=["suppliers"])
@@ -86,6 +86,7 @@ def create_supplier(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Supplier:
+    org_id = _org_id(user)
     data = payload.model_dump()
     supplier_cats = data.pop("supplier_categories", None)
     if supplier_cats is not None:
@@ -94,7 +95,10 @@ def create_supplier(
             data["category"] = supplier_cats[0]
     elif data.get("category") and not data.get("categories"):
         data["categories"] = [data["category"]]
-    supplier = Supplier(organization_id=_org_id(user), **data)
+    data["supplier_code"] = numbering_service.next_master_number(
+        db, org_id, Supplier.supplier_code, "SUP"
+    )
+    supplier = Supplier(organization_id=org_id, **data)
     db.add(supplier)
     db.commit()
     db.refresh(supplier)
@@ -104,7 +108,7 @@ def create_supplier(
 @router.get("", response_model=list[SupplierOut])
 def list_suppliers(
     user: User = Depends(_view),
-    search: str | None = Query(default=None, description="matches name / contact / phone / email"),
+    search: str | None = Query(default=None, description="matches name / contact / phone / email / code"),
     category: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -114,8 +118,13 @@ def list_suppliers(
     if search:
         like = f"%{search}%"
         query = query.filter(
-            or_(Supplier.name.ilike(like), Supplier.contact_person.ilike(like),
-                Supplier.phone.ilike(like), Supplier.email.ilike(like))
+            or_(
+                Supplier.name.ilike(like),
+                Supplier.contact_person.ilike(like),
+                Supplier.phone.ilike(like),
+                Supplier.email.ilike(like),
+                Supplier.supplier_code.ilike(like),
+            )
         )
     if category is not None:
         query = query.filter(Supplier.category == category)
@@ -139,6 +148,7 @@ def update_supplier(
 ) -> Supplier:
     supplier = _owned(db, supplier_id, _org_id(user))
     data = payload.model_dump(exclude_unset=True)
+    data.pop("supplier_code", None)
     if "supplier_categories" in data:
         supplier_cats = data.pop("supplier_categories")
         supplier.categories = supplier_cats
