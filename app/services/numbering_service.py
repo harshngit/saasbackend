@@ -58,9 +58,47 @@ MASTER_SERIES = {"SUP", "PRD"}
 TRANSACTIONAL_SERIES = {"CS", "IN", "SO", "DO", "PO", "EMP", "L", "QT"}
 
 
-def _year() -> int:
-    """Current server-side calendar year in UTC."""
-    return datetime.now(timezone.utc).year
+DEFAULT_BUSINESS_TIMEZONE = "Asia/Kolkata"
+
+
+def get_business_year(
+    db: Session | None = None,
+    org_id: str | None = None,
+    dt: datetime | None = None,
+) -> int:
+    """Current or specified timestamp's calendar year in the business timezone.
+
+    Defaults to Asia/Kolkata, or the organization's configured timezone if available and valid.
+    """
+    from zoneinfo import ZoneInfo
+
+    tz_name = DEFAULT_BUSINESS_TIMEZONE
+    if db is not None and org_id is not None:
+        try:
+            from app.models.organization import Organization
+            org = db.get(Organization, org_id)
+            if org and org.timezone:
+                ZoneInfo(org.timezone)
+                tz_name = org.timezone
+        except Exception:
+            tz_name = DEFAULT_BUSINESS_TIMEZONE
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo(DEFAULT_BUSINESS_TIMEZONE)
+
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(tz).year
+
+
+def _year(db: Session | None = None, org_id: str | None = None) -> int:
+    """Current business calendar year."""
+    return get_business_year(db, org_id)
 
 
 def normalize_series(series: str) -> str:
@@ -143,8 +181,9 @@ def _allocate_next(
     """Atomic, concurrency-safe sequential allocation using NumberSequence.
 
     1. First creation is wrapped in a SAVEPOINT to handle concurrent first-creations.
-    2. The increment is an atomic database-side `UPDATE ... SET last_number = last_number + 1 RETURNING last_number`.
-    3. Result is zero-padded with minimum 4 digits.
+    2. Sequence counter is verified to be at least the highest issued canonical number.
+    3. The increment is an atomic database-side `UPDATE ... SET last_number = last_number + 1 RETURNING last_number`.
+    4. Result is zero-padded with minimum 4 digits.
     """
     from app.models.number_sequence import NumberSequence
 
@@ -154,7 +193,7 @@ def _allocate_next(
         NumberSequence.year == year,
     )
 
-    exists = db.query(NumberSequence.id).filter(*_match).first()
+    exists = db.query(NumberSequence).filter(*_match).first()
     if exists is None:
         try:
             with db.begin_nested():
@@ -171,6 +210,12 @@ def _allocate_next(
         except (IntegrityError, OperationalError):
             # Another concurrent transaction inserted the row; proceed to increment
             pass
+    else:
+        # Ensure sequence counter is synchronized if records with higher numbers exist
+        initial_highest = _highest_issued(db, org_id, column, stem)
+        if exists.last_number < initial_highest:
+            exists.last_number = initial_highest
+            db.flush()
 
     result = db.execute(
         sa_update(NumberSequence)
@@ -196,7 +241,7 @@ def next_transactional_number(
 ) -> str:
     """Next PREFIX-COMPANY_NUMBER-YEAR-SEQUENCE for transactional entities."""
     canonical = normalize_series(series)
-    year = year or _year()
+    year = year or get_business_year(db, org_id)
     company_number = extract_company_number(db, org_id)
     prefix = prefix_for(db, org_id, canonical)
     stem = f"{prefix}-{company_number}-{year}-"

@@ -40,6 +40,15 @@ def upgrade() -> None:
             )
             logger.info("Added supplier_code column to suppliers")
 
+        # Backfill existing suppliers with supplier_code before applying unique constraint
+        try:
+            from sqlalchemy.orm import Session
+            session = Session(bind=bind)
+            from app.scripts.backfill_supplier_codes import backfill_supplier_codes
+            backfill_supplier_codes(db=session)
+        except Exception as exc:
+            logger.warning("Could not backfill suppliers during migration: %s", exc)
+
         # Unique constraint per tenant
         try:
             op.create_unique_constraint(

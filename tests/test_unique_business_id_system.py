@@ -585,3 +585,66 @@ def test_42_supplier_backfill_dry_run_mode(db_session: Session):
 
     db_session.refresh(sup)
     assert sup.supplier_code is None  # Not modified in dry run!
+
+
+def test_43_supplier_sequence_sync_after_backfill(db_session: Session):
+    org = Organization(id=str(uuid.uuid4()), name="Sync Test Org", company_code="CMP-10001")
+    db_session.add(org)
+    db_session.flush()
+
+    # Create supplier with SUP-0047
+    sup1 = Supplier(organization_id=org.id, name="Existing Sup", supplier_code="SUP-0047")
+    sup2 = Supplier(organization_id=org.id, name="Unnumbered Sup", supplier_code=None)
+    db_session.add_all([sup1, sup2])
+    db_session.commit()
+
+    # Backfill
+    updated = backfill_supplier_codes(db=db_session, org_id=org.id)
+    assert updated == 1
+
+    db_session.refresh(sup1)
+    db_session.refresh(sup2)
+    assert sup1.supplier_code == "SUP-0047"
+    assert sup2.supplier_code == "SUP-0048"
+
+    # Next newly allocated supplier must continue at SUP-0049
+    next_code = numbering_service.next_master_number(db_session, org.id, Supplier.supplier_code, "SUP")
+    assert next_code == "SUP-0049"
+
+
+def test_44_business_year_timezone_and_rollover(db_session: Session):
+    org = Organization(id=str(uuid.uuid4()), name="Timezone Org", company_code="CMP-10001")
+    db_session.add(org)
+    db_session.commit()
+
+    # 1. Dec 31, 2026 23:59:00 IST -> Year 2026
+    dt_end_2026 = datetime(2026, 12, 31, 18, 29, 0, tzinfo=timezone.utc)  # 23:59 IST
+    assert numbering_service.get_business_year(db_session, org.id, dt=dt_end_2026) == 2026
+
+    # 2. Jan 01, 2027 00:01:00 IST -> UTC is Dec 31, 2026 18:31:00 UTC -> Year 2027 in Asia/Kolkata
+    dt_start_2027 = datetime(2026, 12, 31, 18, 31, 0, tzinfo=timezone.utc)  # 00:01 IST
+    assert numbering_service.get_business_year(db_session, org.id, dt=dt_start_2027) == 2027
+
+    # 3. Transactional numbering with business year rollover
+    cid_2026 = numbering_service.next_transactional_number(db_session, org.id, Customer.customer_id, "CS", year=2026)
+    assert cid_2026 == "CS-10001-2026-0001"
+
+    cid_2027 = numbering_service.next_transactional_number(db_session, org.id, Customer.customer_id, "CS", year=2027)
+    assert cid_2027 == "CS-10001-2027-0001"
+
+    inv_2026 = numbering_service.next_transactional_number(db_session, org.id, Invoice.invoice_number, "IN", year=2026)
+    assert inv_2026 == "IN-10001-2026-0001"
+
+    inv_2027 = numbering_service.next_transactional_number(db_session, org.id, Invoice.invoice_number, "IN", year=2027)
+    assert inv_2027 == "IN-10001-2027-0001"
+
+
+def test_45_org_custom_timezone_support(db_session: Session):
+    # Org with America/New_York (UTC-5)
+    org = Organization(id=str(uuid.uuid4()), name="NY Org", company_code="CMP-10002", timezone="America/New_York")
+    db_session.add(org)
+    db_session.commit()
+
+    # Jan 01, 2027 02:00:00 UTC -> Dec 31, 2026 21:00:00 EST -> Year 2026 in New York!
+    dt_ny_2026 = datetime(2027, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
+    assert numbering_service.get_business_year(db_session, org.id, dt=dt_ny_2026) == 2026
