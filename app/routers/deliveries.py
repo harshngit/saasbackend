@@ -28,6 +28,7 @@ from app.models import (
     DeliveryItem,
 )
 from app.services import (
+    delivery_redistribution_service,
     delivery_service,
     notification_service,
     numbering_service,
@@ -36,12 +37,15 @@ from app.services import (
     stock_service,
 )
 from app.schemas.delivery import (
+    AppDeliveryConfirm,
+    AppDeliveryConfirmOut,
     CollectionAllocationIn,
     CollectionAllocationOut,
     CustomerCollectionCreate,
     DeliveryBatchLoadItemOut,
     DeliveryBatchLoadRequest,
     DeliveryBatchLoadResponse,
+    DeliveryCapacityOut,
     DeliveryCollectionCreate,
     DeliveryCollectionOut,
     DeliveryConfirm,
@@ -790,6 +794,70 @@ def confirm_delivery(
     db.commit()
     db.refresh(delivery)
     return _delivery_out(db, delivery)
+
+
+@router.get("/{delivery_id}/app/delivery-capacity", response_model=DeliveryCapacityOut)
+def app_delivery_capacity(
+    delivery_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> DeliveryCapacityOut:
+    """Delivery app: the most each line can receive right now.
+
+    `max_allowed_delivery` is the line's own units still on the vehicle plus units
+    other receivers on the **same vehicle run** (the partner's active vehicle
+    loading) did not take — same product and variant only. Send it back as
+    `expected_max` on POST /deliveries/{id}/app/confirm.
+    """
+    delivery = _owned_delivery(db, delivery_id, user)
+    delivery_redistribution_service.require_own_target(user, delivery)
+    return DeliveryCapacityOut.model_validate(delivery_redistribution_service.capacity(db, delivery))
+
+
+@router.post("/{delivery_id}/app/confirm", response_model=AppDeliveryConfirmOut)
+def app_confirm_delivery(
+    delivery_id: str,
+    payload: AppDeliveryConfirm,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> AppDeliveryConfirmOut:
+    """Delivery app: confirm a hand-over that may exceed what was loaded for this
+    delivery, using spare units from the same vehicle run.
+
+    The extra units are first moved onto this delivery's lines from the donor lines
+    (recorded as `quantity_reallocated` on both timelines), then the hand-over is
+    recorded by exactly the same logic as POST /deliveries/{id}/confirm. Ordered
+    quantities never change; no warehouse stock moves.
+
+    409 when an item's `expected_max` no longer matches the server's figure.
+    """
+    delivery = _owned_delivery(db, delivery_id, user)
+    reallocations = delivery_redistribution_service.confirm(
+        db, user, delivery,
+        lines=[
+            {
+                "delivery_item_id": i.delivery_item_id,
+                "delivered_quantity": i.delivered_quantity,
+                "expected_max": i.expected_max,
+            }
+            for i in payload.items
+        ],
+        pod_photo_file_ids=payload.pod_photo_file_ids,
+        signature_file_id=payload.signature_file_id,
+        notes=payload.notes,
+        failed=payload.failed,
+        failure_reason=payload.failure_reason,
+        receiver_name=payload.receiver_name,
+    )
+    db.commit()
+    db.refresh(delivery)
+    out = _delivery_out(db, delivery)
+    return AppDeliveryConfirmOut(
+        **out.model_dump(),
+        reallocations=reallocations,
+        **delivery_redistribution_service.delivered_amounts(db, delivery),
+    )
 
 
 @router.get("/{delivery_id}/challan/pdf")

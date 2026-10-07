@@ -407,6 +407,100 @@ class DeliveryConfirm(BaseModel):
         return self
 
 
+class SurplusSourceOut(BaseModel):
+    """One delivery on the same vehicle run with units it did not take."""
+
+    delivery_id: str
+    delivery_number: str
+    delivery_item_id: str
+    available: float
+
+
+class DeliveryCapacityItemOut(BaseModel):
+    """How much one line can receive in the delivery app right now.
+
+    `max_allowed_delivery = own_remaining + transferable_surplus`. The surplus is
+    capped by what the vehicle physically holds, so the sources can add up to more
+    than `transferable_surplus`.
+    """
+
+    delivery_item_id: str
+    product_id: str | None = None
+    variant_id: str | None = None
+    product_name: str
+    batch_number: str | None = None
+    ordered_quantity: float | None = None
+    planned_quantity: float
+    loaded_quantity: float
+    delivered_quantity: float
+    own_remaining: float
+    transferable_surplus: float
+    max_allowed_delivery: float
+    redistribution_blocked_reason: str | None = None
+    surplus_sources: list[SurplusSourceOut] = Field(default_factory=list)
+
+
+class DeliveryCapacityOut(BaseModel):
+    delivery_id: str
+    delivery_number: str
+    status: str
+    vehicle_loading_id: str | None = None
+    delivered_value: float = Field(
+        default=0, description="This delivery's delivered units billed at the order lines' "
+                               "price, discount and tax — what a delivery invoice would bill")
+    order_delivered_value: float = Field(
+        default=0, description="Every delivered unit on the order, billed the same way")
+    paid_amount: float = Field(default=0, description="Paid on the order's invoices")
+    app_amount_due: float = Field(
+        default=0, description="max(order_delivered_value - paid_amount, 0). Unlike amount_due "
+                               "(order total less payments), this follows what was delivered. "
+                               "Invoice the delivery before collecting more than the order total.")
+    items: list[DeliveryCapacityItemOut] = Field(default_factory=list)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _public_status(cls, v: str | None) -> str | None:
+        return public_delivery_status(v)
+
+
+class AppDeliveryConfirmItem(DeliveryConfirmItem):
+    expected_max: float | None = Field(
+        default=None, ge=0,
+        description="The max_allowed_delivery the app showed. If the server's figure "
+                    "has changed since, the confirm is refused with 409.",
+    )
+
+
+class AppDeliveryConfirm(DeliveryConfirm):
+    """DeliveryConfirm for the delivery app: a line may receive more than was loaded
+    for it, up to the spare units on the same vehicle run."""
+
+    items: list[AppDeliveryConfirmItem] = Field(default_factory=list)
+
+
+class ReallocationOut(BaseModel):
+    from_delivery_id: str
+    from_delivery_item_id: str
+    to_delivery_item_id: str
+    product_id: str | None = None
+    variant_id: str | None = None
+    quantity: float
+
+
+class AppDeliveryConfirmOut(DeliveryOut):
+    reallocations: list[ReallocationOut] = Field(default_factory=list)
+    delivered_value: float = Field(
+        default=0, description="This delivery's delivered units billed at the order lines' "
+                               "price, discount and tax — what a delivery invoice would bill")
+    order_delivered_value: float = Field(
+        default=0, description="Every delivered unit on the order, billed the same way")
+    paid_amount: float = Field(default=0, description="Paid on the order's invoices")
+    app_amount_due: float = Field(
+        default=0, description="max(order_delivered_value - paid_amount, 0). Unlike amount_due "
+                               "(order total less payments), this follows what was delivered. "
+                               "Invoice the delivery before collecting more than the order total.")
+
+
 class DeliveryCollectionCreate(BaseModel):
     amount: float = Field(gt=0, description="Collection amount")
     payment_mode: str = Field(default="cash", description="cash | upi | cheque | bank_transfer | card | object")

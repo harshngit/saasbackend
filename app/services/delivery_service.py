@@ -908,6 +908,51 @@ def dispatch(db: Session, user: User, delivery: Delivery) -> None:
             order.status = "processing"
 
 
+def lock_delivery_row(db: Session, delivery_id: str) -> None:
+    """Write-lock one delivery with a no-op UPDATE — see load() for why this and
+    not SELECT ... FOR UPDATE (SQLite silently ignores the latter)."""
+    db.execute(sa_update(Delivery).where(Delivery.id == delivery_id).values(status=Delivery.status))
+
+
+def lock_run_for_confirm(db: Session, delivery: Delivery) -> VehicleLoading | None:
+    """Lock the partner's active vehicle run, then the delivery, and re-read both.
+
+    Always in that order — run, then delivery — so a website confirm and a delivery
+    app confirm (which also moves spare units between deliveries on the run) queue
+    behind one another instead of deadlocking. Anything read before this call may
+    be stale: a request that waited here sees what the one ahead of it committed,
+    so the hand-over is validated against the current loaded / delivered figures
+    rather than the ones it started with.
+
+    Returns the run, or None when the partner has no active one. Does not commit.
+    """
+    loading = (
+        _open_loading(db, delivery.organization_id, delivery.delivery_partner_id)
+        if delivery.delivery_partner_id else None
+    )
+    if loading is not None:
+        db.execute(
+            sa_update(VehicleLoading)
+            .where(VehicleLoading.id == loading.id)
+            .values(status=VehicleLoading.status)
+        )
+    lock_delivery_row(db, delivery.id)
+
+    db.refresh(delivery)
+    (
+        db.query(DeliveryItem)
+        .options(lazyload(DeliveryItem.product), lazyload(DeliveryItem.variant))
+        .filter(DeliveryItem.delivery_id == delivery.id)
+        .populate_existing()
+        .all()
+    )
+    if loading is not None:
+        db.refresh(loading)
+        if loading.status != "active":
+            return None
+    return loading
+
+
 def confirm(
     db: Session,
     user: User,
@@ -931,6 +976,7 @@ def confirm(
     # exactly the states that may reach "partially_delivered" too, so validating
     # against either representative target correctly gates the real outcome,
     # which is computed further down once the delivered quantity is known.
+    lock_run_for_confirm(db, delivery)
     previous = delivery.status
     _require_transition(delivery.status, "failed" if failed else "delivered")
 
