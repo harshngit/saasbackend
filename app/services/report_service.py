@@ -258,9 +258,11 @@ def _between(query, col, df, dt):
 
 
 def _paginate(rows: list[dict[str, Any]], page: int, page_size: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Helper to paginate in-memory or query-derived row lists cleanly."""
+    """Helper to paginate in-memory or query-derived row lists cleanly.
+    Screen queries are bounded to 100 rows per page; exports can retrieve up to 10,000 rows.
+    """
     total = len(rows)
-    page_size = max(1, min(page_size, 100))
+    page_size = max(1, min(page_size, 10000))
     page = max(1, page)
     total_pages = math.ceil(total / page_size) if total > 0 else 0
     start = (page - 1) * page_size
@@ -2174,12 +2176,21 @@ def build_report(
     df, dt = _range(date_from, date_to, db=db, org_id=org_id)
     params = filters.copy() if filters else {}
 
-    # If export requested, fetch full dataset (e.g. up to 10000)
+    # If export requested, fetch full dataset (up to 10000)
     if is_export:
         params["page"] = 1
         params["page_size"] = 10000
 
     result = _BUILDERS[report_type](db, org_id, df, dt, params)
+
+    if is_export:
+        total_rows = result.get("pagination", {}).get("total", len(result.get("rows", [])))
+        if total_rows > 10000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Export limit exceeded ({total_rows} rows). Maximum supported export is 10,000 rows. Please filter by date range or specific criteria.",
+            )
+
     result["type"] = report_type
     result["date_from"] = date_from
     result["date_to"] = date_to

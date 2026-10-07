@@ -824,3 +824,90 @@ def test_exports_excel_and_pdf(client):
     assert res_pdf.status_code == 200
     assert res_pdf.headers["content-type"] == "application/pdf"
     assert len(res_pdf.content) > 0
+
+
+def test_screen_pagination_capped_at_100(client):
+    """Screen pagination strictly rejects page_size > 100."""
+    res = client.get("/reports/sales?page_size=150")
+    assert res.status_code == 422  # FastAPI validation constraint le=100
+
+
+def test_export_more_than_100_rows_not_truncated(client, db, test_data):
+    """Export with >100 rows does not get truncated to 100 rows."""
+    org = test_data["org"]
+    cust = test_data["customer"]
+
+    # Seed 120 invoices
+    for idx in range(120):
+        inv = Invoice(
+            organization_id=org.id,
+            invoice_number=f"INV-EXP-{idx}",
+            customer_id=cust.id,
+            subtotal=50.0,
+            total=50.0,
+            amount_paid=50.0,
+            status="paid",
+            is_credit_note=False,
+            invoice_date=datetime.now(timezone.utc),
+        )
+        db.add(inv)
+    db.commit()
+
+    report = report_service.build_report(db, org.id, "sales", is_export=True)
+    assert len(report["rows"]) >= 120
+    assert report["pagination"]["page_size"] == 10000
+    assert report["pagination"]["total"] >= 120
+
+    # Excel export works for >100 rows
+    res = client.get("/reports/sales/export?format=excel")
+    assert res.status_code == 200
+    assert len(res.content) > 0
+
+
+def test_export_at_10000_rows_accepted(db, test_data, monkeypatch):
+    """Export dataset containing up to 10,000 rows is accepted."""
+    org = test_data["org"]
+
+    mock_rows = [{"invoice_number": f"INV-{i}", "total": 100.0} for i in range(10000)]
+
+    def mock_builder(db, org_id, df, dt, params):
+        paged_rows, pagination = report_service._paginate(mock_rows, params.get("page", 1), params.get("page_size", 25))
+        return {
+            "summary": {"total_sales": 1000000.0},
+            "rows": paged_rows,
+            "pagination": pagination,
+            "meta": {"currency": "INR", "columns": []},
+            "chart": {"type": "bar", "data": []},
+        }
+
+    monkeypatch.setitem(report_service._BUILDERS, "sales", mock_builder)
+
+    res = report_service.build_report(db, org.id, "sales", is_export=True)
+    assert len(res["rows"]) == 10000
+    assert res["pagination"]["total"] == 10000
+
+
+def test_export_more_than_10000_rows_rejected_with_http_400(client, test_data, monkeypatch):
+    """Export dataset exceeding 10,000 rows returns HTTP 400 with a clear error message."""
+    org = test_data["org"]
+
+    mock_rows = [{"invoice_number": f"INV-{i}", "total": 100.0} for i in range(10005)]
+
+    def mock_builder(db, org_id, df, dt, params):
+        paged_rows, pagination = report_service._paginate(mock_rows, params.get("page", 1), params.get("page_size", 25))
+        return {
+            "summary": {"total_sales": 1000500.0},
+            "rows": paged_rows,
+            "pagination": pagination,
+            "meta": {"currency": "INR", "columns": []},
+            "chart": {"type": "bar", "data": []},
+        }
+
+    monkeypatch.setitem(report_service._BUILDERS, "sales", mock_builder)
+
+    res = client.get("/reports/sales/export?format=excel")
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert "Export limit exceeded" in detail
+    assert "10,000 rows" in detail
+
