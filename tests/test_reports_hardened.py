@@ -14,6 +14,8 @@ from app.main import app
 from app.models import (
     Customer,
     CustomerPayment,
+    Delivery,
+    DeliveryItem,
     Expense,
     Invoice,
     InvoiceItem,
@@ -33,6 +35,7 @@ from app.models import (
     SupplierInvoice,
     SupplierPayment,
     User,
+    Vehicle,
     Warehouse,
     WarehouseStock,
 )
@@ -195,14 +198,15 @@ def client(db, test_data):
     app.dependency_overrides.clear()
 
 
-def test_registry_contains_all_15_reports():
-    assert len(report_service.REPORT_TYPES) == 15
-    assert len(report_service.REPORT_REGISTRY) == 15
+def test_registry_contains_all_reports():
+    assert len(report_service.REPORT_TYPES) == 17
+    assert len(report_service.REPORT_REGISTRY) == 17
     expected_reports = {
         "daily-transaction", "sales", "purchase", "customer-outstanding",
         "supplier-outstanding", "payment-collection", "expense", "cash-collection",
         "gst-summary", "sales-return", "purchase-return", "profit-loss",
         "supplier-payment", "inventory-summary", "stock-movement",
+        "sales-overview", "cash-flow-sheet",
     }
     assert report_service.REPORT_TYPES == expected_reports
 
@@ -910,4 +914,339 @@ def test_export_more_than_10000_rows_rejected_with_http_400(client, test_data, m
     detail = res.json()["detail"]
     assert "Export limit exceeded" in detail
     assert "10,000 rows" in detail
+
+
+def test_sales_overview_operational_report(client, db, test_data):
+    """Test Sales Overview operational report: root SalesOrder, delivery aggregation, quantities, filters, and summary."""
+    org = test_data["org"]
+    cust = test_data["customer"]
+    salesp = test_data["user"]
+    prod = test_data["product"]
+
+    # 1. Driver & Vehicle setup
+    driver = User(
+        id=str(uuid.uuid4()),
+        email="driver@example.com",
+        name="Fast Driver",
+        password_hash="fake",
+        organization_id=org.id,
+        role="delivery_partner",
+        is_active=True,
+    )
+    vehicle = Vehicle(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        vehicle_number="MH-01-AB-1234",
+        vehicle_type="Tata Ace",
+        is_active=True,
+    )
+    db.add_all([driver, vehicle])
+    db.commit()
+
+    # Order 1: No deliveries, not_started, 2 items (qty 5 + 10 = 15)
+    so1 = SalesOrder(
+        organization_id=org.id,
+        order_number="SO-OV-01",
+        sales_order_number="SO-10001-2026-00001",
+        customer_id=cust.id,
+        salesperson_id=salesp.id,
+        status="placed",
+        fulfilment_status="not_started",
+        total=1500.0,
+        order_date=datetime.now(timezone.utc),
+    )
+    db.add(so1)
+    db.flush()
+    item1_1 = SalesOrderItem(
+        order_id=so1.id,
+        product_id=prod.id,
+        product_name=prod.name,
+        quantity=5,
+        unit_price=100.0,
+        delivered_quantity=0,
+        line_total=500.0,
+    )
+    item1_2 = SalesOrderItem(
+        order_id=so1.id,
+        product_id=prod.id,
+        product_name=prod.name,
+        quantity=10,
+        unit_price=100.0,
+        delivered_quantity=0,
+        line_total=1000.0,
+    )
+    db.add_all([item1_1, item1_2])
+
+    # Order 2: 1 delivery, planned
+    so2 = SalesOrder(
+        organization_id=org.id,
+        order_number="SO-OV-02",
+        sales_order_number="SO-10001-2026-00002",
+        customer_id=cust.id,
+        salesperson_id=salesp.id,
+        status="processing",
+        fulfilment_status="planned",
+        total=800.0,
+        order_date=datetime.now(timezone.utc),
+    )
+    db.add(so2)
+    db.flush()
+    item2 = SalesOrderItem(
+        order_id=so2.id,
+        product_id=prod.id,
+        product_name=prod.name,
+        quantity=8,
+        unit_price=100.0,
+        delivered_quantity=0,
+        line_total=800.0,
+    )
+    db.add(item2)
+    deliv2 = Delivery(
+        organization_id=org.id,
+        sales_order_id=so2.id,
+        customer_id=cust.id,
+        delivery_note_number="DN-OV-02",
+        delivery_partner_id=driver.id,
+        vehicle_id=vehicle.id,
+        status="planned",
+        delivery_date=datetime.now(timezone.utc),
+    )
+    db.add(deliv2)
+
+    # Order 3: Multiple deliveries (Deliv A: delivered, Deliv B: in_transit, Deliv C: cancelled)
+    so3 = SalesOrder(
+        organization_id=org.id,
+        order_number="SO-OV-03",
+        sales_order_number="SO-10001-2026-00003",
+        customer_id=cust.id,
+        salesperson_id=salesp.id,
+        status="processing",
+        fulfilment_status="partially_delivered",
+        total=2000.0,
+        order_date=datetime.now(timezone.utc),
+    )
+    db.add(so3)
+    db.flush()
+    item3 = SalesOrderItem(
+        order_id=so3.id,
+        product_id=prod.id,
+        product_name=prod.name,
+        quantity=20,
+        unit_price=100.0,
+        delivered_quantity=12,
+        line_total=2000.0,
+    )
+    db.add(item3)
+    deliv3_a = Delivery(
+        organization_id=org.id,
+        sales_order_id=so3.id,
+        customer_id=cust.id,
+        delivery_note_number="DN-OV-03A",
+        delivery_partner_id=driver.id,
+        vehicle_id=vehicle.id,
+        status="delivered",
+        delivery_date=datetime.now(timezone.utc) - timedelta(days=2),
+    )
+    deliv3_b = Delivery(
+        organization_id=org.id,
+        sales_order_id=so3.id,
+        customer_id=cust.id,
+        delivery_note_number="DN-OV-03B",
+        delivery_partner_id=driver.id,
+        vehicle_id=vehicle.id,
+        status="in_transit",
+        delivery_date=datetime.now(timezone.utc) - timedelta(days=1),
+    )
+    deliv3_cancelled = Delivery(
+        organization_id=org.id,
+        sales_order_id=so3.id,
+        customer_id=cust.id,
+        delivery_note_number="DN-OV-03C-VOID",
+        status="cancelled",
+        delivery_date=datetime.now(timezone.utc),
+    )
+    db.add_all([deliv3_a, deliv3_b, deliv3_cancelled])
+
+    # Order 4: Cancelled order
+    so4_cancelled = SalesOrder(
+        organization_id=org.id,
+        order_number="SO-OV-04-CANC",
+        sales_order_number="SO-10001-2026-00004",
+        customer_id=cust.id,
+        status="cancelled",
+        fulfilment_status="not_started",
+        total=5000.0,
+        order_date=datetime.now(timezone.utc),
+    )
+    db.add(so4_cancelled)
+    db.commit()
+
+    # Query Sales Overview
+    res = client.get("/reports/sales-overview")
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["type"] == "sales-overview"
+    summary = data["summary"]
+    assert summary["total_orders"] >= 4
+    # Cancelled order 4 is excluded from total_sales_value (1500 + 800 + 2000 = 4300)
+    assert summary["total_sales_value"] >= 4300.0
+    assert summary["cancelled_orders"] >= 1
+    assert summary["not_started"] >= 1
+    assert summary["planned"] >= 1
+    assert summary["partially_delivered"] >= 1
+
+    # Find rows by order_number
+    rows = data["rows"]
+    r1 = next(r for r in rows if r["order_number"] == "SO-OV-01")
+    assert r1["delivery_count"] == 0
+    assert r1["ordered_quantity"] == 15.0
+    assert r1["delivered_quantity"] == 0.0
+    assert r1["remaining_quantity"] == 15.0
+    assert r1["latest_delivery"] is None
+
+    r2 = next(r for r in rows if r["order_number"] == "SO-OV-02")
+    assert r2["delivery_count"] == 1
+    assert r2["latest_delivery"]["delivery_number"] == "DN-OV-02"
+    assert r2["latest_delivery"]["delivery_partner"]["name"] == "Fast Driver"
+    assert r2["latest_delivery"]["vehicle"]["vehicle_number"] == "MH-01-AB-1234"
+
+    r3 = next(r for r in rows if r["order_number"] == "SO-OV-03")
+    # Cancelled delivery is excluded from delivery_count (2 active: 3A and 3B)
+    assert r3["delivery_count"] == 2
+    assert r3["ordered_quantity"] == 20.0
+    assert r3["delivered_quantity"] == 12.0
+    assert r3["remaining_quantity"] == 8.0
+    # Latest active delivery is 3B (in_transit)
+    assert r3["latest_delivery"]["delivery_number"] == "DN-OV-03B"
+    assert r3["latest_delivery"]["status"] == "in_transit"
+
+    # Test filtering by search
+    res_search = client.get("/reports/sales-overview?search=DN-OV-03A")
+    assert res_search.status_code == 200
+    search_rows = res_search.json()["rows"]
+    assert any(r["order_number"] == "SO-OV-03" for r in search_rows)
+
+    # Test filtering by fulfilment_status
+    res_f = client.get("/reports/sales-overview?fulfilment_status=partially_delivered")
+    assert res_f.status_code == 200
+    assert any(r["order_number"] == "SO-OV-03" for r in res_f.json()["rows"])
+
+
+def test_cash_flow_sheet_recorded_cash_movements(client, db, test_data):
+    """Test Cash Flow Sheet: verifies cash inflow from CustomerPayment, outflow from SupplierPayment & paid Expense,
+    non-cash exclusion, matching with Daily Transaction semantics, running balance, and exports."""
+    org = test_data["org"]
+    cust = test_data["customer"]
+    sup = test_data["supplier"]
+
+    # 1. Invoice alone (Accrual - must NOT create cash inflow)
+    inv_accrual = Invoice(
+        organization_id=org.id,
+        invoice_number="INV-CF-ACCRUAL",
+        customer_id=cust.id,
+        subtotal=10000.0,
+        total=10000.0,
+        amount_paid=0.0,
+        status="issued",
+        is_credit_note=False,
+        invoice_date=datetime.now(timezone.utc),
+    )
+    db.add(inv_accrual)
+
+    # 2. Real Customer Payment = +4000.0 (Cash In)
+    cp = CustomerPayment(
+        organization_id=org.id,
+        customer_id=cust.id,
+        amount=4000.0,
+        payment_mode="upi",
+        reference="UPI-CF-001",
+        received_on=datetime.now(timezone.utc) - timedelta(hours=3),
+    )
+    db.add(cp)
+
+    # 3. Non-void Supplier Payment = -1500.0 (Cash Out)
+    sp = SupplierPayment(
+        organization_id=org.id,
+        supplier_id=sup.id,
+        amount=1500.0,
+        payment_mode="bank_transfer",
+        reference="NEFT-CF-001",
+        status="recorded",
+        paid_on=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    db.add(sp)
+
+    # 4. Void Supplier Payment = -9999.0 (Must be EXCLUDED)
+    sp_void = SupplierPayment(
+        organization_id=org.id,
+        supplier_id=sup.id,
+        amount=9999.0,
+        payment_mode="cash",
+        reference="VOID-PAY",
+        status="void",
+        paid_on=datetime.now(timezone.utc),
+    )
+    db.add(sp_void)
+
+    # 5. Unpaid approved Expense = -5000.0 (Must be EXCLUDED from cash outflow)
+    exp_unpaid = Expense(
+        organization_id=org.id,
+        category="Office Rent",
+        amount=5000.0,
+        status="approved",
+        payment_status="pending",
+        expense_date=datetime.now(timezone.utc),
+    )
+    db.add(exp_unpaid)
+
+    # 6. Paid approved Expense = -500.0 (Cash Out)
+    exp_paid = Expense(
+        organization_id=org.id,
+        category="Stationery",
+        amount=500.0,
+        status="approved",
+        payment_status="paid",
+        expense_date=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    db.add(exp_paid)
+    db.commit()
+
+    # Query Cash Flow Sheet
+    res_cf = client.get("/reports/cash-flow-sheet")
+    assert res_cf.status_code == 200
+    data_cf = res_cf.json()
+
+    # Query Daily Transaction to compare exact matching
+    res_dt = client.get("/reports/daily-transaction")
+    assert res_dt.status_code == 200
+    data_dt = res_dt.json()
+
+    # Cash in = 4000.0
+    assert data_cf["summary"]["cash_in"] >= 4000.0
+    # Cash out = 1500 (SP) + 500 (Paid Exp) = 2000.0
+    assert data_cf["summary"]["cash_out"] >= 2000.0
+    assert data_cf["summary"]["net_cash_flow"] == round(data_cf["summary"]["cash_in"] - data_cf["summary"]["cash_out"], 2)
+
+    # Must match Daily Transaction cash_in and cash_out exactly
+    assert data_cf["summary"]["cash_in"] == data_dt["summary"]["cash_in"]
+    assert data_cf["summary"]["cash_out"] == data_dt["summary"]["cash_out"]
+    assert data_cf["summary"]["net_cash_flow"] == data_dt["summary"]["net_cash_flow"]
+
+    # Check rows
+    rows = data_cf["rows"]
+    assert len(rows) >= 3
+    # Check that void supplier payment and unpaid expense are NOT in cash flow rows
+    ref_list = [r["reference_number"] for r in rows]
+    assert "VOID-PAY" not in ref_list
+
+    # Check export endpoints
+    res_xlsx = client.get("/reports/cash-flow-sheet/export?format=excel")
+    assert res_xlsx.status_code == 200
+    assert len(res_xlsx.content) > 0
+
+    res_pdf = client.get("/reports/cash-flow-sheet/export?format=pdf")
+    assert res_pdf.status_code == 200
+    assert len(res_pdf.content) > 0
+
 

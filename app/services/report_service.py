@@ -19,11 +19,13 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models import (
     Customer,
     CustomerPayment,
+    Delivery,
+    DeliveryItem,
     Expense,
     Invoice,
     InvoiceItem,
@@ -42,6 +44,7 @@ from app.models import (
     SupplierInvoice,
     SupplierPayment,
     User,
+    Vehicle,
     Warehouse,
     WarehouseStock,
 )
@@ -49,7 +52,7 @@ from app.models.organization import Organization
 from app.services.numbering_service import DEFAULT_BUSINESS_TIMEZONE
 from app.core.workflow import SALE_ORDER_STATUSES as SALE_STATUSES
 
-# All 15 supported report types
+# All supported report types
 REPORT_TYPES = {
     "daily-transaction",
     "sales",
@@ -66,6 +69,8 @@ REPORT_TYPES = {
     "supplier-payment",
     "inventory-summary",
     "stock-movement",
+    "sales-overview",
+    "cash-flow-sheet",
 }
 
 # --------------------------------- Registry ---------------------------------
@@ -199,6 +204,23 @@ REPORT_REGISTRY: dict[str, dict[str, Any]] = {
             "warehouse_id", "product_id", "movement_type", "date_from", "date_to",
             "search", "page", "page_size",
         ],
+        "allowed_group_by": [],
+        "currency": "INR",
+    },
+    "sales-overview": {
+        "title": "Sales Overview (Orders & Deliveries)",
+        "description": "Operational sales order progression and delivery fulfillment tracking per order, ordered vs delivered quantities, and logistics status.",
+        "supported_filters": [
+            "date_from", "date_to", "customer_id", "salesperson_id", "order_status",
+            "fulfilment_status", "delivery_status", "search", "page", "page_size",
+        ],
+        "allowed_group_by": [],
+        "currency": "INR",
+    },
+    "cash-flow-sheet": {
+        "title": "Cash Flow Sheet (Recorded Cash Movements)",
+        "description": "Chronological audit ledger of recorded cash inflows (Customer Payments) and cash outflows (Supplier Payments and settled Operating Expenses) with period running movement.",
+        "supported_filters": ["date_from", "date_to", "search", "page", "page_size"],
         "allowed_group_by": [],
         "currency": "INR",
     },
@@ -2138,6 +2160,412 @@ def _stock_movement(db: Session, org_id: str, df: datetime | None, dt: datetime 
     }
 
 
+def _sales_overview(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    """Operational Sales Overview report rooted on SalesOrder with multiple delivery rollup."""
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    search = params.get("search")
+    customer_id = params.get("customer_id")
+    salesperson_id = params.get("salesperson_id")
+    order_status = params.get("order_status") or params.get("status")
+    fulfilment_status = params.get("fulfilment_status")
+    delivery_status = params.get("delivery_status")
+
+    if customer_id:
+        _verify_tenant_entity(db, org_id, Customer, customer_id, "Customer")
+    if salesperson_id:
+        _verify_tenant_entity(db, org_id, User, salesperson_id, "Salesperson")
+
+    q = (
+        db.query(SalesOrder)
+        .options(
+            selectinload(SalesOrder.deliveries).selectinload(Delivery.items),
+            joinedload(SalesOrder.customer),
+            joinedload(SalesOrder.salesperson),
+            joinedload(SalesOrder.items),
+        )
+        .filter(SalesOrder.organization_id == org_id)
+    )
+
+    if df is not None:
+        q = q.filter(func.coalesce(SalesOrder.order_date, SalesOrder.created_at) >= df)
+    if dt is not None:
+        q = q.filter(func.coalesce(SalesOrder.order_date, SalesOrder.created_at) <= dt)
+
+    if customer_id:
+        q = q.filter(SalesOrder.customer_id == customer_id)
+    if salesperson_id:
+        q = q.filter(SalesOrder.salesperson_id == salesperson_id)
+    if order_status:
+        q = q.filter(SalesOrder.status == order_status)
+    if fulfilment_status:
+        q = q.filter(SalesOrder.fulfilment_status == fulfilment_status)
+
+    if search:
+        s = f"%{search}%"
+        q = q.outerjoin(Customer, Customer.id == SalesOrder.customer_id).outerjoin(
+            Delivery, Delivery.sales_order_id == SalesOrder.id
+        ).filter(
+            or_(
+                SalesOrder.order_number.ilike(s),
+                SalesOrder.sales_order_number.ilike(s),
+                Customer.name.ilike(s),
+                Customer.business_name.ilike(s),
+                Customer.customer_id.ilike(s),
+                Delivery.delivery_note_number.ilike(s),
+            )
+        ).distinct()
+
+    orders = q.order_by(func.coalesce(SalesOrder.order_date, SalesOrder.created_at).desc(), SalesOrder.id.desc()).all()
+
+    if delivery_status:
+        filtered_orders = []
+        for o in orders:
+            active_d = [d for d in o.deliveries if d.status != "cancelled"]
+            if any(d.status == delivery_status for d in active_d):
+                filtered_orders.append(o)
+        orders = filtered_orders
+
+    # Collect partner and vehicle IDs for batch lookup to prevent N+1 queries
+    partner_ids = set()
+    vehicle_ids = set()
+    for o in orders:
+        for d in o.deliveries:
+            if d.delivery_partner_id:
+                partner_ids.add(d.delivery_partner_id)
+            if d.vehicle_id:
+                vehicle_ids.add(d.vehicle_id)
+
+    partners_map = {u.id: u.name for u in db.query(User.id, User.name).filter(User.id.in_(partner_ids)).all()} if partner_ids else {}
+    vehicles_map = {v.id: v.vehicle_number for v in db.query(Vehicle.id, Vehicle.vehicle_number).filter(Vehicle.id.in_(vehicle_ids)).all()} if vehicle_ids else {}
+
+    all_rows = []
+    total_sales_value = 0.0
+    total_ordered_qty = 0.0
+    total_delivered_qty = 0.0
+    total_remaining_qty = 0.0
+    not_started_count = 0
+    planned_count = 0
+    partially_delivered_count = 0
+    delivered_count = 0
+    cancelled_count = 0
+
+    for o in orders:
+        is_cancelled = (o.status == "cancelled")
+        if not is_cancelled:
+            total_sales_value = round(total_sales_value + o.total, 2)
+        else:
+            cancelled_count += 1
+
+        ord_qty = float(sum(item.quantity or 0 for item in o.items))
+        deliv_qty = float(sum(item.delivered_quantity or 0 for item in o.items))
+        rem_qty = max(ord_qty - deliv_qty, 0.0)
+
+        total_ordered_qty = round(total_ordered_qty + ord_qty, 2)
+        total_delivered_qty = round(total_delivered_qty + deliv_qty, 2)
+        total_remaining_qty = round(total_remaining_qty + rem_qty, 2)
+
+        f_st = (o.fulfilment_status or "not_started").lower()
+        if f_st in ("not_started", "pending", "reserved"):
+            not_started_count += 1
+        elif f_st in ("planned", "loaded", "in_transit"):
+            planned_count += 1
+        elif f_st == "partially_delivered":
+            partially_delivered_count += 1
+        elif f_st == "delivered":
+            delivered_count += 1
+
+        active_deliveries = [d for d in o.deliveries if d.status != "cancelled"]
+        active_deliveries.sort(key=lambda d: d.delivery_date or d.created_at, reverse=True)
+        latest_d = active_deliveries[0] if active_deliveries else None
+
+        latest_d_dict = None
+        if latest_d:
+            partner_name = partners_map.get(latest_d.delivery_partner_id) if latest_d.delivery_partner_id else None
+            vehicle_num = vehicles_map.get(latest_d.vehicle_id) if latest_d.vehicle_id else None
+            latest_d_dict = {
+                "id": latest_d.id,
+                "delivery_number": latest_d.delivery_note_number,
+                "status": latest_d.status,
+                "scheduled_date": latest_d.scheduled_date.date().isoformat() if latest_d.scheduled_date else None,
+                "delivery_partner": {
+                    "id": latest_d.delivery_partner_id,
+                    "name": partner_name,
+                } if latest_d.delivery_partner_id else None,
+                "vehicle": {
+                    "id": latest_d.vehicle_id,
+                    "vehicle_number": vehicle_num,
+                } if latest_d.vehicle_id else None,
+            }
+
+        cust = o.customer
+        salesp = o.salesperson
+        o_date_val = o.order_date or o.created_at
+        o_date_str = o_date_val.date().isoformat() if hasattr(o_date_val, "date") else str(o_date_val)[:10]
+
+        all_rows.append({
+            "order_id": o.id,
+            "order_number": o.order_number,
+            "sales_order_number": o.sales_order_number,
+            "order_date": o_date_str,
+            "customer": {
+                "id": o.customer_id,
+                "customer_id": cust.customer_id if cust else None,
+                "customer_code": cust.customer_id if cust else None,
+                "name": (cust.business_name or cust.name) if cust else "Walk-in",
+            },
+            "customer_name": (cust.business_name or cust.name) if cust else "Walk-in",
+            "salesperson": {
+                "id": o.salesperson_id,
+                "name": salesp.name if salesp else "Unassigned",
+            },
+            "salesperson_name": salesp.name if salesp else "Unassigned",
+            "order_total": round(o.total, 2),
+            "order_status": o.status,
+            "fulfilment_status": o.fulfilment_status or "not_started",
+            "ordered_quantity": ord_qty,
+            "delivered_quantity": deliv_qty,
+            "remaining_quantity": rem_qty,
+            "delivery_count": len(active_deliveries),
+            "latest_delivery": latest_d_dict,
+            "latest_delivery_number": latest_d.delivery_note_number if latest_d else None,
+            "latest_delivery_status": latest_d.status if latest_d else None,
+        })
+
+    summary = {
+        "total_orders": len(orders),
+        "total_sales_value": total_sales_value,
+        "not_started": not_started_count,
+        "planned": planned_count,
+        "partially_delivered": partially_delivered_count,
+        "delivered": delivered_count,
+        "cancelled_orders": cancelled_count,
+        "total_ordered_quantity": total_ordered_qty,
+        "total_delivered_quantity": total_delivered_qty,
+        "total_remaining_quantity": total_remaining_qty,
+    }
+
+    paged_rows, pagination = _paginate(all_rows, page, page_size)
+
+    meta = {
+        "currency": "INR",
+        "group_by": None,
+        "columns": [
+            {"key": "order_number", "label": "Order #", "type": "reference"},
+            {"key": "order_date", "label": "Order Date", "type": "date"},
+            {"key": "customer_name", "label": "Customer", "type": "text"},
+            {"key": "salesperson_name", "label": "Salesperson", "type": "text"},
+            {"key": "order_total", "label": "Total Amount", "type": "currency"},
+            {"key": "order_status", "label": "Order Status", "type": "status"},
+            {"key": "fulfilment_status", "label": "Fulfilment", "type": "status"},
+            {"key": "ordered_quantity", "label": "Ordered Qty", "type": "number"},
+            {"key": "delivered_quantity", "label": "Delivered Qty", "type": "number"},
+            {"key": "remaining_quantity", "label": "Remaining Qty", "type": "number"},
+            {"key": "delivery_count", "label": "Deliveries", "type": "number"},
+            {"key": "latest_delivery_number", "label": "Latest Delivery #", "type": "reference"},
+            {"key": "latest_delivery_status", "label": "Delivery Status", "type": "status"},
+        ],
+    }
+
+    chart = {
+        "type": "bar",
+        "title": "Fulfilment Status Distribution",
+        "data": [
+            {"status": "Not Started / Pending", "count": not_started_count},
+            {"status": "Planned / In Transit", "count": planned_count},
+            {"status": "Partially Delivered", "count": partially_delivered_count},
+            {"status": "Delivered", "count": delivered_count},
+            {"status": "Cancelled", "count": cancelled_count},
+        ],
+    }
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+    }
+
+
+def _cash_flow_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    """Recorded Cash Movements Cash Flow Sheet matching Daily Transaction semantics."""
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    search = params.get("search")
+
+    # 1. Customer Payments (Cash Inflow)
+    pay_in_q = db.query(CustomerPayment).filter(
+        CustomerPayment.organization_id == org_id,
+    )
+    pay_in_q = _between(pay_in_q, CustomerPayment.received_on, df, dt)
+    customer_payments = pay_in_q.all()
+
+    # 2. Supplier Payments (Cash Outflow, excluding void)
+    pay_out_q = db.query(SupplierPayment).filter(
+        SupplierPayment.organization_id == org_id,
+        SupplierPayment.status != "void",
+    )
+    pay_out_q = _between(pay_out_q, SupplierPayment.paid_on, df, dt)
+    supplier_payments = pay_out_q.all()
+
+    # 3. Expenses (Approved and actually paid/settled/completed)
+    exp_q = db.query(Expense).filter(
+        Expense.organization_id == org_id,
+        Expense.status == "approved",
+    )
+    exp_q = _between(exp_q, Expense.expense_date, df, dt)
+    expenses = exp_q.all()
+
+    def _is_paid_expense(e: Expense) -> bool:
+        ps = (e.payment_status or "").strip().lower()
+        return ps in ("paid", "settled", "completed")
+
+    paid_expenses = [e for e in expenses if _is_paid_expense(e)]
+
+    all_rows = []
+
+    for cp in customer_payments:
+        cust = db.get(Customer, cp.customer_id) if cp.customer_id else None
+        party_name = (cust.business_name or cust.name) if cust else "Unknown Customer"
+        d_val = cp.received_on
+        d_str = d_val.date().isoformat() if hasattr(d_val, "date") else str(d_val)[:10]
+        all_rows.append({
+            "timestamp": d_val,
+            "date": d_str,
+            "transaction_type": "Customer Payment",
+            "reference_number": cp.reference or cp.receipt_number or cp.id[:8],
+            "party": party_name,
+            "cash_in": round(cp.amount, 2),
+            "cash_out": 0.0,
+            "amount": round(cp.amount, 2),
+            "payment_mode": cp.payment_mode or "cash",
+            "category": "Customer Collection",
+        })
+
+    for sp in supplier_payments:
+        supplier_name = sp.supplier.name if sp.supplier else "Unknown Supplier"
+        d_val = sp.paid_on
+        d_str = d_val.date().isoformat() if hasattr(d_val, "date") else str(d_val)[:10]
+        all_rows.append({
+            "timestamp": d_val,
+            "date": d_str,
+            "transaction_type": "Supplier Payment",
+            "reference_number": sp.payment_number or sp.reference or sp.id[:8],
+            "party": supplier_name,
+            "cash_in": 0.0,
+            "cash_out": round(sp.amount, 2),
+            "amount": round(-sp.amount, 2),
+            "payment_mode": sp.payment_mode or sp.payment_method or "cash",
+            "category": "Supplier Disbursement",
+        })
+
+    for exp in paid_expenses:
+        d_val = exp.expense_date
+        d_str = d_val.date().isoformat() if hasattr(d_val, "date") else str(d_val)[:10]
+        all_rows.append({
+            "timestamp": d_val,
+            "date": d_str,
+            "transaction_type": "Paid Expense",
+            "reference_number": exp.expense_number or exp.category or exp.id[:8],
+            "party": exp.vendor or exp.submitted_by or "Expense Payee",
+            "cash_in": 0.0,
+            "cash_out": round(exp.amount, 2),
+            "amount": round(-exp.amount, 2),
+            "payment_mode": exp.payment_mode or "paid",
+            "category": exp.category or "Operating Expense",
+        })
+
+    if search:
+        s_lower = search.lower()
+        all_rows = [
+            r for r in all_rows
+            if s_lower in (r["reference_number"] or "").lower()
+            or s_lower in (r["party"] or "").lower()
+            or s_lower in (r["transaction_type"] or "").lower()
+            or s_lower in (r["category"] or "").lower()
+            or s_lower in (r["payment_mode"] or "").lower()
+        ]
+
+    # Chronological sort ascending to calculate running balance
+    all_rows.sort(key=lambda r: r["timestamp"] or datetime.min)
+    running = 0.0
+    for r in all_rows:
+        running = round(running + r["amount"], 2)
+        r["running_balance"] = running
+
+    daily_cash_in: dict[str, float] = defaultdict(float)
+    daily_cash_out: dict[str, float] = defaultdict(float)
+    for r in all_rows:
+        daily_cash_in[r["date"]] += r["cash_in"]
+        daily_cash_out[r["date"]] += r["cash_out"]
+
+    all_dates = sorted(set(list(daily_cash_in.keys()) + list(daily_cash_out.keys())))
+    chart_data = [
+        {
+            "date": d,
+            "cash_in": round(daily_cash_in[d], 2),
+            "cash_out": round(daily_cash_out[d], 2),
+            "net_flow": round(daily_cash_in[d] - daily_cash_out[d], 2),
+        }
+        for d in all_dates
+    ]
+
+    # Display rows in reverse chronological order
+    all_rows.reverse()
+    for r in all_rows:
+        r.pop("timestamp", None)
+
+    cash_in_total = round(sum(cp.amount for cp in customer_payments), 2)
+    supplier_payments_total = round(sum(sp.amount for sp in supplier_payments), 2)
+    paid_expenses_total = round(sum(e.amount for e in paid_expenses), 2)
+    cash_out_total = round(supplier_payments_total + paid_expenses_total, 2)
+    net_cash_flow = round(cash_in_total - cash_out_total, 2)
+
+    summary = {
+        "cash_in": cash_in_total,
+        "cash_out": cash_out_total,
+        "net_cash_flow": net_cash_flow,
+        "customer_payments_count": len(customer_payments),
+        "supplier_payments_count": len(supplier_payments),
+        "paid_expenses_count": len(paid_expenses),
+        "total_transactions": len(customer_payments) + len(supplier_payments) + len(paid_expenses),
+    }
+
+    paged_rows, pagination = _paginate(all_rows, page, page_size)
+
+    meta = {
+        "currency": "INR",
+        "group_by": None,
+        "notes": "Represents recorded cash transactions (Customer Payments, Supplier Payments, Paid Expenses). Does not include accrual invoices or unrecorded opening bank balances.",
+        "columns": [
+            {"key": "date", "label": "Date", "type": "date"},
+            {"key": "transaction_type", "label": "Transaction Type", "type": "text"},
+            {"key": "reference_number", "label": "Reference #", "type": "reference"},
+            {"key": "party", "label": "Party / Payee", "type": "text"},
+            {"key": "cash_in", "label": "Cash In (+)", "type": "currency"},
+            {"key": "cash_out", "label": "Cash Out (-)", "type": "currency"},
+            {"key": "payment_mode", "label": "Payment Mode", "type": "text"},
+            {"key": "category", "label": "Category", "type": "text"},
+            {"key": "running_balance", "label": "Period Net Movement", "type": "currency"},
+        ],
+    }
+
+    chart = {
+        "type": "bar",
+        "title": "Daily Cash In vs Cash Out",
+        "data": chart_data,
+    }
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+    }
+
+
 _BUILDERS = {
     "daily-transaction": _daily_transaction,
     "sales": _sales,
@@ -2154,6 +2582,8 @@ _BUILDERS = {
     "supplier-payment": _supplier_payment,
     "inventory-summary": _inventory_summary,
     "stock-movement": _stock_movement,
+    "sales-overview": _sales_overview,
+    "cash-flow-sheet": _cash_flow_sheet,
 }
 
 
