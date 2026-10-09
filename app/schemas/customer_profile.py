@@ -203,6 +203,8 @@ class FinancialSummary(BaseModel):
     outstanding_balance: float = 0
     credit_limit: float = 0
     available_credit: float = 0
+    unreconciled_collection_amount: float = 0
+    unreconciled_collection_count: int = 0
 
 
 class SalesSummary(BaseModel):

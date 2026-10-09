@@ -1178,6 +1178,7 @@ def record_general_customer_collection(
         payment_mode=mode,
         reference=payload.reference,
         notes=payload.notes,
+        payment_proof_url=payload.payment_proof_url,
         reconciliation_status="recorded",
         collected_at=collected_at,
     )
@@ -1262,6 +1263,7 @@ def reconcile_delivery_collection(
                 received_on=coll.collected_at or datetime.now(timezone.utc),
                 allocations=alloc_list,
                 collected_by_user_id=coll.delivery_partner_id,
+                payment_proof_url=coll.payment_proof_url,
             )
             coll.customer_payment_id = payment.id
         except ValueError as exc:
@@ -1398,6 +1400,7 @@ def record_delivery_collection(
         payment_mode=payload.payment_mode,
         reference=payload.reference,
         notes=payload.notes,
+        payment_proof_url=payload.payment_proof_url,
         reconciliation_status="recorded",
         collected_at=datetime.now(timezone.utc),
     )

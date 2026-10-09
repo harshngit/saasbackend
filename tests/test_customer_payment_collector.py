@@ -44,7 +44,7 @@ def collector_setup():
     db = SessionLocal()
     try:
         ts = int(datetime.now(timezone.utc).timestamp())
-        org = Organization(name=f"Collector Test Org {ts}", company_code=f"COL{ts}")
+        org = Organization(name=f"Collector Test Org {ts}", company_code=f"CMP-{ts % 90000 + 10000}")
         db.add(org)
         db.flush()
 

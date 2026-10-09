@@ -135,10 +135,35 @@ class Customer(Base):
     assigned_sales_officer: Mapped["User | None"] = relationship(  # noqa: F821
         foreign_keys=[assigned_sales_officer_id], lazy="joined"
     )
+    delivery_collections: Mapped[list["DeliveryCollection"]] = relationship(  # noqa: F821
+        lazy="selectin", primaryjoin="Customer.id == foreign(DeliveryCollection.customer_id)", overlaps="customer"
+    )
 
     def recompute_outstanding(self) -> None:
         self.outstanding_balance = round(
             (self.opening_balance or 0) + (self.total_billed or 0) - (self.total_received or 0), 2
+        )
+
+    @property
+    def unreconciled_collection_amount(self) -> float:
+        colls = getattr(self, "delivery_collections", None)
+        if not colls:
+            return 0.0
+        return round(sum(
+            float(c.amount or 0.0)
+            for c in colls
+            if getattr(c, "reconciliation_status", None) == "recorded" and getattr(c, "organization_id", None) == self.organization_id
+        ), 2)
+
+    @property
+    def unreconciled_collection_count(self) -> int:
+        colls = getattr(self, "delivery_collections", None)
+        if not colls:
+            return 0
+        return sum(
+            1
+            for c in colls
+            if getattr(c, "reconciliation_status", None) == "recorded" and getattr(c, "organization_id", None) == self.organization_id
         )
 
 

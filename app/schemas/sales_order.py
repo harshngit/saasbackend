@@ -187,10 +187,16 @@ class OrderOut(BaseModel):
     total_due: float = 0.0
     paid_amount: float = 0.0
     remaining_balance: float = 0.0
+    unreconciled_collection_amount: float = Field(
+        default=0.0, description="Total amount recorded in field collections pending accountant reconciliation"
+    )
+    unreconciled_collection_count: int = Field(
+        default=0, description="Count of field collections pending accountant reconciliation"
+    )
 
     # Enhanced Order Flow Output Fields
     delivery_method: str | None = Field(default=None, description="takeaway | home_delivery")
-    payment_status: str | None = Field(default=None, description="paid | partial | pending")
+    payment_status: str | None = Field(default=None, description="paid | partial | pending | pending_reconciliation")
     remaining_amount: float = Field(default=0.0, description="Order total minus paid amount")
     delivery_partner: UserBrief | None = Field(default=None, description="Brief partner object")
 

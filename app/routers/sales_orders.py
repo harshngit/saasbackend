@@ -15,6 +15,7 @@ from app.models import (
     CustomerPaymentAllocation,
     Delivery,
     DeliveryCollection,
+    DeliveryCollectionAllocation,
     Invoice,
     Role,
     SalesOrder,
@@ -179,11 +180,53 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
     else:
         out.delivery_method = order.fulfilment_method
 
+    # Calculate unreconciled collections recorded against this order or its invoices
+    direct_colls = (
+        db.query(DeliveryCollection)
+        .filter(
+            DeliveryCollection.organization_id == order.organization_id,
+            DeliveryCollection.sales_order_id == order.id,
+            DeliveryCollection.reconciliation_status == "recorded",
+        )
+        .all()
+    )
+
+    alloc_colls = (
+        db.query(DeliveryCollectionAllocation, DeliveryCollection)
+        .join(DeliveryCollection, DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id)
+        .join(Invoice, DeliveryCollectionAllocation.invoice_id == Invoice.id)
+        .filter(
+            DeliveryCollection.organization_id == order.organization_id,
+            Invoice.order_id == order.id,
+            DeliveryCollection.reconciliation_status == "recorded",
+        )
+        .all()
+    )
+
+    unreconciled_coll_map: dict[str, float] = {}
+    for c in direct_colls:
+        if not c.allocations:
+            unreconciled_coll_map[c.id] = float(c.amount or 0.0)
+
+    for a, c in alloc_colls:
+        unreconciled_coll_map[c.id] = unreconciled_coll_map.get(c.id, 0.0) + float(a.amount or 0.0)
+
+    unreconciled_amount = round(sum(unreconciled_coll_map.values()), 2)
+    unreconciled_count = len(unreconciled_coll_map)
+
+    out.unreconciled_collection_amount = unreconciled_amount
+    out.unreconciled_collection_count = unreconciled_count
+
     if inv:
         st = payment_service.payment_status(inv)
-        out.payment_status = "pending" if st == "unpaid" else st
+        if st in ("unpaid", "pending"):
+            out.payment_status = "pending_reconciliation" if unreconciled_amount > 0 else "pending"
+        elif st == "partial":
+            out.payment_status = "pending_reconciliation" if (unreconciled_amount > 0 and out.remaining_balance <= unreconciled_amount) else "partial"
+        else:
+            out.payment_status = st
     else:
-        out.payment_status = "pending"
+        out.payment_status = "pending_reconciliation" if unreconciled_amount > 0 else "pending"
 
     out.remaining_amount = out.remaining_balance
 

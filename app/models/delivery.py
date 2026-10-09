@@ -249,6 +249,8 @@ class DeliveryCollection(Base):
     customer_payment_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("customer_payments.id", ondelete="SET NULL"), nullable=True
     )
+    # Proof of payment screenshot / image URL (e.g. /files/{id} from POST /files/upload)
+    payment_proof_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -260,7 +262,7 @@ class DeliveryCollection(Base):
         lazy="selectin", primaryjoin="DeliveryCollection.sales_order_id == SalesOrder.id"
     )
     customer: Mapped["Customer | None"] = relationship(
-        lazy="selectin", primaryjoin="DeliveryCollection.customer_id == Customer.id"
+        lazy="selectin", primaryjoin="DeliveryCollection.customer_id == Customer.id", overlaps="delivery_collections"
     )
     delivery_partner: Mapped["User | None"] = relationship(
         lazy="selectin", foreign_keys=[delivery_partner_id]

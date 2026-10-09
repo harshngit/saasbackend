@@ -506,6 +506,7 @@ class DeliveryCollectionCreate(BaseModel):
     payment_mode: str = Field(default="cash", description="cash | upi | cheque | bank_transfer | card | object")
     reference: str | None = Field(default=None, max_length=150)
     notes: str | None = Field(default=None, max_length=1000)
+    payment_proof_url: str | None = Field(default=None, description="Proof of payment screenshot URL or file_id")
 
 
 class CollectionAllocationIn(BaseModel):
@@ -521,6 +522,7 @@ class CustomerCollectionCreate(BaseModel):
     reference: str | None = Field(default=None, max_length=150)
     notes: str | None = Field(default=None, max_length=1000)
     payment_date: datetime | str | None = Field(default=None)
+    payment_proof_url: str | None = Field(default=None, description="Proof of payment screenshot URL or file_id")
     allocations: list[CollectionAllocationIn] | None = Field(default_factory=list)
     source: str | None = Field(default="delivery_partner")
     delivery_id: str | None = Field(default=None)
@@ -566,6 +568,7 @@ class DeliveryCollectionOut(BaseModel):
     payment_mode: str
     reference: str | None = None
     notes: str | None = None
+    payment_proof_url: str | None = None
     collected_at: datetime
     reconciliation_status: str = Field(description="recorded | reconciled | voided")
     reconciled_at: datetime | None = None
@@ -574,6 +577,12 @@ class DeliveryCollectionOut(BaseModel):
     allocations: list[CollectionAllocationOut] | None = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("payment_proof_url", mode="after")
+    @classmethod
+    def _normalize_payment_proof(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
     @model_validator(mode="after")
     def _populate_computed_fields(self) -> "DeliveryCollectionOut":

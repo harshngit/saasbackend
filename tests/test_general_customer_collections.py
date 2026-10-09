@@ -42,7 +42,8 @@ def collection_setup():
     try:
         # Create unique org codes to avoid collision
         ts = int(datetime.now(timezone.utc).timestamp())
-        org = Organization(name=f"Collection Test Org {ts}", company_code=f"CTO{ts}")
+        code1 = f"CMP-{ts % 90000 + 10000}"
+        org = Organization(name=f"Collection Test Org {ts}", company_code=code1)
         db.add(org)
         db.flush()
 
@@ -71,7 +72,8 @@ def collection_setup():
         db.add(partner)
 
         # Org 2 (For tenant isolation tests)
-        org2 = Organization(name=f"Other Org {ts}", company_code=f"OTH{ts}")
+        code2 = f"CMP-{(ts + 1) % 90000 + 10000}"
+        org2 = Organization(name=f"Other Org {ts}", company_code=code2)
         db.add(org2)
         db.flush()
 
@@ -124,10 +126,31 @@ def collection_setup():
         db.add(cust_org2)
         db.flush()
 
+        # Sales Orders for Customer 1
+        orderA = SalesOrder(
+            organization_id=org.id,
+            customer_id=cust1.id,
+            order_number=f"ORD-A-{ts}",
+            total=500.0,
+            status="confirmed",
+            fulfilment_status="planned",
+        )
+        orderB = SalesOrder(
+            organization_id=org.id,
+            customer_id=cust1.id,
+            order_number=f"ORD-B-{ts}",
+            total=1000.0,
+            status="confirmed",
+            fulfilment_status="planned",
+        )
+        db.add_all([orderA, orderB])
+        db.flush()
+
         # Invoices for Customer 1 (Rahul): Invoice A = 500, Invoice B = 1000
         invA = Invoice(
             organization_id=org.id,
             customer_id=cust1.id,
+            order_id=orderA.id,
             invoice_number=f"INV-A-1001-{ts}",
             invoice_date=datetime.now(timezone.utc),
             total=500.0,
@@ -138,6 +161,7 @@ def collection_setup():
         invB = Invoice(
             organization_id=org.id,
             customer_id=cust1.id,
+            order_id=orderB.id,
             invoice_number=f"INV-B-1005-{ts}",
             invoice_date=datetime.now(timezone.utc),
             total=1000.0,
@@ -187,6 +211,8 @@ def collection_setup():
             "cust1": cust1,
             "cust2": cust2,
             "cust_org2": cust_org2,
+            "orderA": orderA,
+            "orderB": orderB,
             "invA": invA,
             "invB": invB,
             "invC": invC,
@@ -548,3 +574,139 @@ def test_15_database_migration_verification(collection_setup):
     db.commit()
     assert coll_null.id is not None
     assert coll_null.delivery_id is None
+
+
+def test_16_unreconciled_collection_visibility(collection_setup):
+    """TEST 16 — Unreconciled collection visibility on Sales Order and Customer."""
+    s = collection_setup
+    db = s["db"]
+
+    # 1. Check initial state of order & customer
+    ord_res = client.get(f"/orders/{s['orderA'].id}", headers=s["admin_headers"])
+    assert ord_res.status_code == 200
+    ord_data = ord_res.json()
+    assert ord_data["payment_status"] == "pending"
+    assert ord_data["unreconciled_collection_amount"] == 0.0
+    assert ord_data["unreconciled_collection_count"] == 0
+
+    cust_res = client.get(f"/customers/{s['cust1'].id}", headers=s["admin_headers"])
+    assert cust_res.status_code == 200
+    cust_data = cust_res.json()
+    assert cust_data["financial_summary"]["unreconciled_collection_amount"] == 0.0
+    assert cust_data["financial_summary"]["unreconciled_collection_count"] == 0
+
+    # 2. Record a collection allocated to invoice A (500)
+    payload = {
+        "customer_id": s["cust1"].id,
+        "amount": 500,
+        "payment_method": "cash",
+        "delivery_id": None,
+        "allocations": [
+            {"invoice_id": s["invA"].id, "amount": 500},
+        ],
+    }
+    col_res = client.post("/customer-payments/collections", json=payload, headers=s["partner_headers"])
+    assert col_res.status_code == 201
+    col_id = col_res.json()["id"]
+
+    # 3. Verify order now shows pending_reconciliation and unreconciled_collection_amount
+    ord_res2 = client.get(f"/orders/{s['orderA'].id}", headers=s["admin_headers"])
+    assert ord_res2.status_code == 200
+    ord_data2 = ord_res2.json()
+    assert ord_data2["payment_status"] == "pending_reconciliation"
+    assert ord_data2["unreconciled_collection_amount"] == 500.0
+    assert ord_data2["unreconciled_collection_count"] == 1
+    # Financial ledger balance is NOT yet changed
+    assert ord_data2["paid_amount"] == 0.0
+    assert ord_data2["remaining_balance"] == 500.0
+
+    # 4. Verify customer profile & customer list shows unreconciled amount
+    cust_res2 = client.get(f"/customers/{s['cust1'].id}", headers=s["admin_headers"])
+    assert cust_res2.status_code == 200
+    cust_data2 = cust_res2.json()
+    assert cust_data2["financial_summary"]["unreconciled_collection_amount"] == 500.0
+    assert cust_data2["financial_summary"]["unreconciled_collection_count"] == 1
+    assert cust_data2["financial_summary"]["outstanding_balance"] == 1500.0
+
+    cust_list = client.get("/customers", headers=s["admin_headers"]).json()
+    cust_item = next(c for c in cust_list if c["id"] == s["cust1"].id)
+    assert cust_item["unreconciled_collection_amount"] == 500.0
+    assert cust_item["unreconciled_collection_count"] == 1
+
+    # 5. Accountant reconciles
+    rec_res = client.post(f"/deliveries/collections/{col_id}/reconcile", headers=s["admin_headers"])
+    assert rec_res.status_code == 200
+
+    # 6. Verify order updates to paid, and unreconciled collection drops to 0.0
+    ord_res3 = client.get(f"/orders/{s['orderA'].id}", headers=s["admin_headers"])
+    assert ord_res3.status_code == 200
+    ord_data3 = ord_res3.json()
+    assert ord_data3["payment_status"] == "paid"
+    assert ord_data3["paid_amount"] == 500.0
+    assert ord_data3["remaining_balance"] == 0.0
+    assert ord_data3["unreconciled_collection_amount"] == 0.0
+    assert ord_data3["unreconciled_collection_count"] == 0
+
+
+def test_17_voided_collections_excluded_from_unreconciled(collection_setup):
+    """TEST 17 — Voided collections are excluded from unreconciled amounts."""
+    s = collection_setup
+    payload = {
+        "customer_id": s["cust1"].id,
+        "amount": 300,
+        "payment_method": "cash",
+        "delivery_id": None,
+        "allocations": [
+            {"invoice_id": s["invB"].id, "amount": 300},
+        ],
+    }
+    col_res = client.post("/customer-payments/collections", json=payload, headers=s["partner_headers"])
+    assert col_res.status_code == 201
+    col_id = col_res.json()["id"]
+
+    # Void without reconcile
+    v_res = client.post(f"/deliveries/collections/{col_id}/void", headers=s["admin_headers"])
+    assert v_res.status_code == 200
+
+    # Verify order B unreconciled is 0
+    ord_res = client.get(f"/orders/{s['orderB'].id}", headers=s["admin_headers"])
+    assert ord_res.json()["unreconciled_collection_amount"] == 0.0
+    assert ord_res.json()["payment_status"] == "pending"
+
+
+def test_18_payment_proof_upload_and_reconciliation_propagation(collection_setup):
+    """TEST 18 — Payment proof upload, persistence, normalization, and propagation on reconciliation."""
+    s = collection_setup
+    db = s["db"]
+
+    proof_id = "proof-12345-abcde"
+    payload = {
+        "customer_id": s["cust1"].id,
+        "amount": 400,
+        "payment_method": "upi",
+        "reference": "UPIPROOF400",
+        "payment_proof_url": proof_id,
+        "delivery_id": None,
+        "allocations": [
+            {"invoice_id": s["invB"].id, "amount": 400},
+        ],
+    }
+    col_res = client.post("/customer-payments/collections", json=payload, headers=s["partner_headers"])
+    assert col_res.status_code == 201
+    data = col_res.json()
+    assert data["payment_proof_url"] == f"/files/{proof_id}"
+    col_id = data["id"]
+
+    # Reconcile collection
+    rec_res = client.post(f"/deliveries/collections/{col_id}/reconcile", headers=s["admin_headers"])
+    assert rec_res.status_code == 200
+    rec_data = rec_res.json()
+    assert rec_data["payment_proof_url"] == f"/files/{proof_id}"
+
+    # Verify the formal CustomerPayment inherited the payment proof URL
+    coll_db = db.get(DeliveryCollection, col_id)
+    assert coll_db.customer_payment_id is not None
+    pmt = db.get(CustomerPayment, coll_db.customer_payment_id)
+    assert pmt is not None
+    assert pmt.payment_proof_url == f"/files/{proof_id}" or pmt.payment_proof_url == proof_id
+

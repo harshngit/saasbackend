@@ -138,6 +138,8 @@ def financial_summary(customer) -> FinancialSummary:
         # Never negative: a customer over their limit has no credit left, not
         # "minus credit".
         available_credit=round(max(credit_limit - outstanding, 0), 2),
+        unreconciled_collection_amount=getattr(customer, "unreconciled_collection_amount", 0.0),
+        unreconciled_collection_count=getattr(customer, "unreconciled_collection_count", 0),
     )
 
 

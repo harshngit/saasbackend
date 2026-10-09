@@ -37,6 +37,12 @@ class CustomerOut(BaseModel):
     total_billed: float
     total_received: float
     outstanding_balance: float
+    unreconciled_collection_amount: float = Field(
+        default=0.0, description="Total amount recorded in field collections pending accountant reconciliation"
+    )
+    unreconciled_collection_count: int = Field(
+        default=0, description="Count of field collections pending accountant reconciliation"
+    )
     category: str | None
     notes: str | None
     is_active: bool
