@@ -18,7 +18,7 @@ from app.schemas.warehouse import (
     WarehouseOut,
     WarehouseUpdate,
 )
-from app.services import stock_service
+from app.services import entitlement_service, stock_service
 from app.services.tracking_service import TrackingError
 
 router = APIRouter(prefix="/warehouses", tags=["warehouses"])
@@ -88,6 +88,9 @@ def create_warehouse(
     db: Session = Depends(get_db),
 ) -> Warehouse:
     org_id = _org_id(user)
+    wh_count = db.query(Warehouse).filter(Warehouse.organization_id == org_id).count()
+    entitlement_service.check_limit(db, user.organization, "max_warehouses", wh_count)
+
     code = payload.code or _next_code(db, org_id)
     if db.query(Warehouse).filter(
         Warehouse.organization_id == org_id, Warehouse.code == code

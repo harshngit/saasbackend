@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Customer, Lead, Quotation, User
 from app.core.pdf_docs import quotation_pdf
 from app.services import quotation_service
@@ -17,7 +17,11 @@ from app.schemas.quotation import (
     QuotationUpdate,
 )
 
-router = APIRouter(prefix="/quotations", tags=["quotations"])
+router = APIRouter(
+    prefix="/quotations",
+    tags=["quotations"],
+    dependencies=[Depends(require_entitlement("crm.quotations"))],
+)
 
 _view = require_permission("quotations", "view")
 _create = require_permission("quotations", "create")

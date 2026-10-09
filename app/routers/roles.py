@@ -3,13 +3,17 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_system_role
+from app.core.deps import require_entitlement, require_system_role
 from app.core.permissions import catalog, normalize_permissions
 from app.models import Role, SystemRole, User
 from app.schemas.role import RoleCreate, RoleOut, RoleUpdate
 from app.services import role_service
 
-router = APIRouter(prefix="/roles", tags=["roles"])
+router = APIRouter(
+    prefix="/roles",
+    tags=["roles"],
+    dependencies=[Depends(require_entitlement("employee.roles_permissions"))],
+)
 
 _ADMIN = require_system_role(SystemRole.ADMIN)
 

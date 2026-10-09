@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Delivery, User, Vehicle, VehicleAssignmentHistory, VehicleLoading
 from app.schemas.vehicle import (
     DeliveryPartnerBrief,
@@ -21,7 +21,11 @@ from app.schemas.vehicle import (
     VehicleUpdate,
 )
 
-router = APIRouter(prefix="/vehicles", tags=["vehicles"])
+router = APIRouter(
+    prefix="/vehicles",
+    tags=["vehicles"],
+    dependencies=[Depends(require_entitlement("sales.vehicles"))],
+)
 
 _view = require_permission("vehicle_stock", "view")
 _create = require_permission("vehicle_stock", "create")

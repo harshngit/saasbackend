@@ -30,11 +30,14 @@ class Plan(Base):
 
     max_users: Mapped[int | None] = mapped_column(Integer, nullable=True)   # None = unlimited
     max_orders: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None = unlimited
+    max_warehouses: Mapped[int | None] = mapped_column(Integer, nullable=True)  # None = unlimited
     # Upload quota the Company Settings page reports against. None = unlimited.
     max_storage_gb: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # List of feature bullet strings shown on the plan card. JSON works on SQLite + Postgres.
     features: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    # Structured machine-readable feature entitlement configuration: {key: True/False}
+    entitlements: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # The plan new trial organizations are placed on by default (usually the free plan).

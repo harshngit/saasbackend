@@ -4,10 +4,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_permission, require_system_role
+from app.core.deps import (
+    get_current_user,
+    require_entitlement,
+    require_permission,
+    require_system_role,
+)
 from app.models import ATTENDANCE_TYPES, Attendance, SystemRole, User
 
-router = APIRouter(prefix="/attendance", tags=["attendance"])
+router = APIRouter(
+    prefix="/attendance",
+    tags=["attendance"],
+    dependencies=[Depends(require_entitlement("employee.attendance"))],
+)
 
 _mark = require_permission("attendance", "create")
 _view = require_permission("attendance", "view")

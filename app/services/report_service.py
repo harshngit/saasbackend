@@ -2587,6 +2587,10 @@ _BUILDERS = {
 }
 
 
+from app.core.entitlements import REPORT_TYPE_TO_ENTITLEMENT
+from app.services import entitlement_service
+
+
 def build_report(
     db: Session,
     org_id: str,
@@ -2602,6 +2606,10 @@ def build_report(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Unknown report type '{report_type}'. Valid: {sorted(REPORT_TYPES)}",
         )
+
+    entitlement_key = REPORT_TYPE_TO_ENTITLEMENT.get(report_type)
+    if entitlement_key:
+        entitlement_service.check_entitlement(db, org_id, entitlement_key)
 
     df, dt = _range(date_from, date_to, db=db, org_id=org_id)
     params = filters.copy() if filters else {}

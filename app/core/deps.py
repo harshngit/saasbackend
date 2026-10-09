@@ -113,3 +113,26 @@ def require_permission(module: str, action: str) -> Callable[[User], User]:
         return user
 
     return _guard
+
+
+def require_entitlement(entitlement_key: str) -> Callable[[User], User]:
+    """Gate an endpoint by organization plan entitlement / organization override.
+
+    Super Admin (platform-level) is allowed.
+    For tenant users, verifies that their organization has the specified entitlement.
+    """
+    from app.services import entitlement_service
+
+    def _guard(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+        if user.effective_system_role == SystemRole.SUPER_ADMIN.value:
+            return user
+        if not user.organization:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not belong to an organization",
+            )
+        entitlement_service.check_entitlement(db, user.organization, entitlement_key)
+        return user
+
+    return _guard
+

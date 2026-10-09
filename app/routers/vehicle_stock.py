@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import (
     Delivery,
     Product,
@@ -30,7 +30,11 @@ from app.schemas.vehicle_stock import (
     VehicleReconciliationOut,
 )
 
-router = APIRouter(prefix="/vehicle-stock", tags=["vehicle_stock"])
+router = APIRouter(
+    prefix="/vehicle-stock",
+    tags=["vehicle_stock"],
+    dependencies=[Depends(require_entitlement("sales.vehicle_stock"))],
+)
 
 _view = require_permission("vehicle_stock", "view")
 _create = require_permission("vehicle_stock", "create")

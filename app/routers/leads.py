@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Lead, User
 from app.services import lead_service
 from app.schemas.lead import (
@@ -17,7 +17,11 @@ from app.schemas.lead import (
     LeadUpdate,
 )
 
-router = APIRouter(prefix="/leads", tags=["leads"])
+router = APIRouter(
+    prefix="/leads",
+    tags=["leads"],
+    dependencies=[Depends(require_entitlement("crm.leads"))],
+)
 
 _view = require_permission("leads", "view")
 _create = require_permission("leads", "create")

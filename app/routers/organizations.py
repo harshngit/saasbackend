@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.files import normalize_file_url, save_upload
-from app.core.deps import require_system_role
+from app.core.deps import get_current_user, require_system_role
 from app.core import reference_data as R
 from app.core.reference_data import (
     BANK_NAMES,
@@ -33,8 +33,9 @@ from app.schemas.company import (
     UploadResponse,
 )
 from app.schemas.organization import OrganizationOut, UpgradeRequest
+from app.schemas.organization_override import OrganizationEntitlementsOut
 from app.schemas.overview import CompanyOverviewOut
-from app.services import activity_service, numbering_service, org_service, overview_service
+from app.services import activity_service, entitlement_service, numbering_service, org_service, overview_service
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -73,6 +74,20 @@ def my_organization(
     if org is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No organization")
     return org
+
+
+@router.get("/me/entitlements", response_model=OrganizationEntitlementsOut)
+def my_organization_entitlements(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Effective organization features, limits, and plan details. Works for any authenticated tenant user."""
+    org = current_user.organization
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User has no organization")
+    org = org_service.apply_trial_expiry(db, org)
+    return entitlement_service.get_effective_organization_entitlements(db, org)
+
 
 
 @router.post("/upgrade-request", response_model=OrganizationOut)

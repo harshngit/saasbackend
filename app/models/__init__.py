@@ -22,6 +22,10 @@ from app.models.notification import Notification
 from app.models.number_sequence import NumberSequence
 from app.models.stored_file import StoredFile
 from app.models.organization import Organization
+from app.models.organization_override import (
+    OrganizationFeatureOverride,
+    OrganizationLimitOverride,
+)
 from app.models.organization_theme import OrganizationTheme
 from app.models.org_payment_gateway import OrgPaymentGateway
 from app.models.invoice_payment_link import InvoicePaymentLink
@@ -107,6 +111,8 @@ __all__ = [
     "NumberSequence",
     "StoredFile",
     "Organization",
+    "OrganizationFeatureOverride",
+    "OrganizationLimitOverride",
     "OrganizationTheme",
     "OrgPaymentGateway",
     "InvoicePaymentLink",

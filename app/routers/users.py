@@ -24,6 +24,7 @@ from app.schemas.user import (
 from app.services import (
     activity_service,
     employee_profile_service,
+    entitlement_service,
     numbering_service,
     password_service,
     role_service,
@@ -180,6 +181,14 @@ def create_staff(
     using the firm's `employee_id_prefix`, and `name` is composed from first +
     last name.
     """
+    active_users_count = (
+        db.query(User)
+        .filter(User.organization_id == admin.organization_id, User.is_active.is_(True))
+        .count()
+    )
+    entitlement_service.check_limit(db, admin.organization, "max_users", active_users_count)
+    entitlement_service.check_entitlement(db, admin.organization, "employee.staff")
+
     data = payload.to_columns()
     email = data.get("email")
     if not email:

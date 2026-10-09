@@ -10,6 +10,8 @@ from app.models import (
     Customer,
     Invoice,
     Organization,
+    OrganizationFeatureOverride,
+    OrganizationLimitOverride,
     OrganizationStatus,
     Plan,
     SalesOrder,
@@ -24,11 +26,24 @@ from app.schemas.organization import (
     OrgStatusUpdate,
     RejectUpgrade,
 )
+from app.schemas.organization_override import (
+    FeatureOverrideOut,
+    FeatureOverrideUpsert,
+    LimitOverrideOut,
+    LimitOverrideUpsert,
+    OrganizationAdminEntitlementsOut,
+)
 from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
 from app.schemas.razorpay import SubscriptionPaymentOut
 from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
 from app.schemas.user import UserOut
-from app.services import billing_service, org_service, password_service
+from app.services import (
+    activity_service,
+    billing_service,
+    entitlement_service,
+    org_service,
+    password_service,
+)
 
 # Every endpoint here is Super Admin only.
 _super_admin_guard = require_system_role(SystemRole.SUPER_ADMIN)
@@ -422,6 +437,303 @@ def delete_organization(org_id: str, db: Session = Depends(get_db)) -> None:
     org = _get_org(db, org_id)
     db.delete(org)
     db.commit()
+
+
+# ----------------------- Organization Entitlements & Overrides -----------------------
+
+
+@router.get(
+    "/organizations/{org_id}/entitlements",
+    response_model=OrganizationAdminEntitlementsOut,
+)
+def get_organization_entitlements_admin(
+    org_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Super Admin view of effective entitlements, limits, and all active/configured overrides."""
+    org = _get_org(db, org_id)
+    org = org_service.apply_trial_expiry(db, org)
+    summary = entitlement_service.get_effective_organization_entitlements(db, org)
+
+    feature_overrides = (
+        db.query(OrganizationFeatureOverride)
+        .filter(OrganizationFeatureOverride.organization_id == org_id)
+        .order_by(OrganizationFeatureOverride.created_at.desc())
+        .all()
+    )
+    limit_overrides = (
+        db.query(OrganizationLimitOverride)
+        .filter(OrganizationLimitOverride.organization_id == org_id)
+        .order_by(OrganizationLimitOverride.created_at.desc())
+        .all()
+    )
+
+    summary["feature_overrides"] = feature_overrides
+    summary["limit_overrides"] = limit_overrides
+    return summary
+
+
+@router.get(
+    "/organizations/{org_id}/overrides/features",
+    response_model=list[FeatureOverrideOut],
+)
+def list_feature_overrides(
+    org_id: str,
+    db: Session = Depends(get_db),
+) -> list[OrganizationFeatureOverride]:
+    """List all feature overrides configured for the organization."""
+    _get_org(db, org_id)
+    return (
+        db.query(OrganizationFeatureOverride)
+        .filter(OrganizationFeatureOverride.organization_id == org_id)
+        .order_by(OrganizationFeatureOverride.created_at.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/organizations/{org_id}/overrides/features",
+    response_model=FeatureOverrideOut,
+)
+@router.put(
+    "/organizations/{org_id}/overrides/features",
+    response_model=FeatureOverrideOut,
+)
+def upsert_feature_override(
+    org_id: str,
+    payload: FeatureOverrideUpsert,
+    caller: User = Depends(_super_admin_guard),
+    db: Session = Depends(get_db),
+) -> OrganizationFeatureOverride:
+    """Create or update a feature override (ALLOW/BLOCK) for an organization."""
+    org = _get_org(db, org_id)
+    override = (
+        db.query(OrganizationFeatureOverride)
+        .filter(
+            OrganizationFeatureOverride.organization_id == org_id,
+            OrganizationFeatureOverride.entitlement_key == payload.entitlement_key,
+        )
+        .first()
+    )
+
+    is_allowed = payload.effect == "ALLOW"
+    if override is None:
+        override = OrganizationFeatureOverride(
+            organization_id=org_id,
+            entitlement_key=payload.entitlement_key,
+            effect=payload.effect,
+            is_allowed=is_allowed,
+            expires_at=payload.expires_at,
+            reason=payload.reason,
+            created_by_user_id=caller.id,
+        )
+        db.add(override)
+    else:
+        override.effect = payload.effect
+        override.is_allowed = is_allowed
+        override.expires_at = payload.expires_at
+        override.reason = payload.reason
+        override.created_by_user_id = caller.id
+
+    db.commit()
+    db.refresh(override)
+
+    activity_service.record(
+        db,
+        org_id,
+        caller,
+        "entitlements",
+        "Feature override updated",
+        f"Set feature override for '{payload.entitlement_key}' to {payload.effect} (expires: {payload.expires_at})",
+    )
+    return override
+
+
+@router.delete(
+    "/organizations/{org_id}/overrides/features/{entitlement_key}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_feature_override(
+    org_id: str,
+    entitlement_key: str,
+    caller: User = Depends(_super_admin_guard),
+    db: Session = Depends(get_db),
+) -> None:
+    """Delete a feature override, resetting the feature back to plan default."""
+    _get_org(db, org_id)
+    override = (
+        db.query(OrganizationFeatureOverride)
+        .filter(
+            OrganizationFeatureOverride.organization_id == org_id,
+            OrganizationFeatureOverride.entitlement_key == entitlement_key,
+        )
+        .first()
+    )
+    if override is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Feature override for '{entitlement_key}' not found",
+        )
+
+    db.delete(override)
+    db.commit()
+
+    activity_service.record(
+        db,
+        org_id,
+        caller,
+        "entitlements",
+        "Feature override removed",
+        f"Removed feature override for '{entitlement_key}'",
+    )
+
+
+@router.get(
+    "/organizations/{org_id}/overrides/limits",
+    response_model=list[LimitOverrideOut],
+)
+def list_limit_overrides(
+    org_id: str,
+    db: Session = Depends(get_db),
+) -> list[OrganizationLimitOverride]:
+    """List all limit overrides configured for the organization."""
+    _get_org(db, org_id)
+    return (
+        db.query(OrganizationLimitOverride)
+        .filter(OrganizationLimitOverride.organization_id == org_id)
+        .order_by(OrganizationLimitOverride.created_at.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/organizations/{org_id}/overrides/limits",
+    response_model=LimitOverrideOut,
+)
+@router.put(
+    "/organizations/{org_id}/overrides/limits",
+    response_model=LimitOverrideOut,
+)
+def upsert_limit_override(
+    org_id: str,
+    payload: LimitOverrideUpsert,
+    caller: User = Depends(_super_admin_guard),
+    db: Session = Depends(get_db),
+) -> OrganizationLimitOverride:
+    """Create or update a numeric limit override for an organization."""
+    org = _get_org(db, org_id)
+    override = (
+        db.query(OrganizationLimitOverride)
+        .filter(
+            OrganizationLimitOverride.organization_id == org_id,
+            OrganizationLimitOverride.limit_key == payload.limit_key,
+        )
+        .first()
+    )
+
+    if override is None:
+        override = OrganizationLimitOverride(
+            organization_id=org_id,
+            limit_key=payload.limit_key,
+            value=payload.value,
+            expires_at=payload.expires_at,
+            reason=payload.reason,
+            created_by_user_id=caller.id,
+        )
+        db.add(override)
+    else:
+        override.value = payload.value
+        override.expires_at = payload.expires_at
+        override.reason = payload.reason
+        override.created_by_user_id = caller.id
+
+    db.commit()
+    db.refresh(override)
+
+    activity_service.record(
+        db,
+        org_id,
+        caller,
+        "entitlements",
+        "Limit override updated",
+        f"Set limit override for '{payload.limit_key}' to {payload.value} (expires: {payload.expires_at})",
+    )
+    return override
+
+
+@router.delete(
+    "/organizations/{org_id}/overrides/limits/{limit_key}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_limit_override(
+    org_id: str,
+    limit_key: str,
+    caller: User = Depends(_super_admin_guard),
+    db: Session = Depends(get_db),
+) -> None:
+    """Delete a limit override, resetting the limit back to plan default."""
+    _get_org(db, org_id)
+    override = (
+        db.query(OrganizationLimitOverride)
+        .filter(
+            OrganizationLimitOverride.organization_id == org_id,
+            OrganizationLimitOverride.limit_key == limit_key,
+        )
+        .first()
+    )
+    if override is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Limit override for '{limit_key}' not found",
+        )
+
+    db.delete(override)
+    db.commit()
+
+    activity_service.record(
+        db,
+        org_id,
+        caller,
+        "entitlements",
+        "Limit override removed",
+        f"Removed limit override for '{limit_key}'",
+    )
+
+
+@router.post("/organizations/{org_id}/overrides/reset-all")
+def reset_all_overrides(
+    org_id: str,
+    caller: User = Depends(_super_admin_guard),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Reset all feature and limit overrides for an organization."""
+    _get_org(db, org_id)
+    num_features = (
+        db.query(OrganizationFeatureOverride)
+        .filter(OrganizationFeatureOverride.organization_id == org_id)
+        .delete(synchronize_session=False)
+    )
+    num_limits = (
+        db.query(OrganizationLimitOverride)
+        .filter(OrganizationLimitOverride.organization_id == org_id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    activity_service.record(
+        db,
+        org_id,
+        caller,
+        "entitlements",
+        "All overrides reset",
+        f"Reset all overrides ({num_features} features, {num_limits} limits removed)",
+    )
+    return {
+        "message": "All overrides reset successfully",
+        "deleted_feature_overrides": num_features,
+        "deleted_limit_overrides": num_limits,
+    }
+
 
 
 # ----------------------- Subscription payments (Razorpay, Phase 1) -----------------------

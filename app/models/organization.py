@@ -200,6 +200,12 @@ class Organization(Base):
     payment_gateway: Mapped["OrgPaymentGateway | None"] = relationship(  # noqa: F821
         back_populates="organization", uselist=False, cascade="all, delete-orphan"
     )
+    feature_overrides: Mapped[list["OrganizationFeatureOverride"]] = relationship(  # noqa: F821
+        "OrganizationFeatureOverride", back_populates="organization", cascade="all, delete-orphan"
+    )
+    limit_overrides: Mapped[list["OrganizationLimitOverride"]] = relationship(  # noqa: F821
+        "OrganizationLimitOverride", back_populates="organization", cascade="all, delete-orphan"
+    )
 
     @property
     def subscription_status(self) -> str:

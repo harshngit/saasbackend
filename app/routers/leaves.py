@@ -4,12 +4,16 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Leave, SystemRole, User
 from app.schemas.leave import LeaveCreate, LeaveOut, LeaveRejectBody, LeaveUpdate
 from app.services import leave_service
 
-router = APIRouter(prefix="/leaves", tags=["leaves"])
+router = APIRouter(
+    prefix="/leaves",
+    tags=["leaves"],
+    dependencies=[Depends(require_entitlement("employee.leaves"))],
+)
 
 _view = require_permission("leaves", "view")
 _create = require_permission("leaves", "create")

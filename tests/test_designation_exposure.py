@@ -19,6 +19,7 @@ from app.models import (
     Lead,
     Leave,
     Organization,
+    Plan,
     Product,
     Quotation,
     Role,
@@ -49,7 +50,12 @@ def designation_setup():
     db = SessionLocal()
     try:
         ts = int(datetime.now(timezone.utc).timestamp())
-        org = Organization(name=f"Designation Org {ts}", company_code=f"CMP-{ts % 90000 + 10000}")
+        pro_plan = db.query(Plan).filter(Plan.name == "Pro").first()
+        org = Organization(
+            name=f"Designation Org {ts}",
+            company_code=f"CMP-{ts % 90000 + 10000}",
+            plan_id=pro_plan.id if pro_plan else None,
+        )
         db.add(org)
         db.flush()
 

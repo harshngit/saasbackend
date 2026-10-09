@@ -68,13 +68,27 @@ def db():
     session.close()
 
 
+from app.core.entitlements import default_entitlements_for_plan
+from app.models import Plan
+
+
 @pytest.fixture
 def test_data(db):
+    pro_plan = Plan(
+        name="Pro",
+        price_monthly=999,
+        price_yearly=9999,
+        entitlements=default_entitlements_for_plan("Pro"),
+    )
+    db.add(pro_plan)
+    db.flush()
+
     org = Organization(
         id=str(uuid.uuid4()),
         name="Test Reports Org",
         company_code="CMP-10001",
         timezone="Asia/Kolkata",
+        plan_id=pro_plan.id,
     )
     db.add(org)
 
@@ -83,6 +97,7 @@ def test_data(db):
         name="Foreign Org",
         company_code="CMP-20002",
         timezone="Asia/Kolkata",
+        plan_id=pro_plan.id,
     )
     db.add(org2)
 
