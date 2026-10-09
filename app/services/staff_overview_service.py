@@ -719,6 +719,7 @@ def build_staff_overview(
         user_id=staff.id,
         employee_id=staff.employee_id,
         name=staff.name,
+        designation=staff.designation,
         workspace=workspace,
         role=(
             RoleBadge(

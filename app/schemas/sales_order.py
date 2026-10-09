@@ -104,6 +104,7 @@ class SalespersonBrief(BaseModel):
     name: str
     email: str | None = None
     profile_photo: str | None = None
+    designation: str | None = None
 
     @field_validator("profile_photo", mode="after")
     @classmethod
@@ -119,6 +120,7 @@ class UserBrief(BaseModel):
     name: str
     email: str | None = None
     profile_photo: str | None = None
+    designation: str | None = None
 
     @field_validator("profile_photo", mode="after")
     @classmethod

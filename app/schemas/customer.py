@@ -10,6 +10,7 @@ class AssigneeBrief(BaseModel):
     id: str
     name: str
     profile_photo: str | None = None
+    designation: str | None = None
 
     @field_validator("profile_photo", mode="after")
     @classmethod
@@ -46,6 +47,7 @@ class CustomerOut(BaseModel):
     category: str | None
     notes: str | None
     is_active: bool
+    designation: str | None = None
 
     # Customer profile. These columns existed but were never exposed, so
     # `customer_id` looked absent to every caller.
@@ -163,6 +165,7 @@ class CollectorBrief(BaseModel):
     id: str
     name: str
     role: str | None = None
+    designation: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -195,6 +198,7 @@ class CollectorBrief(BaseModel):
                 "id": str(user.id),
                 "name": str(getattr(user, "display_name", None) or user.name),
                 "role": role_str,
+                "designation": getattr(user, "designation", None),
             }
         return data
 

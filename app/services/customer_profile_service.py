@@ -60,7 +60,7 @@ def _section(customer, name: str):
     if name == "sales_crm_information":
         officer = customer.assigned_sales_officer
         block.sales_representative = (
-            NamedRef(id=officer.id, name=officer.name) if officer is not None else None
+            NamedRef(id=officer.id, name=officer.name, designation=getattr(officer, "designation", None)) if officer is not None else None
         )
     if name == "address_information":
         block.google_maps_location = GeoLocation(

@@ -47,6 +47,7 @@ class QuotationSalespersonBrief(BaseModel):
     id: str
     name: str
     profile_photo: str | None = None
+    designation: str | None = None
 
     @field_validator("profile_photo", mode="after")
     @classmethod

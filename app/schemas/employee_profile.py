@@ -105,6 +105,7 @@ class NamedRef(BaseModel):
 
     id: str
     name: str
+    designation: str | None = None
 
 
 class BasicInformation(BaseModel):

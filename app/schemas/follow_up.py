@@ -16,6 +16,7 @@ class FollowUpUserBrief(BaseModel):
     name: str
     email: str
     profile_photo: str | None = None
+    designation: str | None = None
 
     @field_validator("profile_photo", mode="after")
     @classmethod

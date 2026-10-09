@@ -321,7 +321,7 @@ def list_assignable_staff(
         u for u in candidates
         if any(role_service.effective_permissions(db, u).get("follow_ups", {}).values())
     ]
-    return [AssignableStaffOut(id=u.id, name=u.name, role=_assignee_role_label(u)) for u in assignable]
+    return [AssignableStaffOut(id=u.id, name=u.name, role=_assignee_role_label(u), designation=u.designation) for u in assignable]
 
 
 @router.post("/me/location", response_model=LocationPingOut)

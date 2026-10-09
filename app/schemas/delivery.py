@@ -215,6 +215,7 @@ class DeliveryPartnerBrief(BaseModel):
     email: str | None = None
     employee_id: str | None = None
     profile_photo: str | None = None
+    designation: str | None = None
 
     @field_validator("profile_photo", mode="after")
     @classmethod

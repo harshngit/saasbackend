@@ -117,7 +117,7 @@ def _section(db: Session, user, name: str):
     if name == "employment_information":
         manager = db.get(type(user), user.reporting_manager_id) if user.reporting_manager_id else None
         block.reporting_manager = (
-            NamedRef(id=manager.id, name=manager.name) if manager is not None else None
+            NamedRef(id=manager.id, name=manager.name, designation=getattr(manager, "designation", None)) if manager is not None else None
         )
         block.role_detail = (
             RoleBrief.model_validate(user.role_detail) if user.role_detail is not None else None

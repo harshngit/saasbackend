@@ -8,6 +8,7 @@ class TeamMemberBrief(BaseModel):
     id: str
     name: str
     email: str
+    designation: str | None = None
 
 
 class TeamManagerBrief(BaseModel):
@@ -15,6 +16,7 @@ class TeamManagerBrief(BaseModel):
     id: str
     name: str
     email: str
+    designation: str | None = None
 
 
 class TeamCreate(BaseModel):

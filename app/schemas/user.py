@@ -260,3 +260,4 @@ class AssignableStaffOut(BaseModel):
     id: str
     name: str
     role: str
+    designation: str | None = None

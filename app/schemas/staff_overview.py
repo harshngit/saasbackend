@@ -239,6 +239,7 @@ class StaffOverviewOut(BaseModel):
     user_id: str
     employee_id: str | None = None
     name: str
+    designation: str | None = None
     workspace: str | None = Field(
         default=None,
         description="From the role. Switch the page layout on this, not on the role name")
