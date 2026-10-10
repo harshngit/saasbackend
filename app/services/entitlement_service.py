@@ -26,6 +26,7 @@ from app.core.entitlements import (
     DEFAULT_FALLBACK_LIMITS,
     default_entitlements_for_plan,
     default_limits_for_plan,
+    normalize_entitlement_key,
 )
 from app.models.organization import Organization
 from app.models.organization_override import (
@@ -53,7 +54,7 @@ def get_effective_feature_overrides(
         .filter(OrganizationFeatureOverride.organization_id == organization_id)
         .all()
     )
-    return {ov.entitlement_key: ov for ov in overrides if _is_override_active(ov.expires_at)}
+    return {normalize_entitlement_key(ov.entitlement_key): ov for ov in overrides if _is_override_active(ov.expires_at)}
 
 
 def get_effective_limit_overrides(
@@ -80,7 +81,8 @@ def has_entitlement(
     2. Plan default.
     3. Safe fallback.
     """
-    if not organization or not entitlement_key:
+    key = normalize_entitlement_key(entitlement_key)
+    if not organization or not key:
         return False
 
     org_id: str
@@ -99,12 +101,12 @@ def has_entitlement(
     if plan is None and getattr(organization, "plan_id", None):
         plan = db.query(Plan).filter(Plan.id == organization.plan_id).first()
 
-    # 1. Organization Override
+    # 1. Organization Override (check canonical key and legacy alias if applicable)
     override = (
         db.query(OrganizationFeatureOverride)
         .filter(
             OrganizationFeatureOverride.organization_id == org_id,
-            OrganizationFeatureOverride.entitlement_key == entitlement_key,
+            OrganizationFeatureOverride.entitlement_key.in_([key, "report.profit_and_loss"] if key == "report.profit_loss" else [key]),
         )
         .first()
     )
@@ -117,15 +119,18 @@ def has_entitlement(
     # 2. Plan Default
     if plan:
         entitlements = plan.entitlements or {}
-        if entitlement_key in entitlements:
-            return bool(entitlements[entitlement_key])
+        if key in entitlements:
+            return bool(entitlements[key])
+        if key == "report.profit_loss" and "report.profit_and_loss" in entitlements:
+            return bool(entitlements["report.profit_and_loss"])
         # If plan entitlements dict was empty or missing this key, check canonical plan defaults
         plan_defaults = default_entitlements_for_plan(plan.name)
-        if entitlement_key in plan_defaults:
-            return bool(plan_defaults[entitlement_key])
+        if key in plan_defaults:
+            return bool(plan_defaults[key])
 
     # 3. Safe fallback
-    return DEFAULT_FALLBACK_ENTITLEMENTS.get(entitlement_key, False)
+    return DEFAULT_FALLBACK_ENTITLEMENTS.get(key, False)
+
 
 
 def get_effective_limit(
@@ -192,17 +197,19 @@ def check_entitlement(
     entitlement_key: str,
 ) -> None:
     """Raise HTTP 403 PLAN_FEATURE_NOT_AVAILABLE if the feature is not entitled."""
-    if not has_entitlement(db, organization, entitlement_key):
-        info = CANONICAL_ENTITLEMENTS.get(entitlement_key)
-        display_name = info.get("name", entitlement_key) if isinstance(info, dict) else entitlement_key
+    norm_key = normalize_entitlement_key(entitlement_key)
+    if not has_entitlement(db, organization, norm_key):
+        info = CANONICAL_ENTITLEMENTS.get(norm_key)
+        display_name = info.get("name", norm_key) if isinstance(info, dict) else norm_key
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
                 "code": "PLAN_FEATURE_NOT_AVAILABLE",
-                "feature": entitlement_key,
-                "message": f"Feature '{display_name}' ({entitlement_key}) is not available on your current plan.",
+                "feature": norm_key,
+                "message": f"Feature '{display_name}' ({norm_key}) is not available on your current plan.",
             },
         )
+
 
 
 def check_limit(

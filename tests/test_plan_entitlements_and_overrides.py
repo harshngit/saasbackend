@@ -150,10 +150,11 @@ def test_basic_plan_feature_denials():
     else:
         fail("Basic plan POST /vehicle-stock/loading was not properly denied", f"Status: {r.status_code} {r.text}")
 
-    # 6. Denied report: Profit & Loss (report.profit_and_loss)
+    # 6. Denied report: Profit & Loss (report.profit_loss)
     r = client.get("/reports/profit-loss", headers=headers)
     if r.status_code == 403 and r.json().get("detail", {}).get("code") == "PLAN_FEATURE_NOT_AVAILABLE":
-        ok("Basic plan denied GET /reports/profit-loss with PLAN_FEATURE_NOT_AVAILABLE")
+        assert r.json().get("detail", {}).get("feature") == "report.profit_loss"
+        ok("Basic plan denied GET /reports/profit-loss with PLAN_FEATURE_NOT_AVAILABLE (canonical report.profit_loss)")
     else:
         fail("Basic plan GET /reports/profit-loss was not properly denied", f"Status: {r.status_code} {r.text}")
 
@@ -298,7 +299,39 @@ def test_organization_feature_overrides():
     else:
         fail("Basic org with ALLOW override could not access GET /leads", f"{r.status_code} {r.text}")
 
-    # Super Admin deletes the override
+    # Test alias normalization in feature override: report.profit_and_loss -> report.profit_loss
+    r = client.post(
+        f"/superadmin/organizations/{org_id}/overrides/features",
+        headers=sa_headers,
+        json={
+            "entitlement_key": "report.profit_and_loss",
+            "effect": "ALLOW",
+            "reason": "Override with legacy key alias",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["entitlement_key"] == "report.profit_loss"
+    ok("Feature override input normalized legacy 'report.profit_and_loss' to canonical 'report.profit_loss'")
+
+    # P&L is now accessible on Basic due to the normalized override
+    r = client.get("/reports/profit-loss", headers=headers)
+    assert r.status_code == 200
+    ok("Basic org can access P&L following normalized override")
+
+    # Super Admin deletes the override using the legacy alias
+    r = client.delete(
+        f"/superadmin/organizations/{org_id}/overrides/features/report.profit_and_loss",
+        headers=sa_headers,
+    )
+    assert r.status_code == 204
+    ok("Super Admin deleted feature override using legacy alias")
+
+    # P&L is now denied again
+    r = client.get("/reports/profit-loss", headers=headers)
+    assert r.status_code == 403
+    ok("Basic org P&L reverted to denied after override deletion")
+
+    # Super Admin deletes the leads override
     r = client.delete(
         f"/superadmin/organizations/{org_id}/overrides/features/crm.leads",
         headers=sa_headers,
@@ -468,6 +501,100 @@ def test_user_limits_and_overrides():
         fail("Creating staff user failed after limit override", f"{r.status_code} {r.text}")
 
 
+def test_existing_over_limit_users_safety():
+    print("\n--- Test Existing Over-Limit Users Safety (No-Grandfathering) ---")
+    sa_headers = _super_admin_auth()
+    db = SessionLocal()
+    try:
+        # Create an org on Free plan (max_users=1)
+        free_plan = db.query(Plan).filter(Plan.name == "Free").first()
+        assert free_plan is not None
+        assert free_plan.max_users == 1, f"Expected Free plan max_users=1, got {free_plan.max_users}"
+
+        org_uid = uuid.uuid4().hex[:8]
+        org = Organization(
+            name=f"Legacy MultiUser Org {org_uid}",
+            plan_id=free_plan.id,
+            status="active",
+        )
+        db.add(org)
+        db.flush()
+
+        # Seed 3 pre-existing active users for this organization (simulating legacy data)
+        u1 = User(organization_id=org.id, name="Admin 1", email=f"u1_{org_uid}@legacy.com", password_hash="hash", system_role="admin", role=UserRole.ADMIN, is_active=True)
+        u2 = User(organization_id=org.id, name="Staff 2", email=f"u2_{org_uid}@legacy.com", password_hash="hash", system_role="staff", role=UserRole.SALES_OFFICER, is_active=True)
+        u3 = User(organization_id=org.id, name="Staff 3", email=f"u3_{org_uid}@legacy.com", password_hash="hash", system_role="staff", role=UserRole.DELIVERY_PARTNER, is_active=True)
+        db.add_all([u1, u2, u3])
+        db.commit()
+
+        # Verify all 3 users exist and remain active
+        active_users = db.query(User).filter(User.organization_id == org.id, User.is_active.is_(True)).all()
+        assert len(active_users) == 3
+        ok("All 3 pre-existing users remain intact and active in the database")
+
+        # Now authenticate as Admin 1
+        from app.core.security import create_access_token
+        token = create_access_token(user_id=u1.id, role="admin", organization_id=org.id)
+        auth_headers = {"Authorization": f"Bearer {token}"}
+
+
+        # Attempt to create a 4th user via POST /users -> must be blocked with PLAN_LIMIT_REACHED
+        r = client.post(
+            "/users",
+            headers=auth_headers,
+            json={
+                "contact_information": {
+                    "official_email": f"u4_{org_uid}@legacy.com",
+                },
+                "login_security": {
+                    "password": "Password123!",
+                },
+            },
+        )
+        assert r.status_code == 403
+        assert r.json().get("detail", {}).get("code") == "PLAN_LIMIT_REACHED"
+        ok("Creating additional staff in over-limit org (3 users >= limit 1) is blocked with PLAN_LIMIT_REACHED")
+
+        # Confirm all 3 existing users are STILL intact and active
+        active_count = db.query(User).filter(User.organization_id == org.id, User.is_active.is_(True)).count()
+        assert active_count == 3
+        ok("No existing users were deleted or deactivated during failed creation attempt")
+
+        # Super Admin grants limit override max_users = 5
+        r = client.post(
+            f"/superadmin/organizations/{org.id}/overrides/limits",
+            headers=sa_headers,
+            json={"limit_key": "max_users", "value": 5, "reason": "Grandfather expansion"},
+        )
+        assert r.status_code == 200
+
+        # Also grant employee.staff feature override
+        r = client.post(
+            f"/superadmin/organizations/{org.id}/overrides/features",
+            headers=sa_headers,
+            json={"entitlement_key": "employee.staff", "effect": "ALLOW"},
+        )
+        assert r.status_code == 200
+
+        # Now creating 4th user succeeds!
+        r = client.post(
+            "/users",
+            headers=auth_headers,
+            json={
+                "contact_information": {
+                    "official_email": f"u4_{org_uid}@legacy.com",
+                },
+                "login_security": {
+                    "password": "Password123!",
+                },
+            },
+        )
+        assert r.status_code == 201
+        ok("Creating 4th user succeeded after Super Admin limit override to 5")
+    finally:
+        db.close()
+
+
 def test_warehouse_limits_and_overrides():
     print("\n--- Test Warehouse Limits and Overrides ---")
     sa_headers = _super_admin_auth()
@@ -534,9 +661,12 @@ def test_organization_entitlements_endpoint():
         assert "limits" in data
         assert data["features"].get("crm.customers") is True
         assert data["features"].get("crm.leads") is False
+        assert "report.profit_loss" in data["features"]
+        assert "report.profit_and_loss" not in data["features"]
+        assert data["features"].get("report.profit_loss") is False
         assert data["limits"].get("max_users") == 1
         assert data["limits"].get("max_warehouses") == 1
-        ok("GET /organizations/me/entitlements returns correct effective features and limits")
+        ok("GET /organizations/me/entitlements returns canonical report.profit_loss and excludes deprecated key")
     else:
         fail("GET /organizations/me/entitlements failed", f"{r.status_code} {r.text}")
 
@@ -564,7 +694,25 @@ def test_superadmin_plan_management_and_validation():
     else:
         fail("PlanCreate did not reject unknown entitlement key", f"{r.status_code} {r.text}")
 
-    # 2. Reject unknown override keys
+    # 2. PlanCreate normalizes legacy alias report.profit_and_loss to report.profit_loss
+    r = client.post(
+        "/superadmin/plans",
+        headers=sa_headers,
+        json={
+            "name": f"Alias Test Plan {uuid.uuid4().hex[:6]}",
+            "price_monthly": 100,
+            "price_yearly": 1000,
+            "entitlements": {
+                "report.profit_and_loss": True,
+            },
+        },
+    )
+    assert r.status_code == 201
+    assert "report.profit_loss" in r.json()["entitlements"]
+    assert "report.profit_and_loss" not in r.json()["entitlements"]
+    ok("PlanCreate normalized legacy alias 'report.profit_and_loss' to canonical 'report.profit_loss'")
+
+    # 3. Reject unknown override keys
     basic_org = _create_test_org("Basic")
     org_id = basic_org["org_id"]
 
@@ -594,7 +742,7 @@ def test_superadmin_plan_management_and_validation():
     else:
         fail("Limit override did not reject unknown limit key", f"{r.status_code} {r.text}")
 
-    # 3. Super Admin Reset All Overrides
+    # 4. Super Admin Reset All Overrides
     r = client.post(f"/superadmin/organizations/{org_id}/overrides/reset-all", headers=sa_headers)
     if r.status_code == 200:
         ok("Super Admin reset-all overrides endpoint works")
@@ -609,6 +757,7 @@ def main():
     test_organization_feature_overrides()
     test_override_expiry_behavior()
     test_user_limits_and_overrides()
+    test_existing_over_limit_users_safety()
     test_warehouse_limits_and_overrides()
     test_organization_entitlements_endpoint()
     test_superadmin_plan_management_and_validation()
@@ -622,3 +771,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

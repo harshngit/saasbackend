@@ -2,7 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.entitlements import ALL_ENTITLEMENT_KEYS
+from app.core.entitlements import ALL_ENTITLEMENT_KEYS, normalize_entitlement_key
 
 
 class PlanOut(BaseModel):
@@ -45,10 +45,11 @@ class PlanCreate(BaseModel):
     def validate_entitlements(cls, v: dict[str, bool]) -> dict[str, bool]:
         if not v:
             return v
-        unknown_keys = set(v.keys()) - ALL_ENTITLEMENT_KEYS
+        normalized = {normalize_entitlement_key(k): val for k, val in v.items()}
+        unknown_keys = set(normalized.keys()) - ALL_ENTITLEMENT_KEYS
         if unknown_keys:
             raise ValueError(f"Unknown entitlement key(s): {', '.join(sorted(unknown_keys))}")
-        return v
+        return normalized
 
 
 class PlanStatusUpdate(BaseModel):
@@ -77,8 +78,10 @@ class PlanUpdate(BaseModel):
     def validate_entitlements(cls, v: dict[str, bool] | None) -> dict[str, bool] | None:
         if v is None:
             return v
-        unknown_keys = set(v.keys()) - ALL_ENTITLEMENT_KEYS
+        normalized = {normalize_entitlement_key(k): val for k, val in v.items()}
+        unknown_keys = set(normalized.keys()) - ALL_ENTITLEMENT_KEYS
         if unknown_keys:
             raise ValueError(f"Unknown entitlement key(s): {', '.join(sorted(unknown_keys))}")
-        return v
+        return normalized
+
 

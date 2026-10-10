@@ -64,10 +64,16 @@ def seed_plans(db: Session) -> Plan:
             # Safely backfill empty entitlements or warehouse limits on existing plan
             if not plan.entitlements:
                 plan.entitlements = spec["entitlements"]
+            elif "report.profit_and_loss" in plan.entitlements:
+                plan.entitlements = {
+                    ("report.profit_loss" if k == "report.profit_and_loss" else k): v
+                    for k, v in plan.entitlements.items()
+                }
             if plan.max_warehouses is None and spec.get("max_warehouses") is not None:
                 plan.max_warehouses = spec["max_warehouses"]
-            if plan.name == "Basic" and (plan.max_users is None or plan.max_users > 1):
+            if plan.name in ("Free", "Basic") and (plan.max_users is None or plan.max_users > 1):
                 plan.max_users = 1
+
     db.commit()
     default = db.query(Plan).filter(Plan.is_default.is_(True)).first()
     # Backfill any org without a plan onto the default plan.

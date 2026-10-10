@@ -294,7 +294,7 @@ CANONICAL_ENTITLEMENTS: dict[str, dict[str, str]] = {
         "name": "Stock Movement Report",
         "description": "Detailed ledger of goods receipts, dispatches, and adjustments",
     },
-    "report.profit_and_loss": {
+    "report.profit_loss": {
         "category": "report",
         "name": "Profit & Loss Sheet",
         "description": "Trading revenue, COGS, gross margin, and net profit report",
@@ -322,6 +322,19 @@ CANONICAL_ENTITLEMENTS: dict[str, dict[str, str]] = {
 }
 
 ALL_ENTITLEMENT_KEYS: set[str] = set(CANONICAL_ENTITLEMENTS.keys())
+
+# Backward-compatibility alias map for input normalization
+ENTITLEMENT_ALIASES: dict[str, str] = {
+    "report.profit_and_loss": "report.profit_loss",
+}
+
+
+def normalize_entitlement_key(key: str) -> str:
+    """Normalize deprecated or legacy alias keys to their canonical key."""
+    if not key or not isinstance(key, str):
+        return key
+    return ENTITLEMENT_ALIASES.get(key.strip(), key.strip())
+
 
 # ---------------------------------------------------------------------------
 # Canonical Limit Keys
@@ -370,7 +383,7 @@ REPORT_TYPE_TO_ENTITLEMENT: dict[str, str] = {
     "purchase-return": "report.purchase_return",
     "inventory-summary": "report.inventory_summary",
     "stock-movement": "report.stock_movement",
-    "profit-loss": "report.profit_and_loss",
+    "profit-loss": "report.profit_loss",
     "cash-flow-sheet": "report.cash_flow",
     "gst-summary": "report.gst_filing",
     "sales-overview": "report.sales_overview",
@@ -445,7 +458,7 @@ _BASE_CORE_ENTITLEMENTS: dict[str, bool] = {
     "report.inventory_summary": True,
     "report.stock_movement": True,
     "report.sales_overview": True,
-    "report.profit_and_loss": False,
+    "report.profit_loss": False,
     "report.cash_flow": False,
     "report.gst_filing": False,
     "report.balance_sheet": False,
@@ -461,7 +474,7 @@ _PRO_EXTENSIONS: dict[str, bool] = {
     "employee.leaves": True,
     "employee.roles_permissions": True,
     "notifications.whatsapp_delivery": True,
-    "report.profit_and_loss": True,
+    "report.profit_loss": True,
     "report.cash_flow": True,
     "report.gst_filing": True,
     "report.balance_sheet": False,
@@ -524,26 +537,4 @@ def default_limits_for_plan(plan_name: str | None) -> dict[str, Any]:
         "max_storage_gb": None,
     }
 
-
-# Map report endpoint machine names to canonical entitlement keys
-REPORT_TYPE_TO_ENTITLEMENT: dict[str, str] = {
-    "daily-transaction": "report.daily_transaction",
-    "sales": "report.sales",
-    "purchase": "report.purchase",
-    "customer-outstanding": "report.customer_outstanding",
-    "supplier-outstanding": "report.supplier_outstanding",
-    "payment-collection": "report.payment_collection",
-    "expense": "report.expense",
-    "cash-collection": "report.cash_collection",
-    "gst-summary": "report.gst_filing",
-    "sales-return": "report.sales_return",
-    "purchase-return": "report.purchase_return",
-    "profit-loss": "report.profit_and_loss",
-    "supplier-payment": "report.supplier_payment",
-    "inventory-summary": "report.inventory_summary",
-    "stock-movement": "report.stock_movement",
-    "sales-overview": "report.sales_overview",
-    "cash-flow-sheet": "report.cash_flow",
-    "balance-sheet": "report.balance_sheet",
-}
 

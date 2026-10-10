@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.entitlements import ALL_ENTITLEMENT_KEYS, ALL_LIMIT_KEYS
+from app.core.entitlements import ALL_ENTITLEMENT_KEYS, ALL_LIMIT_KEYS, normalize_entitlement_key
 
 
 class FeatureOverrideUpsert(BaseModel):
@@ -15,9 +15,11 @@ class FeatureOverrideUpsert(BaseModel):
     @field_validator("entitlement_key")
     @classmethod
     def validate_key(cls, v: str) -> str:
-        if v not in ALL_ENTITLEMENT_KEYS:
+        norm_v = normalize_entitlement_key(v)
+        if norm_v not in ALL_ENTITLEMENT_KEYS:
             raise ValueError(f"Unknown entitlement key: '{v}'. Must be one of canonical entitlement keys.")
-        return v
+        return norm_v
+
 
     @field_validator("effect")
     @classmethod

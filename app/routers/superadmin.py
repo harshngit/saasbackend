@@ -37,6 +37,7 @@ from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
 from app.schemas.razorpay import SubscriptionPaymentOut
 from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
 from app.schemas.user import UserOut
+from app.core.entitlements import normalize_entitlement_key
 from app.services import (
     activity_service,
     billing_service,
@@ -561,11 +562,12 @@ def delete_feature_override(
 ) -> None:
     """Delete a feature override, resetting the feature back to plan default."""
     _get_org(db, org_id)
+    norm_key = normalize_entitlement_key(entitlement_key)
     override = (
         db.query(OrganizationFeatureOverride)
         .filter(
             OrganizationFeatureOverride.organization_id == org_id,
-            OrganizationFeatureOverride.entitlement_key == entitlement_key,
+            OrganizationFeatureOverride.entitlement_key.in_([norm_key, entitlement_key]),
         )
         .first()
     )
@@ -584,8 +586,9 @@ def delete_feature_override(
         caller,
         "entitlements",
         "Feature override removed",
-        f"Removed feature override for '{entitlement_key}'",
+        f"Removed feature override for '{norm_key}'",
     )
+
 
 
 @router.get(
