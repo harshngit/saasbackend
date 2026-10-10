@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -45,12 +45,40 @@ def create_quotation(
     return quotation_service.create_quotation(db, _org_id(user), user, payload)
 
 
-@router.get("", response_model=list[QuotationListItem])
+from app.schemas.pagination import PaginatedResponse
+
+
+@router.get("", response_model=PaginatedResponse[QuotationListItem])
 def list_quotations(
     user: User = Depends(_view),
+    status_filter: str | None = Query(default=None, alias="status"),
+    customer_id: str | None = Query(default=None),
+    lead_id: str | None = Query(default=None),
+    salesperson_id: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="matches quotation_number or notes"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Quotation]:
-    return quotation_service.list_quotations(db, _org_id(user), user)
+) -> PaginatedResponse[QuotationListItem]:
+    items, total, page, page_size, total_pages = quotation_service.list_quotations(
+        db,
+        _org_id(user),
+        user,
+        status_filter=status_filter,
+        customer_id=customer_id,
+        lead_id=lead_id,
+        salesperson_id=salesperson_id,
+        search=search,
+        page=page,
+        page_size=page_size,
+    )
+    return PaginatedResponse(
+        items=[QuotationListItem.model_validate(q) for q in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{id}", response_model=QuotationOut)

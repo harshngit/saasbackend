@@ -10,7 +10,11 @@ from app.core.deps import (
     require_permission,
     require_system_role,
 )
+from app.core.pagination import paginate
 from app.models import ATTENDANCE_TYPES, Attendance, SystemRole, User
+from app.schemas.attendance import AttendanceOut, CheckInBody
+from app.schemas.pagination import PaginatedResponse
+
 
 router = APIRouter(
     prefix="/attendance",
@@ -21,8 +25,6 @@ router = APIRouter(
 _mark = require_permission("attendance", "create")
 _view = require_permission("attendance", "view")
 _ADMIN = require_system_role(SystemRole.ADMIN)
-
-from app.schemas.attendance import AttendanceOut, CheckInBody  # noqa: E402
 
 
 def _date_range(date_from: str | None, date_to: str | None) -> tuple[date | None, date | None]:
@@ -66,39 +68,43 @@ def check_in(payload: CheckInBody, user: User = Depends(_mark), db: Session = De
     return row
 
 
-@router.get("/me", response_model=list[AttendanceOut])
+@router.get("/me", response_model=PaginatedResponse[AttendanceOut])
 def my_attendance(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     user: User = Depends(_view),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[Attendance]:
+) -> PaginatedResponse[AttendanceOut]:
     d_from, d_to = _date_range(date_from, date_to)
     query = db.query(Attendance).filter(Attendance.user_id == user.id)
     if d_from:
         query = query.filter(Attendance.day >= d_from)
     if d_to:
         query = query.filter(Attendance.day <= d_to)
-    return query.order_by(Attendance.day.desc()).all()
+    query = query.order_by(Attendance.day.desc(), Attendance.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
-@router.get("", response_model=list[AttendanceOut])
+@router.get("", response_model=PaginatedResponse[AttendanceOut])
 def all_attendance(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     admin: User = Depends(_ADMIN),
     user_id: str | None = Query(default=None),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[Attendance]:
+) -> PaginatedResponse[AttendanceOut]:
     """Admin monitoring view — attendance across the firm's staff."""
     d_from, d_to = _date_range(date_from, date_to)
-    # Scope to the admin's org via the users in it.
-    org_user_ids = [u.id for u in db.query(User.id).filter(User.organization_id == admin.organization_id)]
-    query = db.query(Attendance).filter(Attendance.user_id.in_(org_user_ids))
+    query = db.query(Attendance).filter(Attendance.organization_id == admin.organization_id)
     if user_id:
         query = query.filter(Attendance.user_id == user_id)
     if d_from:
         query = query.filter(Attendance.day >= d_from)
     if d_to:
         query = query.filter(Attendance.day <= d_to)
-    return query.order_by(Attendance.day.desc()).all()
+    query = query.order_by(Attendance.day.desc(), Attendance.id.desc())
+    return paginate(query, page=page, page_size=page_size)

@@ -75,8 +75,13 @@ def delivery_partner_dashboard(
     return dashboard_service.build_delivery_partner_dashboard(db, org_id, user.id)
 
 
-@router.get("/delivery-partner/orders", response_model=list[OrderOut])
+from app.schemas.pagination import PaginatedResponse
+
+
+@router.get("/delivery-partner/orders", response_model=PaginatedResponse[OrderOut])
 def list_delivery_partner_company_orders(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     status_filter: str | None = Query(
         default=None,
         alias="status",
@@ -89,21 +94,19 @@ def list_delivery_partner_company_orders(
     ),
     customer_id: str | None = Query(default=None),
     search: str | None = Query(default=None, description="matches order_number"),
-    limit: int = Query(default=50, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[SalesOrder]:
+) -> PaginatedResponse[SalesOrder]:
     """Read-only company-wide orders list for the authenticated delivery partner."""
     org_id = _org_id(user)
     return dashboard_service.list_delivery_partner_company_orders(
         db,
         org_id,
+        page=page,
+        page_size=page_size,
         status_filter=status_filter,
         fulfilment_status=fulfilment_status,
         customer_id=customer_id,
         search=search,
-        limit=limit,
-        offset=offset,
     )
 

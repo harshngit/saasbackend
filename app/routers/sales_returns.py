@@ -14,6 +14,8 @@ from app.core import workflow
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, Invoice, SalesReturn, User
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.sales_return import (
     ReturnApproveBody,
     ReturnReceiveBody,
@@ -173,14 +175,17 @@ def create_sales_return(
     return sales_return
 
 
-@router.get("", response_model=list[SalesReturnOut])
+@router.get("", response_model=PaginatedResponse[SalesReturnOut])
 def list_sales_returns(
     user: User = Depends(_view),
     status_filter: str | None = Query(default=None, alias="status"),
     customer_id: str | None = Query(default=None),
     invoice_id: str | None = Query(default=None, alias="invoice_reference_id"),
+    search: str | None = Query(default=None, description="matches return_number or reason"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[SalesReturn]:
+) -> PaginatedResponse[SalesReturnOut]:
     query = db.query(SalesReturn).filter(SalesReturn.organization_id == _org_id(user))
     if status_filter:
         query = query.filter(SalesReturn.return_status == status_filter)
@@ -188,7 +193,24 @@ def list_sales_returns(
         query = query.filter(SalesReturn.customer_id == customer_id)
     if invoice_id:
         query = query.filter(SalesReturn.invoice_reference_id == invoice_id)
-    return query.order_by(SalesReturn.return_date.desc(), SalesReturn.id.desc()).all()
+    if search:
+        s = f"%{search}%"
+        from sqlalchemy import or_
+        query = query.filter(
+            or_(
+                SalesReturn.return_number.ilike(s),
+                SalesReturn.reason.ilike(s),
+            )
+        )
+    query = query.order_by(SalesReturn.return_date.desc(), SalesReturn.id.desc())
+    items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[SalesReturnOut.model_validate(r) for r in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{id}", response_model=SalesReturnOut)

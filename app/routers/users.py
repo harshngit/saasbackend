@@ -6,10 +6,12 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_permission, require_system_role, require_unlocked_org
+from app.core.pagination import paginate
 from app.core.security import hash_password
 from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, User, VehicleLoading
 from app.schemas.auth import MessageResponse
 from app.schemas.employee_profile import EmployeeProfileIn, EmployeeProfileOut
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.staff_overview import LocationPing, LocationPingOut, StaffOverviewOut
 from app.schemas.user import (
     COLLECTION_COLUMN,
@@ -243,8 +245,10 @@ def create_staff(
     return employee_profile_service.build_profile(db, staff)
 
 
-@router.get("", response_model=list[UserOut])
+@router.get("", response_model=PaginatedResponse[UserOut])
 def list_staff(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     admin: User = Depends(_ADMIN),
     role_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
@@ -256,7 +260,7 @@ def list_staff(
     work_location: str | None = Query(default=None),
     reporting_manager_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[User]:
+) -> PaginatedResponse[UserOut]:
     """List the firm's employees, filtered by role / login state / employee profile.
 
     Rows come back flat — one row per employee, everything at the top level. The
@@ -267,7 +271,7 @@ def list_staff(
     if is_active is not None:
         query = query.filter(User.is_active == is_active)
     if search:
-        like = f"%{search}%"
+        like = f"%{search.strip()}%"
         query = query.filter(
             or_(
                 User.name.ilike(like),
@@ -289,7 +293,8 @@ def list_staff(
         query = query.filter(User.work_location == work_location)
     if reporting_manager_id is not None:
         query = query.filter(User.reporting_manager_id == reporting_manager_id)
-    return query.order_by(User.created_at.desc()).all()
+    query = query.order_by(User.created_at.desc(), User.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 def _assignee_role_label(user: User) -> str:

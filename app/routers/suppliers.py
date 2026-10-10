@@ -10,6 +10,8 @@ from app.core.excel_import import ImportSummaryOut
 from app.models import Product, PurchaseInvoice, Supplier, SupplierPayment, SupplierProduct, User
 from app.models.catalog_hierarchy import SupplierBrand
 from app.schemas.catalog_hierarchy import SupplierBrandLinkCreate, SupplierBrandOut
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.supplier import (
     BulkDelete,
     BulkDeleteResult,
@@ -105,14 +107,16 @@ def create_supplier(
     return supplier
 
 
-@router.get("", response_model=list[SupplierOut])
+@router.get("", response_model=PaginatedResponse[SupplierOut])
 def list_suppliers(
     user: User = Depends(_view),
     search: str | None = Query(default=None, description="matches name / contact / phone / email / code"),
     category: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Supplier]:
+) -> PaginatedResponse[SupplierOut]:
     org_id = _org_id(user)
     query = db.query(Supplier).filter(Supplier.organization_id == org_id)
     if search:
@@ -130,7 +134,16 @@ def list_suppliers(
         query = query.filter(Supplier.category == category)
     if is_active is not None:
         query = query.filter(Supplier.is_active == is_active)
-    return query.order_by(Supplier.name).all()
+
+    query = query.order_by(Supplier.name.asc(), Supplier.id.asc())
+    items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[SupplierOut.model_validate(s) for s in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{supplier_id}", response_model=SupplierOut)

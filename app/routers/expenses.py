@@ -8,6 +8,8 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.files import save_upload
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.expense import BulkDelete, BulkDeleteResult, ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
 from app.services import expense_service, lookup_service, notification_service, numbering_service
 
@@ -169,7 +171,7 @@ def upload_receipt(
     return expense
 
 
-@router.get("", response_model=list[ExpenseOut])
+@router.get("", response_model=PaginatedResponse[ExpenseOut])
 def list_expenses(
     user: User = Depends(_view),
     category: str | None = Query(default=None),
@@ -183,8 +185,11 @@ def list_expenses(
     payment_status: str | None = Query(default=None),
     is_recurring: bool | None = Query(default=None),
     tag: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="matches expense_number, expense_id, description, payee_name"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Expense]:
+) -> PaginatedResponse[ExpenseOut]:
     org_id = _org_id(user)
     q = db.query(Expense).filter(Expense.organization_id == org_id)
     if category:
@@ -210,13 +215,27 @@ def list_expenses(
     if tag:
         # Check tag in JSON list
         q = q.filter(Expense.tags.contains([tag]))
+    if search:
+        s = f"%{search}%"
+        q = q.filter(
+            or_(
+                Expense.expense_number.ilike(s),
+                Expense.expense_id.ilike(s),
+                Expense.description.ilike(s),
+                Expense.payee_name.ilike(s),
+            )
+        )
 
-    # An "own"-scope user only sees expenses they submitted — same dynamic
-    # list-scoping helper as everywhere else. "all"-scope (Admin, Accountant,
-    # or any custom org-wide role) is unaffected. team_columns=(): Expenses
-    # are explicitly excluded from Team Scope.
     q = scoping.owned_by(q, db, user, Expense.submitted_by, team_columns=())
-    return q.order_by(Expense.expense_date.desc()).all()
+    q = q.order_by(Expense.expense_date.desc(), Expense.id.desc())
+    items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[ExpenseOut.model_validate(e) for e in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{expense_id}", response_model=ExpenseOut)

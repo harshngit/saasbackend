@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from sqlalchemy import desc
+from sqlalchemy import desc, or_
 from sqlalchemy.orm import Session
 
 from app.core import scoping
@@ -116,19 +116,24 @@ def get_visit(db: Session, org_id: str, visit_id: str, user: User | None = None)
     return visit
 
 
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
+
+
 def list_visits(
     db: Session,
     org_id: str,
     user: User,
+    page: int = 1,
+    page_size: int = 10,
+    search: str | None = None,
     customer_id: str | None = None,
     lead_id: str | None = None,
     salesperson_id: str | None = None,
     status_filter: str | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> list[Visit]:
+) -> PaginatedResponse[Visit]:
     query = db.query(Visit).filter(Visit.organization_id == org_id)
 
     if customer_id:
@@ -143,9 +148,20 @@ def list_visits(
         query = query.filter(Visit.visit_date >= date_from)
     if date_to:
         query = query.filter(Visit.visit_date <= date_to)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Visit.purpose.ilike(s),
+                Visit.notes.ilike(s),
+                Visit.location.ilike(s),
+                Visit.outcome.ilike(s),
+            )
+        )
 
     query = scoping.owned_by(query, db, user, Visit.user_id)
-    return query.order_by(desc(Visit.visit_date), desc(Visit.created_at)).offset(offset).limit(limit).all()
+    query = query.order_by(Visit.visit_date.desc().nullslast(), Visit.created_at.desc(), Visit.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: VisitUpdate) -> Visit:

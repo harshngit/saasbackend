@@ -66,21 +66,51 @@ def _apply_movement(
     return movement
 
 
-@router.get("/expiring", response_model=list[ExpiringBatch])
+from datetime import datetime, timedelta, timezone
+from app.schemas.pagination import PaginatedResponse
+from app.core.pagination import paginate
+
+
+@router.get("/expiring", response_model=PaginatedResponse[ExpiringBatch])
 def expiring_stock(
-    user: User = Depends(_view),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = None,
+    warehouse_id: str | None = None,
+    product_id: str | None = None,
     within_days: int = Query(default=30, ge=0, le=3650, description="How far ahead to look"),
     include_expired: bool = Query(default=True),
+    user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[ExpiringBatch]:
-    """Batches that are expired or expiring, soonest first.
-
-    Only batch or expiry tracked products have lots, so only their stock appears here.
-    """
+) -> PaginatedResponse[ExpiringBatch]:
+    """Batches that are expired or expiring, soonest first."""
     org_id = _org_id(user)
-    rows = tracking_service.expiring(db, org_id, within_days, include_expired)
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=within_days)
+    q = (
+        db.query(StockBatch)
+        .filter(
+            StockBatch.organization_id == org_id,
+            StockBatch.quantity > 0,
+            StockBatch.expiry_date.isnot(None),
+            StockBatch.expiry_date <= cutoff,
+        )
+    )
+    if not include_expired:
+        q = q.filter(StockBatch.expiry_date >= now)
+    if warehouse_id:
+        q = q.filter(StockBatch.warehouse_id == warehouse_id)
+    if product_id:
+        q = q.filter(StockBatch.product_id == product_id)
+    if search:
+        s = f"%{search.strip()}%"
+        q = q.filter(StockBatch.batch_number.ilike(s))
+
+    q = q.order_by(StockBatch.expiry_date.asc(), StockBatch.id.asc())
+    p = paginate(q, page=page, page_size=page_size)
+
     out = []
-    for row in rows:
+    for row in p.items:
         product = db.get(Product, row.product_id)
         warehouse = db.get(Warehouse, row.warehouse_id)
         out.append(ExpiringBatch(
@@ -93,28 +123,38 @@ def expiring_stock(
             product_name=product.name if product is not None else None,
             warehouse_name=warehouse.name if warehouse is not None else None,
         ))
-    return out
+
+    return PaginatedResponse(
+        items=out,
+        total=p.total,
+        page=p.page,
+        page_size=p.page_size,
+        total_pages=p.total_pages,
+    )
 
 
-@router.get("", response_model=list[InventoryItemOut])
+@router.get("", response_model=PaginatedResponse[InventoryItemOut])
 def stock_board(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     user: User = Depends(_view),
     search: str | None = Query(default=None, description="matches name / sku / brand"),
     category_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[Product]:
+) -> PaginatedResponse[InventoryItemOut]:
     """Stock board: every product with its current available stock (and per-variant)."""
     org_id = _org_id(user)
     query = db.query(Product).filter(Product.organization_id == org_id)
     if search:
-        like = f"%{search}%"
+        like = f"%{search.strip()}%"
         query = query.filter(or_(Product.name.ilike(like), Product.sku.ilike(like), Product.brand.ilike(like)))
     if category_id is not None:
         query = query.filter(Product.category_id == category_id)
     if is_active is not None:
         query = query.filter(Product.is_active == is_active)
-    return query.order_by(Product.name).all()
+    query = query.order_by(Product.name.asc(), Product.id.asc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 @router.get("/{product_id}", response_model=InventoryDetailOut)

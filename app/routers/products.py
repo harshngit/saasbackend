@@ -25,6 +25,8 @@ from app.services import numbering_service, lookup_service, catalog_hierarchy_se
 from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
 from app.schemas.category import BulkDelete, BulkDeleteResult
 from app.schemas.inventory import BatchOut, SerialOut
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.product import (
     ProductAttachment,
     ProductCreate,
@@ -165,7 +167,7 @@ def bulk_delete_products(
     return BulkDeleteResult(deleted=len(products))
 
 
-@router.get("", response_model=list[ProductListItem])
+@router.get("", response_model=PaginatedResponse[ProductListItem])
 def list_products(
     user: User = Depends(_view),
     search: str | None = Query(default=None, description="matches product code / name / sku / barcode / brand / vendor"),
@@ -178,8 +180,10 @@ def list_products(
     preferred_supplier_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status", description="active | inactive | discontinued"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Product]:
+) -> PaginatedResponse[ProductListItem]:
     org_id = _org_id(user)
     query = db.query(Product).filter(Product.organization_id == org_id)
     if search:
@@ -218,7 +222,16 @@ def list_products(
         query = query.filter(Product.is_active == is_active)
     if status_filter is not None:
         query = query.filter(Product.status == status_filter)
-    return query.order_by(Product.created_at.desc()).all()
+
+    query = query.order_by(Product.created_at.desc(), Product.id.desc())
+    items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[ProductListItem.model_validate(p) for p in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{product_id}", response_model=ProductOut)

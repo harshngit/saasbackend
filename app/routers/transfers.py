@@ -8,11 +8,14 @@ Lifecycle:
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
+from app.core.pagination import paginate
 from app.models import NumberSequence, Product, ProductVariant, User, WarehouseTransfer, WarehouseTransferItem
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.transfer import (
     WarehouseTransferCreate,
     WarehouseTransferOut,
@@ -123,14 +126,17 @@ def create_transfer(
     return transfer
 
 
-@router.get("", response_model=list[WarehouseTransferOut])
+@router.get("", response_model=PaginatedResponse[WarehouseTransferOut])
 def list_transfers(
-    user: User = Depends(_view),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     source_warehouse_id: str | None = Query(default=None),
     destination_warehouse_id: str | None = Query(default=None),
+    user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[WarehouseTransfer]:
+) -> PaginatedResponse[WarehouseTransferOut]:
     """List warehouse transfers in this organization."""
     org_id = _org_id(user)
     query = db.query(WarehouseTransfer).filter(WarehouseTransfer.organization_id == org_id)
@@ -141,8 +147,17 @@ def list_transfers(
         query = query.filter(WarehouseTransfer.source_warehouse_id == source_warehouse_id)
     if destination_warehouse_id:
         query = query.filter(WarehouseTransfer.destination_warehouse_id == destination_warehouse_id)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                WarehouseTransfer.transfer_number.ilike(s),
+                WarehouseTransfer.notes.ilike(s),
+            )
+        )
 
-    return query.order_by(WarehouseTransfer.created_at.desc()).all()
+    query = query.order_by(WarehouseTransfer.created_at.desc(), WarehouseTransfer.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 @router.get("/{id}", response_model=WarehouseTransferOut)

@@ -13,6 +13,8 @@ from app.models import (
     SupplierInvoiceItem,
     User,
 )
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.supplier_invoice import (
     BulkDelete,
     BulkDeleteResult,
@@ -133,7 +135,7 @@ def create_supplier_invoice(
     return inv
 
 
-@router.get("", response_model=list[SupplierInvoiceOut])
+@router.get("", response_model=PaginatedResponse[SupplierInvoiceOut])
 def list_supplier_invoices(
     user: User = Depends(_view),
     supplier_id: str | None = Query(default=None),
@@ -142,8 +144,10 @@ def list_supplier_invoices(
     verification_status: str | None = Query(default=None),
     payment_status: str | None = Query(default=None),
     search: str | None = Query(default=None, description="matches supplier_invoice_number"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[SupplierInvoice]:
+) -> PaginatedResponse[SupplierInvoiceOut]:
     org_id = _org_id(user)
     q = db.query(SupplierInvoice).filter(SupplierInvoice.organization_id == org_id)
 
@@ -161,7 +165,15 @@ def list_supplier_invoices(
         s = f"%{search}%"
         q = q.filter(SupplierInvoice.supplier_invoice_number.ilike(s))
 
-    return q.order_by(SupplierInvoice.created_at.desc()).all()
+    q = q.order_by(SupplierInvoice.created_at.desc(), SupplierInvoice.id.desc())
+    items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[SupplierInvoiceOut.model_validate(inv) for inv in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{id}", response_model=SupplierInvoiceOut)

@@ -174,11 +174,42 @@ def create_quotation(db: Session, org_id: str, user: User, payload: QuotationCre
     return quotation
 
 
-def list_quotations(db: Session, org_id: str, user: User) -> list[Quotation]:
+def list_quotations(
+    db: Session,
+    org_id: str,
+    user: User,
+    status_filter: str | None = None,
+    customer_id: str | None = None,
+    lead_id: str | None = None,
+    salesperson_id: str | None = None,
+    search: str | None = None,
+    page: int = 1,
+    page_size: int = 10,
+) -> tuple[list[Quotation], int, int, int, int]:
+    from app.core.pagination import paginate
+    from sqlalchemy import or_
+
     query = db.query(Quotation).filter(Quotation.organization_id == org_id)
+    if status_filter:
+        query = query.filter(Quotation.status == status_filter)
+    if customer_id:
+        query = query.filter(Quotation.customer_id == customer_id)
+    if lead_id:
+        query = query.filter(Quotation.lead_id == lead_id)
+    if salesperson_id:
+        query = query.filter(Quotation.salesperson_id == salesperson_id)
+    if search:
+        s = f"%{search}%"
+        query = query.filter(
+            or_(
+                Quotation.quotation_number.ilike(s),
+                Quotation.notes.ilike(s),
+            )
+        )
     # A field role sees only their own quotations.
     query = scoping.owned_by(query, db, user, Quotation.salesperson_id)
-    return query.order_by(Quotation.created_at.desc()).all()
+    query = query.order_by(Quotation.created_at.desc(), Quotation.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 # Fields whose change alone does not count as a "meaningful edit" for the

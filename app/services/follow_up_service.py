@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from sqlalchemy import asc, desc
+from sqlalchemy import asc, desc, or_
 from sqlalchemy.orm import Session
 
 from app.core import scoping
+from app.core.pagination import paginate
 from app.models import Customer, FollowUp, Lead, User, Visit
 from app.schemas.follow_up import FollowUpComplete, FollowUpCreate, FollowUpUpdate
+from app.schemas.pagination import PaginatedResponse
 from app.services import lead_service
 
 
@@ -148,6 +150,9 @@ def list_follow_ups(
     db: Session,
     org_id: str,
     user: User,
+    page: int = 1,
+    page_size: int = 10,
+    search: str | None = None,
     customer_id: str | None = None,
     lead_id: str | None = None,
     visit_id: str | None = None,
@@ -156,9 +161,7 @@ def list_follow_ups(
     priority: str | None = None,
     due_before: datetime | None = None,
     due_after: datetime | None = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> list[FollowUp]:
+) -> PaginatedResponse[FollowUp]:
     query = db.query(FollowUp).filter(FollowUp.organization_id == org_id)
 
     if customer_id:
@@ -177,9 +180,18 @@ def list_follow_ups(
         query = query.filter(FollowUp.due_date <= due_before)
     if due_after:
         query = query.filter(FollowUp.due_date >= due_after)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                FollowUp.title.ilike(s),
+                FollowUp.description.ilike(s),
+            )
+        )
 
     query = scoping.owned_by(query, db, user, FollowUp.assigned_to_id)
-    return query.order_by(asc(FollowUp.due_date), desc(FollowUp.created_at)).offset(offset).limit(limit).all()
+    query = query.order_by(FollowUp.due_date.asc().nullslast(), FollowUp.created_at.desc(), FollowUp.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 def update_follow_up(

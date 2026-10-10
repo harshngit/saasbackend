@@ -22,6 +22,8 @@ from app.services import (
 )
 from app.services.customer_profile_service import DOCUMENT_TYPES, OTHER_DOCUMENT_TYPE
 from app.schemas.customer_profile import CustomerProfileIn, CustomerProfileOut
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.ledger import CustomerLedger
 from app.schemas.customer import (
     BulkDelete,
@@ -185,7 +187,7 @@ def import_customers(
 
 
 
-@router.get("", response_model=list[CustomerOut])
+@router.get("", response_model=PaginatedResponse[CustomerOut])
 def list_customers(
     user: User = Depends(_view),
     search: str | None = Query(default=None, description="matches customer code / name / business / phone / email"),
@@ -193,8 +195,10 @@ def list_customers(
     is_active: bool | None = Query(default=None),
     assigned_sales_officer_id: str | None = Query(default=None),
     has_outstanding: bool | None = Query(default=None, description="Filter customers with outstanding balance > 0"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Customer]:
+) -> PaginatedResponse[CustomerOut]:
     org_id = _org_id(user)
     query = db.query(Customer).filter(Customer.organization_id == org_id)
     if search:
@@ -220,7 +224,9 @@ def list_customers(
         query = query.filter(or_(Customer.outstanding_balance <= 0, Customer.outstanding_balance.is_(None)))
     if not _is_delivery_partner(user):
         query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
-    customers = query.order_by(Customer.created_at.desc()).all()
+
+    query = query.order_by(Customer.created_at.desc(), Customer.id.desc())
+    customers, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
 
     if customers:
         customer_ids = [c.id for c in customers]
@@ -263,7 +269,13 @@ def list_customers(
             customer.last_order_date = last_order_map.get(customer.id)
             customer.last_visit_date = last_visit_map.get(customer.id)
 
-    return customers
+    return PaginatedResponse(
+        items=[CustomerOut.model_validate(c) for c in customers],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{customer_id}", response_model=CustomerProfileOut)

@@ -573,16 +573,20 @@ def build_delivery_partner_dashboard(
     )
 
 
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
+
+
 def list_delivery_partner_company_orders(
     db: Session,
     org_id: str,
+    page: int = 1,
+    page_size: int = 10,
     status_filter: str | None = None,
     fulfilment_status: str | None = None,
     customer_id: str | None = None,
     search: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[SalesOrder]:
+) -> PaginatedResponse[SalesOrder]:
     query = db.query(SalesOrder).filter(SalesOrder.organization_id == org_id)
 
     if status_filter:
@@ -602,12 +606,8 @@ def list_delivery_partner_company_orders(
         query = query.filter(SalesOrder.customer_id == customer_id)
 
     if search:
-        query = query.filter(SalesOrder.order_number.ilike(f"%{search}%"))
+        query = query.filter(SalesOrder.order_number.ilike(f"%{search.strip()}%"))
 
-    return (
-        query.order_by(SalesOrder.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
+    query = query.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 

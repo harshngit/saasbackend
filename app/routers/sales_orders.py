@@ -24,6 +24,8 @@ from app.models import (
     UserRole,
     Vehicle,
 )
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.customer import CustomerPaymentOut
 from app.schemas.sales_order import (
     AssignDeliveryBody,
@@ -382,9 +384,8 @@ def bulk_delete_orders(
     return BulkDeleteResult(deleted=len(orders))
 
 
-@router.get("", response_model=list[OrderOut])
+@router.get("", response_model=PaginatedResponse[OrderOut])
 def list_orders(
-
     user: User = Depends(_view),
     status_filter: str | None = Query(
         default=None, alias="status",
@@ -398,14 +399,13 @@ def list_orders(
     customer_id: str | None = Query(default=None),
     assigned_delivery_partner_id: str | None = Query(default=None),
     search: str | None = Query(default=None, description="matches order_number"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[SalesOrder]:
+) -> PaginatedResponse[OrderOut]:
     org_id = _org_id(user)
     query = db.query(SalesOrder).filter(SalesOrder.organization_id == org_id)
     if status_filter:
-        # A client still filtering by an old status value is served through the same
-        # map the stored rows were migrated with, so nothing broke on the day of the
-        # split. `fulfilment_status` is the parameter for the goods-side states.
         mapped = workflow.LEGACY_ORDER_STATUS.get(status_filter)
         if mapped and status_filter not in workflow.ORDER_STATUSES:
             new_status, fulfilment = mapped
@@ -422,15 +422,20 @@ def list_orders(
         query = query.filter(SalesOrder.assigned_delivery_partner_id == assigned_delivery_partner_id)
     if search:
         query = query.filter(SalesOrder.order_number.ilike(f"%{search}%"))
-    # A field role sees the orders it raised, was recorded against, or must
-    # deliver. Team Scope widens only salesperson_id to teammates -- see
-    # app.core.scoping.owned_by's team_columns param and _owned's matching note.
     query = scoping.owned_by(
         query, db, user,
         SalesOrder.created_by, SalesOrder.salesperson_id, SalesOrder.assigned_delivery_partner_id,
         team_columns=(SalesOrder.salesperson_id,),
     )
-    return query.order_by(SalesOrder.created_at.desc()).all()
+    query = query.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())
+    items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[_order_out(db, o) for o in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{order_id}", response_model=OrderOut)

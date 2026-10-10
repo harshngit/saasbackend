@@ -1,24 +1,39 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
+from app.core.pagination import paginate
 from app.models import Notification, User
 from app.schemas.notification import MessageResponse, NotificationOut, UnreadCount
+from app.schemas.pagination import PaginatedResponse
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 
-@router.get("", response_model=list[NotificationOut])
+@router.get("", response_model=PaginatedResponse[NotificationOut])
 def list_notifications(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     user: User = Depends(get_current_user),
     unread_only: bool = Query(default=False),
     db: Session = Depends(get_db),
-) -> list[Notification]:
+) -> PaginatedResponse[NotificationOut]:
     q = db.query(Notification).filter(Notification.user_id == user.id)
     if unread_only:
         q = q.filter(Notification.is_read.is_(False))
-    return q.order_by(Notification.created_at.desc()).limit(100).all()
+    if search:
+        s = f"%{search.strip()}%"
+        q = q.filter(
+            or_(
+                Notification.title.ilike(s),
+                Notification.body.ilike(s),
+            )
+        )
+    q = q.order_by(Notification.created_at.desc(), Notification.id.desc())
+    return paginate(q, page=page, page_size=page_size)
 
 
 @router.get("/unread-count", response_model=UnreadCount)

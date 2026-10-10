@@ -13,6 +13,7 @@ from app.schemas.follow_up import (
     FollowUpOut,
     FollowUpUpdate,
 )
+from app.schemas.pagination import PaginatedResponse
 from app.services import follow_up_service
 
 router = APIRouter(prefix="/follow-ups", tags=["follow_ups"])
@@ -40,8 +41,11 @@ def create_follow_up(
     return follow_up_service.create_follow_up(db, org_id, user, payload)
 
 
-@router.get("", response_model=list[FollowUpOut])
+@router.get("", response_model=PaginatedResponse[FollowUpOut])
 def list_follow_ups(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     customer_id: str | None = Query(default=None),
     lead_id: str | None = Query(default=None),
     visit_id: str | None = Query(default=None),
@@ -50,16 +54,17 @@ def list_follow_ups(
     priority: str | None = Query(default=None),
     due_before: datetime | None = Query(default=None),
     due_after: datetime | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[FollowUp]:
+) -> PaginatedResponse[FollowUpOut]:
     org_id = _org_id(user)
     return follow_up_service.list_follow_ups(
         db,
         org_id,
         user,
+        page=page,
+        page_size=page_size,
+        search=search,
         customer_id=customer_id,
         lead_id=lead_id,
         visit_id=visit_id,
@@ -68,8 +73,6 @@ def list_follow_ups(
         priority=priority,
         due_before=due_before,
         due_after=due_after,
-        limit=limit,
-        offset=offset,
     )
 
 

@@ -4,13 +4,17 @@ Gated by the `inventory` module permission, so a firm can let a warehouse or
 dispatch role manage stock without making them an Admin.
 """
 
+import math
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
+from app.core.pagination import paginate
 from app.models import Product, ProductVariant, StockMovement, StockReservation, User, Warehouse, WarehouseStock
 from app.schemas.inventory import StockMovementOut
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.warehouse import (
     StockAdjustment,
     StockRow,
@@ -112,14 +116,17 @@ def create_warehouse(
     return warehouse
 
 
-@router.get("/stock", response_model=list[StockRow])
+@router.get("/stock", response_model=PaginatedResponse[StockRow])
 def stock_positions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     user: User = Depends(_view),
     warehouse_id: str | None = Query(default=None, description="Defaults to the firm's default warehouse"),
     product_id: str | None = Query(default=None),
+    search: str | None = Query(default=None),
     low_stock_only: bool = Query(default=False, description="Only items at or below their minimum level"),
     db: Session = Depends(get_db),
-) -> list[StockRow]:
+) -> PaginatedResponse[StockRow]:
     """On hand, reserved and available for every item in a warehouse.
 
     `available = on_hand − outstanding reservations` — that is the figure an order is
@@ -131,37 +138,83 @@ def stock_positions(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Warehouse not found")
     db.commit()
 
-    # Walk the catalog, not the stock table: an item nobody has tracked per warehouse
-    # yet still has stock on its product record, and leaving it out would show an
-    # empty stock screen to a firm that has never opened a warehouse.
-    products = db.query(Product).filter(Product.organization_id == org_id)
+    products_query = db.query(Product).filter(Product.organization_id == org_id)
     if product_id:
-        products = products.filter(Product.id == product_id)
-
-    rows = []
-    for product in products.all():
-        items: list[tuple[str | None, str | None]] = [
-            (variant.id, variant.name) for variant in (product.variations or [])
-        ] or [(None, None)]
-        for variant_id, variant_name in items:
-            summary = stock_service.stock_summary(db, warehouse.id, product.id, variant_id)
-            minimum = product.minimum_stock_level
-            if low_stock_only and not (minimum and summary["available"] <= minimum):
-                continue
-            rows.append(
-                StockRow(
-                    warehouse_id=warehouse.id,
-                    warehouse_name=warehouse.name,
-                    product_id=product.id,
-                    product_name=product.name,
-                    variant_id=variant_id,
-                    variant_name=variant_name,
-                    minimum_stock_level=minimum,
-                    **{k: summary[k] for k in ("on_hand", "reserved", "available")},
-                )
+        products_query = products_query.filter(Product.id == product_id)
+    if search:
+        s = f"%{search.strip()}%"
+        products_query = products_query.filter(
+            or_(
+                Product.name.ilike(s),
+                Product.sku.ilike(s),
+                Product.brand.ilike(s),
             )
-    rows.sort(key=lambda r: (r.product_name or "", r.variant_name or ""))
-    return rows
+        )
+
+    products_query = products_query.order_by(Product.name.asc(), Product.id.asc())
+
+    if not low_stock_only:
+        p = paginate(products_query, page=page, page_size=page_size)
+        rows = []
+        for product in p.items:
+            items: list[tuple[str | None, str | None]] = [
+                (variant.id, variant.name) for variant in (product.variations or [])
+            ] or [(None, None)]
+            for variant_id, variant_name in items:
+                summary = stock_service.stock_summary(db, warehouse.id, product.id, variant_id)
+                minimum = product.minimum_stock_level
+                rows.append(
+                    StockRow(
+                        warehouse_id=warehouse.id,
+                        warehouse_name=warehouse.name,
+                        product_id=product.id,
+                        product_name=product.name,
+                        variant_id=variant_id,
+                        variant_name=variant_name,
+                        minimum_stock_level=minimum,
+                        **{k: summary[k] for k in ("on_hand", "reserved", "available")},
+                    )
+                )
+        return PaginatedResponse(
+            items=rows,
+            total=p.total,
+            page=p.page,
+            page_size=p.page_size,
+            total_pages=p.total_pages,
+        )
+    else:
+        all_prods = products_query.all()
+        matching_rows = []
+        for product in all_prods:
+            items = [(variant.id, variant.name) for variant in (product.variations or [])] or [(None, None)]
+            for variant_id, variant_name in items:
+                summary = stock_service.stock_summary(db, warehouse.id, product.id, variant_id)
+                minimum = product.minimum_stock_level
+                if minimum and summary["available"] <= minimum:
+                    matching_rows.append(
+                        StockRow(
+                            warehouse_id=warehouse.id,
+                            warehouse_name=warehouse.name,
+                            product_id=product.id,
+                            product_name=product.name,
+                            variant_id=variant_id,
+                            variant_name=variant_name,
+                            minimum_stock_level=minimum,
+                            **{k: summary[k] for k in ("on_hand", "reserved", "available")},
+                        )
+                    )
+        total = len(matching_rows)
+        effective_page_size = min(max(page_size, 1), 100)
+        total_pages = math.ceil(total / effective_page_size) if total > 0 else 0
+        offset = (page - 1) * effective_page_size
+        sliced = matching_rows[offset: offset + effective_page_size]
+        return PaginatedResponse(
+            items=sliced,
+            total=total,
+            page=page,
+            page_size=effective_page_size,
+            total_pages=total_pages,
+        )
 
 
 @router.get("/{warehouse_id}", response_model=WarehouseOut)
@@ -317,17 +370,18 @@ def delete_warehouse(
     db.commit()
 
 
-@router.get("/{warehouse_id}/movements", response_model=list[StockMovementOut])
+@router.get("/{warehouse_id}/movements", response_model=PaginatedResponse[StockMovementOut])
 def list_warehouse_movements(
     warehouse_id: str,
-    user: User = Depends(_view),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = None,
     product_id: str | None = Query(default=None),
     variant_id: str | None = Query(default=None),
     movement_type: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[StockMovementOut]:
+) -> PaginatedResponse[StockMovementOut]:
     """Canonical read API for warehouse stock movement audit ledger."""
     org_id = _org_id(user)
     warehouse = _owned(db, warehouse_id, org_id)
@@ -342,11 +396,20 @@ def list_warehouse_movements(
         query = query.filter(StockMovement.variant_id == variant_id)
     if movement_type:
         query = query.filter(StockMovement.movement_type == movement_type)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                StockMovement.movement_type.ilike(s),
+                StockMovement.note.ilike(s),
+            )
+        )
 
-    movements = query.order_by(StockMovement.created_at.desc()).offset(offset).limit(limit).all()
+    query = query.order_by(StockMovement.created_at.desc(), StockMovement.id.desc())
+    p = paginate(query, page=page, page_size=page_size)
 
     results = []
-    for m in movements:
+    for m in p.items:
         results.append(
             StockMovementOut(
                 id=m.id,
@@ -363,5 +426,11 @@ def list_warehouse_movements(
                 created_at=m.created_at,
             )
         )
-    return results
+    return PaginatedResponse(
+        items=results,
+        total=p.total,
+        page=p.page,
+        page_size=p.page_size,
+        total_pages=p.total_pages,
+    )
 

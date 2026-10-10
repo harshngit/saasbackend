@@ -1,12 +1,15 @@
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.core.pagination import paginate
 from app.models import Leave, SystemRole, User
 from app.schemas.leave import LeaveCreate, LeaveOut, LeaveRejectBody, LeaveUpdate
+from app.schemas.pagination import PaginatedResponse
 from app.services import leave_service
 
 router = APIRouter(
@@ -78,21 +81,27 @@ def create_leave(
     return leave
 
 
-@router.get("/me", response_model=list[LeaveOut])
+@router.get("/me", response_model=PaginatedResponse[LeaveOut])
 def my_leaves(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     user: User = Depends(_view),
     status_filter: str | None = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
-) -> list[Leave]:
+) -> PaginatedResponse[LeaveOut]:
     org_id = _org_id(user)
     query = db.query(Leave).filter(Leave.organization_id == org_id, Leave.user_id == user.id)
     if status_filter:
         query = query.filter(Leave.status == status_filter)
-    return query.order_by(Leave.created_at.desc()).all()
+    query = query.order_by(Leave.created_at.desc(), Leave.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
-@router.get("", response_model=list[LeaveOut])
+@router.get("", response_model=PaginatedResponse[LeaveOut])
 def list_leaves(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     user_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     leave_type: str | None = Query(default=None),
@@ -100,7 +109,7 @@ def list_leaves(
     date_to: date | None = Query(default=None),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[Leave]:
+) -> PaginatedResponse[LeaveOut]:
     org_id = _org_id(user)
     query = db.query(Leave).filter(Leave.organization_id == org_id)
 
@@ -117,8 +126,17 @@ def list_leaves(
         query = query.filter(Leave.start_date >= date_from)
     if date_to:
         query = query.filter(Leave.end_date <= date_to)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Leave.reason.ilike(s),
+                Leave.leave_type.ilike(s),
+            )
+        )
 
-    return query.order_by(Leave.created_at.desc()).all()
+    query = query.order_by(Leave.created_at.desc(), Leave.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 @router.get("/{id}", response_model=LeaveOut)

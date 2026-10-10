@@ -45,7 +45,10 @@ def create_lead(
     return lead_service.create_lead(db, _org_id(user), user, payload)
 
 
-@router.get("", response_model=list[LeadOut])
+from app.schemas.pagination import PaginatedResponse
+
+
+@router.get("", response_model=PaginatedResponse[LeadOut])
 def list_leads(
     user: User = Depends(_view),
     status_filter: str | None = Query(default=None, alias="status"),
@@ -54,11 +57,11 @@ def list_leads(
     search: str | None = Query(default=None, description="Matches name / mobile_number / email / lead_id"),
     created_from: datetime | None = Query(default=None, description="Leads created on or after this timestamp"),
     created_to: datetime | None = Query(default=None, description="Leads created on or before this timestamp"),
-    limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Lead]:
-    return lead_service.list_leads(
+) -> PaginatedResponse[LeadOut]:
+    items, total, page, page_size, total_pages = lead_service.list_leads(
         db,
         _org_id(user),
         user,
@@ -68,8 +71,15 @@ def list_leads(
         search=search,
         created_from=created_from,
         created_to=created_to,
-        limit=limit,
-        offset=offset,
+        page=page,
+        page_size=page_size,
+    )
+    return PaginatedResponse(
+        items=[LeadOut.model_validate(l) for l in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
     )
 
 

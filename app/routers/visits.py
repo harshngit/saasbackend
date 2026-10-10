@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import User, Visit
 from app.schemas.follow_up import FollowUpCreate, FollowUpOut
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.visit import BulkDelete, BulkDeleteResult, VisitCreate, VisitOut, VisitUpdate
 from app.services import follow_up_service, visit_service
 
@@ -35,32 +36,34 @@ def create_visit(
     return visit_service.create_visit(db, org_id, user, payload)
 
 
-@router.get("", response_model=list[VisitOut])
+@router.get("", response_model=PaginatedResponse[VisitOut])
 def list_visits(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     customer_id: str | None = Query(default=None),
     lead_id: str | None = Query(default=None),
     salesperson_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[Visit]:
+) -> PaginatedResponse[VisitOut]:
     org_id = _org_id(user)
     return visit_service.list_visits(
         db,
         org_id,
         user,
+        page=page,
+        page_size=page_size,
+        search=search,
         customer_id=customer_id,
         lead_id=lead_id,
         salesperson_id=salesperson_id,
         status_filter=status,
         date_from=date_from,
         date_to=date_to,
-        limit=limit,
-        offset=offset,
     )
 
 

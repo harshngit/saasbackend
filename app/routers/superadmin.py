@@ -37,6 +37,8 @@ from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
 from app.schemas.razorpay import SubscriptionPaymentOut
 from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
 from app.schemas.user import UserOut
+from app.schemas.pagination import PaginatedResponse
+from app.core.pagination import paginate
 from app.core.entitlements import normalize_entitlement_key
 from app.services import (
     activity_service,
@@ -200,19 +202,32 @@ def delete_super_admin(
     db.commit()
 
 
-@router.get("/organizations", response_model=list[OrganizationOut])
+@router.get("/organizations", response_model=PaginatedResponse[OrganizationOut])
 def list_organizations(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     status_filter: OrganizationStatus | None = Query(default=None, alias="status"),
     upgrade_status: UpgradeStatus | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[Organization]:
+) -> PaginatedResponse[OrganizationOut]:
     """List all organizations, optionally filtered by ?status= and ?upgrade_status=."""
     query = db.query(Organization)
     if status_filter is not None:
         query = query.filter(Organization.status == status_filter)
     if upgrade_status is not None:
         query = query.filter(Organization.upgrade_status == upgrade_status.value)
-    return query.order_by(Organization.created_at.desc()).all()
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Organization.name.ilike(s),
+                Organization.company_code.ilike(s),
+                Organization.email.ilike(s),
+            )
+        )
+    query = query.order_by(Organization.created_at.desc(), Organization.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 @router.get("/organizations/inventory", response_model=list[OrganizationInventoryOut])
@@ -742,11 +757,22 @@ def reset_all_overrides(
 # ----------------------- Subscription payments (Razorpay, Phase 1) -----------------------
 
 
-@router.get("/subscription-payments", response_model=list[SubscriptionPaymentOut])
+@router.get("/subscription-payments", response_model=PaginatedResponse[SubscriptionPaymentOut])
 def list_subscription_payments(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
+    status: str | None = Query(default=None),
     organization_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[SubscriptionPaymentOut]:
+) -> PaginatedResponse[SubscriptionPaymentOut]:
     """Every Razorpay subscription payment, optionally filtered by
     ?organization_id=. Without it, lists across every organization."""
-    return billing_service.list_payments(db, organization_id=organization_id)
+    return billing_service.list_payments(
+        db,
+        organization_id=organization_id,
+        page=page,
+        page_size=page_size,
+        search=search,
+        status=status,
+    )

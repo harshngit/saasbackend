@@ -51,6 +51,7 @@ from app.schemas.delivery import (
     DeliveryConfirm,
     DeliveryCustomerBrief,
     DeliveryHistoryOut,
+    DeliveryNoteOut,
     DeliveryOut,
     DeliveryPartnerBrief,
     DeliveryPartnerOption,
@@ -62,6 +63,8 @@ from app.schemas.delivery import (
     DeliveryWarehouseBrief,
     VehicleBrief,
 )
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
@@ -104,11 +107,13 @@ def _owned_order(db: Session, id: str, user: User) -> SalesOrder:
     return order
 
 
-@router.get("/assigned", response_model=list[OrderOut])
+@router.get("/assigned", response_model=PaginatedResponse[OrderOut])
 def list_assigned_deliveries(
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> list[SalesOrder]:
+) -> PaginatedResponse[OrderOut]:
     """Retrieve all active deliveries assigned to the logged-in delivery partner."""
     org_id = _org_id(user)
     # Check if delivery partner role
@@ -117,16 +122,20 @@ def list_assigned_deliveries(
         .filter(
             SalesOrder.organization_id == org_id,
             SalesOrder.assigned_delivery_partner_id == user.id,
-            # The goods axis, not the order's own status. Everything still to do:
-            # planned once a partner is named, then loaded, in transit, or part
-            # delivered. `fulfilment_status` on each row is what the app shows —
-            # being assigned is not the same as being out for delivery.
             SalesOrder.fulfilment_status.in_(
                 ("planned", "loaded", "in_transit", "partially_delivered")
             ),
         )
     )
-    return q.order_by(SalesOrder.created_at.desc()).all()
+    q = q.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())
+    items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[order_service._order_out(db, o) for o in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/partners", response_model=list[DeliveryPartnerOption])
@@ -334,7 +343,7 @@ def plan_delivery(
     return _delivery_out(db, delivery)
 
 
-@router.get("", response_model=list[DeliveryOut])
+@router.get("", response_model=PaginatedResponse[DeliveryOut])
 def list_deliveries(
     user: User = Depends(_view),
     status_filter: str | None = Query(
@@ -345,8 +354,11 @@ def list_deliveries(
     order_id: str | None = Query(default=None),
     delivery_partner_id: str | None = Query(default=None),
     open_only: bool = Query(default=False, description="Only deliveries still out"),
+    search: str | None = Query(default=None, description="matches delivery_number or notes"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[DeliveryOut]:
+) -> PaginatedResponse[DeliveryOut]:
     """The firm's deliveries, newest first. A field role sees only their own."""
     org_id = _org_id(user)
     query = db.query(Delivery).filter(Delivery.organization_id == org_id)
@@ -358,15 +370,24 @@ def list_deliveries(
         query = query.filter(Delivery.delivery_partner_id == delivery_partner_id)
     if open_only:
         query = query.filter(Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES))
-    # Same dynamic list-scoping helper every other module's list endpoint
-    # uses — an "own"-scope user only ever sees rows where they are the
-    # delivery_partner (a plain SQL equality, so an unassigned Delivery,
-    # where the column is NULL, is never matched either). team_columns=():
-    # Delivery is explicitly excluded from Team Scope.
+    if search:
+        s = f"%{search}%"
+        query = query.filter(
+            or_(
+                Delivery.delivery_number.ilike(s),
+                Delivery.notes.ilike(s),
+            )
+        )
     query = scoping.owned_by(query, db, user, Delivery.delivery_partner_id, team_columns=())
-    return [
-        _delivery_out(db, d) for d in query.order_by(Delivery.created_at.desc()).all()
-    ]
+    query = query.order_by(Delivery.created_at.desc(), Delivery.id.desc())
+    items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[_delivery_out(db, d) for d in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.post("/{delivery_id}/pick", response_model=DeliveryOut)
@@ -950,17 +971,38 @@ def create_delivery_note(
     return delivery
 
 
-@router.get("/notes", response_model=list[DeliveryNoteOut])
+@router.get("/notes", response_model=PaginatedResponse[DeliveryNoteOut])
 def list_delivery_notes(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = None,
+    order_id: str | None = None,
+    customer_id: str | None = None,
+    status: str | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> list[Delivery]:
-    return (
-        db.query(Delivery)
-        .filter(Delivery.organization_id == _org_id(user))
-        .order_by(Delivery.delivery_date.desc())
-        .all()
-    )
+) -> PaginatedResponse[DeliveryNoteOut]:
+    org_id = _org_id(user)
+    q = db.query(Delivery).filter(Delivery.organization_id == org_id)
+
+    if order_id:
+        q = q.filter(Delivery.sales_order_id == order_id)
+    if customer_id:
+        q = q.filter(Delivery.customer_id == customer_id)
+    if status:
+        q = q.filter(Delivery.status == status)
+
+    if search:
+        s = f"%{search.strip()}%"
+        q = q.filter(
+            or_(
+                Delivery.delivery_number.ilike(s),
+                Delivery.notes.ilike(s),
+            )
+        )
+
+    q = q.order_by(Delivery.delivery_date.desc().nullslast(), Delivery.created_at.desc(), Delivery.id.desc())
+    return paginate(q, page=page, page_size=page_size)
 
 
 @router.get("/notes/{id}", response_model=DeliveryNoteOut)
@@ -1000,12 +1042,17 @@ def _is_delivery_partner(user: User) -> bool:
     return False
 
 
-@router.get("/collections", response_model=list[DeliveryCollectionOut])
-@router.get("/collections/all", response_model=list[DeliveryCollectionOut])
+@router.get("/collections", response_model=PaginatedResponse[DeliveryCollectionOut])
+@router.get("/collections/all", response_model=PaginatedResponse[DeliveryCollectionOut])
 def list_delivery_collections(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = None,
+    status: str | None = None,
+    delivery_partner_id: str | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> list[DeliveryCollection]:
+) -> PaginatedResponse[DeliveryCollectionOut]:
     """List organization delivery collections.
 
     Delivery Partners only see collections where they are the assigned partner.
@@ -1018,8 +1065,24 @@ def list_delivery_collections(
     if _is_delivery_partner(user) or data_scope == "own":
         if user.system_role != "admin" and user.effective_system_role != "admin":
             q = q.filter(DeliveryCollection.delivery_partner_id == user.id)
+    elif delivery_partner_id:
+        q = q.filter(DeliveryCollection.delivery_partner_id == delivery_partner_id)
 
-    return q.order_by(DeliveryCollection.collected_at.desc()).all()
+    if status:
+        q = q.filter(DeliveryCollection.status == status)
+
+    if search:
+        s = f"%{search.strip()}%"
+        q = q.filter(
+            or_(
+                DeliveryCollection.collection_number.ilike(s),
+                DeliveryCollection.payment_reference.ilike(s),
+                DeliveryCollection.notes.ilike(s),
+            )
+        )
+
+    q = q.order_by(DeliveryCollection.collected_at.desc().nullslast(), DeliveryCollection.id.desc())
+    return paginate(q, page=page, page_size=page_size)
 
 
 @router.get("/collections/{collection_id}", response_model=DeliveryCollectionOut)

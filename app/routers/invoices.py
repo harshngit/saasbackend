@@ -28,6 +28,8 @@ from app.services import (
     return_service,
     stock_service,
 )
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.invoice import (
     CreditNoteBody,
     InvoiceCreate,
@@ -561,14 +563,17 @@ def create_direct_invoice(
     return invoice
 
 
-@router.get("", response_model=list[InvoiceOut])
+@router.get("", response_model=PaginatedResponse[InvoiceOut])
 def list_invoices(
     user: User = Depends(_view),
     customer_id: str | None = Query(default=None),
     order_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None, description="matches invoice_number"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[Invoice]:
+) -> PaginatedResponse[InvoiceOut]:
     org_id = _org_id(user)
     q = db.query(Invoice).filter(Invoice.organization_id == org_id)
     if customer_id:
@@ -577,7 +582,18 @@ def list_invoices(
         q = q.filter(Invoice.order_id == order_id)
     if status_filter:
         q = q.filter(Invoice.status == status_filter)
-    return q.order_by(Invoice.created_at.desc()).all()
+    if search:
+        q = q.filter(Invoice.invoice_number.ilike(f"%{search}%"))
+
+    q = q.order_by(Invoice.created_at.desc(), Invoice.id.desc())
+    items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[InvoiceOut.model_validate(inv) for inv in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{id}", response_model=InvoiceOut)

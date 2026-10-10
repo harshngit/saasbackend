@@ -7,11 +7,14 @@ manage the fleet without being an Admin.
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.core.pagination import paginate
 from app.models import Delivery, User, Vehicle, VehicleAssignmentHistory, VehicleLoading
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.vehicle import (
     DeliveryPartnerBrief,
     VehicleActivityOut,
@@ -66,14 +69,17 @@ def _vehicle_out(vehicle: Vehicle) -> VehicleOut:
     return out
 
 
-@router.get("", response_model=list[VehicleOut])
+@router.get("", response_model=PaginatedResponse[VehicleOut])
 def list_vehicles(
-    user: User = Depends(_view),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     default_driver_id: str | None = Query(default=None),
+    user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[VehicleOut]:
+) -> PaginatedResponse[VehicleOut]:
     query = db.query(Vehicle).filter(Vehicle.organization_id == _org_id(user))
     if is_active is not None:
         query = query.filter(Vehicle.is_active == is_active)
@@ -81,8 +87,23 @@ def list_vehicles(
         query = query.filter(Vehicle.status == status_filter)
     if default_driver_id:
         query = query.filter(Vehicle.default_driver_id == default_driver_id)
-    vehicles = query.order_by(Vehicle.vehicle_number).all()
-    return [_vehicle_out(v) for v in vehicles]
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Vehicle.vehicle_number.ilike(s),
+                Vehicle.vehicle_type.ilike(s),
+            )
+        )
+    query = query.order_by(Vehicle.vehicle_number.asc(), Vehicle.id.asc())
+    p = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[_vehicle_out(v) for v in p.items],
+        total=p.total,
+        page=p.page,
+        page_size=p.page_size,
+        total_pages=p.total_pages,
+    )
 
 
 @router.post("", response_model=VehicleOut, status_code=status.HTTP_201_CREATED)

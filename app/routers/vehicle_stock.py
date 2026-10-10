@@ -18,6 +18,8 @@ from app.models import (
     VehicleReconciliationItem,
     VehicleStockReconciliation,
 )
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.services import delivery_service, stock_service
 from app.schemas.vehicle_stock import (
     DeliveryLoadOut,
@@ -499,13 +501,16 @@ def get_session_reconciliations(
     )
 
 
-@router.get("", response_model=list[VehicleLoadingOut])
+@router.get("", response_model=PaginatedResponse[VehicleLoadingOut])
 def list_all_loadings(
-    user: User = Depends(_view),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
     delivery_partner_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    user: User = Depends(_view),
     db: Session = Depends(get_db),
-) -> list[VehicleLoading]:
+) -> PaginatedResponse[VehicleLoadingOut]:
     """Organization-wide overview for an "all"-scope user (Admin, or a custom
     org-wide role); an "own"-scope user (e.g. Delivery Partner) sees only
     their own sessions — same dynamic list-scoping helper as everywhere else.
@@ -518,5 +523,6 @@ def list_all_loadings(
         q = q.filter(VehicleLoading.status == status_filter)
     # team_columns=(): Vehicle Stock is explicitly excluded from Team Scope.
     q = scoping.owned_by(q, db, user, VehicleLoading.delivery_partner_id, team_columns=())
-    return q.order_by(VehicleLoading.date.desc()).all()
+    q = q.order_by(VehicleLoading.date.desc(), VehicleLoading.created_at.desc(), VehicleLoading.id.desc())
+    return paginate(q, page=page, page_size=page_size)
 

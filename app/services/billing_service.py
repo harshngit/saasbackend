@@ -299,7 +299,19 @@ def extract_failure_reason(event: dict) -> str | None:
 # ----------------------------------- history ---------------------------------
 
 
-def list_payments(db: Session, organization_id: str | None = None) -> list[SubscriptionPaymentOut]:
+from sqlalchemy import or_
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
+
+
+def list_payments(
+    db: Session,
+    organization_id: str | None = None,
+    page: int = 1,
+    page_size: int = 10,
+    search: str | None = None,
+    status: str | None = None,
+) -> PaginatedResponse[SubscriptionPaymentOut]:
     """GET /billing/payments (organization_id always the caller's own org —
     enforced by the router, never client-supplied) and
     GET /superadmin/subscription-payments (organization_id optional —
@@ -307,8 +319,20 @@ def list_payments(db: Session, organization_id: str | None = None) -> list[Subsc
     query = db.query(SubscriptionPayment, Plan.name).outerjoin(Plan, Plan.id == SubscriptionPayment.plan_id)
     if organization_id is not None:
         query = query.filter(SubscriptionPayment.organization_id == organization_id)
-    rows = query.order_by(SubscriptionPayment.created_at.desc()).all()
-    return [
+    if status is not None:
+        query = query.filter(SubscriptionPayment.status == status)
+    if search:
+        s = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                SubscriptionPayment.razorpay_order_id.ilike(s),
+                SubscriptionPayment.razorpay_payment_id.ilike(s),
+                Plan.name.ilike(s),
+            )
+        )
+    query = query.order_by(SubscriptionPayment.created_at.desc(), SubscriptionPayment.id.desc())
+    p = paginate(query, page=page, page_size=page_size)
+    items = [
         SubscriptionPaymentOut(
             id=payment.id,
             organization_id=payment.organization_id,
@@ -324,5 +348,12 @@ def list_payments(db: Session, organization_id: str | None = None) -> list[Subsc
             created_at=payment.created_at,
             paid_at=payment.paid_at,
         )
-        for payment, plan_name in rows
+        for payment, plan_name in p.items
     ]
+    return PaginatedResponse(
+        items=items,
+        total=p.total,
+        page=p.page,
+        page_size=p.page_size,
+        total_pages=p.total_pages,
+    )

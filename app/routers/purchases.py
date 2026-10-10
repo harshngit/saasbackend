@@ -20,6 +20,8 @@ from app.models import (
     Warehouse,
 )
 from app.services import numbering_service, lookup_service, purchase_return_service, purchase_service, stock_service, supplier_invoice_service
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.purchase import (
     BulkDelete,
     BulkDeleteResult,
@@ -232,7 +234,7 @@ def create_purchase(
     return inv
 
 
-@router.get("", response_model=list[PurchaseOut])
+@router.get("", response_model=PaginatedResponse[PurchaseOut])
 def list_purchases(
     user: User = Depends(_view),
     supplier_id: str | None = Query(default=None),
@@ -245,8 +247,10 @@ def list_purchases(
     project_id: str | None = Query(default=None),
     tag: str | None = Query(default=None),
     search: str | None = Query(default=None, description="matches invoice_number, purchase_number, or reference_number"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[PurchaseInvoice]:
+) -> PaginatedResponse[PurchaseOut]:
     org_id = _org_id(user)
     q = db.query(PurchaseInvoice).filter(PurchaseInvoice.organization_id == org_id)
     if supplier_id:
@@ -278,7 +282,15 @@ def list_purchases(
                 PurchaseInvoice.reference_number.ilike(s),
             )
         )
-    return q.order_by(PurchaseInvoice.created_at.desc()).all()
+    q = q.order_by(PurchaseInvoice.created_at.desc(), PurchaseInvoice.id.desc())
+    items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[PurchaseOut.model_validate(inv) for inv in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{id}", response_model=PurchaseOut)

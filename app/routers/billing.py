@@ -1,7 +1,7 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -143,9 +143,26 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)) -> d
     return {"status": "ok"}
 
 
-@router.get("/payments", response_model=list[SubscriptionPaymentOut])
-def list_payments(admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> list[SubscriptionPaymentOut]:
+from app.schemas.pagination import PaginatedResponse
+
+
+@router.get("/payments", response_model=PaginatedResponse[SubscriptionPaymentOut])
+def list_payments(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> PaginatedResponse[SubscriptionPaymentOut]:
     """Only the authenticated admin's own organization's payments — never
     scoped by a client-supplied organization_id."""
     org = _require_org(admin)
-    return billing_service.list_payments(db, organization_id=org.id)
+    return billing_service.list_payments(
+        db,
+        organization_id=org.id,
+        page=page,
+        page_size=page_size,
+        search=search,
+        status=status,
+    )

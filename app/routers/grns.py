@@ -15,6 +15,8 @@ from app.models import (
     Warehouse,
 )
 from app.schemas.grn import BulkDelete, BulkDeleteResult, GRNCreate, GRNItemIn, GRNOut, GRNUpdate
+from app.schemas.pagination import PaginatedResponse
+from app.core.pagination import paginate
 from app.services import grn_service, lookup_service, numbering_service, purchase_service, stock_service
 
 router = APIRouter(prefix="/grns", tags=["grn"])
@@ -103,16 +105,18 @@ def create_grn(
     return grn
 
 
-@router.get("", response_model=list[GRNOut])
+@router.get("", response_model=PaginatedResponse[GRNOut])
 def list_grns(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
     user: User = Depends(_view),
     purchase_id: str | None = Query(default=None),
     supplier_id: str | None = Query(default=None),
     warehouse_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
-    search: str | None = Query(default=None, description="matches grn_number"),
+    search: str | None = Query(default=None, description="matches grn_number or notes"),
     db: Session = Depends(get_db),
-) -> list[GoodsReceiptNote]:
+) -> PaginatedResponse[GRNOut]:
     org_id = _org_id(user)
     q = db.query(GoodsReceiptNote).filter(GoodsReceiptNote.organization_id == org_id)
     if purchase_id:
@@ -124,10 +128,16 @@ def list_grns(
     if status_filter:
         q = q.filter(GoodsReceiptNote.status == status_filter.lower())
     if search:
-        s = f"%{search}%"
-        q = q.filter(GoodsReceiptNote.grn_number.ilike(s))
+        s = f"%{search.strip()}%"
+        q = q.filter(
+            or_(
+                GoodsReceiptNote.grn_number.ilike(s),
+                GoodsReceiptNote.notes.ilike(s),
+            )
+        )
 
-    return q.order_by(GoodsReceiptNote.created_at.desc()).all()
+    q = q.order_by(GoodsReceiptNote.created_at.desc(), GoodsReceiptNote.id.desc())
+    return paginate(q, page=page, page_size=page_size)
 
 
 @router.get("/{id}", response_model=GRNOut)

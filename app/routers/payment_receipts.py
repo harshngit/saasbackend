@@ -13,6 +13,8 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, CustomerPayment, Invoice, User
 from app.schemas.customer import CollectorBrief
+from app.core.pagination import paginate
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.payment_receipt import (
     PaymentReceiptCreate,
     PaymentReceiptOut,
@@ -175,13 +177,16 @@ def create_receipt(
     return _out(db, payment)
 
 
-@router.get("", response_model=list[PaymentReceiptOut])
+@router.get("", response_model=PaginatedResponse[PaymentReceiptOut])
 def list_receipts(
     user: User = Depends(_view),
     customer_id: str | None = Query(default=None),
     invoice_id: str | None = Query(default=None, description="Receipts against one invoice"),
+    search: str | None = Query(default=None, description="matches receipt_number, reference, or note"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     db: Session = Depends(get_db),
-) -> list[PaymentReceiptOut]:
+) -> PaginatedResponse[PaymentReceiptOut]:
     """Every payment this firm has received, newest first."""
     org_id = _org_id(user)
     query = db.query(CustomerPayment).filter(CustomerPayment.organization_id == org_id)
@@ -189,10 +194,25 @@ def list_receipts(
         query = query.filter(CustomerPayment.customer_id == customer_id)
     if invoice_id:
         query = query.filter(CustomerPayment.invoice_id == invoice_id)
-    rows = query.order_by(
-        CustomerPayment.received_on.desc(), CustomerPayment.id.desc()
-    ).all()
-    return [_out(db, row) for row in rows]
+    if search:
+        s = f"%{search}%"
+        from sqlalchemy import or_
+        query = query.filter(
+            or_(
+                CustomerPayment.receipt_number.ilike(s),
+                CustomerPayment.reference.ilike(s),
+                CustomerPayment.note.ilike(s),
+            )
+        )
+    query = query.order_by(CustomerPayment.received_on.desc(), CustomerPayment.id.desc())
+    items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    return PaginatedResponse(
+        items=[_out(db, row) for row in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{id}", response_model=PaymentReceiptOut)

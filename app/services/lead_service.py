@@ -187,9 +187,11 @@ def list_leads(
     search: str | None = None,
     created_from: datetime | None = None,
     created_to: datetime | None = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> list[Lead]:
+    page: int = 1,
+    page_size: int = 10,
+) -> tuple[list[Lead], int, int, int, int]:
+    from app.core.pagination import paginate
+
     query = db.query(Lead).filter(Lead.organization_id == org_id)
 
     if status_filter:
@@ -220,7 +222,8 @@ def list_leads(
 
     # A field role (data_scope "own") sees only the Leads assigned to them.
     query = scoping.owned_by(query, db, user, Lead.assigned_salesperson_id)
-    return query.order_by(Lead.created_at.desc()).offset(offset).limit(limit).all()
+    query = query.order_by(Lead.created_at.desc(), Lead.id.desc())
+    return paginate(query, page=page, page_size=page_size)
 
 
 def update_lead(db: Session, org_id: str, lead_id: str, user: User, payload: LeadUpdate) -> Lead:
