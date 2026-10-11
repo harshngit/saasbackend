@@ -93,3 +93,18 @@ class VehicleActivityOut(BaseModel):
     description: str
     reference_type: str | None = None
     reference_id: str | None = None
+
+
+from app.schemas.bulk import BulkDelete, BulkDeleteResult  # noqa: E402
+
+__all__ = [
+    "DeliveryPartnerBrief",
+    "VehicleOut",
+    "VehicleCreate",
+    "VehicleUpdate",
+    "VehicleAssignmentHistoryOut",
+    "VehicleActivityOut",
+    "BulkDelete",
+    "BulkDeleteResult",
+]
+

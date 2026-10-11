@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -23,8 +24,9 @@ from app.models import (
 )
 from app.services import numbering_service, lookup_service, catalog_hierarchy_service
 from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
-from app.schemas.category import BulkDelete, BulkDeleteResult
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.inventory import BatchOut, SerialOut
+
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.product import (
@@ -92,6 +94,90 @@ def _build_variants(variations: list[VariantIn]) -> list[ProductVariant]:
     return [ProductVariant(**v.model_dump()) for v in variations]
 
 
+_VARIANT_REFERENCES: list[tuple[str, str]] = [
+    ("SalesOrderItem", "an order"),
+    ("QuotationItem", "a quotation"),
+    ("DeliveryItem", "a delivery"),
+    ("InvoiceItem", "an invoice"),
+    ("PurchaseInvoiceItem", "a purchase invoice"),
+    ("ReturnItem", "a sales return"),
+    ("VehicleLoadingItem", "a vehicle loading"),
+    ("StockReservation", "a stock reservation"),
+    ("StockMovement", "a stock movement"),
+    ("StockBatch", "a batch"),
+    ("ProductSerial", "a serial number"),
+]
+
+
+def _variant_in_use(db: Session, variant_id: str) -> list[str]:
+    """Which kinds of record still point at this variant."""
+    from app import models
+
+    found = []
+    for model_name, label in _VARIANT_REFERENCES:
+        model = getattr(models, model_name, None)
+        if model is None or not hasattr(model, "variant_id"):
+            continue
+        if db.query(model).filter(model.variant_id == variant_id).first() is not None:
+            found.append(label)
+    return found
+
+
+_PRODUCT_REFERENCES: list[tuple[str, str]] = [
+    ("SalesOrderItem", "an order"),
+    ("QuotationItem", "a quotation"),
+    ("DeliveryItem", "a delivery"),
+    ("InvoiceItem", "an invoice"),
+    ("PurchaseInvoiceItem", "a purchase invoice"),
+    ("GoodsReceiptNoteItem", "a goods receipt note"),
+    ("ReturnItem", "a sales return"),
+    ("PurchaseReturnItem", "a purchase return"),
+    ("VehicleLoadingItem", "a vehicle loading"),
+    ("StockReservation", "a stock reservation"),
+    ("StockMovement", "a stock movement"),
+    ("StockBatch", "a batch"),
+    ("ProductSerial", "a serial number"),
+    ("WarehouseTransferItem", "a warehouse transfer"),
+]
+
+
+def _product_in_use(db: Session, product_id: str) -> list[str]:
+    """Which kinds of record still point at this product or its variants."""
+    from app import models
+
+    found = []
+    for model_name, label in _PRODUCT_REFERENCES:
+        model = getattr(models, model_name, None)
+        if model is None or not hasattr(model, "product_id"):
+            continue
+        if db.query(model).filter(model.product_id == product_id).first() is not None:
+            found.append(label)
+
+    # Check warehouse on-hand stock holding
+    holding = (
+        db.query(models.WarehouseStock)
+        .filter(
+            models.WarehouseStock.product_id == product_id,
+            models.WarehouseStock.on_hand_quantity != 0,
+        )
+        .first()
+    )
+    if holding is not None:
+        found.append("physical stock on hand")
+
+    # Check all variants of this product
+    variants = (
+        db.query(models.ProductVariant)
+        .filter(models.ProductVariant.product_id == product_id)
+        .all()
+    )
+    for v in variants:
+        found.extend(_variant_in_use(db, v.id))
+
+    return list(dict.fromkeys(found))
+
+
+
 @router.post("", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
 def create_product(
     payload: ProductCreate,
@@ -149,6 +235,7 @@ def create_product(
 
 
 @router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_products(
     payload: BulkDelete,
     user: User = Depends(_delete),
@@ -156,15 +243,40 @@ def bulk_delete_products(
     db: Session = Depends(get_db),
 ) -> BulkDeleteResult:
     org_id = _org_id(user)
-    products = (
-        db.query(Product)
-        .filter(Product.organization_id == org_id, Product.id.in_(payload.ids))
-        .all()
-    )
-    for p in products:  # ORM delete so variant cascade fires
+    unique_ids = list(dict.fromkeys(payload.ids))
+    if not unique_ids:
+        return BulkDeleteResult(deleted=0)
+
+    products: list[Product] = []
+    for pid in unique_ids:
+        products.append(_owned(db, pid, org_id))
+
+    for p in products:
+        used_by = _product_in_use(db, p.id)
+        if used_by:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Product '{p.name}' is already referenced by "
+                    + ", ".join(sorted(set(used_by)))
+                    + ". Deleting it would compromise historical records. Deactivate it instead."
+                ),
+            )
+
+    for p in products:
         db.delete(p)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not delete one or more products due to referencing records. Deactivate them instead.",
+        )
+
     return BulkDeleteResult(deleted=len(products))
+
 
 
 @router.get("", response_model=PaginatedResponse[ProductListItem])
@@ -433,39 +545,8 @@ def update_product(
     return product
 
 
-# What a variant id can already be referenced by. Deleting a variant those records
-# point at would orphan them -- a delivered order line whose variant no longer exists
-# can no longer say what was delivered -- so deletion is refused while any remain.
-_VARIANT_REFERENCES: list[tuple[str, str]] = [
-    ("SalesOrderItem", "an order"),
-    ("QuotationItem", "a quotation"),
-    ("DeliveryItem", "a delivery"),
-    ("InvoiceItem", "an invoice"),
-    ("PurchaseInvoiceItem", "a purchase invoice"),
-    ("ReturnItem", "a sales return"),
-    ("VehicleLoadingItem", "a vehicle loading"),
-    ("StockReservation", "a stock reservation"),
-    ("StockMovement", "a stock movement"),
-    ("StockBatch", "a batch"),
-    ("ProductSerial", "a serial number"),
-]
-
-
-def _variant_in_use(db: Session, variant_id: str) -> list[str]:
-    """Which kinds of record still point at this variant."""
-    from app import models
-
-    found = []
-    for model_name, label in _VARIANT_REFERENCES:
-        model = getattr(models, model_name, None)
-        if model is None or not hasattr(model, "variant_id"):
-            continue
-        if db.query(model).filter(model.variant_id == variant_id).first() is not None:
-            found.append(label)
-    return found
-
-
 @router.delete("/{product_id}/variants/{variant_id}", status_code=status.HTTP_204_NO_CONTENT)
+
 def delete_product_variant(
     product_id: str,
     variant_id: str,
@@ -517,8 +598,26 @@ def delete_product(
     db: Session = Depends(get_db),
 ) -> None:
     product = _owned(db, product_id, _org_id(user))
+    used_by = _product_in_use(db, product.id)
+    if used_by:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Product '{product.name}' is already referenced by "
+                + ", ".join(sorted(set(used_by)))
+                + ". Deleting it would compromise historical records. Deactivate it instead."
+            ),
+        )
     db.delete(product)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Could not delete product '{product.name}' due to referencing records. Deactivate it instead.",
+        )
+
 
 
 # ------------------------------ Media & documents ------------------------------

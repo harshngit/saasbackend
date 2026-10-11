@@ -122,9 +122,5 @@ class VisitOut(BaseModel):
     follow_ups: list[FollowUpOut] = Field(default_factory=list)
 
 
-class BulkDelete(BaseModel):
-    ids: list[str] = Field(min_length=1)
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 
-
-class BulkDeleteResult(BaseModel):
-    deleted: int

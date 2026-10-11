@@ -260,9 +260,5 @@ class RejectBody(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
-class BulkDelete(BaseModel):
-    ids: list[str] = Field(min_length=1)
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 
-
-class BulkDeleteResult(BaseModel):
-    deleted: int

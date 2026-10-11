@@ -21,3 +21,14 @@ class UnreadCount(BaseModel):
 
 class MessageResponse(BaseModel):
     detail: str
+
+
+from app.schemas.bulk import BulkDelete, BulkDeleteResult  # noqa: E402
+
+__all__ = [
+    "NotificationOut",
+    "UnreadCount",
+    "MessageResponse",
+    "BulkDelete",
+    "BulkDeleteResult",
+]

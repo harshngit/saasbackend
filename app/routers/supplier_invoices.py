@@ -290,8 +290,10 @@ def _validate_supplier_invoice_for_deletion(inv: SupplierInvoice) -> None:
         )
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
 @router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_supplier_invoices(
+
     payload: BulkDelete,
     user: User = Depends(_delete),
     _unlocked: User = Depends(require_unlocked_org),

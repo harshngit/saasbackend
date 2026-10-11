@@ -8,6 +8,7 @@ later, and only then do saleable goods re-enter stock and a credit note go out.
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import workflow
@@ -15,6 +16,7 @@ from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.models import Customer, Invoice, SalesReturn, User
 from app.core.pagination import paginate
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.sales_return import (
     ReturnApproveBody,
@@ -211,6 +213,44 @@ def list_sales_returns(
         page_size=page_size,
         total_pages=total_pages,
     )
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_sales_returns(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Bulk delete unapproved sales return requests.
+
+    Refused if any return has already been approved (which restocked goods and issued a credit note).
+    Atomic (all-or-nothing).
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    returns = []
+    for rid in unique_ids:
+        sr = _owned(db, rid, org_id)
+        if sr.return_status == "approved":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Sales return '{sr.return_number}' has already been approved and cannot be deleted — it has restocked goods and a credit note behind it",
+            )
+        returns.append(sr)
+
+    try:
+        for sr in returns:
+            db.delete(sr)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete sales returns due to database integrity constraints: {exc.orig}",
+        ) from exc
+    return BulkDeleteResult(deleted=len(unique_ids))
 
 
 @router.get("/{id}", response_model=SalesReturnOut)

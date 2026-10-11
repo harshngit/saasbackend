@@ -164,3 +164,24 @@ class SalesReturnOut(BaseModel):
     @property
     def status(self) -> str | None:
         return self.return_status
+
+
+from app.schemas.bulk import BulkDelete, BulkDeleteResult  # noqa: E402
+
+__all__ = [
+    "ReturnCustomerBrief",
+    "ReturnInvoiceBrief",
+    "ReturnCreditNoteBrief",
+    "ReturnItemCreate",
+    "ReturnItemDecision",
+    "ReturnReceiveBody",
+    "ReturnApproveItem",
+    "ReturnApproveBody",
+    "ReturnRejectBody",
+    "SalesReturnCreate",
+    "SalesReturnUpdate",
+    "ReturnItemOut",
+    "SalesReturnOut",
+    "BulkDelete",
+    "BulkDeleteResult",
+]

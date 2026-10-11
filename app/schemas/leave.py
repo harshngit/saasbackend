@@ -68,3 +68,16 @@ class LeaveOut(BaseModel):
     reject_reason: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+from app.schemas.bulk import BulkDelete, BulkDeleteResult  # noqa: E402
+
+__all__ = [
+    "LeaveUserBrief",
+    "LeaveCreate",
+    "LeaveUpdate",
+    "LeaveRejectBody",
+    "LeaveOut",
+    "BulkDelete",
+    "BulkDeleteResult",
+]

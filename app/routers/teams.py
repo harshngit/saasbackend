@@ -59,7 +59,33 @@ def update_team(
     return _out(team)
 
 
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_teams(
+    payload: BulkDelete,
+    admin: User = Depends(_ADMIN),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Permanently delete multiple teams atomically, detaching all members."""
+    unique_ids = list(dict.fromkeys(payload.ids))
+    if not unique_ids:
+        return BulkDeleteResult(deleted=0)
+
+    teams: list[Team] = []
+    for tid in unique_ids:
+        teams.append(team_service.get_team(db, admin.organization_id, tid))
+
+    for team in teams:
+        team_service.delete_team(db, team)
+
+    return BulkDeleteResult(deleted=len(teams))
+
+
 @router.delete("/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
+
 def delete_team(
     team_id: str,
     admin: User = Depends(_ADMIN),

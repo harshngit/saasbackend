@@ -350,9 +350,5 @@ class PurchaseReturnBody(BaseModel):
     reason: str | None = None
 
 
-class BulkDelete(BaseModel):
-    ids: list[str] = Field(min_length=1)
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 
-
-class BulkDeleteResult(BaseModel):
-    deleted: int

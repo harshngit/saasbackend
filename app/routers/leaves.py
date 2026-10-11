@@ -1,6 +1,7 @@
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import scoping
@@ -8,6 +9,7 @@ from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
 from app.models import Leave, SystemRole, User
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.leave import LeaveCreate, LeaveOut, LeaveRejectBody, LeaveUpdate
 from app.schemas.pagination import PaginatedResponse
 from app.services import leave_service
@@ -137,6 +139,44 @@ def list_leaves(
 
     query = query.order_by(Leave.created_at.desc(), Leave.id.desc())
     return paginate(query, page=page, page_size=page_size)
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_leaves(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Bulk delete pending leave requests.
+
+    Preserves approved and rejected leave records. Only pending leaves can be deleted.
+    Atomic (all-or-nothing).
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    leaves = []
+    for lid in unique_ids:
+        leave = _owned(db, lid, org_id, user)
+        if leave.status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Leave request '{lid}' is '{leave.status}'. Only pending leaves can be cancelled/deleted",
+            )
+        leaves.append(leave)
+
+    try:
+        for leave in leaves:
+            db.delete(leave)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete leaves due to database integrity constraints: {exc.orig}",
+        ) from exc
+    return BulkDeleteResult(deleted=len(unique_ids))
 
 
 @router.get("/{id}", response_model=LeaveOut)

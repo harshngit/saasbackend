@@ -388,8 +388,10 @@ def process_recurring(
     return expense_service.process_due_recurring_expenses(db, org_id)
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
 @router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_expenses(
+
     payload: BulkDelete,
     user: User = Depends(_delete),
     _unlocked: User = Depends(require_unlocked_org),

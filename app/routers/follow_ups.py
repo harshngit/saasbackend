@@ -110,8 +110,10 @@ def complete_follow_up(
     return follow_up_service.complete_follow_up(db, org_id, id, user, payload=payload)
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
 @router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_follow_ups(
+
     payload: BulkDelete,
     user: User = Depends(_delete),
     _unlocked: User = Depends(require_unlocked_org),

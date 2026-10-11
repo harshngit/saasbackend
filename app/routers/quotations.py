@@ -165,8 +165,10 @@ def quotation_pdf_download(
     )
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
 @router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_quotations(
+
     payload: BulkDelete,
     user: User = Depends(_delete),
     _unlocked: User = Depends(require_unlocked_org),

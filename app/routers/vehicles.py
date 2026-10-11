@@ -8,12 +8,14 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
 from app.models import Delivery, User, Vehicle, VehicleAssignmentHistory, VehicleLoading
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.vehicle import (
     DeliveryPartnerBrief,
@@ -396,6 +398,66 @@ def get_vehicle_activity(
 
     activities.sort(key=lambda x: x.timestamp, reverse=True)
     return activities
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+@router.delete("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete_vehicles(
+    payload: BulkDelete,
+    user: User = Depends(_delete),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> BulkDeleteResult:
+    """Bulk delete delivery vehicles.
+
+    Refused if any vehicle is referenced in delivery records or has an active loading session.
+    Atomic (all-or-nothing).
+    """
+    org_id = _org_id(user)
+    unique_ids = list(dict.fromkeys(payload.ids))
+    vehicles = (
+        db.query(Vehicle)
+        .filter(Vehicle.id.in_(unique_ids), Vehicle.organization_id == org_id)
+        .all()
+    )
+    if len(vehicles) != len(unique_ids):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="One or more vehicles not found in your organization",
+        )
+    for v in vehicles:
+        used = db.query(Delivery).filter(Delivery.vehicle_id == v.id).count()
+        if used > 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Vehicle '{v.vehicle_number}' cannot be deleted because it is referenced by delivery records. Set is_active false instead.",
+            )
+        active_loading = (
+            db.query(VehicleLoading)
+            .filter(
+                VehicleLoading.vehicle_id == v.id,
+                VehicleLoading.organization_id == org_id,
+                VehicleLoading.status == "active",
+            )
+            .first()
+        )
+        if active_loading:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Vehicle '{v.vehicle_number}' has an active loading session. Complete EOD return first.",
+            )
+
+    try:
+        for v in vehicles:
+            db.delete(v)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete vehicles due to database integrity constraints: {exc.orig}",
+        ) from exc
+    return BulkDeleteResult(deleted=len(unique_ids))
 
 
 @router.delete("/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)

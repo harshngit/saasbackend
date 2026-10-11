@@ -227,8 +227,10 @@ def _validate_grn_for_deletion(grn: GoodsReceiptNote) -> None:
         )
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
 @router.delete("/bulk-delete", response_model=BulkDeleteResult)
 def bulk_delete_grns(
+
     payload: BulkDelete,
     user: User = Depends(_delete),
     _unlocked: User = Depends(require_unlocked_org),

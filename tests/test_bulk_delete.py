@@ -30,18 +30,30 @@ from app.core.database import SessionLocal
 from app.core.security import create_access_token
 from app.main import app
 from app.models import (
+    Brand,
+    Category,
     Customer,
     CustomerPayment,
+    Delivery,
     Expense,
     FollowUp,
     GoodsReceiptNote,
     Lead,
+    Leave,
+    Notification,
+    Organization,
+    Plan,
+    Product,
     PurchaseInvoice,
     Quotation,
     SalesOrder,
+    SalesOrderItem,
+    SalesReturn,
     Supplier,
     SupplierInvoice,
+    Team,
     User,
+    Vehicle,
     Visit,
 )
 from app.models.enums import UserRole
@@ -75,6 +87,12 @@ def _register_org(label: str) -> tuple[dict, str]:
     try:
         admin = db.query(User).filter(User.email == email).first()
         org_id, admin_id = admin.organization_id, admin.id
+        ent_plan = db.query(Plan).filter(Plan.name == "Enterprise").first()
+        if ent_plan:
+            org = db.get(Organization, org_id)
+            if org:
+                org.plan_id = ent_plan.id
+                db.commit()
     finally:
         db.close()
     return {"Authorization": f"Bearer {token}"}, org_id
@@ -751,5 +769,408 @@ def test_sales_order_delete_permission_unchanged():
     db = db_session()
     try:
         check("the order was untouched by either denied attempt", db.get(SalesOrder, oid) is not None)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — Bulk payload limit enforcement (min 1, max 100)
+# ---------------------------------------------------------------------------
+print("\n=== Test 12: Bulk payload limit enforcement ===")
+
+
+def test_bulk_payload_limit_enforced():
+    auth, org_id = _register_org("limit")
+
+    # >100 ids rejected with 422
+    oversized = [f"id-{i}" for i in range(101)]
+    r = client.post("/customers/bulk-delete", json={"ids": oversized}, headers=auth)
+    check("POST /customers/bulk-delete with 101 IDs -> 422", r.status_code == 422, r.text)
+
+    r = client.request("DELETE", "/customers/bulk-delete", json={"ids": oversized}, headers=auth)
+    check("DELETE /customers/bulk-delete with 101 IDs -> 422", r.status_code == 422, r.text)
+
+    r = client.post("/products/bulk-delete", json={"ids": oversized}, headers=auth)
+    check("POST /products/bulk-delete with 101 IDs -> 422", r.status_code == 422, r.text)
+
+    r = client.request("DELETE", "/products/bulk-delete", json={"ids": oversized}, headers=auth)
+    check("DELETE /products/bulk-delete with 101 IDs -> 422", r.status_code == 422, r.text)
+
+
+# ---------------------------------------------------------------------------
+# Test 13 — Dual HTTP methods (POST canonical and DELETE alias)
+# ---------------------------------------------------------------------------
+print("\n=== Test 13: Dual HTTP method aliases ===")
+
+
+def test_dual_http_method_aliases():
+    auth, org_id = _register_org("aliases")
+    db = db_session()
+    try:
+        # Create categories, brands, customers to test both methods
+        cat1 = Category(organization_id=org_id, name="Cat One")
+        cat2 = Category(organization_id=org_id, name="Cat Two")
+        br1 = Brand(organization_id=org_id, name="Brand One")
+        br2 = Brand(organization_id=org_id, name="Brand Two")
+        c1 = Customer(organization_id=org_id, name="Cust Canonical POST")
+        c2 = Customer(organization_id=org_id, name="Cust Legacy DELETE")
+        db.add_all([cat1, cat2, br1, br2, c1, c2])
+        db.commit()
+        db.refresh(cat1)
+        db.refresh(cat2)
+        db.refresh(br1)
+        db.refresh(br2)
+        db.refresh(c1)
+        db.refresh(c2)
+        cat1_id, cat2_id = cat1.id, cat2.id
+        br1_id, br2_id = br1.id, br2.id
+        c1_id, c2_id = c1.id, c2.id
+    finally:
+        db.close()
+
+    # 1. Customer: canonical POST
+    r = client.post("/customers/bulk-delete", json={"ids": [c1_id]}, headers=auth)
+    check("POST /customers/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+    # Customer: backward-compatible DELETE
+    r = client.request("DELETE", "/customers/bulk-delete", json={"ids": [c2_id]}, headers=auth)
+    check("DELETE /customers/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+    # 2. Categories: canonical POST and legacy DELETE
+    r = client.post("/categories/bulk-delete", json={"ids": [cat1_id]}, headers=auth)
+    check("POST /categories/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+    r = client.request("DELETE", "/categories/bulk-delete", json={"ids": [cat2_id]}, headers=auth)
+    check("DELETE /categories/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+    # 3. Brands: canonical POST and legacy DELETE
+    r = client.post("/brands/bulk-delete", json={"ids": [br1_id]}, headers=auth)
+    check("POST /brands/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+    r = client.request("DELETE", "/brands/bulk-delete", json={"ids": [br2_id]}, headers=auth)
+    check("DELETE /brands/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+
+# ---------------------------------------------------------------------------
+# Test 14 — Product deletion safety (single and bulk)
+# ---------------------------------------------------------------------------
+print("\n=== Test 14: Product deletion safety ===")
+
+
+def test_product_deletion_safety_single_and_bulk():
+    auth, org_id = _register_org("prod_safety")
+    db = db_session()
+    try:
+        p_clean = Product(organization_id=org_id, name="Clean Product", sku=f"SKU-{uuid.uuid4().hex[:6]}")
+        p_ref = Product(organization_id=org_id, name="Referenced Product", sku=f"SKU-{uuid.uuid4().hex[:6]}")
+        db.add_all([p_clean, p_ref])
+        db.commit()
+        db.refresh(p_clean)
+        db.refresh(p_ref)
+
+        order = SalesOrder(organization_id=org_id, order_number=f"SO-{uuid.uuid4().hex[:8]}")
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+
+        order_item = SalesOrderItem(
+            order_id=order.id,
+            product_id=p_ref.id,
+            product_name=p_ref.name,
+            quantity=1,
+            unit_price=10.0,
+            line_total=10.0,
+        )
+        db.add(order_item)
+        db.commit()
+
+        clean_id, ref_id = p_clean.id, p_ref.id
+    finally:
+        db.close()
+
+    # 1. Single delete on referenced product -> 409 Conflict (not 500)
+    r = client.delete(f"/products/{ref_id}", headers=auth)
+    check("Single DELETE /products/{id} on referenced product -> 409 Conflict", r.status_code == 409, r.text)
+
+    # 2. Bulk delete batch containing referenced product -> 409 Conflict, atomic rollback
+    r = client.post("/products/bulk-delete", json={"ids": [clean_id, ref_id]}, headers=auth)
+    check("Bulk POST /products/bulk-delete with referenced product -> 409 Conflict", r.status_code == 409, r.text)
+
+    db = db_session()
+    try:
+        check("Clean product was NOT deleted (batch rolled back)", db.get(Product, clean_id) is not None)
+        check("Referenced product was NOT deleted", db.get(Product, ref_id) is not None)
+    finally:
+        db.close()
+
+    # 3. Clean product deletes successfully
+    r = client.post("/products/bulk-delete", json={"ids": [clean_id]}, headers=auth)
+    check("Bulk POST /products/bulk-delete of unreferenced product -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+    db = db_session()
+    try:
+        check("Clean product is now deleted", db.get(Product, clean_id) is None)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — Team bulk delete & user detachment
+# ---------------------------------------------------------------------------
+print("\n=== Test 15: Team bulk delete ===")
+
+
+def test_team_bulk_delete_and_detach():
+    auth, org_id = _register_org("team_bulk")
+    auth_b, org_b = _register_org("team_bulk_b")
+    db = db_session()
+    try:
+        t1 = Team(organization_id=org_id, name="North Sales")
+        t2 = Team(organization_id=org_id, name="South Sales")
+        foreign_team = Team(organization_id=org_b, name="Foreign Team")
+        db.add_all([t1, t2, foreign_team])
+        db.commit()
+        db.refresh(t1)
+        db.refresh(t2)
+        db.refresh(foreign_team)
+
+        member = User(
+            organization_id=org_id,
+            name="Team Member",
+            email=f"member_{uuid.uuid4().hex[:6]}@example.com",
+            password_hash="pw",
+            role=UserRole.SALES_OFFICER,
+            team_id=t1.id,
+        )
+        db.add(member)
+        db.commit()
+        db.refresh(member)
+
+        t1_id, t2_id, foreign_id, member_id = t1.id, t2.id, foreign_team.id, member.id
+    finally:
+        db.close()
+
+    # Cross-tenant rejected
+    r = client.post("/teams/bulk-delete", json={"ids": [t1_id, foreign_id]}, headers=auth)
+    check("Cross-tenant team in batch -> 404", r.status_code == 404, r.text)
+
+    # Valid bulk delete via POST
+    r = client.post("/teams/bulk-delete", json={"ids": [t1_id, t2_id]}, headers=auth)
+    check("Bulk POST /teams/bulk-delete -> 200, deleted=2", r.status_code == 200 and r.json().get("deleted") == 2, r.text)
+
+    db = db_session()
+    try:
+        check("Team 1 deleted", db.get(Team, t1_id) is None)
+        check("Team 2 deleted", db.get(Team, t2_id) is None)
+        m = db.get(User, member_id)
+        check("Team member was safely detached (team_id is None)", m is not None and m.team_id is None)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 16 — Vehicle bulk delete & delivery guards
+# ---------------------------------------------------------------------------
+print("\n=== Test 16: Vehicle bulk delete ===")
+
+
+def test_vehicle_bulk_delete_and_guards():
+    auth, org_id = _register_org("veh_bulk")
+    auth_b, org_b = _register_org("veh_bulk_b")
+    db = db_session()
+    try:
+        v_clean = Vehicle(organization_id=org_id, vehicle_number=f"DL-{uuid.uuid4().hex[:6]}")
+        v_used = Vehicle(organization_id=org_id, vehicle_number=f"MH-{uuid.uuid4().hex[:6]}")
+        v_foreign = Vehicle(organization_id=org_b, vehicle_number=f"KA-{uuid.uuid4().hex[:6]}")
+        db.add_all([v_clean, v_used, v_foreign])
+        db.commit()
+        db.refresh(v_clean)
+        db.refresh(v_used)
+        db.refresh(v_foreign)
+
+        deliv = Delivery(
+            organization_id=org_id,
+            delivery_note_number=f"DN-{uuid.uuid4().hex[:6]}",
+            vehicle_id=v_used.id,
+            status="pending",
+        )
+        db.add(deliv)
+        db.commit()
+
+        clean_id, used_id, foreign_id = v_clean.id, v_used.id, v_foreign.id
+    finally:
+        db.close()
+
+    # Cross-tenant rejected
+    r = client.post("/vehicles/bulk-delete", json={"ids": [clean_id, foreign_id]}, headers=auth)
+    check("Cross-tenant vehicle in batch -> 404", r.status_code == 404, r.text)
+
+    # Referenced by delivery -> 409 Conflict
+    r = client.post("/vehicles/bulk-delete", json={"ids": [clean_id, used_id]}, headers=auth)
+    check("Vehicle with delivery history in batch -> 409 Conflict", r.status_code == 409, r.text)
+
+    db = db_session()
+    try:
+        check("Clean vehicle was NOT deleted (batch rolled back)", db.get(Vehicle, clean_id) is not None)
+    finally:
+        db.close()
+
+    # Clean vehicle deletes cleanly via DELETE alias
+    r = client.request("DELETE", "/vehicles/bulk-delete", json={"ids": [clean_id]}, headers=auth)
+    check("Clean vehicle bulk deleted -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+
+# ---------------------------------------------------------------------------
+# Test 17 — Leave bulk delete & pending guard
+# ---------------------------------------------------------------------------
+print("\n=== Test 17: Leave bulk delete ===")
+
+
+def test_leave_bulk_delete_and_guards():
+    auth, org_id = _register_org("leave_bulk")
+    db = db_session()
+    try:
+        admin = db.query(User).filter(User.organization_id == org_id).first()
+        admin_id = admin.id
+
+        l_pending1 = Leave(
+            organization_id=org_id,
+            user_id=admin_id,
+            leave_type="casual",
+            start_date=datetime.now(timezone.utc).date(),
+            end_date=datetime.now(timezone.utc).date(),
+            days_count=1.0,
+            status="pending",
+        )
+        l_pending2 = Leave(
+            organization_id=org_id,
+            user_id=admin_id,
+            leave_type="sick",
+            start_date=datetime.now(timezone.utc).date(),
+            end_date=datetime.now(timezone.utc).date(),
+            days_count=1.0,
+            status="pending",
+        )
+        l_approved = Leave(
+            organization_id=org_id,
+            user_id=admin_id,
+            leave_type="annual",
+            start_date=datetime.now(timezone.utc).date(),
+            end_date=datetime.now(timezone.utc).date(),
+            days_count=1.0,
+            status="approved",
+        )
+        db.add_all([l_pending1, l_pending2, l_approved])
+        db.commit()
+        db.refresh(l_pending1)
+        db.refresh(l_pending2)
+        db.refresh(l_approved)
+
+        p1_id, p2_id, app_id = l_pending1.id, l_pending2.id, l_approved.id
+    finally:
+        db.close()
+
+    # Approved leave in batch -> 400 Bad Request
+    r = client.post("/leaves/bulk-delete", json={"ids": [p1_id, app_id]}, headers=auth)
+    check("Approved leave in batch -> 400 Bad Request", r.status_code == 400, r.text)
+
+    db = db_session()
+    try:
+        check("Pending leave was NOT deleted (batch rolled back)", db.get(Leave, p1_id) is not None)
+    finally:
+        db.close()
+
+    # Valid pending leaves bulk delete via POST
+    r = client.post("/leaves/bulk-delete", json={"ids": [p1_id, p2_id]}, headers=auth)
+    check("Valid pending leaves bulk delete -> 200, deleted=2", r.status_code == 200 and r.json().get("deleted") == 2, r.text)
+
+
+# ---------------------------------------------------------------------------
+# Test 18 — Sales Return bulk delete & approval guard
+# ---------------------------------------------------------------------------
+print("\n=== Test 18: Sales Return bulk delete ===")
+
+
+def test_sales_return_bulk_delete_and_guards():
+    auth, org_id = _register_org("sr_bulk")
+    db = db_session()
+    try:
+        r_req = SalesReturn(
+            organization_id=org_id,
+            return_number=f"RET-{uuid.uuid4().hex[:6]}",
+            return_status="requested",
+        )
+        r_app = SalesReturn(
+            organization_id=org_id,
+            return_number=f"RET-{uuid.uuid4().hex[:6]}",
+            return_status="approved",
+        )
+        db.add_all([r_req, r_app])
+        db.commit()
+        db.refresh(r_req)
+        db.refresh(r_app)
+        req_id, app_id = r_req.id, r_app.id
+    finally:
+        db.close()
+
+    # Approved return in batch -> 409 Conflict
+    r = client.post("/sales-returns/bulk-delete", json={"ids": [req_id, app_id]}, headers=auth)
+    check("Approved sales return in batch -> 409 Conflict", r.status_code == 409, r.text)
+
+    db = db_session()
+    try:
+        check("Requested return was NOT deleted (batch rolled back)", db.get(SalesReturn, req_id) is not None)
+    finally:
+        db.close()
+
+    # Valid requested return bulk delete via DELETE alias
+    r = client.request("DELETE", "/sales-returns/bulk-delete", json={"ids": [req_id]}, headers=auth)
+    check("Requested sales return bulk delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+
+# ---------------------------------------------------------------------------
+# Test 19 — Notification bulk delete & clear read
+# ---------------------------------------------------------------------------
+print("\n=== Test 19: Notification bulk delete and clear-read ===")
+
+
+def test_notification_bulk_delete_and_clear_read():
+    auth, org_id = _register_org("notif_bulk")
+    auth_b, org_b = _register_org("notif_bulk_b")
+    db = db_session()
+    try:
+        admin_a = db.query(User).filter(User.organization_id == org_id).first()
+        admin_b = db.query(User).filter(User.organization_id == org_b).first()
+
+        n1 = Notification(user_id=admin_a.id, organization_id=org_id, title="Notif 1", is_read=False)
+        n2 = Notification(user_id=admin_a.id, organization_id=org_id, title="Notif 2", is_read=True)
+        n3 = Notification(user_id=admin_a.id, organization_id=org_id, title="Notif 3", is_read=True)
+        foreign_n = Notification(user_id=admin_b.id, organization_id=org_b, title="Notif Foreign", is_read=False)
+
+        db.add_all([n1, n2, n3, foreign_n])
+        db.commit()
+        db.refresh(n1)
+        db.refresh(n2)
+        db.refresh(n3)
+        db.refresh(foreign_n)
+
+        n1_id, n2_id, n3_id, foreign_id = n1.id, n2.id, n3.id, foreign_n.id
+    finally:
+        db.close()
+
+    # Cross-user notification in batch -> 404
+    r = client.post("/notifications/bulk-delete", json={"ids": [n1_id, foreign_id]}, headers=auth)
+    check("Cross-user notification in batch -> 404", r.status_code == 404, r.text)
+
+    # Bulk delete single notification via POST
+    r = client.post("/notifications/bulk-delete", json={"ids": [n1_id]}, headers=auth)
+    check("POST /notifications/bulk-delete -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+
+    # Clear read notifications
+    r = client.post("/notifications/clear-read", headers=auth)
+    check("POST /notifications/clear-read -> 200, deleted=2", r.status_code == 200 and r.json().get("deleted") == 2, r.text)
+
+    db = db_session()
+    try:
+        check("Read notifications n2 and n3 are gone", db.get(Notification, n2_id) is None and db.get(Notification, n3_id) is None)
+        check("Foreign notification is untouched", db.get(Notification, foreign_id) is not None)
     finally:
         db.close()
