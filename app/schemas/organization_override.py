@@ -86,7 +86,7 @@ class OrganizationEntitlementsOut(BaseModel):
     days_left: Optional[int] = None
     upgrade_status: Optional[str] = None
     features: Dict[str, bool]
-    limits: Dict[str, Optional[int]]
+    limits: Dict[str, Optional[Any]]
     active_feature_overrides_count: int = 0
     active_limit_overrides_count: int = 0
 

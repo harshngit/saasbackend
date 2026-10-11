@@ -24,6 +24,7 @@ from app.schemas.overview import (
     OverviewStorage,
 )
 from app.services import activity_service
+from app.services.entitlement_service import get_effective_limit
 
 _BYTES_PER_MB = 1024 * 1024
 _BYTES_PER_GB = 1024 * 1024 * 1024
@@ -63,7 +64,8 @@ def _storage(db: Session, org: Organization) -> OverviewStorage:
         .one()
     )
     used = int(used or 0)
-    limit_gb = org.plan.max_storage_gb if org.plan is not None else None
+    eff_limit = get_effective_limit(db, org, "max_storage_gb")
+    limit_gb = float(eff_limit) if eff_limit is not None else None
     return OverviewStorage(
         files=files or 0,
         used_bytes=used,

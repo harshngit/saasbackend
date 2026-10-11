@@ -112,25 +112,11 @@ def _check_theme_image_type(file: UploadFile) -> None:
 
 
 def _delete_background_file(db: Session, org_id: str, background_url: str | None) -> None:
-    """Safely delete the StoredFile row and R2 object for a background image URL."""
+    """Safely delete the StoredFile row, R2 object, and update storage snapshot."""
     if not background_url:
         return
-    file_id = background_url.rsplit("/", 1)[-1]
-    stored = db.get(StoredFile, file_id)
-    if stored is None:
-        return
-    # Guard: only delete if the file belongs to this org or is unassigned
-    if stored.organization_id is not None and stored.organization_id != org_id:
-        return
-    if stored.storage_key:
-        from app.core import r2
-
-        if not r2.delete_object(stored.storage_key):
-            logger.warning(
-                "R2 delete_object failed for background file_id=%s — deleting DB row anyway",
-                file_id,
-            )
-    db.delete(stored)
+    from app.core.files import delete_stored_file
+    delete_stored_file(db, background_url, org_id)
 
 
 @router.get("/organization/theme", response_model=OrganizationThemeOut)

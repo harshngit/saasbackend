@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.files import MAX_UPLOAD_BYTES, normalize_file_url, save_upload
+from app.core.files import MAX_UPLOAD_BYTES, delete_stored_file, normalize_file_url, save_upload
 from app.models import StoredFile, User
 
 logger = logging.getLogger("crm.files")
@@ -138,15 +138,5 @@ def delete_file(
     caller believes is gone still sitting in the database.
     """
     stored = _stored_file(db, file_id)
-    # Files are uploaded within a firm; only that firm can delete them.
-    if stored.organization_id is not None and stored.organization_id != user.organization_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-
-    if stored.storage_key:
-        from app.core import r2
-
-        if not r2.delete_object(stored.storage_key):
-            logger.warning("R2 object delete failed for file_id=%s — DB row deleted anyway", file_id)
-
-    db.delete(stored)
+    delete_stored_file(db, stored, user.organization_id)
     db.commit()

@@ -23,6 +23,7 @@ from app.models import (
 from app.schemas.organization import (
     OrganizationInventoryOut,
     OrganizationOut,
+    OrganizationStorageUsageOut,
     OrgStatusUpdate,
     RejectUpgrade,
 )
@@ -46,6 +47,7 @@ from app.services import (
     entitlement_service,
     org_service,
     password_service,
+    storage_service,
 )
 
 # Every endpoint here is Super Admin only.
@@ -487,6 +489,35 @@ def get_organization_entitlements_admin(
     summary["feature_overrides"] = feature_overrides
     summary["limit_overrides"] = limit_overrides
     return summary
+
+
+@router.get(
+    "/organizations/{org_id}/storage-usage",
+    response_model=OrganizationStorageUsageOut,
+)
+def get_organization_storage_usage_admin(
+    org_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Super Admin inspection of an organization's storage usage and effective limits."""
+    _get_org(db, org_id)
+    return storage_service.get_storage_usage(org_id, db)
+
+
+@router.post(
+    "/organizations/{org_id}/storage-usage/recalculate",
+    response_model=OrganizationStorageUsageOut,
+)
+def recalculate_organization_storage_admin(
+    org_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Super Admin force recalculation of an organization's storage usage."""
+    org = _get_org(db, org_id)
+    storage_service.recalculate_organization_storage(org_id, db)
+    activity_service.record(db, org_id, None, "storage", f"Storage usage recalculated by Super Admin for {org.name}")
+    db.commit()
+    return storage_service.get_storage_usage(org_id, db)
 
 
 @router.get(

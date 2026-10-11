@@ -134,23 +134,55 @@ def has_entitlement(
 
 
 def get_effective_limit(
+    db_or_org: Any,
+    org_or_key: Any,
+    key_or_db: Any = None,
+) -> Optional[Union[int, float]]:
+    """Evaluate the effective numeric limit for an organization.
+
+    Resolution precedence:
+    1. Active unexpired organization override (organization_limit_overrides).
+    2. Current Plan limit (plan.max_users, plan.max_warehouses, plan.max_orders, plan.max_storage_gb).
+    3. Safe default fallback (DEFAULT_FALLBACK_LIMITS).
+
+    Returns:
+        float or int: Numeric limit ceiling.
+        None: Unlimited.
+    """
+    if isinstance(db_or_org, Session):
+        db = db_or_org
+        organization = org_or_key
+        limit_key = key_or_db
+    else:
+        organization = db_or_org
+        limit_key = org_or_key
+        db = key_or_db
+
+    if not organization or not limit_key or db is None:
+        return None
+
+    limit, _ = get_effective_limit_with_source(db, organization, limit_key)
+    return limit
+
+
+def get_effective_limit_with_source(
     db: Session,
     organization: Union[Organization, str, None],
     limit_key: str,
-) -> Optional[int]:
-    """Evaluate the effective numeric limit for an organization.
+) -> tuple[Optional[Union[int, float]], str]:
+    """Evaluate the effective numeric limit and return (effective_limit, source).
 
-    Returns an integer limit, or None for unlimited.
+    source is one of 'organization_override', 'plan', or 'fallback'.
     """
     if not organization or not limit_key:
-        return None
+        return None, "fallback"
 
     org_id: str
     plan: Optional[Plan] = None
     if isinstance(organization, str):
         org = db.query(Organization).filter(Organization.id == organization).first()
         if not org:
-            return None
+            return None, "fallback"
         org_id = org.id
         plan = org.plan
     else:
@@ -170,25 +202,30 @@ def get_effective_limit(
         .first()
     )
     if override and _is_override_active(override.expires_at):
-        return override.value
+        return override.value, "organization_override"
 
     # 2. Plan Default
     if plan:
         if limit_key == "max_users":
             if plan.max_users is not None:
-                return plan.max_users
-            return default_limits_for_plan(plan.name).get("max_users")
+                return plan.max_users, "plan"
+            return default_limits_for_plan(plan.name).get("max_users"), "plan"
         elif limit_key == "max_warehouses":
             if plan.max_warehouses is not None:
-                return plan.max_warehouses
-            return default_limits_for_plan(plan.name).get("max_warehouses")
+                return plan.max_warehouses, "plan"
+            return default_limits_for_plan(plan.name).get("max_warehouses"), "plan"
         elif limit_key == "max_orders":
             if plan.max_orders is not None:
-                return plan.max_orders
-            return default_limits_for_plan(plan.name).get("max_orders")
+                return plan.max_orders, "plan"
+            return default_limits_for_plan(plan.name).get("max_orders"), "plan"
+        elif limit_key == "max_storage_gb":
+            # If max_storage_gb is set on plan, return it. If explicitly None, it means unlimited.
+            if plan.max_storage_gb is not None:
+                return plan.max_storage_gb, "plan"
+            return None, "plan"
 
     # 3. Safe fallback
-    return DEFAULT_FALLBACK_LIMITS.get(limit_key, None)
+    return DEFAULT_FALLBACK_LIMITS.get(limit_key, None), "fallback"
 
 
 def check_entitlement(

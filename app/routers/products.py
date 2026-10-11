@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.core.files import save_upload
+from app.core.files import safe_delete_unreferenced_file, save_upload
 from app.models import (
     Brand,
     Category,
@@ -654,8 +654,11 @@ def upload_product_file(
     digital product's download file. Replaces whatever was in that slot."""
     org_id = _org_id(user)
     product = _owned(db, product_id, org_id)
+    old_url = getattr(product, field.value, None)
     url, _size = save_upload(db, org_id, file, request, **_FILE_RULES[field])
     setattr(product, field.value, url)
+    if old_url and old_url != url:
+        safe_delete_unreferenced_file(db, old_url, org_id)
     db.commit()
     db.refresh(product)
     return product
@@ -670,8 +673,12 @@ def clear_product_file(
     db: Session = Depends(get_db),
 ) -> Product:
     """Empty one of the product's single-file slots."""
-    product = _owned(db, product_id, _org_id(user))
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
+    old_url = getattr(product, field.value, None)
     setattr(product, field.value, None)
+    if old_url:
+        safe_delete_unreferenced_file(db, old_url, org_id)
     db.commit()
     db.refresh(product)
     return product
@@ -745,12 +752,16 @@ def delete_attachment(
     db: Session = Depends(get_db),
 ) -> list[dict]:
     """Remove one attachment. Returns the remaining list."""
-    product = _owned(db, product_id, _org_id(user))
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
     attachments = _attachments(product)
-    remaining = [a for a in attachments if a.get("id") != attachment_id]
-    if len(remaining) == len(attachments):
+    att_to_delete = next((a for a in attachments if a.get("id") == attachment_id), None)
+    if not att_to_delete:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment not found")
-    return _save_attachments(db, product, remaining)
+    remaining = [a for a in attachments if a.get("id") != attachment_id]
+    result = _save_attachments(db, product, remaining)
+    safe_delete_unreferenced_file(db, att_to_delete.get("url"), org_id)
+    return result
 
 
 @router.delete("/{product_id}/attachments", status_code=status.HTTP_204_NO_CONTENT)
@@ -761,4 +772,9 @@ def clear_attachments(
     db: Session = Depends(get_db),
 ) -> None:
     """Remove every attachment on this product."""
-    _save_attachments(db, _owned(db, product_id, _org_id(user)), [])
+    org_id = _org_id(user)
+    product = _owned(db, product_id, org_id)
+    atts_to_delete = list(_attachments(product))
+    _save_attachments(db, product, [])
+    for a in atts_to_delete:
+        safe_delete_unreferenced_file(db, a.get("url"), org_id)

@@ -29,6 +29,7 @@ from app.models import (  # noqa: F401  (register mappers)
     OAuthExchangeTicket,
     OAuthRegistrationTicket,
     Organization,
+    OrganizationStorageUsage,
     StoredFile,
     Plan,
     Product,

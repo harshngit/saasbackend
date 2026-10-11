@@ -21,6 +21,7 @@ from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense, Ex
 from app.models.notification import Notification
 from app.models.number_sequence import NumberSequence
 from app.models.stored_file import StoredFile
+from app.models.storage_usage import OrganizationStorageUsage
 from app.models.organization import Organization
 from app.models.organization_override import (
     OrganizationFeatureOverride,
@@ -110,6 +111,7 @@ __all__ = [
     "RESERVATION_STATUSES",
     "NumberSequence",
     "StoredFile",
+    "OrganizationStorageUsage",
     "Organization",
     "OrganizationFeatureOverride",
     "OrganizationLimitOverride",

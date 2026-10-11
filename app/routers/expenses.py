@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
-from app.core.files import save_upload
+from app.core.files import safe_delete_unreferenced_file, save_upload
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
@@ -165,7 +165,10 @@ def upload_receipt(
 ) -> Expense:
     """Attach a bill/receipt (image or PDF, max 10 MB) to an expense."""
     expense = _owned(db, expense_id, _org_id(user), user)
+    old_receipt = expense.receipt_url
     expense.receipt_url, _ = save_upload(db, expense.organization_id, file, request)
+    if old_receipt and old_receipt != expense.receipt_url:
+        safe_delete_unreferenced_file(db, old_receipt, expense.organization_id)
     db.commit()
     db.refresh(expense)
     return expense

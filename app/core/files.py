@@ -117,6 +117,11 @@ def _persist(
     from app.core.config import settings
     from app.models.stored_file import StoredFile
 
+    # 1. Enforce storage quota before object upload or database write
+    if org_id:
+        from app.services import storage_service
+        storage_service.check_storage_quota(org_id, len(content), db)
+
     stored = StoredFile(
         id=str(uuid.uuid4()),  # generated up front so the R2 key can use it before the row exists
         organization_id=org_id,
@@ -125,19 +130,282 @@ def _persist(
         size=len(content),
     )
 
+    r2_uploaded_key: str | None = None
     if settings.r2_configured:
         from app.core import r2
 
         key = r2.object_key(org_id, stored.id)
         r2.put_object(key, content, stored.content_type)  # raises on failure — nothing persisted below if so
+        r2_uploaded_key = key
         stored.storage_key = key
         stored.data = None
     else:
         stored.data = content
 
-    db.add(stored)
-    db.flush()
+    try:
+        db.add(stored)
+        db.flush()
+
+        # 2. Atomically reserve quota and increment accounted storage usage under row lock
+        if org_id:
+            from app.services import storage_service
+            storage_service.record_file_upload_serialized(org_id, stored.size, db)
+    except Exception:
+        # If DB write or serialized quota enforcement fails, clean up the object in R2 immediately
+        if r2_uploaded_key:
+            try:
+                from app.core import r2
+                r2.delete_object(r2_uploaded_key)
+            except Exception:
+                pass
+        raise
+
     return stored
+
+
+def extract_file_id_from_url(url: str | None) -> str | None:
+    """Extract UUID / file_id from a /files/{id} or absolute URL."""
+    if not url or not isinstance(url, str):
+        return None
+    val = url.strip()
+    if not val or val.startswith("data:"):
+        return None
+    parts = val.split("/files/")
+    if len(parts) > 1:
+        extracted = parts[-1].split("?")[0].split("/")[0].strip()
+        return extracted or None
+    # Might be a bare UUID
+    if len(val) == 36 and "-" in val:
+        return val
+    return None
+
+
+def delete_stored_file(
+    db: Session,
+    stored_or_id: object,
+    org_id: str | None = None,
+) -> bool:
+    """Delete a StoredFile row, remove R2 object (best effort), and decrement storage usage.
+
+    Returns True if deleted, False if not found.
+    Raises HTTPException(404) if org_id is provided and does not match stored.organization_id.
+    """
+    import logging
+    from app.models.stored_file import StoredFile
+
+    logger = logging.getLogger("crm.files")
+
+    if isinstance(stored_or_id, StoredFile):
+        stored = stored_or_id
+    else:
+        file_id = extract_file_id_from_url(str(stored_or_id)) or str(stored_or_id)
+        stored = db.get(StoredFile, file_id)
+
+    if stored is None:
+        return False
+
+    if org_id is not None and stored.organization_id is not None and stored.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    file_size = stored.size or 0
+    file_org_id = stored.organization_id
+
+    if stored.storage_key:
+        try:
+            from app.core import r2
+            if not r2.delete_object(stored.storage_key):
+                logger.warning("R2 object delete failed for file_id=%s — DB row deleted anyway", stored.id)
+        except Exception as e:
+            logger.warning("R2 deletion error for file_id=%s: %s", stored.id, e)
+
+    db.delete(stored)
+    db.flush()
+
+    if file_org_id:
+        from app.services import storage_service
+        storage_service.record_file_deletion(file_org_id, file_size, db)
+
+    return True
+
+
+def safe_delete_unreferenced_file(
+    db: Session,
+    old_url_or_id: str | None,
+    org_id: str | None = None,
+) -> bool:
+    """If old_url_or_id points to a StoredFile that is no longer referenced anywhere else, delete it."""
+    file_id = extract_file_id_from_url(old_url_or_id)
+    if not file_id:
+        return False
+
+    from app.models.stored_file import StoredFile
+    stored = db.get(StoredFile, file_id)
+    if not stored:
+        return False
+
+    if org_id is not None and stored.organization_id is not None and stored.organization_id != org_id:
+        return False
+
+    pattern = f"%{file_id}%"
+
+    from sqlalchemy import cast, Text, or_
+    from app.models import (
+        Category,
+        Customer,
+        CustomerDocument,
+        CustomerPayment,
+        Delivery,
+        DeliveryCollection,
+        Expense,
+        Organization,
+        OrganizationTheme,
+        Product,
+        ProductVariant,
+        PurchaseInvoice,
+        SupplierInvoice,
+        User,
+    )
+
+    # 1. Organization branding & compliance documents
+    org_refs = db.query(Organization).filter(
+        or_(
+            Organization.logo_url.like(pattern),
+            Organization.signature_url.like(pattern),
+            Organization.stamp_url.like(pattern),
+            Organization.letterhead_url.like(pattern),
+            Organization.banner_url.like(pattern),
+            Organization.payment_qr_url.like(pattern),
+            Organization.doc_gst_url.like(pattern),
+            Organization.doc_pan_url.like(pattern),
+            Organization.doc_coi_url.like(pattern),
+            Organization.doc_trade_license_url.like(pattern),
+            Organization.doc_msme_url.like(pattern),
+            Organization.doc_fssai_url.like(pattern),
+            Organization.doc_other_url.like(pattern),
+            Organization.auth_person_photo_url.like(pattern),
+            Organization.auth_person_signature_url.like(pattern),
+            cast(Organization.doc_other_files, Text).like(pattern),
+        )
+    ).count()
+    if org_refs > 0:
+        return False
+
+    # 2. Product images, brochures, manuals, attachments, variants
+    product_refs = db.query(Product).filter(
+        or_(
+            Product.cover_image.like(pattern),
+            Product.product_video.like(pattern),
+            Product.product_catalog_brochure.like(pattern),
+            Product.product_manual.like(pattern),
+            Product.download_file.like(pattern),
+            Product.warranty_document.like(pattern),
+            cast(Product.images, Text).like(pattern),
+            cast(Product.other_attachments, Text).like(pattern),
+        )
+    ).count()
+    if product_refs > 0:
+        return False
+
+    variant_refs = db.query(ProductVariant).filter(
+        ProductVariant.image_url.like(pattern)
+    ).count()
+    if variant_refs > 0:
+        return False
+
+    # 3. Expense receipts & vendor invoices
+    expense_refs = db.query(Expense).filter(
+        or_(
+            Expense.receipt_url.like(pattern),
+            Expense.vendor_invoice_url.like(pattern),
+            cast(Expense.supporting_documents, Text).like(pattern),
+        )
+    ).count()
+    if expense_refs > 0:
+        return False
+
+    # 4. User profile photos & employee documents
+    user_refs = db.query(User).filter(
+        or_(
+            User.profile_photo.like(pattern),
+            User.identity_proof_file.like(pattern),
+            cast(User.uploaded_documents, Text).like(pattern),
+            cast(User.experience_certificates, Text).like(pattern),
+            cast(User.educational_certificates, Text).like(pattern),
+        )
+    ).count()
+    if user_refs > 0:
+        return False
+
+    # 5. Customer documents & payment proofs
+    cust_refs = db.query(Customer).filter(
+        Customer.profile_image_id.like(pattern),
+    ).count()
+    if cust_refs > 0:
+        return False
+
+    pay_refs = db.query(CustomerPayment).filter(
+        CustomerPayment.payment_proof_url.like(pattern),
+    ).count()
+    if pay_refs > 0:
+        return False
+
+    doc_refs = db.query(CustomerDocument).filter(
+        or_(
+            CustomerDocument.file_id == file_id,
+            CustomerDocument.url.like(pattern),
+        )
+    ).count()
+    if doc_refs > 0:
+        return False
+
+    # 6. Organization Theme background
+    theme_refs = db.query(OrganizationTheme).filter(
+        OrganizationTheme.background_image_url.like(pattern)
+    ).count()
+    if theme_refs > 0:
+        return False
+
+    # 7. Purchase & Supplier Invoices
+    pi_refs = db.query(PurchaseInvoice).filter(
+        or_(
+            PurchaseInvoice.attachment_url.like(pattern),
+            PurchaseInvoice.supplier_quotation_url.like(pattern),
+            PurchaseInvoice.purchase_order_url.like(pattern),
+            PurchaseInvoice.supplier_invoice_url.like(pattern),
+            PurchaseInvoice.delivery_challan_url.like(pattern),
+            cast(PurchaseInvoice.supporting_documents, Text).like(pattern),
+        )
+    ).count()
+    if pi_refs > 0:
+        return False
+
+    si_refs = db.query(SupplierInvoice).filter(
+        SupplierInvoice.attachment_url.like(pattern)
+    ).count()
+    if si_refs > 0:
+        return False
+
+    # 8. Delivery proof of delivery / payment
+    del_refs = db.query(Delivery).filter(
+        cast(Delivery.pod_photo_file_ids, Text).like(pattern)
+    ).count()
+    if del_refs > 0:
+        return False
+
+    dc_refs = db.query(DeliveryCollection).filter(
+        DeliveryCollection.payment_proof_url.like(pattern)
+    ).count()
+    if dc_refs > 0:
+        return False
+
+    # 9. Category images
+    cat_refs = db.query(Category).filter(
+        Category.image.like(pattern)
+    ).count()
+    if cat_refs > 0:
+        return False
+
+    return delete_stored_file(db, stored, org_id)
 
 
 def save_upload(

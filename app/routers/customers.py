@@ -11,7 +11,7 @@ from app.core.database import get_db
 from app.core import scoping
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
-from app.core.files import get_bytes, save_upload
+from app.core.files import get_bytes, safe_delete_unreferenced_file, save_upload
 from app.models import Customer, CustomerDocument, CustomerPayment, Invoice, StoredFile, User
 from app.services import (
     customer_profile_service,
@@ -547,8 +547,12 @@ def upload_customer_document(
     if kind != OTHER_DOCUMENT_TYPE:
         # Named slots hold one file — drop the previous one rather than leaving
         # two rows claiming to be "the" GST certificate.
-        for existing in [d for d in customer.documents if d.document_type == kind]:
+        old_docs = [d for d in customer.documents if d.document_type == kind]
+        for existing in old_docs:
+            old_file_id = existing.file_id or existing.url
             db.delete(existing)
+            db.flush()
+            safe_delete_unreferenced_file(db, old_file_id, org_id)
 
     document = CustomerDocument(
         # One id everywhere: the stored file's id is the document's id.
@@ -658,7 +662,11 @@ def delete_customer_document(
     db: Session = Depends(get_db),
 ) -> None:
     customer = _owned_customer(db, customer_id, user)
-    db.delete(_owned_document(db, customer, document_id))
+    doc = _owned_document(db, customer, document_id)
+    file_id = doc.file_id or doc.id
+    db.delete(doc)
+    db.flush()
+    safe_delete_unreferenced_file(db, file_id, _org_id(user))
     db.commit()
 
 

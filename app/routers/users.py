@@ -474,8 +474,12 @@ def update_user(
     if role_sent:
         target.role_id = role.id if role is not None else None
         target.role = LEGACY_ROLE_BY_NAME.get(role.name) if role is not None else None
+    old_photo = target.profile_photo
     for field, value in data.items():
         setattr(target, field, value)
+    if "profile_photo" in data and old_photo and data["profile_photo"] != old_photo:
+        from app.core.files import safe_delete_unreferenced_file
+        safe_delete_unreferenced_file(db, old_photo, admin.organization_id)
     # Renaming either half of the name refreshes the combined `name`, unless the
     # caller set it themselves in the same request.
     if "name" not in data and ("first_name" in data or "last_name" in data):
@@ -548,11 +552,15 @@ def delete_employee_document(
     target = _owned_user(db, user_id, admin)
     column = COLLECTION_COLUMN[collection]
     documents = list(getattr(target, column) or [])
-    remaining = [d for d in documents if d.get("id") != document_id]
-    if len(remaining) == len(documents):
+    doc_to_delete = next((d for d in documents if d.get("id") == document_id), None)
+    if not doc_to_delete:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    remaining = [d for d in documents if d.get("id") != document_id]
     # Reassigned wholesale — SQLAlchemy does not track in-place JSON mutation.
     setattr(target, column, remaining)
+    db.flush()
+    from app.core.files import safe_delete_unreferenced_file
+    safe_delete_unreferenced_file(db, doc_to_delete.get("url") or document_id, admin.organization_id)
     db.commit()
     db.refresh(target)
     return employee_profile_service.build_profile(db, target)

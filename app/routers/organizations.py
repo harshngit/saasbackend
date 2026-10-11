@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.files import normalize_file_url, save_upload
+from app.core.files import normalize_file_url, safe_delete_unreferenced_file, save_upload
 from app.core.deps import get_current_user, require_system_role
 from app.core import reference_data as R
 from app.core.reference_data import (
@@ -32,10 +32,17 @@ from app.schemas.company import (
     OtherDocument,
     UploadResponse,
 )
-from app.schemas.organization import OrganizationOut, UpgradeRequest
+from app.schemas.organization import OrganizationOut, OrganizationStorageUsageOut, UpgradeRequest
 from app.schemas.organization_override import OrganizationEntitlementsOut
 from app.schemas.overview import CompanyOverviewOut
-from app.services import activity_service, entitlement_service, numbering_service, org_service, overview_service
+from app.services import (
+    activity_service,
+    entitlement_service,
+    numbering_service,
+    org_service,
+    overview_service,
+    storage_service,
+)
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -88,6 +95,17 @@ def my_organization_entitlements(
     org = org_service.apply_trial_expiry(db, org)
     return entitlement_service.get_effective_organization_entitlements(db, org)
 
+
+@router.get("/me/storage-usage", response_model=OrganizationStorageUsageOut)
+def my_organization_storage_usage(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Effective organization storage breakdown, limits, and usage metrics."""
+    org = current_user.organization
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User has no organization")
+    return storage_service.get_storage_usage(org.id, db)
 
 
 @router.post("/upgrade-request", response_model=OrganizationOut)
@@ -257,7 +275,10 @@ def upload_logo(
     db: Session = Depends(get_db),
 ) -> UploadResponse:
     org = _admin_org(admin, db)
+    old_logo = org.logo_url
     org.logo_url = _store_image(db, org.id, file, request)
+    if old_logo and old_logo != org.logo_url:
+        safe_delete_unreferenced_file(db, old_logo, org.id)
     activity_service.record(db, org.id, admin, "branding", "Company logo updated")
     db.commit()
     return UploadResponse(url=normalize_file_url(org.logo_url))
@@ -271,7 +292,10 @@ def upload_signature(
     db: Session = Depends(get_db),
 ) -> UploadResponse:
     org = _admin_org(admin, db)
+    old_sig = org.signature_url
     org.signature_url = _store_image(db, org.id, file, request)
+    if old_sig and old_sig != org.signature_url:
+        safe_delete_unreferenced_file(db, old_sig, org.id)
     activity_service.record(db, org.id, admin, "branding", "Authorized signature updated")
     db.commit()
     return UploadResponse(url=normalize_file_url(org.signature_url))
@@ -398,17 +422,24 @@ def delete_other_document(
     """Remove one uploaded document. Returns the remaining list."""
     org = _admin_org(admin, db)
     documents = _other_documents(org)
-    remaining = [d for d in documents if d.get("id") != document_id]
-    if len(remaining) == len(documents):
+    doc_to_delete = next((d for d in documents if d.get("id") == document_id), None)
+    if not doc_to_delete:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    remaining = [d for d in documents if d.get("id") != document_id]
+    result = _save_documents(db, org, remaining)
+    safe_delete_unreferenced_file(db, doc_to_delete.get("url"), org.id)
     activity_service.record(db, org.id, admin, "document", "Document removed")
-    return _save_documents(db, org, remaining)
+    return result
 
 
 @router.delete("/settings/documents/other", status_code=status.HTTP_204_NO_CONTENT)
 def clear_other_documents(admin: User = Depends(_ADMIN), db: Session = Depends(get_db)) -> None:
     """Remove every "Other Business Document" for this company."""
-    _save_documents(db, _admin_org(admin, db), [])
+    org = _admin_org(admin, db)
+    docs_to_delete = list(_other_documents(org))
+    _save_documents(db, org, [])
+    for doc in docs_to_delete:
+        safe_delete_unreferenced_file(db, doc.get("url"), org.id)
 
 
 # ------------------------- Single business documents -------------------------
@@ -432,8 +463,11 @@ def upload_business_document(
     """Upload one of the single-file business documents. Replaces whatever was in
     that slot. The many-file slot is /settings/documents/other."""
     org = _admin_org(admin, db)
+    old_url = getattr(org, slot.column, None)
     url, _ = _store_document(db, org.id, file, request)
     setattr(org, slot.column, url)
+    if old_url and old_url != url:
+        safe_delete_unreferenced_file(db, old_url, org.id)
     activity_service.record(
         db, org.id, admin, "document", "Document uploaded",
         f"{slot.value.replace('_', ' ').title()} uploaded",
@@ -451,7 +485,10 @@ def clear_business_document(
 ) -> Organization:
     """Remove one of the single-file business documents."""
     org = _admin_org(admin, db)
+    old_url = getattr(org, slot.column, None)
     setattr(org, slot.column, None)
+    if old_url:
+        safe_delete_unreferenced_file(db, old_url, org.id)
     activity_service.record(
         db, org.id, admin, "document", "Document removed",
         f"{slot.value.replace('_', ' ').title()} removed",

@@ -76,3 +76,19 @@ class RejectUpgrade(BaseModel):
 
 class OrgStatusUpdate(BaseModel):
     status: OrganizationStatus
+
+
+class OrganizationStorageUsageOut(BaseModel):
+    organization_id: str
+    files_documents_bytes: int = Field(..., description="Bytes used by uploaded files and documents")
+    stored_reports_bytes: int = Field(default=0, description="Bytes used by persisted reports (0 for ephemeral)")
+    application_data_bytes: int = Field(..., description="Approximate logical bytes used by tenant application records")
+    total_used_bytes: int = Field(..., description="Total accounted bytes")
+    effective_limit_bytes: int | None = Field(default=None, description="Plan or override storage limit in bytes; null if unlimited")
+    effective_limit_gb: float | None = Field(default=None, description="Plan or override storage limit in GB; null if unlimited")
+    remaining_bytes: int | None = Field(default=None, description="Available bytes remaining; null if unlimited")
+    percentage_used: float | None = Field(default=None, description="Percentage of quota used; null if unlimited")
+    is_unlimited: bool = Field(..., description="True if organization has no numeric storage cap")
+    is_over_limit: bool = Field(..., description="True if total_used_bytes exceeds effective_limit_bytes")
+    limit_source: str | None = Field(default=None, description="'plan', 'organization_override', or 'fallback'")
+    calculated_at: datetime = Field(..., description="Timestamp when usage was accounted")
