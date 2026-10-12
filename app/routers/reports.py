@@ -178,20 +178,18 @@ def _to_pdf(report: dict, org_name: str | None = None) -> bytes:
     return bytes(pdf.output())
 
 
-@router.get("/{report_type}", response_model=ReportResponse)
-def get_report(
-    report_type: str,
-    user: User = Depends(_view),
-    date_from: str | None = Query(default=None, description="YYYY-MM-DD"),
-    date_to: str | None = Query(default=None, description="YYYY-MM-DD"),
+def _report_filters(
     search: str | None = Query(default=None),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=100),
     customer_id: str | None = Query(default=None),
     supplier_id: str | None = Query(default=None),
     product_id: str | None = Query(default=None),
     warehouse_id: str | None = Query(default=None),
     salesperson_id: str | None = Query(default=None),
+    purchase_id: str | None = Query(default=None, description="purchase-return: originating purchase invoice id"),
+    submitted_by: str | None = Query(default=None, description="expense: id of the submitting user"),
+    vendor_id: str | None = Query(default=None, description="expense: vendor (supplier) id"),
+    category_id: str | None = Query(default=None, description="inventory-summary: product category id"),
+    brand_id: str | None = Query(default=None, description="inventory-summary: product brand id"),
     category: str | None = Query(default=None),
     status: str | None = Query(default=None),
     order_status: str | None = Query(default=None),
@@ -199,6 +197,7 @@ def get_report(
     delivery_status: str | None = Query(default=None),
     payment_status: str | None = Query(default=None),
     payment_mode: str | None = Query(default=None),
+    payment_method: str | None = Query(default=None, description="supplier-payment: payment method"),
     verification_status: str | None = Query(default=None),
     ageing_bucket: str | None = Query(default=None),
     overdue_only: bool = Query(default=False),
@@ -206,41 +205,44 @@ def get_report(
     as_of_date: str | None = Query(default=None),
     movement_type: str | None = Query(default=None),
     low_stock_only: bool = Query(default=False),
+    # GST transaction view (gst-summary?group_by=transaction)
+    invoice_number: str | None = Query(default=None, description="gst-summary: document or referenced document number"),
+    gst_number: str | None = Query(default=None, description="gst-summary: party GSTIN (exact, case-insensitive)"),
+    gst_classification: str | None = Query(default=None, description="gst-summary: output | output_adjustment | input | input_adjustment"),
+    invoice_type: str | None = Query(default=None, description="gst-summary: sales_invoice | sales_return | supplier_invoice | purchase_return"),
+    min_amount: float | None = Query(default=None, ge=0, description="gst-summary: document total (tax inclusive)"),
+    max_amount: float | None = Query(default=None, ge=0),
+    min_taxable_value: float | None = Query(default=None, ge=0),
+    max_taxable_value: float | None = Query(default=None, ge=0),
+    min_tax_amount: float | None = Query(default=None, ge=0),
+    max_tax_amount: float | None = Query(default=None, ge=0),
+    sort_by: str | None = Query(default=None),
+    sort_order: str | None = Query(default=None, description="asc | desc"),
+) -> dict[str, Any]:
+    """Report filters shared by the screen and export routes, so both build the
+    same dataset from the same parameters."""
+    return dict(locals())
+
+
+@router.get("/{report_type}", response_model=ReportResponse)
+def get_report(
+    report_type: str,
+    user: User = Depends(_view),
+    date_from: str | None = Query(default=None, description="YYYY-MM-DD"),
+    date_to: str | None = Query(default=None, description="YYYY-MM-DD"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    filters: dict[str, Any] = Depends(_report_filters),
     db: Session = Depends(get_db),
 ) -> dict:
     """Standardized financial, inventory, and operational reporting endpoint."""
-    filters: dict[str, Any] = {
-        "search": search,
-        "page": page,
-        "page_size": page_size,
-        "customer_id": customer_id,
-        "supplier_id": supplier_id,
-        "product_id": product_id,
-        "warehouse_id": warehouse_id,
-        "salesperson_id": salesperson_id,
-        "category": category,
-        "status": status,
-        "order_status": order_status,
-        "fulfilment_status": fulfilment_status,
-        "delivery_status": delivery_status,
-        "payment_status": payment_status,
-        "payment_mode": payment_mode,
-        "verification_status": verification_status,
-        "ageing_bucket": ageing_bucket,
-        "overdue_only": overdue_only,
-        "group_by": group_by,
-        "as_of_date": as_of_date,
-        "movement_type": movement_type,
-        "low_stock_only": low_stock_only,
-    }
-
     return report_service.build_report(
         db=db,
         org_id=_org_id(user),
         report_type=report_type,
         date_from=date_from,
         date_to=date_to,
-        filters=filters,
+        filters={**filters, "page": page, "page_size": page_size},
         is_export=False,
     )
 
@@ -252,55 +254,15 @@ def export_report(
     format: str = Query(default="excel", description="excel | pdf"),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
-    search: str | None = Query(default=None),
-    customer_id: str | None = Query(default=None),
-    supplier_id: str | None = Query(default=None),
-    product_id: str | None = Query(default=None),
-    warehouse_id: str | None = Query(default=None),
-    salesperson_id: str | None = Query(default=None),
-    category: str | None = Query(default=None),
-    status: str | None = Query(default=None),
-    order_status: str | None = Query(default=None),
-    fulfilment_status: str | None = Query(default=None),
-    delivery_status: str | None = Query(default=None),
-    payment_status: str | None = Query(default=None),
-    payment_mode: str | None = Query(default=None),
-    verification_status: str | None = Query(default=None),
-    ageing_bucket: str | None = Query(default=None),
-    overdue_only: bool = Query(default=False),
-    group_by: str | None = Query(default=None),
-    as_of_date: str | None = Query(default=None),
-    movement_type: str | None = Query(default=None),
-    low_stock_only: bool = Query(default=False),
+    filters: dict[str, Any] = Depends(_report_filters),
     db: Session = Depends(get_db),
 ) -> Response:
     """Download full unpaginated report as an Excel (.xlsx) or PDF file."""
+    if format not in ("excel", "pdf"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="format must be 'excel' or 'pdf'")
     org_id = _org_id(user)
     org = db.get(Organization, org_id)
     org_name = org.name if org else None
-
-    filters: dict[str, Any] = {
-        "search": search,
-        "customer_id": customer_id,
-        "supplier_id": supplier_id,
-        "product_id": product_id,
-        "warehouse_id": warehouse_id,
-        "salesperson_id": salesperson_id,
-        "category": category,
-        "status": status,
-        "order_status": order_status,
-        "fulfilment_status": fulfilment_status,
-        "delivery_status": delivery_status,
-        "payment_status": payment_status,
-        "payment_mode": payment_mode,
-        "verification_status": verification_status,
-        "ageing_bucket": ageing_bucket,
-        "overdue_only": overdue_only,
-        "group_by": group_by,
-        "as_of_date": as_of_date,
-        "movement_type": movement_type,
-        "low_stock_only": low_stock_only,
-    }
 
     report = report_service.build_report(
         db=db,
@@ -316,12 +278,10 @@ def export_report(
         content = _to_pdf(report, org_name=org_name)
         media = "application/pdf"
         ext = "pdf"
-    elif format == "excel":
+    else:
         content = _to_xlsx(report, org_name=org_name)
         media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ext = "xlsx"
-    else:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="format must be 'excel' or 'pdf'")
 
     filename = f"{report_type}-report.{ext}"
     return Response(

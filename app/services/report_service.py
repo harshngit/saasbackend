@@ -18,7 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models import (
@@ -151,9 +151,15 @@ REPORT_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "gst-summary": {
         "title": "GST Summary Report",
-        "description": "Output GST from issued tax invoices minus sales returns, and Input GST from recorded purchase invoices minus purchase returns.",
-        "supported_filters": ["date_from", "date_to", "page", "page_size"],
-        "allowed_group_by": [],
+        "description": "Output GST from issued tax invoices minus sales returns, and Input GST from recorded purchase invoices minus purchase returns. group_by=transaction lists the underlying documents.",
+        "supported_filters": ["date_from", "date_to", "group_by", "page", "page_size"],
+        "transaction_filters": [
+            "date_from", "date_to", "customer_id", "supplier_id", "search", "invoice_number",
+            "gst_number", "gst_classification", "invoice_type", "status",
+            "min_amount", "max_amount", "min_taxable_value", "max_taxable_value",
+            "min_tax_amount", "max_tax_amount", "sort_by", "sort_order", "group_by", "page", "page_size",
+        ],
+        "allowed_group_by": ["summary", "transaction"],
         "currency": "INR",
     },
     "sales-return": {
@@ -211,7 +217,7 @@ REPORT_REGISTRY: dict[str, dict[str, Any]] = {
         "title": "Sales Overview (Orders & Deliveries)",
         "description": "Operational sales order progression and delivery fulfillment tracking per order, ordered vs delivered quantities, and logistics status.",
         "supported_filters": [
-            "date_from", "date_to", "customer_id", "salesperson_id", "order_status",
+            "date_from", "date_to", "customer_id", "salesperson_id", "order_status", "status",
             "fulfilment_status", "delivery_status", "search", "page", "page_size",
         ],
         "allowed_group_by": [],
@@ -297,6 +303,11 @@ def _paginate(rows: list[dict[str, Any]], page: int, page_size: int) -> tuple[li
         "total_pages": total_pages,
     }
     return paged_rows, pagination
+
+
+def _expense_vendor_name(expense: Expense) -> str | None:
+    """`Expense.vendor` is the Supplier relationship; reports show its name, else the payee."""
+    return expense.vendor.name if expense.vendor else expense.payee_name
 
 
 def _verify_tenant_entity(db: Session, org_id: str, model_cls, entity_id: str, entity_label: str) -> None:
@@ -421,7 +432,7 @@ def _daily_transaction(db: Session, org_id: str, df: datetime | None, dt: dateti
             "date": exp.expense_date.date().isoformat() if hasattr(exp.expense_date, "date") else str(exp.expense_date)[:10],
             "type": "Expense",
             "reference": exp.category,
-            "party": exp.vendor or exp.submitted_by or "Expense",
+            "party": _expense_vendor_name(exp) or exp.submitted_by or "Expense",
             "amount": round(-exp.amount, 2),
             "payment_mode": exp.payment_mode or (exp.payment_status or "unpaid"),
             "direction": "Cash Out" if is_paid else "Accrual Expense",
@@ -512,6 +523,7 @@ def _sales(db: Session, org_id: str, df: datetime | None, dt: datetime | None, p
     product_id = params.get("product_id")
     salesperson_id = params.get("salesperson_id")
     payment_status = params.get("payment_status")
+    warehouse_id = params.get("warehouse_id")
 
     if group_by not in REPORT_REGISTRY["sales"]["allowed_group_by"]:
         raise HTTPException(
@@ -525,6 +537,8 @@ def _sales(db: Session, org_id: str, df: datetime | None, dt: datetime | None, p
         _verify_tenant_entity(db, org_id, Product, product_id, "Product")
     if salesperson_id:
         _verify_tenant_entity(db, org_id, User, salesperson_id, "Salesperson")
+    if warehouse_id:
+        _verify_tenant_entity(db, org_id, Warehouse, warehouse_id, "Warehouse")
 
     q = db.query(Invoice).filter(
         Invoice.organization_id == org_id,
@@ -543,6 +557,29 @@ def _sales(db: Session, org_id: str, df: datetime | None, dt: datetime | None, p
         )
     if product_id:
         q = q.join(InvoiceItem, InvoiceItem.invoice_id == Invoice.id).filter(InvoiceItem.product_id == product_id)
+    if warehouse_id:
+        # An invoice ships from its delivery's warehouse; without a delivery (or when the
+        # delivery has none) it falls back to the warehouse its sales order is promised from.
+        # Invoices with neither (direct / POS invoices) are not attributable to any warehouse
+        # and are excluded while this filter is active. Subqueries keep one row per invoice.
+        deliveries_from_wh = select(Delivery.id).where(
+            Delivery.organization_id == org_id, Delivery.warehouse_id == warehouse_id
+        )
+        deliveries_without_wh = select(Delivery.id).where(
+            Delivery.organization_id == org_id, Delivery.warehouse_id.is_(None)
+        )
+        orders_from_wh = select(SalesOrder.id).where(
+            SalesOrder.organization_id == org_id, SalesOrder.warehouse_id == warehouse_id
+        )
+        q = q.filter(
+            or_(
+                Invoice.delivery_id.in_(deliveries_from_wh),
+                and_(
+                    or_(Invoice.delivery_id.is_(None), Invoice.delivery_id.in_(deliveries_without_wh)),
+                    Invoice.order_id.in_(orders_from_wh),
+                ),
+            )
+        )
 
     if search:
         s = f"%{search}%"
@@ -592,14 +629,21 @@ def _sales(db: Session, org_id: str, df: datetime | None, dt: datetime | None, p
 
     elif group_by == "salesperson":
         sp_map: dict[str, dict[str, Any]] = defaultdict(lambda: {"transaction_count": 0, "sales_value": 0.0})
+        # One lookup for every creator needed as a fallback, instead of one per invoice.
+        creator_ids = {
+            i.created_by for i in invoices
+            if i.created_by and not (i.order and i.order.salesperson)
+        }
+        creator_names = (
+            dict(db.query(User.id, User.name).filter(User.id.in_(creator_ids)).all())
+            if creator_ids else {}
+        )
         for i in invoices:
             sp_name = "Unassigned"
             if i.order and i.order.salesperson:
                 sp_name = i.order.salesperson.name
-            elif i.created_by:
-                creator = db.get(User, i.created_by)
-                if creator:
-                    sp_name = creator.name
+            elif i.created_by and i.created_by in creator_names:
+                sp_name = creator_names[i.created_by]
             sp_map[sp_name]["transaction_count"] += 1
             sp_map[sp_name]["sales_value"] = round(sp_map[sp_name]["sales_value"] + i.total, 2)
 
@@ -704,6 +748,7 @@ def _purchase(db: Session, org_id: str, df: datetime | None, dt: datetime | None
     supplier_id = params.get("supplier_id")
     product_id = params.get("product_id")
     p_status = params.get("status")
+    warehouse_id = params.get("warehouse_id")
 
     if group_by not in REPORT_REGISTRY["purchase"]["allowed_group_by"]:
         raise HTTPException(
@@ -715,6 +760,8 @@ def _purchase(db: Session, org_id: str, df: datetime | None, dt: datetime | None
         _verify_tenant_entity(db, org_id, Supplier, supplier_id, "Supplier")
     if product_id:
         _verify_tenant_entity(db, org_id, Product, product_id, "Product")
+    if warehouse_id:
+        _verify_tenant_entity(db, org_id, Warehouse, warehouse_id, "Warehouse")
 
     q = db.query(SupplierInvoice).filter(
         SupplierInvoice.organization_id == org_id,
@@ -724,6 +771,18 @@ def _purchase(db: Session, org_id: str, df: datetime | None, dt: datetime | None
 
     if supplier_id:
         q = q.filter(SupplierInvoice.supplier_id == supplier_id)
+    if warehouse_id:
+        # The receiving warehouse is recorded on the purchase header (the same field the
+        # purchases list filters on). Supplier invoices whose purchase has no receiving
+        # warehouse are excluded while this filter is active.
+        q = q.filter(
+            SupplierInvoice.purchase_id.in_(
+                select(PurchaseInvoice.id).where(
+                    PurchaseInvoice.organization_id == org_id,
+                    PurchaseInvoice.warehouse_id == warehouse_id,
+                )
+            )
+        )
     if p_status:
         q = q.filter(or_(SupplierInvoice.payment_status == p_status, SupplierInvoice.verification_status == p_status))
     if search:
@@ -1206,9 +1265,21 @@ def _expense(db: Session, org_id: str, df: datetime | None, dt: datetime | None,
     category = params.get("category")
     exp_status = params.get("status")
     payment_mode = params.get("payment_mode")
+    submitted_by = params.get("submitted_by")
+    vendor_id = params.get("vendor_id")
+
+    if submitted_by:
+        _verify_tenant_entity(db, org_id, User, submitted_by, "User")
+    if vendor_id:
+        _verify_tenant_entity(db, org_id, Supplier, vendor_id, "Vendor")
 
     q = db.query(Expense).filter(Expense.organization_id == org_id)
     q = _between(q, Expense.expense_date, df, dt)
+
+    if submitted_by:
+        q = q.filter(Expense.submitted_by == submitted_by)
+    if vendor_id:
+        q = q.filter(Expense.vendor_id == vendor_id)
 
     if category:
         q = q.filter(Expense.category == category)
@@ -1222,7 +1293,8 @@ def _expense(db: Session, org_id: str, df: datetime | None, dt: datetime | None,
             or_(
                 Expense.category.ilike(s),
                 Expense.description.ilike(s),
-                Expense.vendor.ilike(s),
+                Expense.vendor.has(Supplier.name.ilike(s)),
+                Expense.payee_name.ilike(s),
                 Expense.submitted_by.ilike(s),
             )
         )
@@ -1249,7 +1321,7 @@ def _expense(db: Session, org_id: str, df: datetime | None, dt: datetime | None,
             "expense_reference": e.category or e.id[:8],
             "date": e.expense_date.date().isoformat() if hasattr(e.expense_date, "date") else str(e.expense_date)[:10],
             "category": e.category,
-            "vendor": e.vendor,
+            "vendor": _expense_vendor_name(e),
             "description": e.description,
             "amount": round(e.amount, 2),
             "tax": round(getattr(e, "tax_amount", 0.0) or 0.0, 2),
@@ -1393,7 +1465,384 @@ def _cash_collection(db: Session, org_id: str, df: datetime | None, dt: datetime
     }
 
 
+# GST transaction view vocabulary. Each source document type carries exactly one GST
+# classification, mirroring the four lines of the aggregate summary.
+GST_DOCUMENT_TYPES = ("sales_invoice", "sales_return", "supplier_invoice", "purchase_return")
+GST_CLASSIFICATIONS = {
+    "sales_invoice": "output",
+    "sales_return": "output_adjustment",
+    "supplier_invoice": "input",
+    "purchase_return": "input_adjustment",
+}
+_GST_CUSTOMER_DOCUMENTS = ("sales_invoice", "sales_return")
+_GST_SUPPLIER_DOCUMENTS = ("supplier_invoice", "purchase_return")
+# Values a `status` filter may take per document type. Returns and supplier invoices are
+# counted only in these statuses (the aggregate summary's scopes); sales invoices are
+# counted unless void/cancelled, as in the summary, and these are their live statuses.
+GST_DOCUMENT_STATUSES = {
+    "sales_invoice": ("unpaid", "partial", "paid", "returned"),
+    "sales_return": ("received", "approved", "completed"),
+    "supplier_invoice": ("recorded",),
+    "purchase_return": ("confirmed", "dispatched", "completed"),
+}
+GST_SORT_FIELDS = (
+    "document_date", "document_number", "party_name", "gst_number", "document_type",
+    "gst_classification", "status", "taxable_value", "tax_amount", "total_amount",
+)
+_GST_RANGE_FILTERS = (
+    ("min_amount", "max_amount", "total_amount"),
+    ("min_taxable_value", "max_taxable_value", "taxable_value"),
+    ("min_tax_amount", "max_tax_amount", "tax_amount"),
+)
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or value is False or (isinstance(value, str) and not value.strip())
+
+
+def _reject_unsupported_filters(params: dict, supported: list[str], context: str) -> None:
+    """Fail loudly instead of silently ignoring a filter the selected GST view cannot honour."""
+    unsupported = sorted(
+        k for k, v in params.items()
+        if k not in supported and k not in ("page", "page_size") and not _is_blank(v)
+    )
+    if unsupported:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Filter(s) {unsupported} are not supported by {context}. Supported: {sorted(supported)}",
+        )
+
+
+def _enum_filter(params: dict, key: str, allowed) -> set[str] | None:
+    """Parse a single or comma-separated enum filter; reject anything outside `allowed`."""
+    raw = params.get(key)
+    if _is_blank(raw):
+        return None
+    values = {v.strip().lower() for v in str(raw).split(",") if v.strip()}
+    invalid = sorted(values - set(allowed))
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {key} {invalid}. Allowed: {sorted(set(allowed))}",
+        )
+    return values
+
+
+def _amount_bounds(params: dict, lo_key: str, hi_key: str) -> tuple[float | None, float | None]:
+    bounds = []
+    for key in (lo_key, hi_key):
+        raw = params.get(key)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            bounds.append(None)
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{key} must be a number")
+        if not math.isfinite(value) or value < 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{key} must be a non-negative number")
+        bounds.append(value)
+    lo, hi = bounds
+    if lo is not None and hi is not None and lo > hi:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{lo_key} cannot be greater than {hi_key}")
+    return lo, hi
+
+
+def _iso_date(value) -> str:
+    return value.date().isoformat() if hasattr(value, "date") else str(value)[:10]
+
+
 def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    registry = REPORT_REGISTRY["gst-summary"]
+    group_by = params.get("group_by") or "summary"
+    if group_by not in registry["allowed_group_by"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid group_by '{group_by}' for gst-summary report. Allowed: {registry['allowed_group_by']}",
+        )
+    if group_by == "transaction":
+        _reject_unsupported_filters(params, registry["transaction_filters"], "the GST transaction view (group_by=transaction)")
+        return _gst_transactions(db, org_id, df, dt, params)
+    # The aggregate covers every in-scope document; a party/document filter applied to only
+    # part of it would misstate the liability, so those filters require the transaction view.
+    _reject_unsupported_filters(params, registry["supported_filters"], "the aggregate GST summary; use group_by=transaction")
+    return _gst_aggregate(db, org_id, df, dt, params)
+
+
+def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    customer_id = params.get("customer_id") or None
+    supplier_id = params.get("supplier_id") or None
+    search = (params.get("search") or "").strip().lower()
+    doc_ref = (params.get("invoice_number") or "").strip().lower()
+
+    gst_number = None
+    if not _is_blank(params.get("gst_number")):
+        gst_number = "".join(str(params["gst_number"]).split()).upper()
+        if not gst_number.isalnum() or len(gst_number) > 20:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="gst_number must be alphanumeric and at most 20 characters",
+            )
+
+    doc_types = _enum_filter(params, "invoice_type", GST_DOCUMENT_TYPES)
+    classifications = _enum_filter(params, "gst_classification", GST_CLASSIFICATIONS.values())
+    all_statuses = {s for statuses in GST_DOCUMENT_STATUSES.values() for s in statuses}
+    statuses = _enum_filter(params, "status", all_statuses)
+    ranges = [(field, *_amount_bounds(params, lo, hi)) for lo, hi, field in _GST_RANGE_FILTERS]
+
+    sort_by = params.get("sort_by") or "document_date"
+    if sort_by not in GST_SORT_FIELDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid sort_by '{sort_by}' for GST transactions. Allowed: {list(GST_SORT_FIELDS)}",
+        )
+    sort_order = (params.get("sort_order") or "desc").lower()
+    if sort_order not in ("asc", "desc"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="sort_order must be 'asc' or 'desc'")
+
+    if customer_id and supplier_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="customer_id applies to sales-side documents and supplier_id to purchase-side documents; use one at a time",
+        )
+
+    # Which document types are in play: narrowed by invoice_type, gst_classification and
+    # the side a party filter belongs to.
+    active = set(GST_DOCUMENT_TYPES)
+    if doc_types is not None:
+        active &= doc_types
+    if classifications is not None:
+        active &= {t for t, c in GST_CLASSIFICATIONS.items() if c in classifications}
+    if customer_id or supplier_id:
+        side = _GST_CUSTOMER_DOCUMENTS if customer_id else _GST_SUPPLIER_DOCUMENTS
+        requested = doc_types is not None or classifications is not None
+        if requested and not (active & set(side)):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"{'customer_id' if customer_id else 'supplier_id'} only applies to {list(side)} documents, "
+                    "which the requested invoice_type / gst_classification exclude"
+                ),
+            )
+        active &= set(side)
+
+    if customer_id:
+        _verify_tenant_entity(db, org_id, Customer, customer_id, "Customer")
+    if supplier_id:
+        _verify_tenant_entity(db, org_id, Supplier, supplier_id, "Supplier")
+
+    def _statuses_for(doc_type: str) -> tuple[str, ...]:
+        scope = GST_DOCUMENT_STATUSES[doc_type]
+        return scope if statuses is None else tuple(s for s in scope if s in statuses)
+
+    rows: list[dict[str, Any]] = []
+
+    if "sales_invoice" in active and _statuses_for("sales_invoice"):
+        q = db.query(Invoice).filter(
+            Invoice.organization_id == org_id,
+            Invoice.is_credit_note.is_(False),
+            ~Invoice.status.in_(("void", "cancelled")),
+        )
+        if statuses is not None:
+            q = q.filter(Invoice.status.in_(_statuses_for("sales_invoice")))
+        if customer_id:
+            q = q.filter(Invoice.customer_id == customer_id)
+        for inv in _between(q, Invoice.invoice_date, df, dt).all():
+            cust = inv.customer
+            rows.append({
+                "document_type": "sales_invoice",
+                "gst_classification": "output",
+                "source_id": inv.id,
+                "document_number": inv.invoice_number,
+                "document_date": _iso_date(inv.invoice_date),
+                "reference_document": None,
+                "party_type": "customer",
+                "party_id": inv.customer_id,
+                "party_name": (cust.business_name or cust.name) if cust else (inv.walk_in_name or "Walk-in"),
+                "gst_number": cust.gst_number if cust else None,
+                "status": inv.status,
+                "taxable_value": round(inv.subtotal or 0.0, 2),
+                "tax_amount": round(inv.tax or 0.0, 2),
+                "total_amount": round(inv.total or 0.0, 2),
+            })
+
+    if "sales_return" in active and _statuses_for("sales_return"):
+        q = db.query(SalesReturn).options(selectinload(SalesReturn.items)).filter(
+            SalesReturn.organization_id == org_id,
+            SalesReturn.return_status.in_(_statuses_for("sales_return")),
+        )
+        if customer_id:
+            q = q.filter(SalesReturn.customer_id == customer_id)
+        for r in _between(q, SalesReturn.return_date, df, dt).all():
+            cust = r.customer
+            # Return lines store a pre-tax line total and a rate; tax is derived exactly as
+            # the aggregate summary derives it.
+            taxable = sum(item.line_total or 0.0 for item in r.items)
+            tax = sum((item.tax_rate or 0.0) / 100.0 * (item.line_total or 0.0) for item in r.items)
+            rows.append({
+                "document_type": "sales_return",
+                "gst_classification": "output_adjustment",
+                "source_id": r.id,
+                "document_number": r.return_number,
+                "document_date": _iso_date(r.return_date),
+                "reference_document": r.invoice.invoice_number if r.invoice else None,
+                "party_type": "customer",
+                "party_id": r.customer_id,
+                "party_name": (cust.business_name or cust.name) if cust else None,
+                "gst_number": cust.gst_number if cust else None,
+                "status": r.return_status,
+                "taxable_value": round(taxable, 2),
+                "tax_amount": round(tax, 2),
+                "total_amount": round(r.credit_amount if r.credit_amount is not None else taxable + tax, 2),
+            })
+
+    if "supplier_invoice" in active and _statuses_for("supplier_invoice"):
+        q = db.query(SupplierInvoice).filter(
+            SupplierInvoice.organization_id == org_id,
+            SupplierInvoice.status.in_(_statuses_for("supplier_invoice")),
+        )
+        if supplier_id:
+            q = q.filter(SupplierInvoice.supplier_id == supplier_id)
+        for si in _between(q, SupplierInvoice.supplier_invoice_date, df, dt).all():
+            sup = si.supplier
+            purchase = si.purchase
+            rows.append({
+                "document_type": "supplier_invoice",
+                "gst_classification": "input",
+                "source_id": si.id,
+                "document_number": si.supplier_invoice_number,
+                "document_date": _iso_date(si.supplier_invoice_date),
+                "reference_document": purchase.invoice_number if purchase else None,
+                "party_type": "supplier",
+                "party_id": si.supplier_id,
+                "party_name": sup.name if sup else None,
+                "gst_number": (sup.gst_number if sup else None) or (purchase.payee_gstin if purchase else None),
+                "status": si.status,
+                "taxable_value": round(si.subtotal or 0.0, 2),
+                "tax_amount": round(si.tax_amount or 0.0, 2),
+                "total_amount": round(si.grand_total or 0.0, 2),
+            })
+
+    if "purchase_return" in active and _statuses_for("purchase_return"):
+        q = db.query(PurchaseReturn).options(selectinload(PurchaseReturn.items)).filter(
+            PurchaseReturn.organization_id == org_id,
+            PurchaseReturn.status.in_(_statuses_for("purchase_return")),
+        )
+        if supplier_id:
+            q = q.filter(PurchaseReturn.supplier_id == supplier_id)
+        for r in _between(q, PurchaseReturn.return_date, df, dt).all():
+            sup = r.supplier
+            purchase = r.purchase
+            # Purchase return lines store tax_amount and a tax-inclusive line_total.
+            tax = sum(item.tax_amount or 0.0 for item in r.items)
+            total = sum(item.line_total or 0.0 for item in r.items)
+            rows.append({
+                "document_type": "purchase_return",
+                "gst_classification": "input_adjustment",
+                "source_id": r.id,
+                "document_number": r.return_number,
+                "document_date": _iso_date(r.return_date),
+                "reference_document": purchase.invoice_number if purchase else None,
+                "party_type": "supplier",
+                "party_id": r.supplier_id,
+                "party_name": sup.name if sup else None,
+                "gst_number": (sup.gst_number if sup else None) or (purchase.payee_gstin if purchase else None),
+                "status": r.status,
+                "taxable_value": round(total - tax, 2),
+                "tax_amount": round(tax, 2),
+                "total_amount": round(total, 2),
+            })
+
+    def _keep(row: dict) -> bool:
+        if gst_number and "".join((row["gst_number"] or "").split()).upper() != gst_number:
+            return False
+        if doc_ref and not any(doc_ref in (row[k] or "").lower() for k in ("document_number", "reference_document")):
+            return False
+        if search and not any(
+            search in (row[k] or "").lower()
+            for k in ("party_name", "document_number", "reference_document", "gst_number")
+        ):
+            return False
+        for field, lo, hi in ranges:
+            if lo is not None and row[field] < lo:
+                return False
+            if hi is not None and row[field] > hi:
+                return False
+        return True
+
+    rows = [r for r in rows if _keep(r)]
+
+    def _sort_key(row: dict):
+        v = row[sort_by]
+        return v if isinstance(v, (int, float)) else (v or "").lower()
+
+    rows.sort(key=lambda r: (r["document_number"] or "", r["source_id"]), reverse=sort_order == "desc")
+    rows.sort(key=_sort_key, reverse=sort_order == "desc")
+
+    totals = {c: {"taxable_value": 0.0, "tax_amount": 0.0, "count": 0} for c in GST_CLASSIFICATIONS.values()}
+    for r in rows:
+        t = totals[r["gst_classification"]]
+        t["taxable_value"] += r["taxable_value"]
+        t["tax_amount"] += r["tax_amount"]
+        t["count"] += 1
+
+    summary: dict[str, Any] = {"row_count": len(rows)}
+    for c, t in totals.items():
+        summary[f"{c}_count"] = t["count"]
+        summary[f"{c}_taxable_value"] = round(t["taxable_value"], 2)
+        summary[f"{c}_tax_amount"] = round(t["tax_amount"], 2)
+    summary["net_tax_amount"] = round(
+        (totals["output"]["tax_amount"] - totals["output_adjustment"]["tax_amount"])
+        - (totals["input"]["tax_amount"] - totals["input_adjustment"]["tax_amount"]),
+        2,
+    )
+
+    paged_rows, pagination = _paginate(rows, page, page_size)
+
+    meta = {
+        "currency": "INR",
+        "group_by": "transaction",
+        "notes": (
+            "Transaction view: one row per GST document. All amounts are positive document values; "
+            "gst_classification gives the direction (output, output_adjustment reduces output, input, "
+            "input_adjustment reduces input). net_tax_amount = (output - output_adjustment) - (input - input_adjustment) "
+            "over the filtered rows. Return tax: sales returns = stored rate x pre-tax line total; purchase returns = "
+            "stored line tax_amount (same as the aggregate view). customer_id limits rows to sales-side documents, supplier_id to purchase-side ones. "
+            "min_amount/max_amount compare total_amount (tax inclusive; credited amount for sales returns)."
+        ),
+        "columns": [
+            {"key": "document_date", "label": "Date", "type": "date"},
+            {"key": "document_type", "label": "Document Type", "type": "text"},
+            {"key": "gst_classification", "label": "GST Classification", "type": "status"},
+            {"key": "document_number", "label": "Document #", "type": "reference"},
+            {"key": "reference_document", "label": "Reference #", "type": "reference"},
+            {"key": "party_name", "label": "Party", "type": "text"},
+            {"key": "gst_number", "label": "GSTIN", "type": "text"},
+            {"key": "status", "label": "Status", "type": "status"},
+            {"key": "taxable_value", "label": "Taxable Value", "type": "currency"},
+            {"key": "tax_amount", "label": "Tax Amount", "type": "currency"},
+            {"key": "total_amount", "label": "Total", "type": "currency"},
+        ],
+    }
+
+    chart = {
+        "type": "bar",
+        "title": "GST by Classification",
+        "data": [{"component": c, "amount": round(t["tax_amount"], 2)} for c, t in totals.items()],
+    }
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+    }
+
+
+def _gst_aggregate(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
     page = int(params.get("page", 1))
     page_size = int(params.get("page_size", 25))
 
@@ -1428,7 +1877,7 @@ def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | N
         PurchaseReturn.status.in_(("confirmed", "dispatched", "completed")),
     )
     pr_q = _between(pr_q, PurchaseReturn.return_date, df, dt)
-    purchase_returns = pr_q.all()
+    purchase_returns = pr_q.options(selectinload(PurchaseReturn.items)).all()
 
     gross_output_gst = sum(i.tax for i in invoices)
     sales_return_gst = sum(
@@ -1438,8 +1887,16 @@ def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | N
     output_gst = round(max(gross_output_gst - sales_return_gst, 0.0), 2)
 
     gross_input_gst = sum(i.tax_amount or 0.0 for i in sup_invoices)
-    purchase_return_gst = 0.0
+    # Purchase return lines store their own tax_amount; that input tax is reversed.
+    purchase_return_gst = sum(item.tax_amount or 0.0 for r in purchase_returns for item in r.items)
     input_gst = round(max(gross_input_gst - purchase_return_gst, 0.0), 2)
+
+    # Taxable values are pre-tax: return lines store a pre-tax line_total (sales) or a
+    # tax-inclusive line_total alongside its tax_amount (purchase).
+    sales_return_taxable = sum(item.line_total or 0.0 for r in sales_returns for item in r.items)
+    purchase_return_taxable = sum(
+        (item.line_total or 0.0) - (item.tax_amount or 0.0) for r in purchase_returns for item in r.items
+    )
 
     gst_adjustments = round(sales_return_gst + purchase_return_gst, 2)
     net_gst = round(output_gst - input_gst, 2)
@@ -1460,7 +1917,7 @@ def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | N
         },
         {
             "type": "Output GST Adjustment (Sales Returns)",
-            "taxable_value": round(-sum(r.credit_amount or 0.0 for r in sales_returns), 2),
+            "taxable_value": round(-sales_return_taxable, 2),
             "tax_amount": round(-sales_return_gst, 2),
             "description": f"Deduction for {len(sales_returns)} approved sales returns / credit notes",
         },
@@ -1468,13 +1925,17 @@ def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | N
             "type": "Input GST (Purchase Invoices)",
             "taxable_value": round(sum(i.subtotal for i in sup_invoices), 2),
             "tax_amount": round(gross_input_gst, 2),
-            "description": f"Input tax credit on {len(sup_invoices)} supplier purchase invoices",
+            "description": f"Input tax credit on {len(sup_invoices)} supplier purchase invoices (before purchase-return reversals)",
         },
         {
             "type": "Net GST Liability",
-            "taxable_value": round(sum(i.subtotal for i in invoices) - sum(i.subtotal for i in sup_invoices), 2),
+            "taxable_value": round(
+                (sum(i.subtotal for i in invoices) - sales_return_taxable)
+                - (sum(i.subtotal for i in sup_invoices) - purchase_return_taxable),
+                2,
+            ),
             "tax_amount": net_gst,
-            "description": "Output GST minus eligible Input Tax Credit",
+            "description": f"Output GST minus eligible Input Tax Credit (net of {len(purchase_returns)} purchase returns)",
         },
     ]
 
@@ -1482,7 +1943,12 @@ def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | N
 
     meta = {
         "currency": "INR",
-        "group_by": None,
+        "group_by": "summary",
+        "notes": (
+            "Aggregate view. Taxable values are pre-tax. input_gst and net_gst deduct the stored tax on "
+            "confirmed/dispatched/completed purchase returns; the Input GST row shows gross input tax. "
+            "Use group_by=transaction for document-level rows and filters."
+        ),
         "columns": [
             {"key": "type", "label": "GST Classification", "type": "text"},
             {"key": "taxable_value", "label": "Taxable Value", "type": "currency"},
@@ -1607,15 +2073,20 @@ def _purchase_return(db: Session, org_id: str, df: datetime | None, dt: datetime
     search = params.get("search")
     supplier_id = params.get("supplier_id")
     ret_status = params.get("status")
+    purchase_id = params.get("purchase_id")
 
     if supplier_id:
         _verify_tenant_entity(db, org_id, Supplier, supplier_id, "Supplier")
+    if purchase_id:
+        _verify_tenant_entity(db, org_id, PurchaseInvoice, purchase_id, "Purchase")
 
     q = db.query(PurchaseReturn).filter(PurchaseReturn.organization_id == org_id)
     q = _between(q, PurchaseReturn.return_date, df, dt)
 
     if supplier_id:
         q = q.filter(PurchaseReturn.supplier_id == supplier_id)
+    if purchase_id:
+        q = q.filter(PurchaseReturn.purchase_id == purchase_id)
     if ret_status:
         q = q.filter(PurchaseReturn.status == ret_status.lower())
     if search:
@@ -2468,7 +2939,7 @@ def _cash_flow_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime
             "date": d_str,
             "transaction_type": "Paid Expense",
             "reference_number": exp.expense_number or exp.category or exp.id[:8],
-            "party": exp.vendor or exp.submitted_by or "Expense Payee",
+            "party": _expense_vendor_name(exp) or exp.submitted_by or "Expense Payee",
             "cash_in": 0.0,
             "cash_out": round(exp.amount, 2),
             "amount": round(-exp.amount, 2),
@@ -2613,6 +3084,9 @@ def build_report(
 
     df, dt = _range(date_from, date_to, db=db, org_id=org_id)
     params = filters.copy() if filters else {}
+    # gst-summary validates per view (summary vs transaction) inside its builder.
+    if report_type != "gst-summary":
+        _reject_unsupported_filters(params, REPORT_REGISTRY[report_type]["supported_filters"], f"the {report_type} report")
 
     # If export requested, fetch full dataset (up to 10000)
     if is_export:
