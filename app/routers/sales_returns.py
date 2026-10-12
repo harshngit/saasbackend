@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core import workflow
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Customer, Invoice, SalesReturn, User
 from app.core.pagination import paginate
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
@@ -29,7 +29,11 @@ from app.schemas.sales_return import (
 from app.services import lookup_service, numbering_service, return_service, stock_service
 from app.services.return_service import ReturnError
 
-router = APIRouter(prefix="/sales-returns", tags=["sales_returns"])
+router = APIRouter(
+    prefix="/sales-returns",
+    tags=["sales_returns"],
+    dependencies=[Depends(require_entitlement("sales.sales_returns"))],
+)
 
 _view = require_permission("sales_returns", "view")
 _create = require_permission("sales_returns", "create")

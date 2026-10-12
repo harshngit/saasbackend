@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping, workflow
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
 from app.core.realtime import queue_event
 from app.services.order_import_service import get_order_template, import_orders_from_file
@@ -43,7 +43,11 @@ from app.schemas.sales_order import (
 )
 from app.services import delivery_service, lookup_service, order_service, payment_service, stock_service
 
-router = APIRouter(prefix="/orders", tags=["sales_orders"])
+router = APIRouter(
+    prefix="/orders",
+    tags=["sales_orders"],
+    dependencies=[Depends(require_entitlement("sales.orders"))],
+)
 
 _view = require_permission("sales_orders", "view")
 _create = require_permission("sales_orders", "create")

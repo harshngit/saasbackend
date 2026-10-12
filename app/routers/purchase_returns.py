@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import User
 from app.schemas.purchase_return import (
     PurchaseReturnCancel,
@@ -15,7 +15,11 @@ from app.schemas.purchase_return import (
 )
 from app.services import purchase_return_service
 
-router = APIRouter(prefix="/purchase-returns", tags=["purchase_returns"])
+router = APIRouter(
+    prefix="/purchase-returns",
+    tags=["purchase_returns"],
+    dependencies=[Depends(require_entitlement("erp.purchase_returns"))],
+)
 
 _view = require_permission("purchases", "view")
 _create = require_permission("purchases", "create")

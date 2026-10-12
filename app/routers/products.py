@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import safe_delete_unreferenced_file, save_upload
 from app.models import (
     Brand,
@@ -39,7 +39,11 @@ from app.schemas.product import (
     VariantIn,
 )
 
-router = APIRouter(prefix="/products", tags=["products"])
+router = APIRouter(
+    prefix="/products",
+    tags=["products"],
+    dependencies=[Depends(require_entitlement("erp.products"))],
+)
 
 _view = require_permission("products", "view")
 _create = require_permission("products", "create")

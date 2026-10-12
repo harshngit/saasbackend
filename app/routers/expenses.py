@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import safe_delete_unreferenced_file, save_upload
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
 from app.core.pagination import paginate
@@ -13,7 +13,11 @@ from app.schemas.pagination import PaginatedResponse
 from app.schemas.expense import BulkDelete, BulkDeleteResult, ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
 from app.services import expense_service, lookup_service, notification_service, numbering_service
 
-router = APIRouter(prefix="/expenses", tags=["expenses"])
+router = APIRouter(
+    prefix="/expenses",
+    tags=["expenses"],
+    dependencies=[Depends(require_entitlement("finance.expenses"))],
+)
 
 _view = require_permission("expenses", "view")
 _create = require_permission("expenses", "create")

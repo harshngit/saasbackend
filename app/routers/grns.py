@@ -5,7 +5,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import (
     GoodsReceiptNote,
     GoodsReceiptNoteItem,
@@ -19,7 +19,11 @@ from app.schemas.pagination import PaginatedResponse
 from app.core.pagination import paginate
 from app.services import grn_service, lookup_service, numbering_service, purchase_service, stock_service
 
-router = APIRouter(prefix="/grns", tags=["grn"])
+router = APIRouter(
+    prefix="/grns",
+    tags=["grn"],
+    dependencies=[Depends(require_entitlement("erp.purchases"))],
+)
 
 _view = require_permission("grn", "view")
 _create = require_permission("grn", "create")

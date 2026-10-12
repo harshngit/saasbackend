@@ -10,7 +10,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
 from app.models import Product, ProductVariant, StockMovement, StockReservation, User, Warehouse, WarehouseStock
 from app.schemas.inventory import StockMovementOut
@@ -25,7 +25,11 @@ from app.schemas.warehouse import (
 from app.services import entitlement_service, stock_service
 from app.services.tracking_service import TrackingError
 
-router = APIRouter(prefix="/warehouses", tags=["warehouses"])
+router = APIRouter(
+    prefix="/warehouses",
+    tags=["warehouses"],
+    dependencies=[Depends(require_entitlement("erp.warehouses"))],
+)
 
 _view = require_permission("inventory", "view")
 _create = require_permission("inventory", "create")

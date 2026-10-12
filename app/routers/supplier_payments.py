@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import User
 from app.schemas.supplier_payment import (
     InvoicePaymentAllocationOut,
@@ -15,7 +15,11 @@ from app.schemas.supplier_payment import (
 )
 from app.services import supplier_payment_service
 
-router = APIRouter(prefix="/supplier-payments", tags=["supplier-payments"])
+router = APIRouter(
+    prefix="/supplier-payments",
+    tags=["supplier-payments"],
+    dependencies=[Depends(require_entitlement("finance.supplier_payments"))],
+)
 
 _view = require_permission("supplier_payments", "view")
 _create = require_permission("supplier_payments", "create")

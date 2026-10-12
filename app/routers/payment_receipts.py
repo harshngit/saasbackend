@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Customer, CustomerPayment, Invoice, User
 from app.schemas.customer import CollectorBrief
 from app.core.pagination import paginate
@@ -23,7 +23,11 @@ from app.schemas.payment_receipt import (
 )
 from app.services import payment_service
 
-router = APIRouter(prefix="/payment-receipts", tags=["payment_receipts"])
+router = APIRouter(
+    prefix="/payment-receipts",
+    tags=["payment_receipts"],
+    dependencies=[Depends(require_entitlement("finance.receivables"))],
+)
 
 _view = require_permission("payment_receipts", "view")
 _create = require_permission("payment_receipts", "create")

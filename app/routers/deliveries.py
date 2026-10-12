@@ -5,7 +5,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_permission, require_unlocked_org
+from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
 from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
 from app.core import scoping, workflow
 from app.models.enums import UserRole
@@ -67,8 +67,16 @@ from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.sales_order import OrderItemOut, OrderOut
 
-router = APIRouter(prefix="/deliveries", tags=["deliveries"])
-customer_payments_router = APIRouter(prefix="/customer-payments", tags=["customer-payments"])
+router = APIRouter(
+    prefix="/deliveries",
+    tags=["deliveries"],
+    dependencies=[Depends(require_entitlement("sales.deliveries"))],
+)
+customer_payments_router = APIRouter(
+    prefix="/customer-payments",
+    tags=["customer-payments"],
+    dependencies=[Depends(require_entitlement("sales.deliveries"))],
+)
 
 
 _view = require_permission("deliveries", "view")

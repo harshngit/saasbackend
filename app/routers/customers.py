@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core import scoping
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
 from app.core.files import get_bytes, safe_delete_unreferenced_file, save_upload
 from app.models import Customer, CustomerDocument, CustomerPayment, Invoice, StoredFile, User
@@ -40,7 +40,11 @@ from app.services.customer_import_service import get_customer_template, import_c
 from app.schemas.visit import VisitOut
 from app.schemas.follow_up import FollowUpOut
 
-router = APIRouter(prefix="/customers", tags=["customers"])
+router = APIRouter(
+    prefix="/customers",
+    tags=["customers"],
+    dependencies=[Depends(require_entitlement("crm.customers"))],
+)
 
 # Permission gates (admin/super_admin bypass; staff checked against their role matrix).
 _view = require_permission("customers", "view")

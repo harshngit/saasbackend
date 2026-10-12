@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission
+from app.core.deps import require_entitlement, require_permission
 from app.models import User
 from app.schemas.accounts_payable import (
     APAgeingBucketOut,
@@ -12,7 +12,11 @@ from app.schemas.accounts_payable import (
 )
 from app.services import accounts_payable_service
 
-router = APIRouter(prefix="/accounts-payable", tags=["accounts-payable"])
+router = APIRouter(
+    prefix="/accounts-payable",
+    tags=["accounts-payable"],
+    dependencies=[Depends(require_entitlement("finance.accounts_payable"))],
+)
 
 _view = require_permission("accounts_payable", "view")
 

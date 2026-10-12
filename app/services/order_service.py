@@ -18,13 +18,14 @@ that starts at the invoice.
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core import scoping, workflow
 from app.core.realtime import queue_event
-from app.models import Customer, Delivery, Invoice, Product, ProductVariant, SalesOrder, SalesOrderItem, User
+from app.models import Customer, Delivery, Invoice, Organization, Product, ProductVariant, SalesOrder, SalesOrderItem, User
 from app.schemas.sales_order import OrderUpdate
-from app.services import notification_service, numbering_service, stock_service
+from app.services import entitlement_service, notification_service, numbering_service, stock_service
 
 
 class OrderLine:
@@ -126,6 +127,28 @@ def place_order(
     mark it converted in the same one.
     """
     org_id = customer.organization_id
+    org = getattr(user, "organization", None) or db.get(Organization, org_id)
+
+    entitlement_service.check_entitlement(db, org, "sales.orders")
+
+    now = datetime.now(timezone.utc)
+    month_start = datetime(now.year, now.month, 1, 0, 0, 0, tzinfo=timezone.utc)
+    if now.month == 12:
+        next_month_start = datetime(now.year + 1, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    else:
+        next_month_start = datetime(now.year, now.month + 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    order_ts = func.coalesce(SalesOrder.order_date, SalesOrder.created_at)
+    current_month_count = (
+        db.query(SalesOrder)
+        .filter(
+            SalesOrder.organization_id == org_id,
+            order_ts >= month_start,
+            order_ts < next_month_start,
+        )
+        .count()
+    )
+    entitlement_service.check_limit(db, org, "max_orders", current_month_count)
 
     warehouse = stock_service.owned_warehouse(db, warehouse_id, org_id)
     if warehouse is None:

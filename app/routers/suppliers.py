@@ -5,7 +5,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
 from app.models import Product, PurchaseInvoice, Supplier, SupplierPayment, SupplierProduct, User
 from app.models.catalog_hierarchy import SupplierBrand
@@ -27,7 +27,11 @@ from app.schemas.supplier import (
 from app.services import catalog_hierarchy_service, numbering_service
 from app.services.supplier_import_service import get_supplier_template, import_suppliers_from_file
 
-router = APIRouter(prefix="/suppliers", tags=["suppliers"])
+router = APIRouter(
+    prefix="/suppliers",
+    tags=["suppliers"],
+    dependencies=[Depends(require_entitlement("erp.suppliers"))],
+)
 
 # Supplier records are gated by the `suppliers` module; payments by the `payments` module.
 _view = require_permission("suppliers", "view")

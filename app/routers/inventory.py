@@ -3,7 +3,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Product, ProductVariant, StockMovement, User, Warehouse
 from app.services import tracking_service
 from app.schemas.inventory import (
@@ -14,7 +14,11 @@ from app.schemas.inventory import (
     StockAdjustmentCreate,
 )
 
-router = APIRouter(prefix="/inventory", tags=["inventory"])
+router = APIRouter(
+    prefix="/inventory",
+    tags=["inventory"],
+    dependencies=[Depends(require_entitlement("erp.inventory"))],
+)
 
 _view = require_permission("inventory", "view")
 _create = require_permission("inventory", "create")

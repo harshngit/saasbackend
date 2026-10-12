@@ -12,7 +12,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
 from app.models import NumberSequence, Product, ProductVariant, User, WarehouseTransfer, WarehouseTransferItem
 from app.schemas.pagination import PaginatedResponse
@@ -22,7 +22,11 @@ from app.schemas.transfer import (
 )
 from app.services import stock_service
 
-router = APIRouter(prefix="/transfers", tags=["transfers"])
+router = APIRouter(
+    prefix="/transfers",
+    tags=["transfers"],
+    dependencies=[Depends(require_entitlement("erp.inventory"))],
+)
 
 _view = require_permission("inventory", "view")
 _create = require_permission("inventory", "create")

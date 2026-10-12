@@ -13,7 +13,7 @@ from app.core import scoping
 from app.core.workflow import LEAD_STATUSES, LeadTransitionError, validate_lead_transition
 from app.models import Customer, FollowUp, Lead, LeadInterestedProduct, Product, Quotation, Role, User, Visit
 from app.schemas.lead import LeadConvertToCustomerIn, LeadCreate, LeadUpdate
-from app.services import lookup_service, numbering_service, role_service
+from app.services import entitlement_service, lookup_service, numbering_service, role_service
 
 
 def _require_manual_transition(current: str | None, new: str) -> None:
@@ -401,6 +401,7 @@ def convert_lead_to_customer(
         _validate_assignee(db, org_id, cust_assignee)
 
     # 3. Create customer.
+    entitlement_service.check_entitlement(db, user.organization or org_id, "crm.customers")
     new_cust_code = numbering_service.next_number(db, org_id, Customer.customer_id, "CS")
     b_name = data.get("business_name") or data.get("legal_business_name")
     customer = Customer(

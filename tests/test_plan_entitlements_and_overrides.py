@@ -750,6 +750,281 @@ def test_superadmin_plan_management_and_validation():
         fail("Super Admin reset-all overrides failed", f"{r.status_code} {r.text}")
 
 
+def test_hardened_core_routers_entitlement_guards():
+    print("\n--- Test Hardened Core Routers Entitlement Guards ---")
+    org = _create_test_org("Enterprise")
+    headers = org["auth"]
+    org_id = org["org_id"]
+    sa_headers = _super_admin_auth()
+
+    checks = [
+        ("/brands", "erp.brands"),
+        ("/categories", "erp.categories"),
+        ("/products", "erp.products"),
+        ("/suppliers", "erp.suppliers"),
+        ("/inventory", "erp.inventory"),
+        ("/warehouses", "erp.warehouses"),
+        ("/purchases", "erp.purchases"),
+        ("/purchase-returns", "erp.purchase_returns"),
+        ("/expenses", "finance.expenses"),
+        ("/customers", "crm.customers"),
+        ("/orders", "sales.orders"),
+        ("/grns", "erp.purchases"),
+        ("/accounts-payable", "finance.accounts_payable"),
+        ("/supplier-payments", "finance.supplier_payments"),
+        ("/payment-receipts", "finance.receivables"),
+        ("/sales-returns", "sales.sales_returns"),
+        ("/transfers", "erp.inventory"),
+    ]
+
+    for path, key in checks:
+        r = client.get(path, headers=headers)
+        assert r.status_code == 200, f"Expected 200 for {path} on Enterprise, got {r.status_code}: {r.text}"
+
+        r_ov = client.post(
+            f"/superadmin/organizations/{org_id}/overrides/features",
+            headers=sa_headers,
+            json={"entitlement_key": key, "effect": "BLOCK", "reason": f"Testing {key}"},
+        )
+        assert r_ov.status_code == 200, r_ov.text
+
+        r_blocked = client.get(path, headers=headers)
+        if r_blocked.status_code == 403 and r_blocked.json().get("detail", {}).get("code") == "PLAN_FEATURE_NOT_AVAILABLE":
+            assert r_blocked.json().get("detail", {}).get("feature") == key
+            ok(f"Core route {path} blocked by {key} with PLAN_FEATURE_NOT_AVAILABLE")
+        else:
+            fail(f"Core route {path} was not blocked by {key}", f"{r_blocked.status_code} {r_blocked.text}")
+
+        r_del = client.delete(
+            f"/superadmin/organizations/{org_id}/overrides/features/{key}",
+            headers=sa_headers,
+        )
+        assert r_del.status_code in (200, 204)
+
+
+def test_invoice_segregation_and_entitlements():
+    print("\n--- Test Invoice Segregation and Entitlements ---")
+    org = _create_test_org("Enterprise")
+    headers = org["auth"]
+    org_id = org["org_id"]
+    sa_headers = _super_admin_auth()
+
+    # Block invoice.sales_invoices
+    client.post(
+        f"/superadmin/organizations/{org_id}/overrides/features",
+        headers=sa_headers,
+        json={"entitlement_key": "invoice.sales_invoices", "effect": "BLOCK"},
+    )
+    r_sales = client.get("/invoices", headers=headers)
+    assert r_sales.status_code == 403 and r_sales.json().get("detail", {}).get("feature") == "invoice.sales_invoices"
+    ok("GET /invoices blocked by invoice.sales_invoices")
+
+    # Supplier invoices unaffected
+    r_supp = client.get("/supplier-invoices", headers=headers)
+    assert r_supp.status_code == 200
+    ok("GET /supplier-invoices remains accessible when invoice.sales_invoices is blocked")
+
+    # Remove sales invoice block, block supplier invoices
+    client.delete(f"/superadmin/organizations/{org_id}/overrides/features/invoice.sales_invoices", headers=sa_headers)
+    client.post(
+        f"/superadmin/organizations/{org_id}/overrides/features",
+        headers=sa_headers,
+        json={"entitlement_key": "invoice.supplier_invoices", "effect": "BLOCK"},
+    )
+
+    r_supp = client.get("/supplier-invoices", headers=headers)
+    assert r_supp.status_code == 403 and r_supp.json().get("detail", {}).get("feature") == "invoice.supplier_invoices"
+    ok("GET /supplier-invoices blocked by invoice.supplier_invoices")
+
+    r_sales = client.get("/invoices", headers=headers)
+    assert r_sales.status_code == 200
+    ok("GET /invoices remains accessible when invoice.supplier_invoices is blocked")
+
+    client.delete(f"/superadmin/organizations/{org_id}/overrides/features/invoice.supplier_invoices", headers=sa_headers)
+
+
+def test_delivery_and_whatsapp_separation():
+    print("\n--- Test Delivery and WhatsApp Separation ---")
+    org = _create_test_org("Enterprise")
+    headers = org["auth"]
+    org_id = org["org_id"]
+    sa_headers = _super_admin_auth()
+
+    # Block sales.deliveries
+    client.post(
+        f"/superadmin/organizations/{org_id}/overrides/features",
+        headers=sa_headers,
+        json={"entitlement_key": "sales.deliveries", "effect": "BLOCK"},
+    )
+    r = client.get("/deliveries", headers=headers)
+    assert r.status_code == 403 and r.json().get("detail", {}).get("feature") == "sales.deliveries"
+    ok("GET /deliveries blocked by sales.deliveries")
+
+    r_cp = client.post("/customer-payments/collections", headers=headers, json={"customer_id": "dummy", "amount": 100})
+    assert r_cp.status_code == 403 and r_cp.json().get("detail", {}).get("feature") == "sales.deliveries"
+    ok("POST /customer-payments/collections blocked by sales.deliveries")
+
+    client.delete(f"/superadmin/organizations/{org_id}/overrides/features/sales.deliveries", headers=sa_headers)
+
+    # Basic plan has notifications.whatsapp_delivery == False, verify delivery still works
+    basic_org = _create_test_org("Basic")
+    r_basic_del = client.get("/deliveries", headers=basic_org["auth"])
+    assert r_basic_del.status_code == 200
+    ok("GET /deliveries works on Basic plan even though WhatsApp delivery is disabled")
+
+
+def test_monthly_order_limits_and_conversion_bypass():
+    print("\n--- Test Monthly Order Limits and Alternate Paths ---")
+    org = _create_test_org("Basic")
+    headers = org["auth"]
+    org_id = org["org_id"]
+    sa_headers = _super_admin_auth()
+
+    # 1. Create a customer, warehouse, product for order creation
+    r_cust = client.post("/customers", headers=headers, json={"name": "Order Test Cust"})
+    assert r_cust.status_code == 201
+    cust_id = r_cust.json()["id"]
+
+    r_wh = client.get("/warehouses", headers=headers)
+    wh_id = r_wh.json()[0]["id"]
+
+    r_prod = client.post("/products", headers=headers, json={"name": "Order Test Prod", "price": 100.0})
+    assert r_prod.status_code == 201
+    prod_id = r_prod.json()["id"]
+
+    # Super Admin sets max_orders = 1 for this org
+    r_ov = client.post(
+        f"/superadmin/organizations/{org_id}/overrides/limits",
+        headers=sa_headers,
+        json={"limit_key": "max_orders", "value": 1, "reason": "Test monthly limit"},
+    )
+    assert r_ov.status_code == 200
+
+    # First order succeeds
+    order_payload = {
+        "customer_id": cust_id,
+        "warehouse_id": wh_id,
+        "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 100.0}],
+    }
+    r_ord1 = client.post("/orders", headers=headers, json=order_payload)
+    assert r_ord1.status_code == 201, r_ord1.text
+    ok("First order created successfully within max_orders=1 limit")
+
+    # Second order is blocked by monthly max_orders limit
+    r_ord2 = client.post("/orders", headers=headers, json=order_payload)
+    if r_ord2.status_code == 403 and r_ord2.json().get("detail", {}).get("code") == "PLAN_LIMIT_REACHED":
+        assert r_ord2.json().get("detail", {}).get("limit_key") == "max_orders"
+        ok("Second order blocked by max_orders limit with PLAN_LIMIT_REACHED")
+    else:
+        fail("Second order was not blocked by max_orders limit", f"{r_ord2.status_code} {r_ord2.text}")
+
+    # Quotation conversion bypass attempt:
+    # First allow crm.quotations temporarily so we can create a quote
+    client.post(
+        f"/superadmin/organizations/{org_id}/overrides/features",
+        headers=sa_headers,
+        json={"entitlement_key": "crm.quotations", "effect": "ALLOW"},
+    )
+    r_q = client.post(
+        "/quotations",
+        headers=headers,
+        json={
+            "customer_id": cust_id,
+            "items": [{"product_id": prod_id, "quantity": 1, "unit_price": 100.0}],
+        },
+    )
+    assert r_q.status_code == 201, r_q.text
+    quote_id = r_q.json()["id"]
+
+    # Transition quotation: draft -> sent -> accepted
+    r_s = client.patch(f"/quotations/{quote_id}", headers=headers, json={"status": "sent"})
+    assert r_s.status_code == 200, r_s.text
+    r_a = client.patch(f"/quotations/{quote_id}", headers=headers, json={"status": "accepted"})
+    assert r_a.status_code == 200, r_a.text
+
+    # Convert quote to order -> must also be blocked by max_orders limit!
+    r_conv = client.post(
+        f"/quotations/{quote_id}/convert-to-order",
+        headers=headers,
+        json={"warehouse_id": wh_id},
+    )
+    if r_conv.status_code == 403 and r_conv.json().get("detail", {}).get("code") == "PLAN_LIMIT_REACHED":
+        assert r_conv.json().get("detail", {}).get("limit_key") == "max_orders"
+        ok("Quotation conversion to order blocked by max_orders limit with PLAN_LIMIT_REACHED")
+    else:
+        fail("Quotation conversion bypassed max_orders limit", f"{r_conv.status_code} {r_conv.text}")
+
+    # Override limit to 10
+    client.post(
+        f"/superadmin/organizations/{org_id}/overrides/limits",
+        headers=sa_headers,
+        json={"limit_key": "max_orders", "value": 10, "reason": "Increased limit"},
+    )
+
+    # Now quotation conversion succeeds!
+    r_conv2 = client.post(
+        f"/quotations/{quote_id}/convert-to-order",
+        headers=headers,
+        json={"warehouse_id": wh_id},
+    )
+    assert r_conv2.status_code == 201, r_conv2.text
+    ok("Quotation conversion succeeded after max_orders limit increased to 10")
+
+
+def test_rbac_and_entitlement_dual_guards():
+    print("\n--- Test RBAC and Entitlement Dual Guards ---")
+    org = _create_test_org("Enterprise")
+    admin_headers = org["auth"]
+
+    # 1. Create a custom role with no customers permissions
+    r_role = client.post(
+        "/roles",
+        headers=admin_headers,
+        json={
+            "name": f"Restricted_{uuid.uuid4().hex[:4]}",
+            "description": "No customer access",
+            "data_scope": "all",
+            "permissions": {
+                "customers": {"view": False, "create": False, "edit": False, "delete": False},
+            },
+        },
+    )
+    assert r_role.status_code == 201, r_role.text
+    role_id = r_role.json()["id"]
+
+    # 2. Create a staff user with this role
+    staff_email = f"staff_{uuid.uuid4().hex[:6]}@test.com"
+    r_staff = client.post(
+        "/users",
+        headers=admin_headers,
+        json={
+            "contact_information": {"official_email": staff_email},
+            "login_security": {"password": "Password123!"},
+            "role_id": role_id,
+        },
+    )
+    assert r_staff.status_code == 201, r_staff.text
+
+    # Login as staff
+    r_log = client.post("/auth/login", json={"email": staff_email, "password": "Password123!"})
+    assert r_log.status_code == 200, r_log.text
+    staff_token = r_log.json()["tokens"]["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+
+    # Enterprise plan allows crm.customers, but staff lacks RBAC permission -> denied 403 (Permission denied)
+    r_c = client.get("/customers", headers=staff_headers)
+    assert r_c.status_code == 403
+    assert "PLAN_FEATURE_NOT_AVAILABLE" not in str(r_c.json())
+    ok("Plan allows crm.customers but staff RBAC denies it -> 403 RBAC permission denied")
+
+    # Admin (has full RBAC) on Basic plan calls /leads (entitlement denied) -> 403 PLAN_FEATURE_NOT_AVAILABLE
+    basic_org = _create_test_org("Basic")
+    r_lead = client.get("/leads", headers=basic_org["auth"])
+    assert r_lead.status_code == 403
+    assert r_lead.json().get("detail", {}).get("code") == "PLAN_FEATURE_NOT_AVAILABLE"
+    ok("Admin has RBAC but plan denies crm.leads -> 403 PLAN_FEATURE_NOT_AVAILABLE")
+
+
 def main():
     test_basic_plan_feature_denials()
     test_pro_plan_access()
@@ -761,6 +1036,11 @@ def main():
     test_warehouse_limits_and_overrides()
     test_organization_entitlements_endpoint()
     test_superadmin_plan_management_and_validation()
+    test_hardened_core_routers_entitlement_guards()
+    test_invoice_segregation_and_entitlements()
+    test_delivery_and_whatsapp_separation()
+    test_monthly_order_limits_and_conversion_bypass()
+    test_rbac_and_entitlement_dual_guards()
 
     print("\n" + "=" * 50)
     print(f"Results: {_passed} passed, {_failed} failed")

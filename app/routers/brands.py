@@ -3,7 +3,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Brand, User
 from app.models.catalog_hierarchy import BrandCategory
 from app.schemas.brand import (
@@ -16,7 +16,11 @@ from app.schemas.brand import (
 from app.schemas.catalog_hierarchy import BrandCategoryLinkCreate, BrandCategoryOut
 from app.services import catalog_hierarchy_service
 
-router = APIRouter(prefix="/brands", tags=["brands"])
+router = APIRouter(
+    prefix="/brands",
+    tags=["brands"],
+    dependencies=[Depends(require_entitlement("erp.brands"))],
+)
 
 # Brands are part of product management — gated by the `products` module, same as categories.
 _view = require_permission("products", "view")

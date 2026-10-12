@@ -3,7 +3,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Category, User
 from app.schemas.category import (
     BulkDelete,
@@ -13,7 +13,11 @@ from app.schemas.category import (
     CategoryUpdate,
 )
 
-router = APIRouter(prefix="/categories", tags=["categories"])
+router = APIRouter(
+    prefix="/categories",
+    tags=["categories"],
+    dependencies=[Depends(require_entitlement("erp.categories"))],
+)
 
 # Categories are part of product management — gated by the `products` module.
 _view = require_permission("products", "view")

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core import workflow
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import decode_data_url, get_bytes
 from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf
 from app.models import (
@@ -41,10 +41,18 @@ from app.schemas.payment_gateway import (
     InvoicePaymentLinkOut,
 )
 
-router = APIRouter(prefix="/invoices", tags=["invoices"])
+router = APIRouter(
+    prefix="/invoices",
+    tags=["invoices"],
+    dependencies=[Depends(require_entitlement("invoice.sales_invoices"))],
+)
 # "Invoice this order" reads better hanging off the order it belongs to, so the
 # same handler is served at POST /orders/{order_id}/invoice as well.
-orders_router = APIRouter(prefix="/orders", tags=["invoices"])
+orders_router = APIRouter(
+    prefix="/orders",
+    tags=["invoices"],
+    dependencies=[Depends(require_entitlement("invoice.sales_invoices"))],
+)
 
 _view = require_permission("invoices", "view")
 _create = require_permission("invoices", "create")

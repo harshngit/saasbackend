@@ -5,7 +5,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import (
     PurchaseInvoice,
     Supplier,
@@ -25,7 +25,11 @@ from app.schemas.supplier_invoice import (
 )
 from app.services import lookup_service, purchase_service, supplier_invoice_service
 
-router = APIRouter(prefix="/supplier-invoices", tags=["supplier-invoices"])
+router = APIRouter(
+    prefix="/supplier-invoices",
+    tags=["supplier-invoices"],
+    dependencies=[Depends(require_entitlement("invoice.supplier_invoices"))],
+)
 
 _view = require_permission("supplier_invoices", "view")
 _create = require_permission("supplier_invoices", "create")

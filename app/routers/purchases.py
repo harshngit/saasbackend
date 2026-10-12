@@ -4,7 +4,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.deps import require_permission, require_unlocked_org
+from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import save_upload
 from app.core.excel_import import ImportSummaryOut
 from app.services.purchase_import_service import get_purchase_template, import_purchases_from_file
@@ -34,7 +34,11 @@ from app.schemas.purchase import (
     PurchaseUpdate,
 )
 
-router = APIRouter(prefix="", tags=["purchases"])
+router = APIRouter(
+    prefix="",
+    tags=["purchases"],
+    dependencies=[Depends(require_entitlement("erp.purchases"))],
+)
 
 _view = require_permission("purchases", "view")
 _create = require_permission("purchases", "create")
