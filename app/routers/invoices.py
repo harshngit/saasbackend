@@ -428,6 +428,8 @@ def create_direct_invoice(
         additional_charges=payload.additional_charges,
         round_off=payload.round_off,
         notes=payload.notes,
+        eway_bill_number=payload.eway_bill_number,
+        vehicle_number=payload.vehicle_number,
         created_by=user.id,
     )
 

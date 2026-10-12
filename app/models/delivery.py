@@ -103,6 +103,7 @@ class Delivery(Base):
         return round(sum(i.delivered_quantity or 0 for i in self.items), 3)
     customer: Mapped["Customer | None"] = relationship(lazy="selectin", primaryjoin="Delivery.customer_id == Customer.id")  # noqa: F821
     sales_order: Mapped["SalesOrder | None"] = relationship(lazy="selectin", primaryjoin="Delivery.sales_order_id == SalesOrder.id")  # noqa: F821
+    vehicle: Mapped["Vehicle | None"] = relationship(lazy="selectin", primaryjoin="Delivery.vehicle_id == Vehicle.id")  # noqa: F821
 
 
 class DeliveryItem(Base):

@@ -608,6 +608,7 @@ def create_order(
         payment_terms=payload.payment_terms,
         delivery_terms=payload.delivery_terms,
         currency=payload.currency or "INR",
+        customer_po_number=payload.customer_po_number,
     )
 
     if not is_automated_flow:

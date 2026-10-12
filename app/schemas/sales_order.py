@@ -207,6 +207,7 @@ class OrderOut(BaseModel):
     delivery_number: str | None = None
     invoice_id: str | None = None
     invoice_number: str | None = None
+    customer_po_number: str | None = None
 
     # Proof Screenshots
     delivery_proof_url: str | None = Field(
@@ -263,6 +264,7 @@ class OrderCreate(BaseModel):
     source: str = Field(default="direct", description="direct | quotation | office | delivery_vehicle")
     discount: float = Field(default=0, ge=0)  # order-level
     tax: float = Field(default=0, ge=0)
+    customer_po_number: str | None = Field(default=None, max_length=60, description="Customer Purchase Order reference")
     notes: str | None = None
     items: list[OrderItemIn] = Field(min_length=1)
 

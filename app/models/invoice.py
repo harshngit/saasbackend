@@ -82,11 +82,15 @@ class Invoice(Base):
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
     )
 
+    eway_bill_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    vehicle_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
     items: Mapped[list["InvoiceItem"]] = relationship(
         back_populates="invoice", cascade="all, delete-orphan", lazy="joined"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined")  # noqa: F821
     order: Mapped["SalesOrder | None"] = relationship(lazy="joined")  # noqa: F821
+    delivery: Mapped["Delivery | None"] = relationship(lazy="joined")  # noqa: F821
 
 
 class InvoiceItem(Base):

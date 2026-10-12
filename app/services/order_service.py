@@ -116,6 +116,7 @@ def place_order(
     payment_terms: str | None = None,
     delivery_terms: str | None = None,
     currency: str | None = "INR",
+    customer_po_number: str | None = None,
 ) -> tuple[SalesOrder, list[str]]:
     """Validate, price, reserve and place. Returns the order and any warnings.
 
@@ -181,6 +182,7 @@ def place_order(
         fulfilment_status="not_started",
         warehouse_id=warehouse.id,
         quotation_id=quotation_id,
+        customer_po_number=customer_po_number,
         delivery_date=delivery_date,
         fulfilment_method=fulfilment_method,
         payment_type=payment_type,

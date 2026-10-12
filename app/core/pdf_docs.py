@@ -674,7 +674,8 @@ def _two_column_rows(
     """Who it is for on the left, the invoice's own details on the right."""
     style = style or _TEMPLATE_STYLES["classic"]
     _font(pdf, settings, "", "body")
-    height = max(style["row_height"] - 1, 4)
+    body_sz = float(((settings or {}).get("typography") or {}).get("body_size", 9))
+    height = max(style["row_height"] - 1, body_sz * 0.45, 4.0)
     if column < 60:
         for left, right in rows:
             for text in (left, right):
@@ -876,6 +877,18 @@ def invoice_simple_pdf(
         right_rows.append(f"Order Ref: {invoice.order.order_number}" if invoice.order else "Direct Sale")
     if inv_cfg.get("show_due_date", True) and invoice.due_date:
         right_rows.append(f"Due Date: {invoice.due_date.date().isoformat()}")
+    if inv_cfg.get("show_po_number", fields.get("show_po_number", False)) and getattr(invoice, "order", None) and getattr(invoice.order, "customer_po_number", None):
+        right_rows.append(f"PO No: {invoice.order.customer_po_number}")
+    if inv_cfg.get("show_eway_bill_number", fields.get("show_eway_bill_number", False)) and getattr(invoice, "eway_bill_number", None):
+        right_rows.append(f"E-Way Bill: {invoice.eway_bill_number}")
+    if inv_cfg.get("show_vehicle_number", fields.get("show_vehicle_number", False)):
+        veh_num = getattr(invoice, "vehicle_number", None)
+        if not veh_num and getattr(invoice, "delivery", None) and getattr(invoice.delivery, "vehicle_id", None):
+            delivery_veh = getattr(invoice.delivery, "vehicle", None)
+            if delivery_veh and getattr(delivery_veh, "vehicle_number", None):
+                veh_num = delivery_veh.vehicle_number
+        if veh_num:
+            right_rows.append(f"Vehicle: {veh_num}")
 
     max_len = max(len(left_rows), len(right_rows))
     left_rows += [""] * (max_len - len(left_rows))
@@ -887,7 +900,8 @@ def invoice_simple_pdf(
 
     shares = [0.52, 0.12, 0.16, 0.20]
     widths = [round(width * share, 2) for share in shares]
-    row_h = style.get("row_height", 6)
+    tbl_font_sz = float(((settings or {}).get("typography") or {}).get("table_size", 8))
+    row_h = max(style.get("row_height", 6), tbl_font_sz * 0.55 + 1.5, 4.0)
     table_border = style.get("border", 1)
     _font(pdf, settings, "B", "table")
     for w, header, align in zip(widths, ["Item", "Qty", "Rate", "Amount"], "LRRR"):
@@ -917,9 +931,8 @@ def invoice_simple_pdf(
     _font(pdf, settings, "B", "body", offset=2)
     _amount_row(pdf, "Total", invoice.total, width, height=7, brand_rgb=brand_rgb, settings=settings)
 
-    # The short copy never carries bank details; everything else is the firm's choice.
     _invoice_footer(
-        pdf, org, settings, {**fields, "show_bank_details": False},
+        pdf, org, settings, fields,
         signature=signature, qr=qr, stamp=stamp,
     )
 
@@ -997,12 +1010,18 @@ def invoice_detailed_pdf(
         right.append(f"Order Ref: {invoice.order.order_number}" if invoice.order else "Direct Sale")
     if inv_cfg.get("show_due_date", True):
         right.append(f"Due Date: {invoice.due_date.date().isoformat() if invoice.due_date else '-'}")
-    if inv_cfg.get("show_po_number", False) and getattr(invoice, "order", None) and getattr(invoice.order, "customer_po_number", None):
+    if inv_cfg.get("show_po_number", fields.get("show_po_number", False)) and getattr(invoice, "order", None) and getattr(invoice.order, "customer_po_number", None):
         right.append(f"PO No: {invoice.order.customer_po_number}")
-    if inv_cfg.get("show_eway_bill_number", False) and getattr(invoice, "eway_bill_number", None):
+    if inv_cfg.get("show_eway_bill_number", fields.get("show_eway_bill_number", False)) and getattr(invoice, "eway_bill_number", None):
         right.append(f"E-Way Bill: {invoice.eway_bill_number}")
-    if inv_cfg.get("show_vehicle_number", False) and getattr(invoice, "vehicle_number", None):
-        right.append(f"Vehicle: {invoice.vehicle_number}")
+    if inv_cfg.get("show_vehicle_number", fields.get("show_vehicle_number", False)):
+        veh_num = getattr(invoice, "vehicle_number", None)
+        if not veh_num and getattr(invoice, "delivery", None) and getattr(invoice.delivery, "vehicle_id", None):
+            delivery_veh = getattr(invoice.delivery, "vehicle", None)
+            if delivery_veh and getattr(delivery_veh, "vehicle_number", None):
+                veh_num = delivery_veh.vehicle_number
+        if veh_num:
+            right.append(f"Vehicle: {veh_num}")
 
     pad = [""] * abs(len(left) - len(right))
     rows = list(zip(left + pad if len(left) < len(right) else left,
@@ -1048,12 +1067,14 @@ def invoice_detailed_pdf(
         col_widths[0] += round(diff, 2)
 
     has_img_col = ("product_image" in active_cols) and show_images
-    row_height = max(style["row_height"], 12) if has_img_col else style["row_height"]
+    tbl_font_sz = float(((settings or {}).get("typography") or {}).get("table_size", 8))
+    base_h = max(style["row_height"], tbl_font_sz * 0.55 + 1.5, 4.0)
+    row_height = max(base_h, 12) if has_img_col else base_h
 
     _font(pdf, settings, "B", "table")
     for w, c in zip(col_widths, active_cols):
-        pdf.cell(w, style["row_height"] + 1, COLUMN_HEADERS[c], border=style["border"], align=COLUMN_ALIGNS[c])
-    pdf.ln(style["row_height"] + 1)
+        pdf.cell(w, row_height + 1, COLUMN_HEADERS[c], border=style["border"], align=COLUMN_ALIGNS[c])
+    pdf.ln(row_height + 1)
 
     _font(pdf, settings, "", "table")
     for item in invoice.items:

@@ -74,6 +74,7 @@ class SalesOrder(Base):
     quotation_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("quotations.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    customer_po_number: Mapped[str | None] = mapped_column(String(60), nullable=True)
     # "office" (warehouse stock) or "delivery_vehicle" (field sale — vehicle stock, module pending)
     source: Mapped[str] = mapped_column(String(30), default="office", nullable=False)
 

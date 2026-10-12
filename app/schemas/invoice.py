@@ -124,6 +124,8 @@ class InvoiceOut(BaseModel):
     invoice_status: str | None = None
     payment_status: str | None = None
     billing_address: str | None = None
+    eway_bill_number: str | None = None
+    vehicle_number: str | None = None
 
     # Razorpay Part B — Invoice Payment Link summary
     has_active_payment_link: bool | None = None
@@ -185,6 +187,8 @@ class InvoiceCreate(BaseModel):
     invoice_status: str | None = Field(default=None, max_length=30, description="Draft, Issued, Paid, …")
     payment_status: InvoicePaymentStatus | None = Field(default=None, description="Unpaid | Partial | Paid | Refunded")
     billing_address: str | None = Field(default=None, description="Defaults to the customer's billing address")
+    eway_bill_number: str | None = Field(default=None, max_length=50, description="GST E-Way Bill Number")
+    vehicle_number: str | None = Field(default=None, max_length=50, description="Transport Vehicle Number")
 
 
 class CreditNoteItem(BaseModel):
