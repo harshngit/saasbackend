@@ -85,9 +85,12 @@ from app.models.purchase_return import (
 from app.models.transfer import WarehouseTransfer, WarehouseTransferItem
 from app.models.visit import Visit
 from app.models.follow_up import FollowUp
+from app.models.cash_reconciliation import CashReconciliation, CashReconciliationDetail
 from app.models.leave import LEAVE_STATUSES, LEAVE_TYPES, Leave
 
 __all__ = [
+    "CashReconciliation",
+    "CashReconciliationDetail",
     "PurchaseReturn",
     "PurchaseReturnItem",
     "PURCHASE_RETURN_STATUSES",
