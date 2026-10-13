@@ -14,6 +14,7 @@ Complete reporting suite providing 15 report types with:
 from collections import defaultdict
 from datetime import date, datetime, time, timezone
 import math
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -71,6 +72,8 @@ REPORT_TYPES = {
     "stock-movement",
     "sales-overview",
     "cash-flow-sheet",
+    "statement-of-pl",
+    "notes-to-pl",
 }
 
 # --------------------------------- Registry ---------------------------------
@@ -230,6 +233,20 @@ REPORT_REGISTRY: dict[str, dict[str, Any]] = {
         "allowed_group_by": [],
         "currency": "INR",
     },
+    "statement-of-pl": {
+        "title": "Statement of Profit & Loss (Detailed)",
+        "description": "Transaction-level ledger of realized revenues, sales returns, cost of goods sold, and operating expenses contributing to net profit.",
+        "supported_filters": ["date_from", "date_to", "search", "section", "page", "page_size"],
+        "allowed_group_by": [],
+        "currency": "INR",
+    },
+    "notes-to-pl": {
+        "title": "Notes to Profit & Loss",
+        "description": "Detailed schedules and breakdowns for revenue, sales returns, COGS, and operating expenses reconciling to P&L statement lines.",
+        "supported_filters": ["date_from", "date_to", "search", "line_item", "page", "page_size"],
+        "allowed_group_by": [],
+        "currency": "INR",
+    },
 }
 
 # --------------------------------- Timezone / Helpers ---------------------------------
@@ -376,6 +393,7 @@ def _daily_transaction(db: Session, org_id: str, df: datetime | None, dt: dateti
     for inv in invoices:
         party_name = inv.customer.name if inv.customer else (inv.walk_in_name or "Walk-in")
         all_rows.append({
+            "source_id": inv.id,
             "date": inv.invoice_date.date().isoformat() if hasattr(inv.invoice_date, "date") else str(inv.invoice_date)[:10],
             "type": "Sale Invoice",
             "reference": inv.invoice_number,
@@ -389,6 +407,7 @@ def _daily_transaction(db: Session, org_id: str, df: datetime | None, dt: dateti
     for p in purchases:
         supplier_name = p.supplier.name if p.supplier else "Unknown Supplier"
         all_rows.append({
+            "source_id": p.id,
             "date": p.supplier_invoice_date.date().isoformat() if hasattr(p.supplier_invoice_date, "date") else str(p.supplier_invoice_date)[:10],
             "type": "Purchase Invoice",
             "reference": p.supplier_invoice_number,
@@ -403,6 +422,7 @@ def _daily_transaction(db: Session, org_id: str, df: datetime | None, dt: dateti
         cust = db.get(Customer, cp.customer_id) if cp.customer_id else None
         party_name = (cust.business_name or cust.name) if cust else "Unknown Customer"
         all_rows.append({
+            "source_id": cp.id,
             "date": cp.received_on.date().isoformat() if hasattr(cp.received_on, "date") else str(cp.received_on)[:10],
             "type": "Customer Payment",
             "reference": cp.reference or cp.receipt_number or cp.id[:8],
@@ -416,6 +436,7 @@ def _daily_transaction(db: Session, org_id: str, df: datetime | None, dt: dateti
     for sp in supplier_payments:
         supplier_name = sp.supplier.name if sp.supplier else "Unknown Supplier"
         all_rows.append({
+            "source_id": sp.id,
             "date": sp.paid_on.date().isoformat() if hasattr(sp.paid_on, "date") else str(sp.paid_on)[:10],
             "type": "Supplier Payment",
             "reference": sp.payment_number or sp.reference or sp.id[:8],
@@ -429,6 +450,7 @@ def _daily_transaction(db: Session, org_id: str, df: datetime | None, dt: dateti
     for exp in expenses:
         is_paid = _is_paid_expense(exp)
         all_rows.append({
+            "source_id": exp.id,
             "date": exp.expense_date.date().isoformat() if hasattr(exp.expense_date, "date") else str(exp.expense_date)[:10],
             "type": "Expense",
             "reference": exp.category,
@@ -687,6 +709,7 @@ def _sales(db: Session, org_id: str, df: datetime | None, dt: datetime | None, p
     else:  # transaction
         rows = [
             {
+                "invoice_id": i.id,
                 "invoice_number": i.invoice_number,
                 "invoice_date": i.invoice_date.date().isoformat() if hasattr(i.invoice_date, "date") else str(i.invoice_date)[:10],
                 "customer": (i.customer.business_name or i.customer.name) if i.customer else (i.walk_in_name or "Walk-in"),
@@ -849,6 +872,7 @@ def _purchase(db: Session, org_id: str, df: datetime | None, dt: datetime | None
     else:  # transaction
         rows = [
             {
+                "invoice_id": i.id,
                 "invoice_number": i.supplier_invoice_number,
                 "date": i.supplier_invoice_date.date().isoformat() if hasattr(i.supplier_invoice_date, "date") else str(i.supplier_invoice_date)[:10],
                 "supplier": i.supplier.name if i.supplier else None,
@@ -979,6 +1003,7 @@ def _customer_outstanding(db: Session, org_id: str, df: datetime | None, dt: dat
 
         cust = inv.customer
         rows.append({
+            "invoice_id": inv.id,
             "customer_id": inv.customer_id,
             "customer": (cust.business_name or cust.name) if cust else (inv.walk_in_name or "Walk-in"),
             "phone": cust.phone if cust else inv.walk_in_phone,
@@ -1096,6 +1121,8 @@ def _supplier_outstanding(db: Session, org_id: str, df: datetime | None, dt: dat
             continue
 
         rows.append({
+            "purchase_id": inv.id,
+            "supplier_id": inv.supplier_id,
             "supplier_code": inv.supplier.supplier_code if inv.supplier else None,
             "supplier": ap_item.supplier_name,
             "invoice_number": ap_item.supplier_invoice_number,
@@ -1214,6 +1241,7 @@ def _payment_collection(db: Session, org_id: str, df: datetime | None, dt: datet
     cust_names = {c.id: (c.business_name or c.name) for c in db.query(Customer).filter(Customer.organization_id == org_id).all()}
     rows = [
         {
+            "payment_id": p.id,
             "reference": p.receipt_number or p.reference or p.id[:8],
             "date": p.received_on.date().isoformat() if hasattr(p.received_on, "date") else str(p.received_on)[:10],
             "customer": cust_names.get(p.customer_id) if p.customer_id else None,
@@ -1318,6 +1346,7 @@ def _expense(db: Session, org_id: str, df: datetime | None, dt: datetime | None,
 
     rows = [
         {
+            "expense_id": e.id,
             "expense_reference": e.category or e.id[:8],
             "date": e.expense_date.date().isoformat() if hasattr(e.expense_date, "date") else str(e.expense_date)[:10],
             "category": e.category,
@@ -1399,6 +1428,7 @@ def _cash_collection(db: Session, org_id: str, df: datetime | None, dt: datetime
         c_name = cust_names.get(p.customer_id) if p.customer_id else None
         if p.payment_mode == "cash":
             rows.append({
+                "payment_id": p.id,
                 "date": p.received_on.date().isoformat() if hasattr(p.received_on, "date") else str(p.received_on)[:10],
                 "receipt_reference": p.receipt_number or p.reference or p.id[:8],
                 "customer": c_name,
@@ -1411,6 +1441,7 @@ def _cash_collection(db: Session, org_id: str, df: datetime | None, dt: datetime
             for s in p.splits:
                 if s.payment_mode == "cash" and s.amount > 0:
                     rows.append({
+                        "payment_id": p.id,
                         "date": p.received_on.date().isoformat() if hasattr(p.received_on, "date") else str(p.received_on)[:10],
                         "receipt_reference": p.receipt_number or p.reference or p.id[:8],
                         "customer": c_name,
@@ -2017,6 +2048,7 @@ def _sales_return(db: Session, org_id: str, df: datetime | None, dt: datetime | 
 
     rows = [
         {
+            "return_id": r.id,
             "return_number": r.return_number,
             "date": r.return_date.date().isoformat() if hasattr(r.return_date, "date") else str(r.return_date)[:10],
             "customer": (r.customer.business_name or r.customer.name) if r.customer else None,
@@ -2110,6 +2142,7 @@ def _purchase_return(db: Session, org_id: str, df: datetime | None, dt: datetime
 
     rows = [
         {
+            "return_id": r.id,
             "return_number": r.return_number,
             "date": r.return_date.date().isoformat() if hasattr(r.return_date, "date") else str(r.return_date)[:10],
             "supplier": r.supplier.name if r.supplier else None,
@@ -2324,6 +2357,7 @@ def _supplier_payment(db: Session, org_id: str, df: datetime | None, dt: datetim
 
     rows = [
         {
+            "payment_id": p.id,
             "payment_number": p.payment_number or p.id[:8],
             "date": p.paid_on.date().isoformat() if hasattr(p.paid_on, "date") else str(p.paid_on)[:10],
             "supplier": p.supplier.name if p.supplier else None,
@@ -2583,6 +2617,7 @@ def _stock_movement(db: Session, org_id: str, df: datetime | None, dt: datetime 
 
     rows = [
         {
+            "movement_id": m.id,
             "date_time": m.created_at.isoformat(),
             "warehouse": m.warehouse.name if m.warehouse else None,
             "product": m.product.name if m.product else "Unknown Product",
@@ -2902,6 +2937,7 @@ def _cash_flow_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime
         d_val = cp.received_on
         d_str = d_val.date().isoformat() if hasattr(d_val, "date") else str(d_val)[:10]
         all_rows.append({
+            "source_id": cp.id,
             "timestamp": d_val,
             "date": d_str,
             "transaction_type": "Customer Payment",
@@ -2919,6 +2955,7 @@ def _cash_flow_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime
         d_val = sp.paid_on
         d_str = d_val.date().isoformat() if hasattr(d_val, "date") else str(d_val)[:10]
         all_rows.append({
+            "source_id": sp.id,
             "timestamp": d_val,
             "date": d_str,
             "transaction_type": "Supplier Payment",
@@ -2935,6 +2972,7 @@ def _cash_flow_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime
         d_val = exp.expense_date
         d_str = d_val.date().isoformat() if hasattr(d_val, "date") else str(d_val)[:10]
         all_rows.append({
+            "source_id": exp.id,
             "timestamp": d_val,
             "date": d_str,
             "transaction_type": "Paid Expense",
@@ -3037,6 +3075,525 @@ def _cash_flow_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime
     }
 
 
+def _statement_of_pl(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    search = params.get("search")
+    section = params.get("section")
+    if section:
+        section = section.strip().lower()
+        if section not in ("revenue", "sales_returns", "cogs", "operating_expenses"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="section must be one of: 'revenue', 'sales_returns', 'cogs', 'operating_expenses'",
+            )
+
+    # 1. Gross Sales (Invoices)
+    inv_q = db.query(Invoice).filter(
+        Invoice.organization_id == org_id,
+        Invoice.is_credit_note.is_(False),
+        ~Invoice.status.in_(("void", "cancelled")),
+    )
+    inv_q = _between(inv_q, Invoice.invoice_date, df, dt)
+    invoices = inv_q.order_by(Invoice.invoice_date.asc(), Invoice.id.asc()).all()
+    gross_sales = round(sum(i.total for i in invoices), 2)
+
+    # 2. Sales Returns
+    sr_q = db.query(SalesReturn).filter(
+        SalesReturn.organization_id == org_id,
+        SalesReturn.return_status.in_(("approved", "completed", "received")),
+    )
+    sr_q = _between(sr_q, SalesReturn.return_date, df, dt)
+    sales_returns = sr_q.order_by(SalesReturn.return_date.asc(), SalesReturn.id.asc()).all()
+    sales_returns_total = round(sum(r.credit_amount or 0.0 for r in sales_returns), 2)
+
+    net_sales = round(gross_sales - sales_returns_total, 2)
+
+    # 3. Cost of Goods Sold (COGS) strictly from sale-time cost snapshots
+    cogs = 0.0
+    missing_cogs_lines = 0
+    cogs_items = []
+    for i in invoices:
+        for item in i.items:
+            qty = float(item.quantity or 0)
+            cost = 0.0
+            has_snapshot = False
+            cost_price = None
+            if item.order_item_id:
+                so_item = db.get(SalesOrderItem, item.order_item_id)
+                if so_item and so_item.cost_price is not None and so_item.cost_price > 0:
+                    cost_price = float(so_item.cost_price)
+                    cost = round(cost_price * qty, 2)
+                    has_snapshot = True
+            if cost == 0.0 and qty > 0:
+                missing_cogs_lines += 1
+            cogs += cost
+            cogs_items.append((i, item, qty, cost_price, cost, has_snapshot))
+    cogs = round(cogs, 2)
+
+    gross_profit = round(net_sales - cogs, 2)
+
+    # 4. Operating Expenses (Approved only)
+    exp_q = db.query(Expense).filter(
+        Expense.organization_id == org_id,
+        Expense.status == "approved",
+    )
+    exp_q = _between(exp_q, Expense.expense_date, df, dt)
+    expenses = exp_q.order_by(Expense.expense_date.asc(), Expense.id.asc()).all()
+    operating_expenses = round(sum(e.amount for e in expenses), 2)
+
+    net_profit = round(gross_profit - operating_expenses, 2)
+
+    gross_margin_pct = round((gross_profit / net_sales * 100.0), 2) if net_sales > 0 else 0.0
+    net_margin_pct = round((net_profit / net_sales * 100.0), 2) if net_sales > 0 else 0.0
+
+    all_rows: list[dict[str, Any]] = []
+
+    # Section 1: Revenue
+    for i in invoices:
+        cust = (i.customer.business_name or i.customer.name) if i.customer else (i.walk_in_name or "Walk-in")
+        all_rows.append({
+            "section": "revenue",
+            "section_label": "Revenue from Operations",
+            "date": i.invoice_date.date().isoformat() if hasattr(i.invoice_date, "date") else str(i.invoice_date)[:10],
+            "reference": i.invoice_number,
+            "source_id": i.id,
+            "invoice_id": i.id,
+            "party": cust,
+            "description": f"Sales Invoice {i.invoice_number}",
+            "amount": round(i.total, 2),
+            "impact": round(i.total, 2),
+            "status": i.status,
+        })
+
+    # Section 2: Sales Returns
+    for r in sales_returns:
+        cust = (r.customer.business_name or r.customer.name) if r.customer else "Customer"
+        amt = round(r.credit_amount or 0.0, 2)
+        ref_text = f"Sales Return {r.return_number}" + (f" (Ref: {r.invoice.invoice_number})" if r.invoice else "")
+        all_rows.append({
+            "section": "sales_returns",
+            "section_label": "Less: Sales Returns & Allowances",
+            "date": r.return_date.date().isoformat() if hasattr(r.return_date, "date") else str(r.return_date)[:10],
+            "reference": r.return_number,
+            "source_id": r.id,
+            "return_id": r.id,
+            "party": cust,
+            "description": ref_text,
+            "amount": amt,
+            "impact": -amt,
+            "status": r.return_status,
+        })
+
+    # Section 3: COGS
+    for i, item, qty, cost_price, line_cogs, has_snapshot in cogs_items:
+        p_name = item.product_name or (item.product.name if item.product else "Unknown Product")
+        sku = item.product.sku if (item.product and item.product.sku) else None
+        p_label = f"{p_name} ({sku})" if sku else p_name
+        desc = f"{p_name} - Qty: {qty:.0f}" + (f" @ {cost_price:.2f}" if has_snapshot else " (No cost snapshot)")
+        all_rows.append({
+            "section": "cogs",
+            "section_label": "Cost of Goods Sold (COGS)",
+            "date": i.invoice_date.date().isoformat() if hasattr(i.invoice_date, "date") else str(i.invoice_date)[:10],
+            "reference": i.invoice_number,
+            "source_id": item.id,
+            "item_id": item.id,
+            "invoice_id": i.id,
+            "party": p_label,
+            "description": desc,
+            "amount": line_cogs,
+            "impact": -line_cogs,
+            "status": "costed" if has_snapshot else "unrecorded_cost",
+        })
+
+    # Section 4: Operating Expenses
+    for e in expenses:
+        vendor = _expense_vendor_name(e) or "Operating Payee"
+        amt = round(e.amount, 2)
+        all_rows.append({
+            "section": "operating_expenses",
+            "section_label": "Operating Expenses (Approved)",
+            "date": e.expense_date.date().isoformat() if hasattr(e.expense_date, "date") else str(e.expense_date)[:10],
+            "reference": e.category or e.id[:8],
+            "source_id": e.id,
+            "expense_id": e.id,
+            "party": vendor,
+            "description": e.description or f"Expense: {e.category}",
+            "amount": amt,
+            "impact": -amt,
+            "status": e.status,
+        })
+
+    if section:
+        all_rows = [r for r in all_rows if r["section"] == section]
+
+    if search:
+        s = search.lower()
+        all_rows = [
+            r for r in all_rows
+            if s in (r["reference"] or "").lower()
+            or s in (r["party"] or "").lower()
+            or s in (r["description"] or "").lower()
+            or s in (r["section"] or "").lower()
+            or s in (r["status"] or "").lower()
+        ]
+
+    summary = {
+        "gross_sales": gross_sales,
+        "sales_returns": sales_returns_total,
+        "net_sales": net_sales,
+        "cogs": cogs,
+        "cogs_basis": "historical_cost_snapshots",
+        "missing_cogs_lines": missing_cogs_lines,
+        "gross_profit": gross_profit,
+        "operating_expenses": operating_expenses,
+        "net_profit": net_profit,
+        "gross_margin_percent": gross_margin_pct,
+        "net_margin_percent": net_margin_pct,
+        "total_line_items": len(all_rows),
+    }
+
+    paged_rows, pagination = _paginate(all_rows, page, page_size)
+
+    meta = {
+        "currency": "INR",
+        "group_by": None,
+        "cogs_notes": (
+            f"COGS is calculated strictly from sale-time cost snapshots. {missing_cogs_lines} line(s) had no historical cost snapshot and were not assigned fabricated catalog pricing."
+            if missing_cogs_lines > 0
+            else "COGS is calculated strictly from historical sale-time cost snapshots."
+        ),
+        "columns": [
+            {"key": "date", "label": "Date", "type": "date"},
+            {"key": "section_label", "label": "Statement Section", "type": "text"},
+            {"key": "reference", "label": "Reference #", "type": "reference"},
+            {"key": "party", "label": "Party / Product / Payee", "type": "text"},
+            {"key": "description", "label": "Description", "type": "text"},
+            {"key": "amount", "label": "Gross Amount", "type": "currency"},
+            {"key": "impact", "label": "Profit Impact", "type": "currency"},
+            {"key": "status", "label": "Status", "type": "status"},
+        ],
+    }
+
+    chart = {
+        "type": "bar",
+        "title": "Profit & Loss Waterfall",
+        "data": [
+            {"metric": "Gross Sales", "amount": gross_sales},
+            {"metric": "Sales Returns", "amount": -sales_returns_total},
+            {"metric": "Net Sales", "amount": net_sales},
+            {"metric": "COGS", "amount": -cogs},
+            {"metric": "Gross Profit", "amount": gross_profit},
+            {"metric": "Operating Expenses", "amount": -operating_expenses},
+            {"metric": "Net Profit", "amount": net_profit},
+        ],
+    }
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+    }
+
+
+def _notes_to_pl(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    search = params.get("search")
+    raw_item = params.get("line_item")
+    if not raw_item:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="line_item is required. Supported values: 'revenue', 'sales_returns', 'cogs', 'operating_expenses'",
+        )
+
+    line_item = raw_item.strip().lower()
+    if line_item not in ("revenue", "sales_returns", "cogs", "operating_expenses"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported line_item '{raw_item}'. Supported values: 'revenue', 'sales_returns', 'cogs', 'operating_expenses'",
+        )
+
+    rows: list[dict[str, Any]] = []
+
+    if line_item == "revenue":
+        inv_q = db.query(Invoice).filter(
+            Invoice.organization_id == org_id,
+            Invoice.is_credit_note.is_(False),
+            ~Invoice.status.in_(("void", "cancelled")),
+        )
+        inv_q = _between(inv_q, Invoice.invoice_date, df, dt)
+        invoices = inv_q.order_by(Invoice.invoice_date.asc(), Invoice.id.asc()).all()
+        gross_sales = round(sum(i.total for i in invoices), 2)
+
+        cust_map: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "subtotal": 0.0, "tax": 0.0, "total": 0.0, "customer_id": None})
+        for i in invoices:
+            c_name = (i.customer.business_name or i.customer.name) if i.customer else (i.walk_in_name or "Walk-in")
+            c_id = i.customer_id
+            m = cust_map[c_name]
+            m["count"] += 1
+            m["subtotal"] = round(m["subtotal"] + (i.subtotal or 0.0), 2)
+            m["tax"] = round(m["tax"] + (i.tax or 0.0), 2)
+            m["total"] = round(m["total"] + (i.total or 0.0), 2)
+            if c_id:
+                m["customer_id"] = c_id
+
+        for c_name, data in sorted(cust_map.items(), key=lambda x: x[1]["total"], reverse=True):
+            pct = round((data["total"] / gross_sales * 100.0), 2) if gross_sales > 0 else 0.0
+            rows.append({
+                "party": c_name,
+                "party_id": data["customer_id"],
+                "invoice_count": data["count"],
+                "subtotal": data["subtotal"],
+                "tax": data["tax"],
+                "total_revenue": data["total"],
+                "percent_of_total": pct,
+            })
+
+        if search:
+            s = search.lower()
+            rows = [r for r in rows if s in r["party"].lower()]
+
+        summary = {
+            "schedule": "Note 1: Revenue from Operations Breakdown",
+            "gross_sales": gross_sales,
+            "invoice_count": len(invoices),
+            "customer_count": len(cust_map),
+        }
+        meta = {
+            "currency": "INR",
+            "title": "Notes to P&L - Revenue Schedule",
+            "line_item": "revenue",
+            "columns": [
+                {"key": "party", "label": "Customer / Channel", "type": "text"},
+                {"key": "invoice_count", "label": "Invoices", "type": "number"},
+                {"key": "subtotal", "label": "Subtotal", "type": "currency"},
+                {"key": "tax", "label": "Tax", "type": "currency"},
+                {"key": "total_revenue", "label": "Total Revenue", "type": "currency"},
+                {"key": "percent_of_total", "label": "% of Revenue", "type": "percent"},
+            ],
+        }
+        chart = {
+            "type": "pie",
+            "title": "Revenue by Customer",
+            "data": [{"party": r["party"], "amount": r["total_revenue"]} for r in rows[:10]],
+        }
+
+    elif line_item == "sales_returns":
+        sr_q = db.query(SalesReturn).filter(
+            SalesReturn.organization_id == org_id,
+            SalesReturn.return_status.in_(("approved", "completed", "received")),
+        )
+        sr_q = _between(sr_q, SalesReturn.return_date, df, dt)
+        sales_returns = sr_q.order_by(SalesReturn.return_date.desc(), SalesReturn.id.desc()).all()
+        sales_returns_total = round(sum(r.credit_amount or 0.0 for r in sales_returns), 2)
+
+        for r in sales_returns:
+            cust = (r.customer.business_name or r.customer.name) if r.customer else "Customer"
+            amt = round(r.credit_amount or 0.0, 2)
+            pct = round((amt / sales_returns_total * 100.0), 2) if sales_returns_total > 0 else 0.0
+            rows.append({
+                "return_id": r.id,
+                "return_number": r.return_number,
+                "date": r.return_date.date().isoformat() if hasattr(r.return_date, "date") else str(r.return_date)[:10],
+                "customer": cust,
+                "invoice_reference": r.invoice.invoice_number if r.invoice else None,
+                "credit_amount": amt,
+                "percent_of_returns": pct,
+                "status": r.return_status,
+            })
+
+        if search:
+            s = search.lower()
+            rows = [
+                r for r in rows
+                if s in r["return_number"].lower()
+                or s in r["customer"].lower()
+                or s in (r["invoice_reference"] or "").lower()
+            ]
+
+        summary = {
+            "schedule": "Note 2: Sales Returns & Allowances Schedule",
+            "sales_returns": sales_returns_total,
+            "return_count": len(sales_returns),
+        }
+        meta = {
+            "currency": "INR",
+            "title": "Notes to P&L - Sales Returns Schedule",
+            "line_item": "sales_returns",
+            "columns": [
+                {"key": "return_number", "label": "Return #", "type": "reference"},
+                {"key": "date", "label": "Return Date", "type": "date"},
+                {"key": "customer", "label": "Customer", "type": "text"},
+                {"key": "invoice_reference", "label": "Invoice Ref #", "type": "reference"},
+                {"key": "status", "label": "Status", "type": "status"},
+                {"key": "credit_amount", "label": "Credit Amount", "type": "currency"},
+                {"key": "percent_of_returns", "label": "% of Returns", "type": "percent"},
+            ],
+        }
+        chart = {
+            "type": "bar",
+            "title": "Top Sales Returns",
+            "data": [{"return_number": r["return_number"], "amount": r["credit_amount"]} for r in rows[:10]],
+        }
+
+    elif line_item == "cogs":
+        inv_q = db.query(Invoice).filter(
+            Invoice.organization_id == org_id,
+            Invoice.is_credit_note.is_(False),
+            ~Invoice.status.in_(("void", "cancelled")),
+        )
+        inv_q = _between(inv_q, Invoice.invoice_date, df, dt)
+        invoices = inv_q.all()
+
+        prod_map: dict[str, dict[str, Any]] = defaultdict(lambda: {"qty": 0.0, "cogs": 0.0, "snapshots": 0, "missing": 0, "sku": None, "product_id": None})
+        total_cogs = 0.0
+        missing_cogs_lines = 0
+
+        for i in invoices:
+            for item in i.items:
+                qty = float(item.quantity or 0)
+                cost = 0.0
+                has_snapshot = False
+                if item.order_item_id:
+                    so_item = db.get(SalesOrderItem, item.order_item_id)
+                    if so_item and so_item.cost_price is not None and so_item.cost_price > 0:
+                        cost = round(float(so_item.cost_price) * qty, 2)
+                        has_snapshot = True
+                if cost == 0.0 and qty > 0:
+                    missing_cogs_lines += 1
+
+                total_cogs += cost
+                p_name = item.product_name or (item.product.name if item.product else "Unknown Product")
+                m = prod_map[p_name]
+                m["qty"] += qty
+                m["cogs"] = round(m["cogs"] + cost, 2)
+                if has_snapshot:
+                    m["snapshots"] += 1
+                elif qty > 0:
+                    m["missing"] += 1
+                if item.product:
+                    m["sku"] = item.product.sku
+                    m["product_id"] = item.product_id
+
+        total_cogs = round(total_cogs, 2)
+
+        for p_name, data in sorted(prod_map.items(), key=lambda x: x[1]["cogs"], reverse=True):
+            pct = round((data["cogs"] / total_cogs * 100.0), 2) if total_cogs > 0 else 0.0
+            rows.append({
+                "product_name": p_name,
+                "sku": data["sku"],
+                "product_id": data["product_id"],
+                "quantity_sold": round(data["qty"], 2),
+                "total_cogs": data["cogs"],
+                "percent_of_cogs": pct,
+                "snapshot_count": data["snapshots"],
+                "missing_snapshot_count": data["missing"],
+            })
+
+        if search:
+            s = search.lower()
+            rows = [r for r in rows if s in r["product_name"].lower() or s in (r["sku"] or "").lower()]
+
+        summary = {
+            "schedule": "Note 3: Cost of Goods Sold (COGS) Schedule",
+            "cogs": total_cogs,
+            "cogs_basis": "historical_cost_snapshots",
+            "missing_cogs_lines": missing_cogs_lines,
+            "product_count": len(prod_map),
+        }
+        meta = {
+            "currency": "INR",
+            "title": "Notes to P&L - COGS Schedule",
+            "line_item": "cogs",
+            "cogs_notes": (
+                f"COGS is calculated strictly from sale-time cost snapshots. {missing_cogs_lines} line(s) had no historical cost snapshot and were not assigned fabricated catalog pricing."
+                if missing_cogs_lines > 0
+                else "COGS is calculated strictly from historical sale-time cost snapshots."
+            ),
+            "columns": [
+                {"key": "product_name", "label": "Product Name", "type": "text"},
+                {"key": "sku", "label": "SKU", "type": "text"},
+                {"key": "quantity_sold", "label": "Qty Sold", "type": "number"},
+                {"key": "total_cogs", "label": "COGS Amount", "type": "currency"},
+                {"key": "percent_of_cogs", "label": "% of Total COGS", "type": "percent"},
+                {"key": "missing_snapshot_count", "label": "Uncosted Lines", "type": "number"},
+            ],
+        }
+        chart = {
+            "type": "bar",
+            "title": "COGS by Product",
+            "data": [{"product_name": r["product_name"], "amount": r["total_cogs"]} for r in rows[:10]],
+        }
+
+    else:  # operating_expenses
+        exp_q = db.query(Expense).filter(
+            Expense.organization_id == org_id,
+            Expense.status == "approved",
+        )
+        exp_q = _between(exp_q, Expense.expense_date, df, dt)
+        expenses = exp_q.all()
+        operating_expenses = round(sum(e.amount for e in expenses), 2)
+
+        cat_map: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "amount": 0.0, "tax": 0.0})
+        for e in expenses:
+            cat = e.category or "General"
+            m = cat_map[cat]
+            m["count"] += 1
+            m["amount"] = round(m["amount"] + (e.amount or 0.0), 2)
+            m["tax"] = round(m["tax"] + (getattr(e, "tax_amount", 0.0) or 0.0), 2)
+
+        for cat, data in sorted(cat_map.items(), key=lambda x: x[1]["amount"], reverse=True):
+            pct = round((data["amount"] / operating_expenses * 100.0), 2) if operating_expenses > 0 else 0.0
+            rows.append({
+                "category": cat,
+                "entry_count": data["count"],
+                "tax_amount": data["tax"],
+                "total_amount": data["amount"],
+                "percent_of_expenses": pct,
+            })
+
+        if search:
+            s = search.lower()
+            rows = [r for r in rows if s in r["category"].lower()]
+
+        summary = {
+            "schedule": "Note 4: Operating Expenses Breakdown Schedule",
+            "operating_expenses": operating_expenses,
+            "entry_count": len(expenses),
+            "category_count": len(cat_map),
+        }
+        meta = {
+            "currency": "INR",
+            "title": "Notes to P&L - Operating Expenses Schedule",
+            "line_item": "operating_expenses",
+            "columns": [
+                {"key": "category", "label": "Expense Category", "type": "text"},
+                {"key": "entry_count", "label": "Entries", "type": "number"},
+                {"key": "tax_amount", "label": "Tax Component", "type": "currency"},
+                {"key": "total_amount", "label": "Total Expense", "type": "currency"},
+                {"key": "percent_of_expenses", "label": "% of Expenses", "type": "percent"},
+            ],
+        }
+        chart = {
+            "type": "pie",
+            "title": "Operating Expenses by Category",
+            "data": [{"category": r["category"], "amount": r["total_amount"]} for r in rows[:10]],
+        }
+
+    paged_rows, pagination = _paginate(rows, page, page_size)
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+    }
+
+
 _BUILDERS = {
     "daily-transaction": _daily_transaction,
     "sales": _sales,
@@ -3055,6 +3612,8 @@ _BUILDERS = {
     "stock-movement": _stock_movement,
     "sales-overview": _sales_overview,
     "cash-flow-sheet": _cash_flow_sheet,
+    "statement-of-pl": _statement_of_pl,
+    "notes-to-pl": _notes_to_pl,
 }
 
 
@@ -3108,3 +3667,347 @@ def build_report(
     result["date_to"] = date_to
 
     return result
+
+
+def resolve_report_row(
+    report_type: str,
+    report: dict[str, Any],
+    row_id: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve an exact single row from a built report dataset.
+
+    Raises HTTPException 400 for empty or ambiguous identifiers,
+    or 404 if the row does not exist in the tenant's filtered dataset.
+    """
+    raw_id = (row_id or "").strip()
+    if not raw_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="row_id cannot be empty",
+        )
+
+    rows: list[dict[str, Any]] = report.get("rows", [])
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Row '{row_id}' not found in {report_type} report",
+        )
+
+    filters = params or {}
+    norm_target = raw_id.lower()
+    slug_target = re.sub(r"[^a-z0-9]+", "_", norm_target).strip("_")
+
+    matched_rows: list[dict[str, Any]] = []
+
+    if report_type == "sales":
+        group_by = filters.get("group_by") or "transaction"
+        if group_by == "transaction":
+            for r in rows:
+                inv_no = str(r.get("invoice_number") or "").strip().lower()
+                inv_id = str(r.get("invoice_id") or "").strip().lower()
+                if norm_target in (inv_no, inv_id):
+                    matched_rows.append(r)
+        elif group_by == "customer":
+            for r in rows:
+                c_name = str(r.get("customer") or "").strip().lower()
+                c_slug = re.sub(r"[^a-z0-9]+", "_", c_name).strip("_")
+                if norm_target == c_name or slug_target == c_slug:
+                    matched_rows.append(r)
+        elif group_by == "salesperson":
+            for r in rows:
+                sp_name = str(r.get("salesperson") or "").strip().lower()
+                sp_slug = re.sub(r"[^a-z0-9]+", "_", sp_name).strip("_")
+                if norm_target == sp_name or slug_target == sp_slug:
+                    matched_rows.append(r)
+        elif group_by == "product":
+            for r in rows:
+                p_name = str(r.get("product") or "").strip().lower()
+                p_slug = re.sub(r"[^a-z0-9]+", "_", p_name).strip("_")
+                if norm_target == p_name or slug_target == p_slug:
+                    matched_rows.append(r)
+
+    elif report_type == "purchase":
+        group_by = filters.get("group_by") or "transaction"
+        if group_by == "transaction":
+            for r in rows:
+                inv_no = str(r.get("invoice_number") or "").strip().lower()
+                inv_id = str(r.get("invoice_id") or "").strip().lower()
+                if norm_target in (inv_no, inv_id):
+                    matched_rows.append(r)
+        elif group_by == "supplier":
+            for r in rows:
+                s_name = str(r.get("supplier") or "").strip().lower()
+                s_slug = re.sub(r"[^a-z0-9]+", "_", s_name).strip("_")
+                if norm_target == s_name or slug_target == s_slug:
+                    matched_rows.append(r)
+        elif group_by == "product":
+            for r in rows:
+                p_name = str(r.get("product") or "").strip().lower()
+                p_slug = re.sub(r"[^a-z0-9]+", "_", p_name).strip("_")
+                if norm_target == p_name or slug_target == p_slug:
+                    matched_rows.append(r)
+
+    elif report_type == "sales-overview":
+        for r in rows:
+            oid = str(r.get("order_id") or "").strip().lower()
+            onum = str(r.get("order_number") or "").strip().lower()
+            sonum = str(r.get("sales_order_number") or "").strip().lower()
+            if norm_target in (oid, onum, sonum):
+                matched_rows.append(r)
+
+    elif report_type == "gst-summary":
+        group_by = filters.get("group_by") or "summary"
+        if group_by == "transaction":
+            # 1. First priority: match exact source_id (UUID)
+            for r in rows:
+                src_id = str(r.get("source_id") or "").strip().lower()
+                if norm_target == src_id:
+                    matched_rows.append(r)
+            # 2. If no source_id match, check qualified document_type:document_number
+            if not matched_rows and ":" in raw_id:
+                for r in rows:
+                    doc_type = str(r.get("document_type") or "").strip().lower()
+                    doc_no = str(r.get("document_number") or "").strip().lower()
+                    if norm_target == f"{doc_type}:{doc_no}":
+                        matched_rows.append(r)
+            # 3. If still no match, check document_number
+            if not matched_rows:
+                for r in rows:
+                    doc_no = str(r.get("document_number") or "").strip().lower()
+                    if norm_target == doc_no:
+                        matched_rows.append(r)
+                if len(matched_rows) > 1:
+                    types = sorted(set(r.get("document_type") for r in matched_rows))
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            f"Multiple documents found with reference '{row_id}' across types {types}. "
+                            f"Please qualify as '<document_type>:{row_id}' or specify source_id."
+                        ),
+                    )
+        elif group_by == "summary":
+            slug_aliases = {
+                "output_gst": "output gst (sales invoices)",
+                "output_gst_adjustment": "output gst adjustment (sales returns)",
+                "input_gst": "input gst (purchase invoices)",
+                "net_gst_liability": "net gst liability",
+            }
+            target_expanded = slug_aliases.get(slug_target, norm_target)
+            for r in rows:
+                row_type = str(r.get("type") or "").strip().lower()
+                row_slug = re.sub(r"[^a-z0-9]+", "_", row_type).strip("_")
+                if norm_target == row_type or slug_target == row_slug or target_expanded == row_type:
+                    matched_rows.append(r)
+
+    elif report_type == "profit-loss":
+        pl_aliases = {
+            "gross_sales": "gross sales revenue",
+            "gross_sales_revenue": "gross sales revenue",
+            "sales_returns": "less: sales returns & allowances",
+            "sales_returns_allowances": "less: sales returns & allowances",
+            "net_sales": "net sales revenue",
+            "net_sales_revenue": "net sales revenue",
+            "cogs": "cost of goods sold (cogs)",
+            "cost_of_goods_sold": "cost of goods sold (cogs)",
+            "gross_profit": "gross profit",
+            "operating_expenses": "operating expenses (approved)",
+            "net_profit": "net profit / loss",
+            "net_loss": "net profit / loss",
+            "net_profit_loss": "net profit / loss",
+        }
+        target_expanded = pl_aliases.get(slug_target, norm_target)
+        for r in rows:
+            row_item = str(r.get("item") or "").strip().lower()
+            row_slug = re.sub(r"[^a-z0-9]+", "_", row_item).strip("_")
+            if norm_target == row_item or slug_target == row_slug or target_expanded == row_item:
+                matched_rows.append(r)
+
+    elif report_type == "customer-outstanding":
+        for r in rows:
+            inv_no = str(r.get("invoice_number") or "").strip().lower()
+            inv_id = str(r.get("invoice_id") or "").strip().lower()
+            cid = str(r.get("customer_id") or "").strip().lower()
+            cname = str(r.get("customer") or "").strip().lower()
+            cslug = re.sub(r"[^a-z0-9]+", "_", cname).strip("_")
+            if norm_target in (inv_no, inv_id, cid, cname) or slug_target == cslug:
+                matched_rows.append(r)
+        if len(matched_rows) > 1 and any(norm_target in (str(r.get("customer_id") or "").lower(), str(r.get("customer") or "").lower()) or slug_target == re.sub(r"[^a-z0-9]+", "_", str(r.get("customer") or "").lower()).strip("_") for r in matched_rows):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Multiple outstanding invoices found for customer '{row_id}'. Please specify the exact invoice_number.",
+            )
+
+    elif report_type == "supplier-outstanding":
+        for r in rows:
+            inv_no = str(r.get("invoice_number") or "").strip().lower()
+            pid = str(r.get("purchase_id") or "").strip().lower()
+            scode = str(r.get("supplier_code") or "").strip().lower()
+            sname = str(r.get("supplier") or "").strip().lower()
+            sslug = re.sub(r"[^a-z0-9]+", "_", sname).strip("_")
+            if norm_target in (inv_no, pid, scode, sname) or slug_target == sslug:
+                matched_rows.append(r)
+        if len(matched_rows) > 1 and any(norm_target in (str(r.get("supplier_code") or "").lower(), str(r.get("supplier") or "").lower()) or slug_target == re.sub(r"[^a-z0-9]+", "_", str(r.get("supplier") or "").lower()).strip("_") for r in matched_rows):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Multiple outstanding invoices found for supplier '{row_id}'. Please specify the exact invoice_number.",
+            )
+
+    elif report_type == "payment-collection":
+        for r in rows:
+            ref = str(r.get("reference") or "").strip().lower()
+            txn_ref = str(r.get("txn_reference") or "").strip().lower()
+            pid = str(r.get("payment_id") or "").strip().lower()
+            if norm_target in (ref, txn_ref, pid):
+                matched_rows.append(r)
+
+    elif report_type == "cash-collection":
+        for r in rows:
+            ref = str(r.get("receipt_reference") or "").strip().lower()
+            pid = str(r.get("payment_id") or "").strip().lower()
+            if norm_target in (ref, pid):
+                matched_rows.append(r)
+
+    elif report_type == "expense":
+        for r in rows:
+            ref = str(r.get("expense_reference") or "").strip().lower()
+            eid = str(r.get("expense_id") or "").strip().lower()
+            if norm_target in (ref, eid):
+                matched_rows.append(r)
+
+    elif report_type == "sales-return":
+        for r in rows:
+            ret_no = str(r.get("return_number") or "").strip().lower()
+            rid = str(r.get("return_id") or "").strip().lower()
+            if norm_target in (ret_no, rid):
+                matched_rows.append(r)
+
+    elif report_type == "purchase-return":
+        for r in rows:
+            ret_no = str(r.get("return_number") or "").strip().lower()
+            rid = str(r.get("return_id") or "").strip().lower()
+            if norm_target in (ret_no, rid):
+                matched_rows.append(r)
+
+    elif report_type == "supplier-payment":
+        for r in rows:
+            p_no = str(r.get("payment_number") or "").strip().lower()
+            ref = str(r.get("reference") or "").strip().lower()
+            pid = str(r.get("payment_id") or "").strip().lower()
+            if norm_target in (p_no, ref, pid):
+                matched_rows.append(r)
+
+    elif report_type == "inventory-summary":
+        for r in rows:
+            pid = str(r.get("product_id") or "").strip().lower()
+            sku = str(r.get("sku") or "").strip().lower()
+            wh = str(r.get("warehouse") or "").strip().lower()
+            composite = f"{pid}:{wh}"
+            if norm_target in (pid, sku, composite):
+                matched_rows.append(r)
+
+    elif report_type == "stock-movement":
+        for r in rows:
+            mid = str(r.get("movement_id") or "").strip().lower()
+            ref = str(r.get("reference") or "").strip().lower()
+            if norm_target in (mid, ref):
+                matched_rows.append(r)
+
+    elif report_type == "daily-transaction":
+        for r in rows:
+            ref = str(r.get("reference") or "").strip().lower()
+            sid = str(r.get("source_id") or "").strip().lower()
+            rtype = str(r.get("type") or "").strip().lower()
+            composite = f"{rtype}:{ref}"
+            if norm_target in (ref, sid, composite):
+                matched_rows.append(r)
+
+    elif report_type == "cash-flow-sheet":
+        for r in rows:
+            ref = str(r.get("reference_number") or "").strip().lower()
+            sid = str(r.get("source_id") or "").strip().lower()
+            ttype = str(r.get("transaction_type") or "").strip().lower()
+            composite = f"{ttype}:{ref}"
+            if norm_target in (ref, sid, composite):
+                matched_rows.append(r)
+
+    elif report_type == "statement-of-pl":
+        # 1. Match exact source_id (UUID)
+        for r in rows:
+            sid = str(r.get("source_id") or "").strip().lower()
+            if norm_target == sid:
+                matched_rows.append(r)
+        # 2. Qualified identifier, e.g. "<section>:<reference>" or "<section>:<source_id>"
+        if not matched_rows and ":" in raw_id:
+            for r in rows:
+                sec = str(r.get("section") or "").strip().lower()
+                ref = str(r.get("reference") or "").strip().lower()
+                sid = str(r.get("source_id") or "").strip().lower()
+                if norm_target in (f"{sec}:{ref}", f"{sec}:{sid}"):
+                    matched_rows.append(r)
+        # 3. Bare reference
+        if not matched_rows:
+            for r in rows:
+                ref = str(r.get("reference") or "").strip().lower()
+                if norm_target == ref:
+                    matched_rows.append(r)
+            if len(matched_rows) > 1:
+                secs = sorted(set(str(r.get("section")) for r in matched_rows))
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Multiple statement items found with reference '{row_id}' across sections {secs}. "
+                        f"Please qualify as '<section>:{row_id}' or specify source_id."
+                    ),
+                )
+
+    elif report_type == "notes-to-pl":
+        for r in rows:
+            p_name = str(r.get("party") or "").strip().lower()
+            p_id = str(r.get("party_id") or "").strip().lower()
+            p_slug = re.sub(r"[^a-z0-9]+", "_", p_name).strip("_")
+
+            ret_no = str(r.get("return_number") or "").strip().lower()
+            ret_id = str(r.get("return_id") or "").strip().lower()
+
+            prod_name = str(r.get("product_name") or "").strip().lower()
+            prod_id = str(r.get("product_id") or "").strip().lower()
+            sku = str(r.get("sku") or "").strip().lower()
+            prod_slug = re.sub(r"[^a-z0-9]+", "_", prod_name).strip("_")
+
+            cat = str(r.get("category") or "").strip().lower()
+            cat_slug = re.sub(r"[^a-z0-9]+", "_", cat).strip("_")
+
+            if norm_target in (
+                p_name, p_id,
+                ret_no, ret_id,
+                prod_name, prod_id, sku,
+                cat,
+            ) or slug_target in (p_slug, prod_slug, cat_slug):
+                matched_rows.append(r)
+
+    else:
+        for r in rows:
+            for k in ("id", "reference", "code", "name", "number"):
+                if norm_target == str(r.get(k) or "").strip().lower():
+                    matched_rows.append(r)
+                    break
+
+    if not matched_rows:
+        if report_type in ("sales", "purchase") and (filters.get("group_by") or "transaction") == "transaction":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Row '{row_id}' not found in {report_type} report. If you are exporting a grouped row (e.g. customer, supplier, product, or salesperson), please specify the matching 'group_by' parameter.",
+            )
+        if report_type == "gst-summary" and (filters.get("group_by") or "summary") == "summary":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Row '{row_id}' not found in gst-summary aggregate view. For transaction-level exports, specify group_by=transaction.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Row '{row_id}' not found in {report_type} report",
+        )
+
+    return matched_rows[0]
+

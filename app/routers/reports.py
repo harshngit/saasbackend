@@ -1,4 +1,5 @@
 from io import BytesIO
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -218,6 +219,9 @@ def _report_filters(
     max_tax_amount: float | None = Query(default=None, ge=0),
     sort_by: str | None = Query(default=None),
     sort_order: str | None = Query(default=None, description="asc | desc"),
+    # Statement of P&L and Notes to P&L filters
+    section: str | None = Query(default=None, description="statement-of-pl: revenue | sales_returns | cogs | operating_expenses"),
+    line_item: str | None = Query(default=None, description="notes-to-pl: revenue | sales_returns | cogs | operating_expenses"),
 ) -> dict[str, Any]:
     """Report filters shared by the screen and export routes, so both build the
     same dataset from the same parameters."""
@@ -251,15 +255,21 @@ def get_report(
 def export_report(
     report_type: str,
     user: User = Depends(_export),
-    format: str = Query(default="excel", description="excel | pdf"),
+    format: str = Query(default="excel", description="excel | pdf | xlsx"),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     filters: dict[str, Any] = Depends(_report_filters),
     db: Session = Depends(get_db),
 ) -> Response:
     """Download full unpaginated report as an Excel (.xlsx) or PDF file."""
-    if format not in ("excel", "pdf"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="format must be 'excel' or 'pdf'")
+    fmt = (format or "").strip().lower()
+    if fmt == "xlsx":
+        fmt = "excel"
+    if fmt not in ("excel", "pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="format must be 'excel' or 'pdf'",
+        )
     org_id = _org_id(user)
     org = db.get(Organization, org_id)
     org_name = org.name if org else None
@@ -274,7 +284,7 @@ def export_report(
         is_export=True,
     )
 
-    if format == "pdf":
+    if fmt == "pdf":
         content = _to_pdf(report, org_name=org_name)
         media = "application/pdf"
         ext = "pdf"
@@ -284,6 +294,84 @@ def export_report(
         ext = "xlsx"
 
     filename = f"{report_type}-report.{ext}"
+    return Response(
+        content=content,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{report_type}/export/{row_id}")
+def export_report_row(
+    report_type: str,
+    row_id: str,
+    user: User = Depends(_export),
+    format: str = Query(default="excel", description="excel | pdf | xlsx"),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    filters: dict[str, Any] = Depends(_report_filters),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Download an individual report row as an Excel (.xlsx) or PDF file."""
+    if not (row_id and row_id.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="row_id cannot be empty",
+        )
+
+    fmt = (format or "").strip().lower()
+    if fmt == "xlsx":
+        fmt = "excel"
+    if fmt not in ("excel", "pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="format must be 'excel' or 'pdf'",
+        )
+
+    org_id = _org_id(user)
+    org = db.get(Organization, org_id)
+    org_name = org.name if org else None
+
+    report = report_service.build_report(
+        db=db,
+        org_id=org_id,
+        report_type=report_type,
+        date_from=date_from,
+        date_to=date_to,
+        filters=filters,
+        is_export=True,
+    )
+
+    matched_row = report_service.resolve_report_row(
+        report_type=report_type,
+        report=report,
+        row_id=row_id,
+        params=filters,
+    )
+
+    single_row_report = {
+        **report,
+        "summary": {},
+        "rows": [matched_row],
+        "pagination": {
+            "page": 1,
+            "page_size": 1,
+            "total_rows": 1,
+            "total_pages": 1,
+        },
+    }
+
+    if fmt == "pdf":
+        content = _to_pdf(single_row_report, org_name=org_name)
+        media = "application/pdf"
+        ext = "pdf"
+    else:
+        content = _to_xlsx(single_row_report, org_name=org_name)
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ext = "xlsx"
+
+    safe_row_id = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", row_id.strip())
+    filename = f"{report_type}-{safe_row_id}-report.{ext}"
     return Response(
         content=content,
         media_type=media,

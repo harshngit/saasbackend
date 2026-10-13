@@ -12,12 +12,16 @@ class ReportColumn(BaseModel):
 
 
 class ReportMeta(BaseModel):
+    title: str | None = None
+    line_item: str | None = None
     currency: str = "INR"
     group_by: str | None = None
     valuation_basis: str | None = None
     cogs_notes: str | None = None
     notes: str | None = None
     columns: list[ReportColumn] = Field(default_factory=list)
+
+    model_config = {"extra": "allow"}
 
 
 class ReportPagination(BaseModel):

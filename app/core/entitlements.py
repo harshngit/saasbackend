@@ -384,6 +384,8 @@ REPORT_TYPE_TO_ENTITLEMENT: dict[str, str] = {
     "inventory-summary": "report.inventory_summary",
     "stock-movement": "report.stock_movement",
     "profit-loss": "report.profit_loss",
+    "statement-of-pl": "report.profit_loss",
+    "notes-to-pl": "report.profit_loss",
     "cash-flow-sheet": "report.cash_flow",
     "gst-summary": "report.gst_filing",
     "sales-overview": "report.sales_overview",

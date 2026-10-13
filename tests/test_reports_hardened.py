@@ -214,14 +214,15 @@ def client(db, test_data):
 
 
 def test_registry_contains_all_reports():
-    assert len(report_service.REPORT_TYPES) == 17
-    assert len(report_service.REPORT_REGISTRY) == 17
+    assert len(report_service.REPORT_TYPES) == 19
+    assert len(report_service.REPORT_REGISTRY) == 19
     expected_reports = {
         "daily-transaction", "sales", "purchase", "customer-outstanding",
         "supplier-outstanding", "payment-collection", "expense", "cash-collection",
         "gst-summary", "sales-return", "purchase-return", "profit-loss",
         "supplier-payment", "inventory-summary", "stock-movement",
         "sales-overview", "cash-flow-sheet",
+        "statement-of-pl", "notes-to-pl",
     }
     assert report_service.REPORT_TYPES == expected_reports
 
@@ -1751,3 +1752,800 @@ def test_expense_vendor_filter(client, db, test_data):
     for report in ("daily-transaction", "cash-flow-sheet"):
         res = client.get(f"/reports/{report}", params={"page_size": 100})
         assert res.status_code == 200, report
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Row-Level Export Tests
+# ---------------------------------------------------------------------------
+
+def test_row_export_sales_invoice_excel_and_pdf(client, gst_data):
+    # 1. Sales invoice row exported as Excel
+    res_excel = client.get("/reports/sales/export/INV-GST-001?format=excel")
+    assert res_excel.status_code == 200
+    assert res_excel.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert res_excel.headers["content-disposition"] == 'attachment; filename="sales-INV-GST-001-report.xlsx"'
+
+    rows = _xlsx_table(res_excel.content, "Invoice #")
+    assert len(rows) == 1
+    assert rows[0]["Invoice #"] == "INV-GST-001"
+
+    # 2. Sales invoice row exported as PDF
+    res_pdf = client.get("/reports/sales/export/INV-GST-001?format=pdf")
+    assert res_pdf.status_code == 200
+    assert res_pdf.headers["content-type"] == "application/pdf"
+    assert res_pdf.headers["content-disposition"] == 'attachment; filename="sales-INV-GST-001-report.pdf"'
+    assert res_pdf.content.startswith(b"%PDF-")
+    assert len(res_pdf.content) > 200
+
+
+def test_row_export_sales_overview_order_identity(client, db, test_data):
+    org, cust = test_data["org"], test_data["customer"]
+    so = SalesOrder(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        customer_id=cust.id,
+        order_number="SO-ORD-999",
+        status="confirmed",
+        total=1250.0,
+    )
+    db.add(so)
+    db.commit()
+
+    # 3. Sales-overview order row exported using its correct identity (UUID and order_number)
+    # By order_number:
+    res_num = client.get(f"/reports/sales-overview/export/{so.order_number}?format=excel")
+    assert res_num.status_code == 200
+    rows_num = _xlsx_table(res_num.content, "Order #")
+    assert len(rows_num) == 1
+    assert rows_num[0]["Order #"] == "SO-ORD-999"
+
+    # By order_id UUID:
+    res_id = client.get(f"/reports/sales-overview/export/{so.id}?format=excel")
+    assert res_id.status_code == 200
+    rows_id = _xlsx_table(res_id.content, "Order #")
+    assert len(rows_id) == 1
+    assert rows_id[0]["Order #"] == "SO-ORD-999"
+
+
+def test_row_export_gst_transaction_disambiguation(client, db, gst_data):
+    org, sup = gst_data["org"], gst_data["supplier"]
+    # 4. GST transaction row resolved without confusing documents that share a reference
+    pinv = PurchaseInvoice(
+        organization_id=org.id,
+        supplier_id=sup.id,
+        invoice_number="PUR-AMBIG-001",
+        status="approved",
+    )
+    db.add(pinv)
+    db.flush()
+    sinv = SupplierInvoice(
+        organization_id=org.id,
+        supplier_id=sup.id,
+        purchase_id=pinv.id,
+        supplier_invoice_number="INV-GST-001",  # Same number as sales invoice!
+        subtotal=1000.0,
+        tax_amount=180.0,
+        grand_total=1180.0,
+        status="recorded",
+    )
+    db.add(sinv)
+    db.commit()
+
+    # Requesting ambiguous reference without type qualification should return 400
+    ambig_res = client.get("/reports/gst-summary/export/INV-GST-001?group_by=transaction&format=excel")
+    assert ambig_res.status_code == 400
+    assert "Multiple documents found with reference" in ambig_res.json()["detail"]
+    assert "sales_invoice" in ambig_res.json()["detail"]
+    assert "supplier_invoice" in ambig_res.json()["detail"]
+
+    # Resolving with type-qualification: sales_invoice:INV-GST-001
+    sales_res = client.get("/reports/gst-summary/export/sales_invoice:INV-GST-001?group_by=transaction&format=excel")
+    assert sales_res.status_code == 200
+    sales_rows = _xlsx_table(sales_res.content, "Date")
+    assert len(sales_rows) == 1
+    assert sales_rows[0]["Document #"] == "INV-GST-001"
+    assert sales_rows[0]["Document Type"] == "sales_invoice"
+
+    # Resolving with type-qualification: supplier_invoice:INV-GST-001
+    supp_res = client.get("/reports/gst-summary/export/supplier_invoice:INV-GST-001?group_by=transaction&format=excel")
+    assert supp_res.status_code == 200
+    supp_rows = _xlsx_table(supp_res.content, "Date")
+    assert len(supp_rows) == 1
+    assert supp_rows[0]["Document #"] == "INV-GST-001"
+    assert supp_rows[0]["Document Type"] == "supplier_invoice"
+
+    # Resolving with exact source_id UUID
+    src_res = client.get(f"/reports/gst-summary/export/{sinv.id}?group_by=transaction&format=excel")
+    assert src_res.status_code == 200
+    src_rows = _xlsx_table(src_res.content, "Date")
+    assert len(src_rows) == 1
+    assert src_rows[0]["Document #"] == "INV-GST-001"
+    assert src_rows[0]["Document Type"] == "supplier_invoice"
+
+
+def test_row_export_grouped_report_resolution(client, gst_data):
+    # 5. Grouped report row resolution with its grouping parameter
+    # With grouping parameter: group_by=customer
+    res = client.get("/reports/sales/export/Acme%20Retail?group_by=customer&format=excel")
+    assert res.status_code == 200
+    rows = _xlsx_table(res.content, "Customer")
+    assert len(rows) == 1
+    assert rows[0]["Customer"] == "Acme Retail"
+
+    # Grouped row requested without required grouping context returns clear 404
+    res_no_grp = client.get("/reports/sales/export/Acme%20Retail?format=excel")
+    assert res_no_grp.status_code == 404
+    assert "group_by" in res_no_grp.json()["detail"]
+
+
+def test_row_export_calculated_and_summary_rows(client, gst_data):
+    # 6. GST summary/calculated row resolution
+    res_gst = client.get("/reports/gst-summary/export/output_gst?format=excel")
+    assert res_gst.status_code == 200
+    gst_rows = _xlsx_table(res_gst.content, "GST Classification")
+    assert len(gst_rows) == 1
+    assert "Output GST" in gst_rows[0]["GST Classification"]
+
+    # Profit and Loss calculated summary line (cogs)
+    res_pl = client.get("/reports/profit-loss/export/cogs?format=excel")
+    assert res_pl.status_code == 200
+    pl_rows = _xlsx_table(res_pl.content, "P&L Statement Line Item")
+    assert len(pl_rows) == 1
+    assert "Cost of Goods Sold (COGS)" in pl_rows[0]["P&L Statement Line Item"]
+
+
+def test_row_export_cross_tenant_isolation(client, gst_data):
+    # 7. Cross-tenant row request returns 404
+    # "INV-GST-FOREIGN" was created under foreign organization org2
+    res = client.get("/reports/sales/export/INV-GST-FOREIGN?format=excel")
+    assert res.status_code == 404
+    assert "Row 'INV-GST-FOREIGN' not found in sales report" in res.json()["detail"]
+
+
+def test_row_export_nonexistent_row(client, gst_data):
+    # 8. Nonexistent row returns 404
+    res = client.get("/reports/sales/export/NONEXISTENT-999?format=excel")
+    assert res.status_code == 404
+    assert "Row 'NONEXISTENT-999' not found in sales report" in res.json()["detail"]
+
+
+def test_row_export_excluded_by_active_filters(client, gst_data):
+    # 9. Row excluded by active filters returns 404
+    # INV-GST-001 is on 2026-03-05. Filtering for April 2026 excludes it.
+    res = client.get("/reports/sales/export/INV-GST-001?format=excel&date_from=2026-04-01&date_to=2026-04-30")
+    assert res.status_code == 404
+    assert "not found" in res.json()["detail"]
+
+
+def test_row_export_unsupported_format(client, gst_data):
+    # 10. Unsupported export format returns the expected client error
+    res = client.get("/reports/sales/export/INV-GST-001?format=csv")
+    assert res.status_code == 400
+    assert "format must be" in res.json()["detail"]
+
+
+def test_row_export_xlsx_alias_and_headers(client, gst_data):
+    # 11. format=xlsx works as an alias for Excel
+    # 12. Excel response has correct MIME type, attachment header, and valid non-empty workbook bytes
+    from openpyxl import load_workbook
+    from io import BytesIO
+
+    res = client.get("/reports/sales/export/INV-GST-001?format=xlsx")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert res.headers["content-disposition"] == 'attachment; filename="sales-INV-GST-001-report.xlsx"'
+    wb = load_workbook(BytesIO(res.content))
+    assert len(wb.sheetnames) >= 1
+    assert len(res.content) > 1000
+
+
+def test_row_export_pdf_headers_and_bytes(client, gst_data):
+    # 13. PDF response has correct MIME type, attachment header, and valid non-empty PDF bytes
+    res = client.get("/reports/sales/export/INV-GST-001?format=pdf")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/pdf"
+    assert res.headers["content-disposition"] == 'attachment; filename="sales-INV-GST-001-report.pdf"'
+    assert res.content.startswith(b"%PDF-")
+    assert len(res.content) > 200
+
+
+def test_row_export_contains_only_selected_row(client, gst_data):
+    # 14. Export contains only the selected row and not other rows
+    all_res = client.get("/reports/sales?date_from=2026-03-01&date_to=2026-03-31")
+    assert len(all_res.json()["rows"]) >= 2
+
+    exp_res = client.get("/reports/sales/export/INV-GST-001?date_from=2026-03-01&date_to=2026-03-31&format=excel")
+    assert exp_res.status_code == 200
+    rows = _xlsx_table(exp_res.content, "Invoice #")
+    assert len(rows) == 1
+    assert rows[0]["Invoice #"] == "INV-GST-001"
+    assert not any(r.get("Invoice #") == "INV-GST-002" for r in rows)
+
+
+def test_row_export_empty_identifier_rejected(client, gst_data):
+    # Empty row identifier rejected with 400
+    res = client.get("/reports/sales/export/%20?format=excel")
+    assert res.status_code == 400
+    assert "empty" in res.json()["detail"].lower()
+
+
+def test_row_export_additional_report_coverage(client, db, test_data):
+    # Verify row exports on additional reports: customer-outstanding, inventory-summary, daily-transaction, expense
+    org, cust, prod = test_data["org"], test_data["customer"], test_data["product"]
+
+    # 1. customer-outstanding
+    inv = Invoice(
+        organization_id=org.id,
+        invoice_number="INV-OUT-001",
+        customer_id=cust.id,
+        subtotal=1000.0,
+        tax=0.0,
+        total=1000.0,
+        amount_paid=400.0,
+        status="unpaid",
+        is_credit_note=False,
+        invoice_date=datetime.now(timezone.utc),
+    )
+    db.add(inv)
+
+    # 2. expense
+    exp = Expense(
+        organization_id=org.id,
+        category="Stationery",
+        amount=150.0,
+        status="approved",
+        payment_status="paid",
+        expense_date=datetime.now(timezone.utc),
+    )
+    db.add(exp)
+    db.commit()
+
+    # customer-outstanding by invoice_number
+    res_co = client.get(f"/reports/customer-outstanding/export/{inv.invoice_number}?format=excel")
+    assert res_co.status_code == 200
+    co_rows = _xlsx_table(res_co.content, "Customer")
+    assert len(co_rows) == 1
+    assert co_rows[0]["Invoice #"] == "INV-OUT-001"
+
+    # inventory-summary by SKU
+    res_inv = client.get(f"/reports/inventory-summary/export/{prod.sku}?format=excel")
+    assert res_inv.status_code == 200
+    inv_rows = _xlsx_table(res_inv.content, "Product")
+    assert len(inv_rows) == 1
+    assert inv_rows[0]["SKU"] == prod.sku
+
+    # expense by UUID
+    res_exp = client.get(f"/reports/expense/export/{exp.id}?format=excel")
+    assert res_exp.status_code == 200
+    exp_rows = _xlsx_table(res_exp.content, "Date")
+    assert len(exp_rows) == 1
+    assert exp_rows[0]["Category"] == "Stationery"
+
+    # daily-transaction by reference
+    res_dt = client.get(f"/reports/daily-transaction/export/{inv.invoice_number}?format=excel")
+    assert res_dt.status_code == 200
+    dt_rows = _xlsx_table(res_dt.content, "Date")
+    assert len(dt_rows) == 1
+    assert dt_rows[0]["Reference #"] == "INV-OUT-001"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Statement of P&L and Notes to P&L Tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def pl_statement_data(db, test_data):
+    org, org2 = test_data["org"], test_data["org2"]
+    cust, foreign_cust = test_data["customer"], test_data["foreign_customer"]
+    prod1 = test_data["product"]
+
+    prod2 = Product(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        name="Standard Gadget",
+        sku="GADGET-02",
+        price=50.0,
+        minimum_stock_level=5,
+        is_active=True,
+    )
+    db.add(prod2)
+
+    # 1. SalesOrder 1 with sale-time historical cost_price snapshot = 45.0
+    so1 = SalesOrder(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        customer_id=cust.id,
+        order_number="SO-PL-101",
+        status="completed",
+        total=1000.0,
+    )
+    db.add(so1)
+    db.flush()
+
+    so_item1 = SalesOrderItem(
+        id=str(uuid.uuid4()),
+        order_id=so1.id,
+        product_id=prod1.id,
+        product_name=prod1.name,
+        quantity=10,
+        unit_price=100.0,
+        cost_price=45.0,  # historical snapshot
+        line_total=1000.0,
+    )
+    db.add(so_item1)
+
+    # Invoice 1 (gross revenue = 1000.0, line COGS = 10 * 45 = 450.0)
+    inv1 = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        invoice_number="INV-PL-001",
+        order_id=so1.id,
+        customer_id=cust.id,
+        subtotal=1000.0,
+        tax=0.0,
+        total=1000.0,
+        amount_paid=1000.0,
+        status="paid",
+        is_credit_note=False,
+        invoice_date=_ist(2026, 5, 10),
+    )
+    db.add(inv1)
+    db.flush()
+
+    item1 = InvoiceItem(
+        id=str(uuid.uuid4()),
+        invoice_id=inv1.id,
+        product_id=prod1.id,
+        order_item_id=so_item1.id,
+        product_name=prod1.name,
+        quantity=10,
+        unit_price=100.0,
+        line_total=1000.0,
+    )
+    db.add(item1)
+
+    # 2. SalesOrder 2 without historical cost snapshot (cost_price=None)
+    so2 = SalesOrder(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        customer_id=cust.id,
+        order_number="SO-PL-102",
+        status="completed",
+        total=500.0,
+    )
+    db.add(so2)
+    db.flush()
+
+    so_item2 = SalesOrderItem(
+        id=str(uuid.uuid4()),
+        order_id=so2.id,
+        product_id=prod2.id,
+        product_name=prod2.name,
+        quantity=5,
+        unit_price=100.0,
+        cost_price=None,  # missing historical cost snapshot
+        line_total=500.0,
+    )
+    db.add(so_item2)
+
+    # Invoice 2 (gross revenue = 500.0, COGS missing snapshot = 0.0)
+    inv2 = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        invoice_number="INV-PL-002",
+        order_id=so2.id,
+        customer_id=cust.id,
+        subtotal=500.0,
+        tax=0.0,
+        total=500.0,
+        amount_paid=500.0,
+        status="paid",
+        is_credit_note=False,
+        invoice_date=_ist(2026, 5, 15),
+    )
+    db.add(inv2)
+    db.flush()
+
+    item2 = InvoiceItem(
+        id=str(uuid.uuid4()),
+        invoice_id=inv2.id,
+        product_id=prod2.id,
+        order_item_id=so_item2.id,
+        product_name=prod2.name,
+        quantity=5,
+        unit_price=100.0,
+        line_total=500.0,
+    )
+    db.add(item2)
+
+    # 3. Approved SalesReturn (returns = 200.0)
+    sr = SalesReturn(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        return_number="SR-PL-001",
+        customer_id=cust.id,
+        invoice_reference_id=inv1.id,
+        return_status="approved",
+        credit_amount=200.0,
+        return_date=_ist(2026, 5, 20),
+    )
+    db.add(sr)
+
+    # 4. Approved Operating Expenses (150.0 + 75.0 = 225.0)
+    exp1 = Expense(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        category="Marketing",
+        amount=150.0,
+        status="approved",
+        payment_status="paid",
+        expense_date=_ist(2026, 5, 12),
+        description="Q2 Ad Campaign",
+    )
+    db.add(exp1)
+
+    exp2 = Expense(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        category="Office Supplies",
+        amount=75.0,
+        status="approved",
+        payment_status="paid",
+        expense_date=_ist(2026, 5, 18),
+        description="Printer Paper and Ink",
+    )
+    db.add(exp2)
+
+    # 5. Non-approved (pending) expense (must be excluded from statement and summary)
+    exp_pending = Expense(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        category="Travel",
+        amount=999.0,
+        status="pending",
+        payment_status="unpaid",
+        expense_date=_ist(2026, 5, 18),
+    )
+    db.add(exp_pending)
+
+    # 6. Cancelled invoice (must be excluded from statement and summary)
+    inv_cancelled = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        invoice_number="INV-PL-CANCELLED",
+        customer_id=cust.id,
+        subtotal=888.0,
+        tax=0.0,
+        total=888.0,
+        status="cancelled",
+        is_credit_note=False,
+        invoice_date=_ist(2026, 5, 11),
+    )
+    db.add(inv_cancelled)
+
+    # 7. Cross-tenant records (org2)
+    inv_foreign = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org2.id,
+        invoice_number="INV-PL-FOREIGN",
+        customer_id=foreign_cust.id,
+        subtotal=777.0,
+        tax=0.0,
+        total=777.0,
+        status="paid",
+        is_credit_note=False,
+        invoice_date=_ist(2026, 5, 10),
+    )
+    db.add(inv_foreign)
+
+    exp_foreign = Expense(
+        id=str(uuid.uuid4()),
+        organization_id=org2.id,
+        category="Legal",
+        amount=333.0,
+        status="approved",
+        expense_date=_ist(2026, 5, 10),
+    )
+    db.add(exp_foreign)
+
+    db.commit()
+
+    return {
+        **test_data,
+        "inv1": inv1,
+        "item1": item1,
+        "inv2": inv2,
+        "item2": item2,
+        "sr": sr,
+        "exp1": exp1,
+        "exp2": exp2,
+        "prod2": prod2,
+    }
+
+
+def test_statement_of_pl_sections_and_reconciliation(client, pl_statement_data):
+    # 1. statement-of-pl returns required transaction-level sections
+    # 2. Each section reconciles with corresponding existing profit-loss summary values
+    # 3. Returns and expenses have the correct signed impact
+    params = {"date_from": "2026-05-01", "date_to": "2026-05-31", "page_size": 100}
+
+    pl_res = client.get("/reports/profit-loss", params=params)
+    assert pl_res.status_code == 200
+    pl_summary = pl_res.json()["summary"]
+
+    stmt_res = client.get("/reports/statement-of-pl", params=params)
+    assert stmt_res.status_code == 200
+    stmt_data = stmt_res.json()
+    stmt_summary = stmt_data["summary"]
+    rows = stmt_data["rows"]
+
+    # Verify summary reconciliation between statement-of-pl and profit-loss
+    assert stmt_summary["gross_sales"] == 1500.0
+    assert stmt_summary["gross_sales"] == pl_summary["gross_sales"]
+
+    assert stmt_summary["sales_returns"] == 200.0
+    assert stmt_summary["sales_returns"] == pl_summary["sales_returns"]
+
+    assert stmt_summary["net_sales"] == 1300.0
+    assert stmt_summary["net_sales"] == pl_summary["net_sales"]
+
+    assert stmt_summary["cogs"] == 450.0
+    assert stmt_summary["cogs"] == pl_summary["cogs"]
+
+    assert stmt_summary["gross_profit"] == 850.0
+    assert stmt_summary["gross_profit"] == pl_summary["gross_profit"]
+
+    assert stmt_summary["operating_expenses"] == 225.0
+    assert stmt_summary["operating_expenses"] == pl_summary["operating_expenses"]
+
+    assert stmt_summary["net_profit"] == 625.0
+    assert stmt_summary["net_profit"] == pl_summary["net_profit"]
+
+    # Verify transaction-level rows across all 4 sections
+    sections = {r["section"] for r in rows}
+    assert sections == {"revenue", "sales_returns", "cogs", "operating_expenses"}
+
+    rev_rows = [r for r in rows if r["section"] == "revenue"]
+    ret_rows = [r for r in rows if r["section"] == "sales_returns"]
+    cogs_rows = [r for r in rows if r["section"] == "cogs"]
+    exp_rows = [r for r in rows if r["section"] == "operating_expenses"]
+
+    # Section 1: Revenue rows sum to gross sales
+    assert sum(r["amount"] for r in rev_rows) == 1500.0
+    for r in rev_rows:
+        assert r["impact"] == r["amount"]  # Positive contribution to profit
+
+    # Section 2: Returns rows sum to sales returns with negative impact
+    assert sum(r["amount"] for r in ret_rows) == 200.0
+    for r in ret_rows:
+        assert r["impact"] == -r["amount"]  # Negative contribution
+
+    # Section 3: COGS rows sum to COGS with negative impact
+    assert sum(r["amount"] for r in cogs_rows) == 450.0
+    for r in cogs_rows:
+        assert r["impact"] == -r["amount"]  # Negative contribution
+
+    # Section 4: Expense rows sum to operating expenses with negative impact
+    assert sum(r["amount"] for r in exp_rows) == 225.0
+    for r in exp_rows:
+        assert r["impact"] == -r["amount"]  # Negative contribution
+
+    # Net profit equals sum of all signed impacts
+    total_net_impact = round(sum(r["impact"] for r in rows), 2)
+    assert total_net_impact == 625.0
+    assert total_net_impact == stmt_summary["net_profit"]
+
+
+def test_statement_of_pl_missing_cogs_no_catalog_fallback(client, pl_statement_data):
+    # 4. Missing COGS snapshots are NOT replaced by current catalog prices
+    params = {"date_from": "2026-05-01", "date_to": "2026-05-31", "page_size": 100}
+    res = client.get("/reports/statement-of-pl", params=params)
+    assert res.status_code == 200
+    data = res.json()
+
+    # Find the COGS row for INV-PL-002 (item with no snapshot)
+    cogs_rows = [r for r in data["rows"] if r["section"] == "cogs"]
+    missing_cogs_row = next(r for r in cogs_rows if r["reference"] == "INV-PL-002")
+
+    assert missing_cogs_row["amount"] == 0.0
+    assert missing_cogs_row["impact"] == 0.0
+    assert missing_cogs_row["status"] == "unrecorded_cost"
+    assert "No cost snapshot" in missing_cogs_row["description"]
+
+    # Verify summary and metadata flag missing lines
+    assert data["summary"]["missing_cogs_lines"] == 1
+    assert "1 line(s) had no historical cost snapshot" in data["meta"]["cogs_notes"]
+
+
+def test_statement_of_pl_filters_and_tenant_isolation(client, pl_statement_data):
+    # 5. Date filters, section filter, and tenant isolation work
+    # Date filtering
+    res_range = client.get("/reports/statement-of-pl", params={"date_from": "2026-05-01", "date_to": "2026-05-11"})
+    assert res_range.status_code == 200
+    refs = [r["reference"] for r in res_range.json()["rows"]]
+    assert "INV-PL-001" in refs
+    assert "INV-PL-002" not in refs  # 2026-05-15 is excluded
+
+    # Section filter: only revenue
+    res_sec = client.get("/reports/statement-of-pl", params={"section": "revenue", "date_from": "2026-05-01", "date_to": "2026-05-31"})
+    assert res_sec.status_code == 200
+    assert all(r["section"] == "revenue" for r in res_sec.json()["rows"])
+
+    # Invalid section filter returns 400
+    res_invalid_sec = client.get("/reports/statement-of-pl", params={"section": "nonexistent"})
+    assert res_invalid_sec.status_code == 400
+    assert "section must be one of" in res_invalid_sec.json()["detail"]
+
+    # Tenant isolation: org2 records must never appear
+    all_rows = client.get("/reports/statement-of-pl", params={"date_from": "2026-05-01", "date_to": "2026-05-31", "page_size": 100}).json()["rows"]
+    assert not any(r["reference"] in ("INV-PL-FOREIGN", "Legal") for r in all_rows)
+    assert not any(r.get("source_id") == pl_statement_data["org2"].id for r in all_rows)
+
+
+def test_notes_to_pl_all_schedules_reconciliation(client, pl_statement_data):
+    # 6. notes-to-pl supports all 4 canonical line_item values
+    # 7. Each notes schedule reconciles to its parent P&L line
+    params = {"date_from": "2026-05-01", "date_to": "2026-05-31", "page_size": 100}
+
+    # 1. line_item=revenue
+    res_rev = client.get("/reports/notes-to-pl", params={**params, "line_item": "revenue"})
+    assert res_rev.status_code == 200
+    rev_data = res_rev.json()
+    assert rev_data["meta"]["line_item"] == "revenue"
+    assert rev_data["summary"]["gross_sales"] == 1500.0
+    assert sum(r["total_revenue"] for r in rev_data["rows"]) == 1500.0
+
+    # 2. line_item=sales_returns
+    res_ret = client.get("/reports/notes-to-pl", params={**params, "line_item": "sales_returns"})
+    assert res_ret.status_code == 200
+    ret_data = res_ret.json()
+    assert ret_data["meta"]["line_item"] == "sales_returns"
+    assert ret_data["summary"]["sales_returns"] == 200.0
+    assert sum(r["credit_amount"] for r in ret_data["rows"]) == 200.0
+
+    # 3. line_item=cogs
+    res_cogs = client.get("/reports/notes-to-pl", params={**params, "line_item": "cogs"})
+    assert res_cogs.status_code == 200
+    cogs_data = res_cogs.json()
+    assert cogs_data["meta"]["line_item"] == "cogs"
+    assert cogs_data["summary"]["cogs"] == 450.0
+    assert sum(r["total_cogs"] for r in cogs_data["rows"]) == 450.0
+    assert cogs_data["summary"]["missing_cogs_lines"] == 1
+
+    # 4. line_item=operating_expenses
+    res_exp = client.get("/reports/notes-to-pl", params={**params, "line_item": "operating_expenses"})
+    assert res_exp.status_code == 200
+    exp_data = res_exp.json()
+    assert exp_data["meta"]["line_item"] == "operating_expenses"
+    assert exp_data["summary"]["operating_expenses"] == 225.0
+    assert sum(r["total_amount"] for r in exp_data["rows"]) == 225.0
+    categories = {r["category"]: r["total_amount"] for r in exp_data["rows"]}
+    assert categories["Marketing"] == 150.0
+    assert categories["Office Supplies"] == 75.0
+
+
+def test_notes_to_pl_validation(client):
+    # 8. An invalid line_item returns HTTP 400
+    # Missing line_item
+    res_missing = client.get("/reports/notes-to-pl")
+    assert res_missing.status_code == 400
+    assert "line_item is required" in res_missing.json()["detail"]
+    assert "revenue" in res_missing.json()["detail"]
+
+    # Unsupported line_item
+    res_bad = client.get("/reports/notes-to-pl", params={"line_item": "dividends"})
+    assert res_bad.status_code == 400
+    assert "Unsupported line_item 'dividends'" in res_bad.json()["detail"]
+
+
+def test_statement_of_pl_and_notes_exports(client, pl_statement_data):
+    # 9. Both new reports support existing Excel/PDF export behavior
+    params = {"date_from": "2026-05-01", "date_to": "2026-05-31"}
+
+    # statement-of-pl Excel export
+    res_stmt_excel = client.get("/reports/statement-of-pl/export", params={**params, "format": "excel"})
+    assert res_stmt_excel.status_code == 200
+    assert res_stmt_excel.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    stmt_rows = _xlsx_table(res_stmt_excel.content, "Date")
+    assert len(stmt_rows) >= 4
+
+    # statement-of-pl PDF export
+    res_stmt_pdf = client.get("/reports/statement-of-pl/export", params={**params, "format": "pdf"})
+    assert res_stmt_pdf.status_code == 200
+    assert res_stmt_pdf.headers["content-type"] == "application/pdf"
+    assert res_stmt_pdf.content.startswith(b"%PDF-")
+
+    # notes-to-pl Excel export
+    res_notes_excel = client.get("/reports/notes-to-pl/export", params={**params, "line_item": "revenue", "format": "excel"})
+    assert res_notes_excel.status_code == 200
+    notes_rows = _xlsx_table(res_notes_excel.content, "Customer / Channel")
+    assert len(notes_rows) >= 1
+
+    # notes-to-pl PDF export
+    res_notes_pdf = client.get("/reports/notes-to-pl/export", params={**params, "line_item": "cogs", "format": "pdf"})
+    assert res_notes_pdf.status_code == 200
+    assert res_notes_pdf.content.startswith(b"%PDF-")
+
+
+def test_statement_of_pl_and_notes_row_exports(client, pl_statement_data):
+    # 10. Row-level export works for representative rows from both new report types
+    params = {"date_from": "2026-05-01", "date_to": "2026-05-31"}
+    item1 = pl_statement_data["item1"]
+
+    # statement-of-pl: qualified section export
+    res_stmt_row_qual = client.get(
+        "/reports/statement-of-pl/export/revenue:INV-PL-001",
+        params={**params, "format": "excel"},
+    )
+    assert res_stmt_row_qual.status_code == 200
+    r_qual = _xlsx_table(res_stmt_row_qual.content, "Date")
+    assert len(r_qual) == 1
+    assert r_qual[0]["Reference #"] == "INV-PL-001"
+
+    # statement-of-pl: source_id UUID export
+    res_stmt_row_src = client.get(
+        f"/reports/statement-of-pl/export/{item1.id}",
+        params={**params, "format": "excel"},
+    )
+    assert res_stmt_row_src.status_code == 200
+    r_src = _xlsx_table(res_stmt_row_src.content, "Date")
+    assert len(r_src) == 1
+    assert r_src[0]["Statement Section"] == "Cost of Goods Sold (COGS)"
+
+    # statement-of-pl: ambiguous bare reference across sections returns HTTP 400
+    res_ambig = client.get(
+        "/reports/statement-of-pl/export/INV-PL-001",
+        params={**params, "format": "excel"},
+    )
+    assert res_ambig.status_code == 400
+    assert "Multiple statement items found" in res_ambig.json()["detail"]
+
+    # statement-of-pl: bare reference filtered by section resolves uniquely
+    res_sec_row = client.get(
+        "/reports/statement-of-pl/export/INV-PL-001",
+        params={**params, "section": "revenue", "format": "excel"},
+    )
+    assert res_sec_row.status_code == 200
+    r_sec = _xlsx_table(res_sec_row.content, "Date")
+    assert len(r_sec) == 1
+    assert r_sec[0]["Reference #"] == "INV-PL-001"
+
+    # notes-to-pl: row export for revenue by customer name
+    res_note_rev = client.get(
+        "/reports/notes-to-pl/export/Acme%20Retail",
+        params={**params, "line_item": "revenue", "format": "excel"},
+    )
+    assert res_note_rev.status_code == 200
+    n_rev = _xlsx_table(res_note_rev.content, "Customer / Channel")
+    assert len(n_rev) == 1
+    assert n_rev[0]["Customer / Channel"] == "Acme Retail"
+
+    # notes-to-pl: row export for operating expenses by category
+    res_note_exp = client.get(
+        "/reports/notes-to-pl/export/Marketing",
+        params={**params, "line_item": "operating_expenses", "format": "excel"},
+    )
+    assert res_note_exp.status_code == 200
+    n_exp = _xlsx_table(res_note_exp.content, "Expense Category")
+    assert len(n_exp) == 1
+    assert n_exp[0]["Expense Category"] == "Marketing"
+
+
+def test_profit_loss_summary_and_phase1_exports_unbroken(client, pl_statement_data):
+    # 11. Existing profit-loss summary and Phase 1 row-export behavior remain compatible
+    params = {"date_from": "2026-05-01", "date_to": "2026-05-31"}
+
+    # Existing profit-loss summary
+    pl_res = client.get("/reports/profit-loss", params=params)
+    assert pl_res.status_code == 200
+    pl_data = pl_res.json()
+    assert pl_data["summary"]["net_profit"] == 625.0
+    assert len(pl_data["rows"]) == 7  # 7 standard summary lines
+
+    # Existing profit-loss row export for COGS line
+    pl_row_res = client.get("/reports/profit-loss/export/cogs", params={**params, "format": "excel"})
+    assert pl_row_res.status_code == 200
+    pl_row = _xlsx_table(pl_row_res.content, "P&L Statement Line Item")
+    assert len(pl_row) == 1
+    assert "Cost of Goods Sold (COGS)" in pl_row[0]["P&L Statement Line Item"]
+
