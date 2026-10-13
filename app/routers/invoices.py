@@ -353,6 +353,16 @@ def generate_from_order(
         order.customer.recompute_outstanding()
 
     db.add(invoice)
+    db.flush()
+    try:
+        from app.services import accounting_service
+        accounting_service.post_operational_document(db, org_id, "invoice", invoice.id)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to post invoice to general ledger: {exc}",
+        ) from exc
     db.commit()
     db.refresh(invoice)
     return invoice
@@ -548,6 +558,16 @@ def create_direct_invoice(
 
     db.add(invoice)
     db.flush()
+
+    try:
+        from app.services import accounting_service
+        accounting_service.post_operational_document(db, org_id, "invoice", invoice.id)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to post invoice to general ledger: {exc}",
+        ) from exc
 
     if payload.payment is not None:
         try:

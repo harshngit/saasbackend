@@ -371,6 +371,16 @@ def approve_sales_return(
         raise _bad_request(exc) from exc
     if payload.notes is not None:
         sales_return.notes = payload.notes
+    db.flush()
+    try:
+        from app.services import accounting_service
+        accounting_service.post_operational_document(db, org_id, "sales_return", sales_return.id)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to post approved sales return to general ledger: {exc}",
+        ) from exc
     db.commit()
     db.refresh(sales_return)
     return sales_return

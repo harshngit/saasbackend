@@ -332,6 +332,16 @@ def approve_expense(
     expense.status = "approved"
     expense.approval_status = "Approved"
     expense.approved_by = user.id
+    db.flush()
+    try:
+        from app.services import accounting_service
+        accounting_service.post_operational_document(db, expense.organization_id, "expense", expense.id)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to post approved expense to general ledger: {exc}",
+        ) from exc
     db.commit()
     db.refresh(expense)
     return expense

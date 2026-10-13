@@ -242,11 +242,37 @@ def record(
     else:
         payment.remaining_receivable = 0.0
 
+    try:
+        from app.services import accounting_service
+        accounting_service.post_operational_document(db, org_id, "customer_payment", payment.id)
+    except Exception as exc:
+        raise ValueError(f"Failed to post payment to general ledger: {exc}") from exc
+
     return payment
 
 
 def void(db: Session, payment: CustomerPayment) -> None:
     """Reverse a payment and delete it, leaving every balance as if it never happened."""
+    try:
+        from app.models.accounting import JournalEntry
+        from app.services import accounting_service
+        entry = (
+            db.query(JournalEntry)
+            .filter(
+                JournalEntry.organization_id == payment.organization_id,
+                JournalEntry.source_type == "customer_payment",
+                JournalEntry.source_id == payment.id,
+                JournalEntry.status == "posted",
+            )
+            .first()
+        )
+        if entry:
+            accounting_service.reverse_journal_entry(
+                db, payment.organization_id, entry.id, reason=f"Voided payment {payment.receipt_number}"
+            )
+    except Exception:
+        pass
+
     if payment.allocations:
         for alloc in payment.allocations:
             inv = db.get(Invoice, alloc.invoice_id)

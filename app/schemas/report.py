@@ -41,6 +41,7 @@ class ReportResponse(BaseModel):
     type: str
     date_from: str | None = None
     date_to: str | None = None
+    as_of_date: str | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     pagination: ReportPagination | None = None

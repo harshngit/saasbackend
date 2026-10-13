@@ -48,7 +48,10 @@ def _to_xlsx(report: dict, org_name: str | None = None) -> bytes:
     ws.cell(row=row_idx, column=1, value=f"{title} Report").font = Font(name="Arial", size=12, bold=True)
     row_idx += 1
 
-    period_str = f"Period: {report.get('date_from') or 'All Time'} to {report.get('date_to') or 'Present'}"
+    if report.get("as_of_date"):
+        period_str = f"As of Date: {report.get('as_of_date')}"
+    else:
+        period_str = f"Period: {report.get('date_from') or 'All Time'} to {report.get('date_to') or 'Present'}"
     ws.cell(row=row_idx, column=1, value=period_str).font = sub_font
     row_idx += 2
 
@@ -133,7 +136,10 @@ def _to_pdf(report: dict, org_name: str | None = None) -> bytes:
     pdf.cell(0, 7, _s(f"{title} Report"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_font("Helvetica", size=9)
-    period = f"Period: {report.get('date_from') or 'All Time'} to {report.get('date_to') or 'Present'}"
+    if report.get("as_of_date"):
+        period = f"As of Date: {report.get('as_of_date')}"
+    else:
+        period = f"Period: {report.get('date_from') or 'All Time'} to {report.get('date_to') or 'Present'}"
     pdf.cell(0, 6, _s(period), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # Summary
@@ -221,7 +227,8 @@ def _report_filters(
     sort_order: str | None = Query(default=None, description="asc | desc"),
     # Statement of P&L and Notes to P&L filters
     section: str | None = Query(default=None, description="statement-of-pl: revenue | sales_returns | cogs | operating_expenses"),
-    line_item: str | None = Query(default=None, description="notes-to-pl: revenue | sales_returns | cogs | operating_expenses"),
+    line_item: str | None = Query(default=None, description="notes-to-pl / notes-to-balance-sheet: revenue | sales_returns | cogs | operating_expenses | cash_and_bank | accounts_receivable | accounts_payable | tax_liabilities | equity"),
+    schedule: str | None = Query(default=None, description="notes-to-balance-sheet: cash_and_bank | accounts_receivable | accounts_payable | tax_liabilities | equity"),
 ) -> dict[str, Any]:
     """Report filters shared by the screen and export routes, so both build the
     same dataset from the same parameters."""

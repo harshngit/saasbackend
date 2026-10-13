@@ -204,7 +204,7 @@ def delete_stored_file(
     if stored is None:
         return False
 
-    if org_id is not None and stored.organization_id is not None and stored.organization_id != org_id:
+    if org_id is not None and stored.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
     file_size = stored.size or 0
@@ -243,7 +243,7 @@ def safe_delete_unreferenced_file(
     if not stored:
         return False
 
-    if org_id is not None and stored.organization_id is not None and stored.organization_id != org_id:
+    if org_id is not None and stored.organization_id != org_id:
         return False
 
     pattern = f"%{file_id}%"

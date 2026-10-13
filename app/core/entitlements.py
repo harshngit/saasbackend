@@ -390,6 +390,7 @@ REPORT_TYPE_TO_ENTITLEMENT: dict[str, str] = {
     "gst-summary": "report.gst_filing",
     "sales-overview": "report.sales_overview",
     "balance-sheet": "report.balance_sheet",
+    "notes-to-balance-sheet": "report.balance_sheet",
 }
 
 # ---------------------------------------------------------------------------
@@ -479,7 +480,7 @@ _PRO_EXTENSIONS: dict[str, bool] = {
     "report.profit_loss": True,
     "report.cash_flow": True,
     "report.gst_filing": True,
-    "report.balance_sheet": False,
+    "report.balance_sheet": True,
 }
 
 

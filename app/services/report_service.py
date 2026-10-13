@@ -49,6 +49,7 @@ from app.models import (
     Warehouse,
     WarehouseStock,
 )
+from app.models.accounting import Account, JournalEntry, JournalLine
 from app.models.organization import Organization
 from app.services.numbering_service import DEFAULT_BUSINESS_TIMEZONE
 from app.core.workflow import SALE_ORDER_STATUSES as SALE_STATUSES
@@ -74,6 +75,8 @@ REPORT_TYPES = {
     "cash-flow-sheet",
     "statement-of-pl",
     "notes-to-pl",
+    "balance-sheet",
+    "notes-to-balance-sheet",
 }
 
 # --------------------------------- Registry ---------------------------------
@@ -244,6 +247,20 @@ REPORT_REGISTRY: dict[str, dict[str, Any]] = {
         "title": "Notes to Profit & Loss",
         "description": "Detailed schedules and breakdowns for revenue, sales returns, COGS, and operating expenses reconciling to P&L statement lines.",
         "supported_filters": ["date_from", "date_to", "search", "line_item", "page", "page_size"],
+        "allowed_group_by": [],
+        "currency": "INR",
+    },
+    "balance-sheet": {
+        "title": "Balance Sheet (Statement of Financial Position)",
+        "description": "Date-based statement of financial position calculating assets, liabilities, and equity from posted general ledger accounting records.",
+        "supported_filters": ["as_of_date", "date_to", "search", "page", "page_size"],
+        "allowed_group_by": [],
+        "currency": "INR",
+    },
+    "notes-to-balance-sheet": {
+        "title": "Notes to Balance Sheet",
+        "description": "Detailed schedules and ledger breakdowns for cash/bank, accounts receivable, accounts payable, tax liabilities, and equity reconciling to Balance Sheet lines.",
+        "supported_filters": ["as_of_date", "date_to", "line_item", "schedule", "search", "page", "page_size"],
         "allowed_group_by": [],
         "currency": "INR",
     },
@@ -3594,6 +3611,587 @@ def _notes_to_pl(db: Session, org_id: str, df: datetime | None, dt: datetime | N
     }
 
 
+def _balance_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    search = params.get("search")
+
+    # 1. Determine as_of_date boundary
+    tz = get_org_timezone(db, org_id)
+    raw_as_of = params.get("as_of_date")
+    if raw_as_of:
+        try:
+            d = date.fromisoformat(raw_as_of.strip())
+            as_of_dt = datetime.combine(d, time.max, tzinfo=tz).astimezone(timezone.utc)
+            as_of_str = d.isoformat()
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid as_of_date '{raw_as_of}'. Expected format: YYYY-MM-DD",
+            )
+    elif dt:
+        as_of_dt = dt
+        as_of_str = dt.astimezone(tz).date().isoformat()
+    else:
+        now_org = datetime.now(tz)
+        as_of_dt = datetime.combine(now_org.date(), time.max, tzinfo=tz).astimezone(timezone.utc)
+        as_of_str = now_org.date().isoformat()
+
+    # 2. Query all accounts and journal lines effective on or before as_of_dt
+    accounts = (
+        db.query(Account)
+        .filter(Account.organization_id == org_id)
+        .order_by(Account.account_code.asc())
+        .all()
+    )
+
+    total_posted_entries = (
+        db.query(func.count(JournalEntry.id))
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.status.in_(["posted", "reversed"]),
+            JournalEntry.effective_date <= as_of_dt,
+        )
+        .scalar() or 0
+    )
+
+    line_totals = (
+        db.query(
+            JournalLine.account_id,
+            func.coalesce(func.sum(JournalLine.debit), 0.0).label("total_debit"),
+            func.coalesce(func.sum(JournalLine.credit), 0.0).label("total_credit"),
+        )
+        .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.status.in_(["posted", "reversed"]),
+            JournalEntry.effective_date <= as_of_dt,
+        )
+        .group_by(JournalLine.account_id)
+        .all()
+    )
+    activity = {row[0]: (float(row[1]), float(row[2])) for row in line_totals}
+
+    # 3. Categorize accounts into Assets, Liabilities, Equity, and calculate Period Net Income
+    asset_rows: list[dict[str, Any]] = []
+    liability_rows: list[dict[str, Any]] = []
+    equity_rows: list[dict[str, Any]] = []
+
+    cumulative_revenue = 0.0
+    cumulative_expense = 0.0
+
+    for acc in accounts:
+        dr, cr = activity.get(acc.id, (0.0, 0.0))
+        dr = round(dr, 2)
+        cr = round(cr, 2)
+
+        if acc.account_type == "revenue":
+            net_rev = round(cr - dr, 2)
+            cumulative_revenue += net_rev
+            continue
+        elif acc.account_type == "expense":
+            net_exp = round(dr - cr, 2)
+            cumulative_expense += net_exp
+            continue
+
+        if acc.account_type == "asset":
+            bal = round(dr - cr, 2)
+            asset_rows.append({
+                "section": "assets",
+                "section_label": "Assets",
+                "classification": acc.classification or "other_asset",
+                "account_code": acc.account_code,
+                "account_name": acc.name,
+                "balance": bal,
+                "debit_total": dr,
+                "credit_total": cr,
+                "account_id": acc.id,
+                "is_active": acc.is_active,
+            })
+        elif acc.account_type == "liability":
+            bal = round(cr - dr, 2)
+            liability_rows.append({
+                "section": "liabilities",
+                "section_label": "Liabilities",
+                "classification": acc.classification or "other_liability",
+                "account_code": acc.account_code,
+                "account_name": acc.name,
+                "balance": bal,
+                "debit_total": dr,
+                "credit_total": cr,
+                "account_id": acc.id,
+                "is_active": acc.is_active,
+            })
+        elif acc.account_type == "equity":
+            bal = round(cr - dr, 2)
+            equity_rows.append({
+                "section": "equity",
+                "section_label": "Equity",
+                "classification": acc.classification or "owner_equity",
+                "account_code": acc.account_code,
+                "account_name": acc.name,
+                "balance": bal,
+                "debit_total": dr,
+                "credit_total": cr,
+                "account_id": acc.id,
+                "is_active": acc.is_active,
+            })
+
+    # Cumulative net income from operational revenue/expenses to date
+    period_net_income = round(cumulative_revenue - cumulative_expense, 2)
+
+    # In double entry, if there are revenue/expense transactions in the ledger,
+    # period net income is represented in Equity so that Assets = Liabilities + Equity balances
+    if period_net_income != 0.0:
+        equity_rows.append({
+            "section": "equity",
+            "section_label": "Equity",
+            "classification": "retained_earnings",
+            "account_code": "NET-INC",
+            "account_name": "Current Period Net Profit / (Loss) to Date",
+            "balance": period_net_income,
+            "debit_total": cumulative_expense if period_net_income < 0 else 0.0,
+            "credit_total": cumulative_revenue if period_net_income >= 0 else 0.0,
+            "account_id": "current-period-net-income",
+            "is_active": True,
+        })
+
+    total_assets = round(sum(r["balance"] for r in asset_rows), 2)
+    total_liabilities = round(sum(r["balance"] for r in liability_rows), 2)
+    total_equity = round(sum(r["balance"] for r in equity_rows), 2)
+    total_liabilities_and_equity = round(total_liabilities + total_equity, 2)
+    diff = round(total_assets - total_liabilities_and_equity, 2)
+    is_balanced = (diff == 0.0)
+
+    # 4. Completeness assessment against operational business documents
+    posted_invoice_ids = (
+        select(JournalEntry.source_id)
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.source_type == "invoice",
+            JournalEntry.status.in_(["posted", "reversed"]),
+        )
+    )
+    unposted_invoices_count = (
+        db.query(func.count(Invoice.id))
+        .filter(
+            Invoice.organization_id == org_id,
+            Invoice.is_credit_note.is_(False),
+            Invoice.status.notin_(["void", "cancelled", "draft"]),
+            Invoice.invoice_date <= as_of_dt,
+            Invoice.id.notin_(posted_invoice_ids),
+        )
+        .scalar() or 0
+    )
+
+    posted_payment_ids = (
+        select(JournalEntry.source_id)
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.source_type == "customer_payment",
+            JournalEntry.status.in_(["posted", "reversed"]),
+        )
+    )
+    unposted_payments_count = (
+        db.query(func.count(CustomerPayment.id))
+        .filter(
+            CustomerPayment.organization_id == org_id,
+            CustomerPayment.received_on <= as_of_dt,
+            CustomerPayment.id.notin_(posted_payment_ids),
+        )
+        .scalar() or 0
+    )
+
+    posted_expense_ids = (
+        select(JournalEntry.source_id)
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.source_type == "expense",
+            JournalEntry.status.in_(["posted", "reversed"]),
+        )
+    )
+    unposted_expenses_count = (
+        db.query(func.count(Expense.id))
+        .filter(
+            Expense.organization_id == org_id,
+            Expense.status == "approved",
+            Expense.expense_date <= as_of_dt,
+            Expense.id.notin_(posted_expense_ids),
+        )
+        .scalar() or 0
+    )
+
+    posted_return_ids = (
+        select(JournalEntry.source_id)
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.source_type == "sales_return",
+            JournalEntry.status.in_(["posted", "reversed"]),
+        )
+    )
+    unposted_returns_count = (
+        db.query(func.count(SalesReturn.id))
+        .filter(
+            SalesReturn.organization_id == org_id,
+            SalesReturn.return_status.in_(["approved", "completed", "received"]),
+            SalesReturn.return_date <= as_of_dt,
+            SalesReturn.id.notin_(posted_return_ids),
+        )
+        .scalar() or 0
+    )
+
+    unposted_operational_count = (
+        unposted_invoices_count + unposted_payments_count + unposted_expenses_count + unposted_returns_count
+    )
+
+    # Build warnings and disclosures
+    warnings: list[str] = []
+    unsupported_categories: list[str] = []
+
+    if total_posted_entries == 0:
+        status_val = "unconfigured"
+        completeness_status = "unconfigured"
+        warnings.append("No general ledger entries recorded for this organization as of the requested date. Opening balances or journal entries must be established before a complete Balance Sheet can be presented.")
+    elif not is_balanced:
+        status_val = "out_of_balance"
+        completeness_status = "incomplete" if unposted_operational_count > 0 else "complete"
+        warnings.append(f"Statement is out of balance by {diff:.2f} INR. Verify that all journal entries and opening balances are balanced.")
+    else:
+        status_val = "balanced"
+        if unposted_operational_count > 0:
+            completeness_status = "incomplete"
+            warnings.append(
+                f"{unposted_operational_count} eligible operational document(s) ({unposted_invoices_count} invoices, {unposted_payments_count} payments, {unposted_expenses_count} expenses, {unposted_returns_count} returns) have not been posted to the general ledger as of {as_of_str}. The general ledger balances mathematically, but operational books are incomplete."
+            )
+        else:
+            completeness_status = "complete"
+
+    warnings.append("Bank balances reflect posted general ledger receipts and disbursements; external bank reconciliations are not verified.")
+    warnings.append("Inventory asset valuation reflects posted general ledger inventory entries; dynamic warehouse stock valuation requires opening inventory entry.")
+
+    unsupported_categories.append("Fixed Asset registers and accumulated depreciation schedules are not yet configured.")
+    unsupported_categories.append("Automatic tax liability reconciliation against external GST portals is not configured.")
+
+    all_rows = asset_rows + liability_rows + equity_rows
+
+    if search:
+        s = search.lower()
+        all_rows = [
+            r for r in all_rows
+            if s in r["account_code"].lower()
+            or s in r["account_name"].lower()
+            or s in r["classification"].lower()
+            or s in r["section"].lower()
+        ]
+
+    summary = {
+        "as_of_date": as_of_str,
+        "total_assets": total_assets,
+        "total_liabilities": total_liabilities,
+        "total_equity": total_equity,
+        "total_liabilities_and_equity": total_liabilities_and_equity,
+        "difference": diff,
+        "is_balanced": is_balanced,
+        "status": status_val,
+        "completeness_status": completeness_status,
+        "is_complete": (completeness_status == "complete"),
+        "unposted_operational_count": unposted_operational_count,
+        "total_posted_entries": total_posted_entries,
+        "account_count": len(all_rows),
+    }
+
+    paged_rows, pagination = _paginate(all_rows, page, page_size)
+
+    meta = {
+        "currency": "INR",
+        "as_of_date": as_of_str,
+        "group_by": None,
+        "completeness_status": completeness_status,
+        "unposted_operational_breakdown": {
+            "invoices": unposted_invoices_count,
+            "payments": unposted_payments_count,
+            "expenses": unposted_expenses_count,
+            "sales_returns": unposted_returns_count,
+        },
+        "warnings": warnings,
+        "unsupported_categories": unsupported_categories,
+        "columns": [
+            {"key": "section_label", "label": "Section", "type": "text"},
+            {"key": "classification", "label": "Classification", "type": "text"},
+            {"key": "account_code", "label": "Account Code", "type": "reference"},
+            {"key": "account_name", "label": "Account Name", "type": "text"},
+            {"key": "balance", "label": "Balance", "type": "currency"},
+            {"key": "debit_total", "label": "Total Debits", "type": "currency"},
+            {"key": "credit_total", "label": "Total Credits", "type": "currency"},
+        ],
+    }
+
+    chart = {
+        "type": "bar",
+        "title": f"Balance Sheet Position as of {as_of_str}",
+        "data": [
+            {"label": "Total Assets", "amount": total_assets},
+            {"label": "Total Liabilities", "amount": total_liabilities},
+            {"label": "Total Equity", "amount": total_equity},
+            {"label": "Liabilities + Equity", "amount": total_liabilities_and_equity},
+        ],
+    }
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+        "as_of_date": as_of_str,
+    }
+
+
+def _notes_to_balance_sheet(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
+    page = int(params.get("page", 1))
+    page_size = int(params.get("page_size", 25))
+    search = params.get("search")
+    raw_schedule = params.get("schedule") or params.get("line_item")
+
+    if not raw_schedule:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="schedule (or line_item) is required. Supported values: 'cash_and_bank', 'accounts_receivable', 'accounts_payable', 'tax_liabilities', 'equity'",
+        )
+
+    schedule = raw_schedule.strip().lower()
+    valid_schedules = ("cash_and_bank", "accounts_receivable", "accounts_payable", "tax_liabilities", "equity")
+    if schedule not in valid_schedules:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported schedule '{raw_schedule}'. Supported values: {', '.join(repr(s) for s in valid_schedules)}",
+        )
+
+    # Determine as_of_date boundary
+    tz = get_org_timezone(db, org_id)
+    raw_as_of = params.get("as_of_date")
+    if raw_as_of:
+        try:
+            d = date.fromisoformat(raw_as_of.strip())
+            as_of_dt = datetime.combine(d, time.max, tzinfo=tz).astimezone(timezone.utc)
+            as_of_str = d.isoformat()
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid as_of_date '{raw_as_of}'. Expected format: YYYY-MM-DD",
+            )
+    elif dt:
+        as_of_dt = dt
+        as_of_str = dt.astimezone(tz).date().isoformat()
+    else:
+        now_org = datetime.now(tz)
+        as_of_dt = datetime.combine(now_org.date(), time.max, tzinfo=tz).astimezone(timezone.utc)
+        as_of_str = now_org.date().isoformat()
+
+    # Query lines matching the requested schedule
+    classifications_map = {
+        "cash_and_bank": ["cash_and_bank"],
+        "accounts_receivable": ["accounts_receivable"],
+        "accounts_payable": ["accounts_payable"],
+        "tax_liabilities": ["tax_liability"],
+        "equity": ["owner_equity", "retained_earnings", "capital"],
+    }
+    target_classifications = classifications_map[schedule]
+
+    accounts = (
+        db.query(Account)
+        .filter(
+            Account.organization_id == org_id,
+            Account.classification.in_(target_classifications),
+        )
+        .order_by(Account.account_code.asc())
+        .all()
+    )
+    acc_ids = [a.id for a in accounts]
+
+    line_query = (
+        db.query(
+            JournalLine.id,
+            JournalLine.line_number,
+            JournalLine.debit,
+            JournalLine.credit,
+            JournalLine.description,
+            JournalEntry.entry_number,
+            JournalEntry.effective_date,
+            JournalEntry.reference,
+            JournalEntry.entry_type,
+            Account.account_code,
+            Account.name.label("account_name"),
+            Account.account_type,
+        )
+        .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
+        .join(Account, JournalLine.account_id == Account.id)
+        .filter(
+            JournalEntry.organization_id == org_id,
+            JournalEntry.status.in_(["posted", "reversed"]),
+            JournalEntry.effective_date <= as_of_dt,
+            JournalLine.account_id.in_(acc_ids),
+        )
+        .order_by(JournalEntry.effective_date.desc(), JournalLine.id.asc())
+    )
+    raw_lines = line_query.all()
+
+    rows = []
+    total_debit = 0.0
+    total_credit = 0.0
+
+    for l in raw_lines:
+        dr = round(float(l.debit or 0.0), 2)
+        cr = round(float(l.credit or 0.0), 2)
+        total_debit += dr
+        total_credit += cr
+
+        line_impact = dr - cr if l.account_type == "asset" else cr - dr
+
+        rows.append({
+            "line_id": l.id,
+            "entry_number": l.entry_number,
+            "effective_date": l.effective_date.date().isoformat() if hasattr(l.effective_date, "date") else str(l.effective_date)[:10],
+            "account_code": l.account_code,
+            "account_name": l.account_name,
+            "reference": l.reference or l.entry_number,
+            "entry_type": l.entry_type,
+            "description": l.description,
+            "debit": dr,
+            "credit": cr,
+            "amount": round(line_impact, 2),
+        })
+
+    # For equity schedule: dynamically include cumulative net income from revenue/expense accounts to date
+    # so that the Note reconciles exactly with the Balance Sheet equity total prior to closing entries.
+    if schedule == "equity":
+        rev_exp_lines = (
+            db.query(
+                Account.account_type,
+                func.coalesce(func.sum(JournalLine.debit), 0.0).label("total_debit"),
+                func.coalesce(func.sum(JournalLine.credit), 0.0).label("total_credit"),
+            )
+            .join(JournalLine, JournalLine.account_id == Account.id)
+            .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
+            .filter(
+                Account.organization_id == org_id,
+                Account.account_type.in_(["revenue", "expense"]),
+                JournalEntry.organization_id == org_id,
+                JournalEntry.status.in_(["posted", "reversed"]),
+                JournalEntry.effective_date <= as_of_dt,
+            )
+            .group_by(Account.account_type)
+            .all()
+        )
+        cum_rev = 0.0
+        cum_exp = 0.0
+        for rel in rev_exp_lines:
+            d_val = float(rel.total_debit or 0.0)
+            c_val = float(rel.total_credit or 0.0)
+            if rel.account_type == "revenue":
+                cum_rev += (c_val - d_val)
+            elif rel.account_type == "expense":
+                cum_exp += (d_val - c_val)
+
+        period_net_income = round(cum_rev - cum_exp, 2)
+        if period_net_income != 0.0:
+            if period_net_income > 0:
+                net_dr = 0.0
+                net_cr = period_net_income
+            else:
+                net_dr = abs(period_net_income)
+                net_cr = 0.0
+
+            total_debit += net_dr
+            total_credit += net_cr
+
+            rows.append({
+                "line_id": "current-period-net-income",
+                "entry_number": "NET-INC",
+                "effective_date": as_of_str,
+                "account_code": "NET-INC",
+                "account_name": "Current Period Net Profit / (Loss) to Date",
+                "reference": "P&L Transfer",
+                "entry_type": "closing_adjustment",
+                "description": "Dynamic net profit/(loss) transfer to equity prior to year-end closing",
+                "debit": round(net_dr, 2),
+                "credit": round(net_cr, 2),
+                "amount": round(period_net_income, 2),
+            })
+
+    if search:
+        s = search.lower()
+        rows = [
+            r for r in rows
+            if s in r["entry_number"].lower()
+            or s in r["account_code"].lower()
+            or s in r["account_name"].lower()
+            or s in (r["reference"] or "").lower()
+            or s in (r["description"] or "").lower()
+        ]
+
+    total_debit = round(total_debit, 2)
+    total_credit = round(total_credit, 2)
+    net_schedule_balance = round(
+        (total_debit - total_credit) if schedule in ("cash_and_bank", "accounts_receivable") else (total_credit - total_debit),
+        2,
+    )
+
+    titles_map = {
+        "cash_and_bank": "Note 1: Cash and Cash Equivalents Schedule",
+        "accounts_receivable": "Note 2: Trade Receivables Schedule",
+        "accounts_payable": "Note 3: Trade Payables Schedule",
+        "tax_liabilities": "Note 4: Statutory and Tax Liabilities Schedule",
+        "equity": "Note 5: Capital and Reserves Schedule",
+    }
+
+    summary = {
+        "schedule": titles_map[schedule],
+        "schedule_key": schedule,
+        "as_of_date": as_of_str,
+        "total_debits": total_debit,
+        "total_credits": total_credit,
+        "net_balance": net_schedule_balance,
+        "transaction_count": len(rows),
+    }
+
+    paged_rows, pagination = _paginate(rows, page, page_size)
+
+    meta = {
+        "currency": "INR",
+        "title": titles_map[schedule],
+        "schedule": schedule,
+        "line_item": schedule,
+        "as_of_date": as_of_str,
+        "columns": [
+            {"key": "effective_date", "label": "Date", "type": "date"},
+            {"key": "entry_number", "label": "Entry #", "type": "reference"},
+            {"key": "account_code", "label": "Account", "type": "reference"},
+            {"key": "account_name", "label": "Account Name", "type": "text"},
+            {"key": "reference", "label": "Reference", "type": "text"},
+            {"key": "description", "label": "Description", "type": "text"},
+            {"key": "debit", "label": "Debit", "type": "currency"},
+            {"key": "credit", "label": "Credit", "type": "currency"},
+            {"key": "amount", "label": "Net Impact", "type": "currency"},
+        ],
+    }
+
+    chart = {
+        "type": "bar",
+        "title": f"{titles_map[schedule]} Breakdown",
+        "data": [{"account": r["account_name"], "amount": r["amount"]} for r in rows[:10]],
+    }
+
+    return {
+        "summary": summary,
+        "rows": paged_rows,
+        "pagination": pagination,
+        "meta": meta,
+        "chart": chart,
+        "as_of_date": as_of_str,
+    }
+
+
 _BUILDERS = {
     "daily-transaction": _daily_transaction,
     "sales": _sales,
@@ -3614,6 +4212,8 @@ _BUILDERS = {
     "cash-flow-sheet": _cash_flow_sheet,
     "statement-of-pl": _statement_of_pl,
     "notes-to-pl": _notes_to_pl,
+    "balance-sheet": _balance_sheet,
+    "notes-to-balance-sheet": _notes_to_balance_sheet,
 }
 
 
@@ -3665,6 +4265,8 @@ def build_report(
     result["type"] = report_type
     result["date_from"] = date_from
     result["date_to"] = date_to
+    if "as_of_date" not in result and params.get("as_of_date"):
+        result["as_of_date"] = params.get("as_of_date")
 
     return result
 
@@ -3984,6 +4586,26 @@ def resolve_report_row(
                 prod_name, prod_id, sku,
                 cat,
             ) or slug_target in (p_slug, prod_slug, cat_slug):
+                matched_rows.append(r)
+
+    elif report_type == "balance-sheet":
+        for r in rows:
+            acc_code = str(r.get("account_code") or "").strip().lower()
+            acc_id = str(r.get("account_id") or "").strip().lower()
+            acc_name = str(r.get("account_name") or "").strip().lower()
+            acc_slug = re.sub(r"[^a-z0-9]+", "_", acc_name).strip("_")
+            if norm_target in (acc_code, acc_id, acc_name) or slug_target == acc_slug:
+                matched_rows.append(r)
+
+    elif report_type == "notes-to-balance-sheet":
+        for r in rows:
+            lid = str(r.get("line_id") or "").strip().lower()
+            enum = str(r.get("entry_number") or "").strip().lower()
+            ref = str(r.get("reference") or "").strip().lower()
+            acc_code = str(r.get("account_code") or "").strip().lower()
+            acc_name = str(r.get("account_name") or "").strip().lower()
+            acc_slug = re.sub(r"[^a-z0-9]+", "_", acc_name).strip("_")
+            if norm_target in (lid, enum, ref, acc_code, acc_name) or slug_target == acc_slug:
                 matched_rows.append(r)
 
     else:

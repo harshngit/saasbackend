@@ -364,6 +364,13 @@ def convert_lead_to_customer(
             detail="Lost lead cannot be converted to customer. Reopen the lead first.",
         )
 
+    from app.models.enums import UserRole
+    if user.role == UserRole.DELIVERY_PARTNER or (user.role_detail and user.role_detail.name == "Delivery Partner"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Delivery partners cannot create customers",
+        )
+
     # 1. If already converted (by us or by the request we were racing),
     # return the existing customer — idempotent duplicate protection.
     if lead.customer_id:

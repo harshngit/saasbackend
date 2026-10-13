@@ -141,6 +141,11 @@ def create_customer(
     the `documents` section is filled by uploading, not by writing ids.
     """
     org_id = _org_id(user)
+    if _is_delivery_partner(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Delivery partners cannot create customers",
+        )
     data = payload.to_columns()
     _validate_assignee(db, org_id, data.get("assigned_sales_officer_id"))
     if not data.get("name"):
@@ -185,6 +190,11 @@ def import_customers(
 ) -> ImportSummaryOut:
     """Bulk import customers from an Excel (.xlsx) or CSV (.csv) file using the 10-column template."""
     org_id = _org_id(user)
+    if _is_delivery_partner(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Delivery partners cannot create customers",
+        )
     content = file.file.read()
     filename = file.filename or "customers.xlsx"
     return import_customers_from_file(db, org_id, user, content, filename)

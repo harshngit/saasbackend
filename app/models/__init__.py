@@ -87,8 +87,20 @@ from app.models.visit import Visit
 from app.models.follow_up import FollowUp
 from app.models.cash_reconciliation import CashReconciliation, CashReconciliationDetail
 from app.models.leave import LEAVE_STATUSES, LEAVE_TYPES, Leave
+from app.models.accounting import (
+    ACCOUNT_CLASSIFICATIONS,
+    ACCOUNT_TYPES,
+    Account,
+    JournalEntry,
+    JournalLine,
+)
 
 __all__ = [
+    "Account",
+    "JournalEntry",
+    "JournalLine",
+    "ACCOUNT_TYPES",
+    "ACCOUNT_CLASSIFICATIONS",
     "CashReconciliation",
     "CashReconciliationDetail",
     "PurchaseReturn",

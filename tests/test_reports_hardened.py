@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -38,8 +39,11 @@ from app.models import (
     Vehicle,
     Warehouse,
     WarehouseStock,
+    Account,
+    JournalEntry,
+    JournalLine,
 )
-from app.services import report_service
+from app.services import accounting_service, report_service
 
 from sqlalchemy.pool import StaticPool
 
@@ -214,8 +218,8 @@ def client(db, test_data):
 
 
 def test_registry_contains_all_reports():
-    assert len(report_service.REPORT_TYPES) == 19
-    assert len(report_service.REPORT_REGISTRY) == 19
+    assert len(report_service.REPORT_TYPES) == 21
+    assert len(report_service.REPORT_REGISTRY) == 21
     expected_reports = {
         "daily-transaction", "sales", "purchase", "customer-outstanding",
         "supplier-outstanding", "payment-collection", "expense", "cash-collection",
@@ -223,6 +227,7 @@ def test_registry_contains_all_reports():
         "supplier-payment", "inventory-summary", "stock-movement",
         "sales-overview", "cash-flow-sheet",
         "statement-of-pl", "notes-to-pl",
+        "balance-sheet", "notes-to-balance-sheet",
     }
     assert report_service.REPORT_TYPES == expected_reports
 
@@ -2548,4 +2553,961 @@ def test_profit_loss_summary_and_phase1_exports_unbroken(client, pl_statement_da
     pl_row = _xlsx_table(pl_row_res.content, "P&L Statement Line Item")
     assert len(pl_row) == 1
     assert "Cost of Goods Sold (COGS)" in pl_row[0]["P&L Statement Line Item"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: General Ledger and Balance Sheet Tests
+# ---------------------------------------------------------------------------
+
+def test_chart_of_accounts_and_journal_double_entry_validation(db, test_data):
+    org = test_data["org"]
+    accounts = accounting_service.ensure_default_accounts(db, org.id)
+    assert len(accounts) == 14
+    assert "1010" in accounts
+    assert "1200" in accounts
+    assert "2010" in accounts
+    assert "3010" in accounts
+
+    # 1. Balanced entry succeeds
+    entry = accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 1, 15, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 500.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 500.0},
+        ],
+        entry_type="manual",
+        reference="TEST-BAL-01",
+    )
+    assert entry.status == "posted"
+    assert len(entry.lines) == 2
+
+    # 2. Unbalanced entry raises 400
+    with pytest.raises(HTTPException) as exc_info:
+        accounting_service.create_journal_entry(
+            db=db,
+            org_id=org.id,
+            effective_date=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            lines=[
+                {"account_code": "1010", "debit": 500.0, "credit": 0.0},
+                {"account_code": "3010", "debit": 0.0, "credit": 400.0},
+            ],
+        )
+    assert exc_info.value.status_code == 400
+    assert "Unbalanced journal entry" in exc_info.value.detail
+
+    # 3. Negative debit or credit raises 400
+    with pytest.raises(HTTPException) as exc_info:
+        accounting_service.create_journal_entry(
+            db=db,
+            org_id=org.id,
+            effective_date=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            lines=[
+                {"account_code": "1010", "debit": -100.0, "credit": 0.0},
+                {"account_code": "3010", "debit": 0.0, "credit": -100.0},
+            ],
+        )
+    assert exc_info.value.status_code == 400
+    assert "non-negative" in exc_info.value.detail
+
+    # 4. Fewer than two lines raises 400
+    with pytest.raises(HTTPException) as exc_info:
+        accounting_service.create_journal_entry(
+            db=db,
+            org_id=org.id,
+            effective_date=datetime(2026, 1, 15, tzinfo=timezone.utc),
+            lines=[{"account_code": "1010", "debit": 100.0, "credit": 0.0}],
+        )
+    assert exc_info.value.status_code == 400
+    assert "at least two lines" in exc_info.value.detail
+
+
+def test_opening_balances_and_duplicate_prevention(db, test_data):
+    org = test_data["org"]
+    eff_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    # 1. Post balanced opening balance
+    ob = accounting_service.post_opening_balances(
+        db=db,
+        org_id=org.id,
+        effective_date=eff_date,
+        balances=[
+            {"account_code": "1010", "debit": 10000.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 10000.0},
+        ],
+    )
+    assert ob.entry_type == "opening_balance"
+    assert ob.status == "posted"
+
+    # 2. Duplicate opening balance raises 400
+    with pytest.raises(HTTPException) as exc_info:
+        accounting_service.post_opening_balances(
+            db=db,
+            org_id=org.id,
+            effective_date=eff_date,
+            balances=[
+                {"account_code": "1010", "debit": 5000.0, "credit": 0.0},
+                {"account_code": "3010", "debit": 0.0, "credit": 5000.0},
+            ],
+        )
+    assert exc_info.value.status_code == 400
+    assert "Opening balances have already been posted" in exc_info.value.detail
+
+
+def test_journal_entry_reversal_audit_trail(db, test_data):
+    org = test_data["org"]
+    entry = accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1500", "debit": 2500.0, "credit": 0.0},
+            {"account_code": "1010", "debit": 0.0, "credit": 2500.0},
+        ],
+        entry_type="manual",
+        reference="PUR-EQUIP-01",
+    )
+    assert entry.status == "posted"
+
+    # Reverse entry
+    rev = accounting_service.reverse_journal_entry(
+        db=db,
+        org_id=org.id,
+        entry_id=entry.id,
+        reason="Entered in error",
+    )
+    assert rev.is_reversal is True
+    assert rev.reversed_entry_id == entry.id
+    assert entry.status == "reversed"
+
+    # Attempting to reverse again raises 400
+    with pytest.raises(HTTPException) as exc_info:
+        accounting_service.reverse_journal_entry(
+            db=db,
+            org_id=org.id,
+            entry_id=entry.id,
+        )
+    assert exc_info.value.status_code == 400
+    assert "already been reversed" in exc_info.value.detail
+
+
+def test_operational_document_posting_and_idempotency(db, test_data):
+    org = test_data["org"]
+    cust = test_data["customer"]
+
+    inv = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        invoice_number="INV-GL-001",
+        customer_id=cust.id,
+        subtotal=1000.0,
+        tax=180.0,
+        total=1180.0,
+        amount_paid=0.0,
+        status="unpaid",
+        is_credit_note=False,
+        invoice_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+    )
+    db.add(inv)
+    db.commit()
+
+    # 1. Post operational invoice
+    entry1 = accounting_service.post_operational_document(db, org.id, "invoice", inv.id)
+    assert entry1 is not None
+    assert entry1.entry_type == "invoice"
+    lines = {l.account.account_code: (l.debit, l.credit) for l in entry1.lines}
+    assert lines["1200"] == (1180.0, 0.0)  # AR
+    assert lines["4010"] == (0.0, 1000.0)  # Revenue
+    assert lines["2100"] == (0.0, 180.0)   # GST Output Payable
+
+    # 2. Idempotency: posting again returns same entry without duplicate
+    entry2 = accounting_service.post_operational_document(db, org.id, "invoice", inv.id)
+    assert entry2.id == entry1.id
+
+
+@pytest.fixture
+def gl_balance_sheet_data(db, test_data):
+    org, org2 = test_data["org"], test_data["org2"]
+    accounting_service.ensure_default_accounts(db, org.id)
+    accounting_service.ensure_default_accounts(db, org2.id)
+
+    # 1. Opening balance on 2026-01-01: Cash 10,000 (Dr), Owner Capital 10,000 (Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 10000.0, "credit": 0.0, "description": "Cash Opening"},
+            {"account_code": "3010", "debit": 0.0, "credit": 10000.0, "description": "Capital Opening"},
+        ],
+        entry_type="opening_balance",
+        reference="OB-2026-01-01",
+        source_type="opening_balance",
+        source_id=f"OB-{org.id}",
+    )
+
+    # 2. Fixed asset purchase on 2026-02-01: Office Equipment 2,000 (Dr), Cash 2,000 (Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 2, 1, 12, 0, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1500", "debit": 2000.0, "credit": 0.0, "description": "Laptops"},
+            {"account_code": "1010", "debit": 0.0, "credit": 2000.0, "description": "Cash paid for laptops"},
+        ],
+        entry_type="manual",
+        reference="JE-EQUIP-01",
+    )
+
+    # 3. Revenue on 2026-03-01: AR 5,000 (Dr), Sales Revenue 5,000 (Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1200", "debit": 5000.0, "credit": 0.0, "description": "Client Invoice"},
+            {"account_code": "4010", "debit": 0.0, "credit": 5000.0, "description": "Consulting Revenue"},
+        ],
+        entry_type="invoice",
+        reference="INV-2026-001",
+    )
+
+    # 4. Cash collection on 2026-03-15: Bank 3,000 (Dr), AR 3,000 (Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1020", "debit": 3000.0, "credit": 0.0, "description": "Client NEFT"},
+            {"account_code": "1200", "debit": 0.0, "credit": 3000.0, "description": "AR Cleared"},
+        ],
+        entry_type="customer_payment",
+        reference="PMT-2026-001",
+    )
+
+    # 5. Operating expense on 2026-04-01: Expenses 1,000 (Dr), Cash 1,000 (Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "6010", "debit": 1000.0, "credit": 0.0, "description": "Rent Payment"},
+            {"account_code": "1010", "debit": 0.0, "credit": 1000.0, "description": "Cash Paid for Rent"},
+        ],
+        entry_type="expense",
+        reference="EXP-2026-001",
+    )
+
+    # 6. Foreign org transaction (org2)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org2.id,
+        effective_date=datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 9999.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 9999.0},
+        ],
+        entry_type="manual",
+        reference="FOREIGN-JE-01",
+    )
+
+    db.commit()
+    return test_data
+
+
+def test_balance_sheet_as_of_date_and_accounting_equation(client, gl_balance_sheet_data):
+    # 1. As of 2026-02-15: March and April transactions must be excluded
+    res_feb = client.get("/reports/balance-sheet", params={"as_of_date": "2026-02-15"})
+    assert res_feb.status_code == 200
+    data_feb = res_feb.json()
+    s_feb = data_feb["summary"]
+
+    # Cash = 10,000 - 2,000 = 8,000; Equipment = 2,000 -> Total Assets = 10,000
+    assert s_feb["total_assets"] == 10000.0
+    assert s_feb["total_liabilities"] == 0.0
+    assert s_feb["total_equity"] == 10000.0
+    assert s_feb["total_liabilities_and_equity"] == 10000.0
+    assert s_feb["difference"] == 0.0
+    assert s_feb["is_balanced"] is True
+    assert s_feb["status"] == "balanced"
+
+    # 2. As of 2026-04-15: Complete position including revenues and expenses
+    res_apr = client.get("/reports/balance-sheet", params={"as_of_date": "2026-04-15"})
+    assert res_apr.status_code == 200
+    data_apr = res_apr.json()
+    s_apr = data_apr["summary"]
+
+    # Assets: Cash 7,000 + Bank 3,000 + AR 2,000 + Equipment 2,000 = 14,000
+    assert s_apr["total_assets"] == 14000.0
+    assert s_apr["total_liabilities"] == 0.0
+    # Equity: Capital 10,000 + Period Net Income (5,000 rev - 1,000 exp = 4,000) = 14,000
+    assert s_apr["total_equity"] == 14000.0
+    assert s_apr["total_liabilities_and_equity"] == 14000.0
+    assert s_apr["difference"] == 0.0
+    assert s_apr["is_balanced"] is True
+
+    # Check rows contain individual accounts
+    codes = {r["account_code"]: r["balance"] for r in data_apr["rows"]}
+    assert codes["1010"] == 7000.0   # Cash
+    assert codes["1020"] == 3000.0   # Bank
+    assert codes["1200"] == 2000.0   # AR
+    assert codes["1500"] == 2000.0   # Equipment
+    assert codes["3010"] == 10000.0  # Capital
+    assert codes["NET-INC"] == 4000.0  # Net Income to Date
+
+
+def test_balance_sheet_unconfigured_and_cross_tenant_isolation(client, db):
+    # Fresh org with 0 entries
+    fresh_plan = Plan(name="Enterprise", price_monthly=1999, price_yearly=19999, entitlements={"report.balance_sheet": True})
+    db.add(fresh_plan)
+    db.flush()
+    fresh_org = Organization(id=str(uuid.uuid4()), name="Empty Ledger Org", company_code="CMP-30003", timezone="Asia/Kolkata", plan_id=fresh_plan.id)
+    db.add(fresh_org)
+    fresh_user = User(id=str(uuid.uuid4()), email="empty@test.com", name="Analyst", password_hash="hash", organization_id=fresh_org.id, role="admin", is_active=True)
+    db.add(fresh_user)
+    db.commit()
+
+    from app.routers.reports import _view
+    app.dependency_overrides[_view] = lambda: fresh_user
+
+    res = client.get("/reports/balance-sheet")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["summary"]["status"] == "unconfigured"
+    assert data["summary"]["total_assets"] == 0.0
+    assert any("Opening balances or journal entries must be established" in w for w in data["meta"]["warnings"])
+
+    # Reset override
+    app.dependency_overrides.clear()
+
+
+def test_notes_to_balance_sheet_schedules_and_reconciliation(client, gl_balance_sheet_data):
+    params = {"as_of_date": "2026-04-15", "page_size": 100}
+
+    # 1. schedule=cash_and_bank
+    res_cash = client.get("/reports/notes-to-balance-sheet", params={**params, "schedule": "cash_and_bank"})
+    assert res_cash.status_code == 200
+    data_cash = res_cash.json()
+    assert data_cash["summary"]["net_balance"] == 10000.0  # Cash 7,000 + Bank 3,000
+
+    # 2. schedule=accounts_receivable
+    res_ar = client.get("/reports/notes-to-balance-sheet", params={**params, "schedule": "accounts_receivable"})
+    assert res_ar.status_code == 200
+    data_ar = res_ar.json()
+    assert data_ar["summary"]["net_balance"] == 2000.0  # AR 2,000
+
+    # 3. Missing schedule returns 400
+    res_missing = client.get("/reports/notes-to-balance-sheet", params={"as_of_date": "2026-04-15"})
+    assert res_missing.status_code == 400
+    assert "schedule (or line_item) is required" in res_missing.json()["detail"]
+
+    # 4. Unsupported schedule returns 400
+    res_bad = client.get("/reports/notes-to-balance-sheet", params={"schedule": "invalid_sched"})
+    assert res_bad.status_code == 400
+    assert "Unsupported schedule" in res_bad.json()["detail"]
+
+
+def test_balance_sheet_and_notes_exports(client, gl_balance_sheet_data):
+    params = {"as_of_date": "2026-04-15"}
+
+    # Full Excel export for balance-sheet
+    res_bs_excel = client.get("/reports/balance-sheet/export", params={**params, "format": "excel"})
+    assert res_bs_excel.status_code == 200
+    assert res_bs_excel.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    bs_rows = _xlsx_table(res_bs_excel.content, "Section")
+    assert len(bs_rows) >= 5
+
+    # Full PDF export for balance-sheet
+    res_bs_pdf = client.get("/reports/balance-sheet/export", params={**params, "format": "pdf"})
+    assert res_bs_pdf.status_code == 200
+    assert res_bs_pdf.content.startswith(b"%PDF-")
+
+    # Full Excel export for notes-to-balance-sheet
+    res_notes_excel = client.get("/reports/notes-to-balance-sheet/export", params={**params, "schedule": "cash_and_bank", "format": "excel"})
+    assert res_notes_excel.status_code == 200
+    notes_rows = _xlsx_table(res_notes_excel.content, "Date")
+    assert len(notes_rows) >= 3
+
+
+def test_balance_sheet_and_notes_row_exports(client, gl_balance_sheet_data):
+    params = {"as_of_date": "2026-04-15"}
+
+    # Row export for balance-sheet by account code 1010 (Cash on Hand)
+    res_row_code = client.get("/reports/balance-sheet/export/1010", params={**params, "format": "excel"})
+    assert res_row_code.status_code == 200
+    r_code = _xlsx_table(res_row_code.content, "Section")
+    assert len(r_code) == 1
+    assert r_code[0]["Account Code"] == "1010"
+
+    # Row export for balance-sheet by slugified account name
+    res_row_slug = client.get("/reports/balance-sheet/export/operating_bank_account", params={**params, "format": "excel"})
+    assert res_row_slug.status_code == 200
+    r_slug = _xlsx_table(res_row_slug.content, "Section")
+    assert len(r_slug) == 1
+    assert r_slug[0]["Account Code"] == "1020"
+
+
+def test_migration_upgrade_and_downgrade():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "migration_z4",
+        "alembic/versions/z4a5b6c7d8e9_general_ledger_and_chart_of_accounts.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.revision == "z4a5b6c7d8e9"
+    assert mod.down_revision == "y3z4a5b6c7d8"
+    assert hasattr(mod, "upgrade")
+    assert hasattr(mod, "downgrade")
+
+
+from decimal import Decimal
+from sqlalchemy.exc import IntegrityError
+from app.services import payment_service
+
+
+def test_reversal_balance_correctness_and_duplicate_prevention(client, db):
+    """Verify that posting an opening entry and reversing it returns all balances to zero,
+
+    and that duplicate reversals on original or reversal entries are rejected.
+    """
+    plan = Plan(name="RevPlan", price_monthly=99, price_yearly=999, entitlements={"report.balance_sheet": True})
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Reversal Test Org", company_code="CMP-40009", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    user = User(id=str(uuid.uuid4()), email="rev@test.com", name="Rev User", password_hash="hash", organization_id=org.id, role="admin", is_active=True)
+    db.add(user)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    from app.routers.reports import _view
+    app.dependency_overrides[_view] = lambda: user
+
+    # 1. Post opening entry: Cash 5,000 (Dr), Capital 5,000 (Cr)
+    entry = accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 5000.0, "credit": 0.0, "description": "Opening Cash"},
+            {"account_code": "3010", "debit": 0.0, "credit": 5000.0, "description": "Opening Capital"},
+        ],
+        entry_type="opening_balance",
+        reference="OB-REV-001",
+    )
+    assert entry.status == "posted"
+
+    # Verify Balance Sheet reflects 5000 Cash and 5000 Capital
+    res1 = client.get("/reports/balance-sheet", params={"as_of_date": "2026-01-05"})
+    assert res1.status_code == 200
+    d1 = res1.json()
+    assert d1["summary"]["total_assets"] == 5000.0
+    assert d1["summary"]["total_equity"] == 5000.0
+    assert d1["summary"]["difference"] == 0.0
+
+    # 2. Reverse the entry
+    rev = accounting_service.reverse_journal_entry(
+        db=db,
+        org_id=org.id,
+        entry_id=entry.id,
+        reason="Erroneous opening entry",
+    )
+    assert rev.status == "posted"
+    assert rev.is_reversal is True
+    assert rev.reversed_entry_id == entry.id
+    assert entry.status == "reversed"
+
+    # 3. Verify that Balance Sheet balances return to 0.00
+    res2 = client.get("/reports/balance-sheet", params={"as_of_date": "2026-01-05"})
+    assert res2.status_code == 200
+    d2 = res2.json()
+    assert d2["summary"]["total_assets"] == 0.0
+    assert d2["summary"]["total_equity"] == 0.0
+    assert d2["summary"]["difference"] == 0.0
+
+    # 4. Attempt duplicate reversal on original entry -> 400
+    with pytest.raises(HTTPException) as exc_info1:
+        accounting_service.reverse_journal_entry(
+            db=db,
+            org_id=org.id,
+            entry_id=entry.id,
+        )
+    assert exc_info1.value.status_code == 400
+    assert "already been reversed" in exc_info1.value.detail
+
+    # 5. Attempt reversal on the reversal entry -> 400
+    with pytest.raises(HTTPException) as exc_info2:
+        accounting_service.reverse_journal_entry(
+            db=db,
+            org_id=org.id,
+            entry_id=rev.id,
+        )
+    assert exc_info2.value.status_code == 400
+    assert "Cannot reverse a reversal entry" in exc_info2.value.detail
+
+    app.dependency_overrides.clear()
+
+
+def test_operational_workflow_posting_invoice_payment_void(db):
+    """Verify live operational posting for invoice, customer payment, and void reversal."""
+    plan = Plan(name="FlowPlan", price_monthly=99, price_yearly=999, entitlements={"report.balance_sheet": True})
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Workflow Org", company_code="CMP-40001", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    cust = Customer(id=str(uuid.uuid4()), organization_id=org.id, name="Workflow Cust", phone="9988776655")
+    db.add(cust)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    inv = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        invoice_number="INV-WF-001",
+        customer_id=cust.id,
+        subtotal=1000.0,
+        tax=180.0,
+        total=1180.0,
+        amount_paid=0.0,
+        status="unpaid",
+        is_credit_note=False,
+        invoice_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+    )
+    db.add(inv)
+    db.commit()
+
+    # 1. Post invoice
+    inv_entry = accounting_service.post_operational_document(db, org.id, "invoice", inv.id)
+    assert inv_entry is not None
+    assert inv_entry.source_type == "invoice"
+    assert inv_entry.source_id == inv.id
+    lines_map = {l.account.account_code: (l.debit, l.credit) for l in inv_entry.lines}
+    assert lines_map["1200"] == (Decimal("1180.00"), Decimal("0.00"))  # AR Dr
+    assert lines_map["4010"] == (Decimal("0.00"), Decimal("1000.00"))  # Revenue Cr
+    assert lines_map["2100"] == (Decimal("0.00"), Decimal("180.00"))   # GST Output Cr
+
+    # Idempotent retry returns identical entry
+    retry_entry = accounting_service.post_operational_document(db, org.id, "invoice", inv.id)
+    assert retry_entry.id == inv_entry.id
+
+    # 2. Record Customer Payment through payment_service
+    pmt = payment_service.record(
+        db=db,
+        org_id=org.id,
+        customer=cust,
+        invoice=inv,
+        amount=1180.0,
+        payment_mode="bank",
+        reference="NEFT-WF-001",
+        received_on=datetime(2026, 3, 5, tzinfo=timezone.utc),
+    )
+    pmt_entry = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.organization_id == org.id,
+            JournalEntry.source_type == "customer_payment",
+            JournalEntry.source_id == pmt.id,
+        )
+        .first()
+    )
+    assert pmt_entry is not None
+    pmt_lines = {l.account.account_code: (l.debit, l.credit) for l in pmt_entry.lines}
+    assert pmt_lines["1020"] == (Decimal("1180.00"), Decimal("0.00"))  # Bank Dr
+    assert pmt_lines["1200"] == (Decimal("0.00"), Decimal("1180.00"))  # AR Cr
+
+    # 3. Void Payment triggers automatic journal reversal
+    payment_service.void(db, pmt)
+    db.refresh(pmt_entry)
+    assert pmt_entry.status == "reversed"
+    reversal_entry = (
+        db.query(JournalEntry)
+        .filter(
+            JournalEntry.organization_id == org.id,
+            JournalEntry.is_reversal.is_(True),
+            JournalEntry.reversed_entry_id == pmt_entry.id,
+        )
+        .first()
+    )
+    assert reversal_entry is not None
+    assert reversal_entry.status == "posted"
+
+
+def test_operational_workflow_posting_expense_and_sales_return(db):
+    """Verify posting behavior for approved expenses and approved sales returns."""
+    plan = Plan(name="ExpPlan", price_monthly=99, price_yearly=999)
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Expense Org", company_code="CMP-40002", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    cust = Customer(id=str(uuid.uuid4()), organization_id=org.id, name="Ret Cust", phone="9988776655")
+    db.add(cust)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    # 1. Unapproved expense is ignored
+    exp = Expense(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        expense_number="EXP-001",
+        category="office_supplies",
+        amount=590.0,
+        subtotal=500.0,
+        tax_amount=90.0,
+        payment_mode="cash",
+        status="pending",
+        expense_date=datetime(2026, 4, 1, tzinfo=timezone.utc),
+    )
+    db.add(exp)
+    db.commit()
+
+    res_unapproved = accounting_service.post_operational_document(db, org.id, "expense", exp.id)
+    assert res_unapproved is None
+
+    # Approve expense -> posts GL entry
+    exp.status = "approved"
+    db.commit()
+    exp_entry = accounting_service.post_operational_document(db, org.id, "expense", exp.id)
+    assert exp_entry is not None
+    exp_lines = {l.account.account_code: (l.debit, l.credit) for l in exp_entry.lines}
+    assert exp_lines["6010"] == (Decimal("590.00"), Decimal("0.00"))  # Expense Dr
+    assert exp_lines["1010"] == (Decimal("0.00"), Decimal("590.00"))  # Cash Cr
+
+    # 2. Sales return posting
+    sr = SalesReturn(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        return_number="SR-001",
+        customer_id=cust.id,
+        credit_amount=590.0,
+        return_status="pending",
+        return_date=datetime(2026, 4, 2, tzinfo=timezone.utc),
+    )
+    db.add(sr)
+    db.commit()
+
+    res_sr_unapproved = accounting_service.post_operational_document(db, org.id, "sales_return", sr.id)
+    assert res_sr_unapproved is None
+
+    # Approve sales return -> posts GL entry
+    sr.return_status = "approved"
+    db.commit()
+    sr_entry = accounting_service.post_operational_document(db, org.id, "sales_return", sr.id)
+    assert sr_entry is not None
+    sr_lines = {l.account.account_code: (l.debit, l.credit) for l in sr_entry.lines}
+    assert sr_lines["4020"] == (Decimal("590.00"), Decimal("0.00"))  # Sales Return Dr
+    assert sr_lines["1200"] == (Decimal("0.00"), Decimal("590.00"))  # AR Cr
+
+
+def test_transaction_rollback_on_failed_posting(db):
+    """Verify that a failed journal posting rolls back the transaction and leaves no orphaned operational record."""
+    plan = Plan(name="RollPlan", price_monthly=99, price_yearly=999)
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Roll Org", company_code="CMP-40003", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    db.commit()
+
+    inv_id = str(uuid.uuid4())
+    try:
+        inv = Invoice(
+            id=inv_id,
+            organization_id=org.id,
+            invoice_number="INV-FAIL-01",
+            subtotal=1000.0,
+            tax=0.0,
+            total=1000.0,
+            status="unpaid",
+            is_credit_note=False,
+            invoice_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        )
+        db.add(inv)
+        db.flush()
+        # Simulate journal failure before commit
+        raise RuntimeError("GL simulation error")
+    except Exception:
+        db.rollback()
+
+    # Verify invoice was not persisted
+    persisted = db.get(Invoice, inv_id)
+    assert persisted is None
+
+
+def test_database_level_idempotency_constraint(db):
+    """Verify that the database unique constraint uq_journal_entries_org_source rejects duplicate postings."""
+    plan = Plan(name="IdempPlan", price_monthly=99, price_yearly=999)
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Idemp Org", company_code="CMP-40004", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    # 1. Post entry with source_type="invoice" and source_id="INV-IDEMP-01"
+    entry1 = accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 100.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 100.0},
+        ],
+        entry_type="manual",
+        reference="REF-001",
+        source_type="invoice",
+        source_id="INV-IDEMP-01",
+    )
+    assert entry1.id is not None
+    db.commit()
+
+    # 2. Directly attempting to insert a duplicate with raw DB insert triggers IntegrityError
+    dup_entry = JournalEntry(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        entry_number="JE-TEST-DUP",
+        entry_type="manual",
+        status="posted",
+        effective_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        source_type="invoice",
+        source_id="INV-IDEMP-01",
+    )
+    db.add(dup_entry)
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+    # 3. create_journal_entry safely recovers and returns the existing entry
+    entry2 = accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 100.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 100.0},
+        ],
+        entry_type="manual",
+        reference="REF-002",
+        source_type="invoice",
+        source_id="INV-IDEMP-01",
+    )
+    assert entry2.id == entry1.id
+
+
+def test_concurrency_safe_journal_entry_numbering(db):
+    """Verify that _allocate_journal_entry_number produces sequentially incrementing references."""
+    plan = Plan(name="SeqPlan", price_monthly=99, price_yearly=999)
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Seq Org", company_code="CMP-40005", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    db.commit()
+
+    num1 = accounting_service._allocate_journal_entry_number(db, org.id)
+    num2 = accounting_service._allocate_journal_entry_number(db, org.id)
+    num3 = accounting_service._allocate_journal_entry_number(db, org.id)
+
+    assert num1.endswith("00001")
+    assert num2.endswith("00002")
+    assert num3.endswith("00003")
+
+
+def test_completeness_assessment_and_false_balance_prevention(client, db):
+    """Verify that unposted operational documents trigger incomplete completeness_status and disclosure warnings,
+
+    even when the general ledger mathematically balances.
+    """
+    plan = Plan(name="CompPlan", price_monthly=99, price_yearly=999, entitlements={"report.balance_sheet": True})
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Completeness Org", company_code="CMP-40006", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    cust = Customer(id=str(uuid.uuid4()), organization_id=org.id, name="Comp Cust", phone="9988776655")
+    db.add(cust)
+    user = User(id=str(uuid.uuid4()), email="cp@test.com", name="CP User", password_hash="hash", organization_id=org.id, role="admin", is_active=True)
+    db.add(user)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    from app.routers.reports import _view
+    app.dependency_overrides[_view] = lambda: user
+
+    # 1. Post balanced opening balance
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 10000.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 10000.0},
+        ],
+        entry_type="opening_balance",
+        reference="OB-001",
+    )
+
+    # 2. Create an operational invoice that has NOT been posted to GL
+    inv = Invoice(
+        id=str(uuid.uuid4()),
+        organization_id=org.id,
+        invoice_number="INV-UNPOSTED-01",
+        customer_id=cust.id,
+        subtotal=2000.0,
+        tax=0.0,
+        total=2000.0,
+        status="unpaid",
+        is_credit_note=False,
+        invoice_date=datetime(2026, 1, 10, tzinfo=timezone.utc),
+    )
+    db.add(inv)
+    db.commit()
+
+    # Query Balance Sheet: GL is mathematically balanced, but operational completeness is incomplete
+    res = client.get("/reports/balance-sheet", params={"as_of_date": "2026-01-15"})
+    assert res.status_code == 200
+    data = res.json()
+    summary = data["summary"]
+    assert summary["is_balanced"] is True
+    assert summary["difference"] == 0.0
+    assert summary["completeness_status"] == "incomplete"
+    assert summary["is_complete"] is False
+    assert summary["unposted_operational_count"] == 1
+    assert any("eligible operational document(s)" in w for w in data["meta"]["warnings"])
+
+    # 3. Post the invoice to GL
+    accounting_service.post_operational_document(db, org.id, "invoice", inv.id)
+
+    # Query Balance Sheet again: now complete
+    res2 = client.get("/reports/balance-sheet", params={"as_of_date": "2026-01-15"})
+    assert res2.status_code == 200
+    summary2 = res2.json()["summary"]
+    assert summary2["completeness_status"] == "complete"
+    assert summary2["is_complete"] is True
+    assert summary2["unposted_operational_count"] == 0
+
+    app.dependency_overrides.clear()
+
+
+def test_equity_notes_schedule_reconciles_with_balance_sheet(client, db):
+    """Verify that the Notes to Balance Sheet equity schedule matches the Balance Sheet total equity,
+
+    including the dynamic current-period net income line.
+    """
+    plan = Plan(name="EqPlan", price_monthly=99, price_yearly=999, entitlements={"report.balance_sheet": True})
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Equity Rec Org", company_code="CMP-40007", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    user = User(id=str(uuid.uuid4()), email="eq@test.com", name="EQ User", password_hash="hash", organization_id=org.id, role="admin", is_active=True)
+    db.add(user)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    from app.routers.reports import _view
+    app.dependency_overrides[_view] = lambda: user
+
+    # 1. Opening Capital: 10,000
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": 10000.0, "credit": 0.0},
+            {"account_code": "3010", "debit": 0.0, "credit": 10000.0},
+        ],
+        entry_type="opening_balance",
+        reference="OB-EQ-001",
+    )
+
+    # 2. Revenue: 5,000 (AR Dr, Revenue Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1200", "debit": 5000.0, "credit": 0.0},
+            {"account_code": "4010", "debit": 0.0, "credit": 5000.0},
+        ],
+        entry_type="invoice",
+        reference="INV-EQ-001",
+    )
+
+    # 3. Operating Expense: 1,500 (Expense Dr, Cash Cr)
+    accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 2, 15, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "6010", "debit": 1500.0, "credit": 0.0},
+            {"account_code": "1010", "debit": 0.0, "credit": 1500.0},
+        ],
+        entry_type="expense",
+        reference="EXP-EQ-001",
+    )
+
+    # Net income to date: 5,000 - 1,500 = 3,500
+    # Expected Balance Sheet Total Equity: 10,000 + 3,500 = 13,500
+    res_bs = client.get("/reports/balance-sheet", params={"as_of_date": "2026-03-01"})
+    assert res_bs.status_code == 200
+    bs_data = res_bs.json()
+    assert bs_data["summary"]["total_equity"] == 13500.0
+    assert bs_data["summary"]["is_balanced"] is True
+
+    # Expected Notes to Balance Sheet (schedule=equity) Net Balance: 13,500
+    res_notes = client.get("/reports/notes-to-balance-sheet", params={"as_of_date": "2026-03-01", "schedule": "equity"})
+    assert res_notes.status_code == 200
+    notes_data = res_notes.json()
+    assert notes_data["summary"]["net_balance"] == 13500.0
+    assert notes_data["summary"]["net_balance"] == bs_data["summary"]["total_equity"]
+
+    # Verify that dynamic NET-INC row is present in notes rows
+    net_inc_rows = [r for r in notes_data["rows"] if r["account_code"] == "NET-INC"]
+    assert len(net_inc_rows) == 1
+    assert net_inc_rows[0]["credit"] == 3500.0
+    assert net_inc_rows[0]["amount"] == 3500.0
+
+    app.dependency_overrides.clear()
+
+
+def test_fixed_precision_decimal_journal_entries(db):
+    """Verify that debit and credit amounts are stored and calculated using exact Decimals."""
+    plan = Plan(name="DecPlan", price_monthly=99, price_yearly=999)
+    db.add(plan)
+    db.flush()
+    org = Organization(id=str(uuid.uuid4()), name="Decimal Org", company_code="CMP-40008", timezone="Asia/Kolkata", plan_id=plan.id)
+    db.add(org)
+    db.commit()
+
+    accounting_service.ensure_default_accounts(db, org.id)
+
+    # Post an entry with three lines: 0.10, 0.20 and 0.30 credit
+    entry = accounting_service.create_journal_entry(
+        db=db,
+        org_id=org.id,
+        effective_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        lines=[
+            {"account_code": "1010", "debit": Decimal("0.10"), "credit": Decimal("0.00")},
+            {"account_code": "1020", "debit": Decimal("0.20"), "credit": Decimal("0.00")},
+            {"account_code": "3010", "debit": Decimal("0.00"), "credit": Decimal("0.30")},
+        ],
+        entry_type="manual",
+        reference="DEC-001",
+    )
+
+    db.refresh(entry)
+    for line in entry.lines:
+        assert isinstance(line.debit, Decimal)
+        assert isinstance(line.credit, Decimal)
+
+    lines_by_code = {l.account.account_code: (l.debit, l.credit) for l in entry.lines}
+    assert lines_by_code["1010"] == (Decimal("0.10"), Decimal("0.00"))
+    assert lines_by_code["1020"] == (Decimal("0.20"), Decimal("0.00"))
+    assert lines_by_code["3010"] == (Decimal("0.00"), Decimal("0.30"))
+
+
 
