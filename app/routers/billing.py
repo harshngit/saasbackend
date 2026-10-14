@@ -152,6 +152,8 @@ def list_payments(
     page_size: int = Query(10, ge=1, le=100),
     search: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    sort_by: str | None = Query(default=None),
+    sort_order: str | None = Query(default="desc"),
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[SubscriptionPaymentOut]:
@@ -165,4 +167,6 @@ def list_payments(
         page_size=page_size,
         search=search,
         status=status,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )

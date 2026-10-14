@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.sorting import apply_sorting
 from app.models.supplier import Supplier
 from app.models.supplier_invoice import SupplierInvoice
 from app.schemas.accounts_payable import (
@@ -12,6 +13,27 @@ from app.schemas.accounts_payable import (
     APSummaryOut,
     SupplierAPStatementOut,
 )
+
+ACCOUNTS_PAYABLE_SORTABLE_FIELDS = {
+    "supplier": Supplier.name,
+    "supplier_name": Supplier.name,
+    "supplier_invoice_number": SupplierInvoice.supplier_invoice_number,
+    "invoice_number": SupplierInvoice.supplier_invoice_number,
+    "supplier_invoice_date": SupplierInvoice.supplier_invoice_date,
+    "invoice_date": SupplierInvoice.supplier_invoice_date,
+    "date": SupplierInvoice.supplier_invoice_date,
+    "due_date": SupplierInvoice.due_date,
+    "grand_total": SupplierInvoice.grand_total,
+    "invoice_amount": SupplierInvoice.grand_total,
+    "total": SupplierInvoice.grand_total,
+    "amount": SupplierInvoice.grand_total,
+    "outstanding_amount": (SupplierInvoice.grand_total - func.coalesce(SupplierInvoice.return_amount, 0.0) - func.coalesce(SupplierInvoice.amount_paid, 0.0)),
+    "outstanding": (SupplierInvoice.grand_total - func.coalesce(SupplierInvoice.return_amount, 0.0) - func.coalesce(SupplierInvoice.amount_paid, 0.0)),
+    "status": SupplierInvoice.status,
+    "payment_status": SupplierInvoice.payment_status,
+    "verification_status": SupplierInvoice.verification_status,
+    "created_at": SupplierInvoice.created_at,
+}
 
 
 def _aware(moment: datetime | None) -> datetime | None:
@@ -74,7 +96,7 @@ def build_ap_item(invoice: SupplierInvoice, now: datetime) -> APItemOut:
     )
 
 
-def query_open_payables(
+def query_open_payables_query(
     db: Session,
     org_id: str,
     supplier_id: str | None = None,
@@ -82,8 +104,7 @@ def query_open_payables(
     verification_status: str | None = None,
     overdue_only: bool = False,
     search: str | None = None,
-) -> list[SupplierInvoice]:
-    """Derived query returning recorded SupplierInvoices with outstanding_amount > 0."""
+):
     now = datetime.now(timezone.utc)
     q = (
         db.query(SupplierInvoice)
@@ -115,7 +136,28 @@ def query_open_payables(
                 Supplier.name.ilike(s),
             )
         )
+    return q
 
+
+def query_open_payables(
+    db: Session,
+    org_id: str,
+    supplier_id: str | None = None,
+    payment_status: str | None = None,
+    verification_status: str | None = None,
+    overdue_only: bool = False,
+    search: str | None = None,
+) -> list[SupplierInvoice]:
+    """Derived query returning recorded SupplierInvoices with outstanding_amount > 0."""
+    q = query_open_payables_query(
+        db,
+        org_id,
+        supplier_id=supplier_id,
+        payment_status=payment_status,
+        verification_status=verification_status,
+        overdue_only=overdue_only,
+        search=search,
+    )
     return q.order_by(SupplierInvoice.supplier_invoice_date.asc(), SupplierInvoice.id.asc()).all()
 
 
@@ -129,10 +171,16 @@ def get_accounts_payable_list(
     search: str | None = None,
     page: int | None = None,
     page_size: int | None = None,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
 ) -> APListResponse:
-    """Build complete AP list response with header summary and aging buckets."""
+    """Build complete AP list response with header summary and aging buckets.
+
+    Preserves global aging summary and counts across the complete filtered dataset
+    while applying database-level dynamic sorting and pagination to the returned items.
+    """
     now = datetime.now(timezone.utc)
-    invoices = query_open_payables(
+    base_q = query_open_payables_query(
         db,
         org_id,
         supplier_id=supplier_id,
@@ -142,7 +190,17 @@ def get_accounts_payable_list(
         search=search,
     )
 
-    items: list[APItemOut] = []
+    summary_records = (
+        base_q.with_entities(
+            SupplierInvoice.id,
+            SupplierInvoice.supplier_id,
+            SupplierInvoice.due_date,
+            SupplierInvoice.grand_total,
+            SupplierInvoice.return_amount,
+            SupplierInvoice.amount_paid,
+        ).all()
+    )
+
     total_payable = 0.0
     total_overdue = 0.0
     total_due_today = 0.0
@@ -155,28 +213,35 @@ def get_accounts_payable_list(
         "90_plus": 0.0,
     }
 
-    for inv in invoices:
-        ap_item = build_ap_item(inv, now)
-        items.append(ap_item)
-
-        out_amt = ap_item.outstanding_amount
+    today = now.date()
+    for row_id, s_id, due_date, grand_total, return_amt, amt_paid in summary_records:
+        out_amt = round(max((grand_total or 0.0) - (return_amt or 0.0) - (amt_paid or 0.0), 0.0), 2)
         total_payable = round(total_payable + out_amt, 2)
-        suppliers_set.add(inv.supplier_id)
+        suppliers_set.add(s_id)
 
-        if ap_item.is_overdue:
-            total_overdue = round(total_overdue + out_amt, 2)
-            if ap_item.ageing_bucket in ageing:
-                ageing[ap_item.ageing_bucket] = round(ageing[ap_item.ageing_bucket] + out_amt, 2)
-
-        due = _aware(inv.due_date)
-        if due is not None and due.date() == now.date():
-            total_due_today = round(total_due_today + out_amt, 2)
+        due = _aware(due_date)
+        if due is not None:
+            due_date_only = due.date()
+            if due_date_only < today:
+                total_overdue = round(total_overdue + out_amt, 2)
+                days = (today - due_date_only).days
+                if days <= 30:
+                    bucket = "0_30"
+                elif days <= 60:
+                    bucket = "31_60"
+                elif days <= 90:
+                    bucket = "61_90"
+                else:
+                    bucket = "90_plus"
+                ageing[bucket] = round(ageing[bucket] + out_amt, 2)
+            elif due_date_only == today:
+                total_due_today = round(total_due_today + out_amt, 2)
 
     summary = APSummaryOut(
         total_payable=round(total_payable, 2),
         total_overdue=round(total_overdue, 2),
         total_due_today=round(total_due_today, 2),
-        open_invoice_count=len(items),
+        open_invoice_count=len(summary_records),
         supplier_count=len(suppliers_set),
     )
 
@@ -187,13 +252,22 @@ def get_accounts_payable_list(
         bucket_90_plus=round(ageing["90_plus"], 2),
     )
 
+    sorted_q = apply_sorting(
+        base_q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=ACCOUNTS_PAYABLE_SORTABLE_FIELDS,
+        default_order=[SupplierInvoice.supplier_invoice_date.asc(), SupplierInvoice.id.asc()],
+        secondary_key=SupplierInvoice.id.asc(),
+    )
+
     if page is not None and page_size is not None:
         start = (page - 1) * page_size
-        end = start + page_size
-        paginated_items = items[start:end]
+        paginated_invoices = sorted_q.offset(start).limit(page_size).all()
     else:
-        paginated_items = items
+        paginated_invoices = sorted_q.all()
 
+    paginated_items = [build_ap_item(inv, now) for inv in paginated_invoices]
     return APListResponse(summary=summary, ageing=ageing_out, items=paginated_items)
 
 

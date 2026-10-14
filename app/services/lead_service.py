@@ -177,6 +177,37 @@ def create_lead(db: Session, org_id: str, user: User, payload: LeadCreate) -> Le
     return lead
 
 
+from app.core.sorting import apply_sorting
+from app.models.follow_up import FollowUp
+from sqlalchemy import func, select
+
+LEAD_SORTABLE_FIELDS = {
+    "name": Lead.name,
+    "lead_name": Lead.name,
+    "company": Lead.name,
+    "company_name": Lead.name,
+    "lead_id": Lead.lead_id,
+    "contact_person": Lead.contact_person,
+    "mobile_number": Lead.mobile_number,
+    "mobile": Lead.mobile_number,
+    "email": Lead.email,
+    "lead_source": Lead.lead_source,
+    "lead_status": Lead.lead_status,
+    "status": Lead.lead_status,
+    "lead_type": Lead.lead_type,
+    "segment": Lead.segment,
+    "created_at": Lead.created_at,
+    "updated_at": Lead.updated_at,
+    "assigned_sales_officer": select(User.name).where(User.id == Lead.assigned_salesperson_id).scalar_subquery(),
+    "assigned_salesperson": select(User.name).where(User.id == Lead.assigned_salesperson_id).scalar_subquery(),
+    "sales_officer": select(User.name).where(User.id == Lead.assigned_salesperson_id).scalar_subquery(),
+    "next_follow_up": select(func.min(FollowUp.due_date)).where(
+        FollowUp.lead_id == Lead.id,
+        FollowUp.status == "pending",
+    ).scalar_subquery(),
+}
+
+
 def list_leads(
     db: Session,
     org_id: str,
@@ -189,6 +220,8 @@ def list_leads(
     created_to: datetime | None = None,
     page: int = 1,
     page_size: int = 10,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
 ) -> tuple[list[Lead], int, int, int, int]:
     from app.core.pagination import paginate
 
@@ -222,7 +255,14 @@ def list_leads(
 
     # A field role (data_scope "own") sees only the Leads assigned to them.
     query = scoping.owned_by(query, db, user, Lead.assigned_salesperson_id)
-    query = query.order_by(Lead.created_at.desc(), Lead.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=LEAD_SORTABLE_FIELDS,
+        default_order=[Lead.created_at.desc(), Lead.id.desc()],
+        secondary_key=Lead.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

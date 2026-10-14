@@ -1,14 +1,33 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_permission, require_system_role, require_unlocked_org
 from app.core.pagination import paginate
 from app.core.security import hash_password
-from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, User, VehicleLoading
+from app.core.sorting import apply_sorting
+from app.models import LEGACY_ROLE_BY_NAME, Role, SystemRole, Team, User, VehicleLoading
+
+STAFF_SORTABLE_FIELDS = {
+    "name": User.name,
+    "employee_name": User.name,
+    "role": User.role,
+    "designation": User.designation,
+    "department": select(Team.name).where(Team.id == User.team_id).scalar_subquery(),
+    "team": select(Team.name).where(Team.id == User.team_id).scalar_subquery(),
+    "status": User.status,
+    "employee_status": User.employee_status,
+    "is_active": User.is_active,
+    "date_of_joining": User.date_of_joining,
+    "joined_date": User.date_of_joining,
+    "employee_id": User.employee_id,
+    "email": User.email,
+    "phone": User.phone,
+    "created_at": User.created_at,
+}
 from app.schemas.auth import MessageResponse
 from app.schemas.employee_profile import EmployeeProfileIn, EmployeeProfileOut
 from app.schemas.pagination import PaginatedResponse
@@ -249,6 +268,8 @@ def create_staff(
 def list_staff(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     admin: User = Depends(_ADMIN),
     role_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
@@ -293,7 +314,14 @@ def list_staff(
         query = query.filter(User.work_location == work_location)
     if reporting_manager_id is not None:
         query = query.filter(User.reporting_manager_id == reporting_manager_id)
-    query = query.order_by(User.created_at.desc(), User.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=STAFF_SORTABLE_FIELDS,
+        default_order=[User.created_at.desc(), User.id.desc()],
+        secondary_key=User.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

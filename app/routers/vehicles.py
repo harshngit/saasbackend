@@ -7,13 +7,14 @@ manage the fleet without being an Admin.
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import Delivery, User, Vehicle, VehicleAssignmentHistory, VehicleLoading
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.pagination import PaginatedResponse
@@ -36,6 +37,22 @@ _view = require_permission("vehicle_stock", "view")
 _create = require_permission("vehicle_stock", "create")
 _edit = require_permission("vehicle_stock", "edit")
 _delete = require_permission("vehicle_stock", "delete")
+
+VEHICLE_SORTABLE_FIELDS = {
+    "vehicle_number": Vehicle.vehicle_number,
+    "number": Vehicle.vehicle_number,
+    "vehicle_name": Vehicle.vehicle_type,
+    "vehicle_type": Vehicle.vehicle_type,
+    "type": Vehicle.vehicle_type,
+    "capacity_kg": Vehicle.capacity_kg,
+    "capacity": Vehicle.capacity_kg,
+    "status": Vehicle.status,
+    "is_active": Vehicle.is_active,
+    "assigned_delivery_partner": select(User.name).where(User.id == Vehicle.default_driver_id).scalar_subquery(),
+    "driver": select(User.name).where(User.id == Vehicle.default_driver_id).scalar_subquery(),
+    "created_at": Vehicle.created_at,
+    "updated_at": Vehicle.updated_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -75,6 +92,8 @@ def _vehicle_out(vehicle: Vehicle) -> VehicleOut:
 def list_vehicles(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
@@ -97,7 +116,14 @@ def list_vehicles(
                 Vehicle.vehicle_type.ilike(s),
             )
         )
-    query = query.order_by(Vehicle.vehicle_number.asc(), Vehicle.id.asc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=VEHICLE_SORTABLE_FIELDS,
+        default_order=[Vehicle.vehicle_number.asc(), Vehicle.id.asc()],
+        secondary_key=Vehicle.id.asc(),
+    )
     p = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[_vehicle_out(v) for v in p.items],

@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -11,6 +12,7 @@ from app.core.deps import (
     require_system_role,
 )
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import ATTENDANCE_TYPES, Attendance, SystemRole, User
 from app.schemas.attendance import AttendanceOut, CheckInBody
 from app.schemas.pagination import PaginatedResponse
@@ -25,6 +27,20 @@ router = APIRouter(
 _mark = require_permission("attendance", "create")
 _view = require_permission("attendance", "view")
 _ADMIN = require_system_role(SystemRole.ADMIN)
+
+ATTENDANCE_SORTABLE_FIELDS = {
+    "day": Attendance.day,
+    "date": Attendance.day,
+    "office_check_in": Attendance.office_check_in,
+    "check_in": Attendance.office_check_in,
+    "final_check_out": Attendance.final_check_out,
+    "check_out": Attendance.final_check_out,
+    "employee": select(User.name).where(User.id == Attendance.user_id).scalar_subquery(),
+    "employee_name": select(User.name).where(User.id == Attendance.user_id).scalar_subquery(),
+    "user": select(User.name).where(User.id == Attendance.user_id).scalar_subquery(),
+    "name": select(User.name).where(User.id == Attendance.user_id).scalar_subquery(),
+    "created_at": Attendance.created_at,
+}
 
 
 def _date_range(date_from: str | None, date_to: str | None) -> tuple[date | None, date | None]:
@@ -72,6 +88,8 @@ def check_in(payload: CheckInBody, user: User = Depends(_mark), db: Session = De
 def my_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     user: User = Depends(_view),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
@@ -83,7 +101,14 @@ def my_attendance(
         query = query.filter(Attendance.day >= d_from)
     if d_to:
         query = query.filter(Attendance.day <= d_to)
-    query = query.order_by(Attendance.day.desc(), Attendance.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=ATTENDANCE_SORTABLE_FIELDS,
+        default_order=[Attendance.day.desc(), Attendance.id.desc()],
+        secondary_key=Attendance.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 
@@ -91,6 +116,8 @@ def my_attendance(
 def all_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     admin: User = Depends(_ADMIN),
     user_id: str | None = Query(default=None),
     date_from: str | None = Query(default=None),
@@ -106,5 +133,12 @@ def all_attendance(
         query = query.filter(Attendance.day >= d_from)
     if d_to:
         query = query.filter(Attendance.day <= d_to)
-    query = query.order_by(Attendance.day.desc(), Attendance.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=ATTENDANCE_SORTABLE_FIELDS,
+        default_order=[Attendance.day.desc(), Attendance.id.desc()],
+        secondary_key=Attendance.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)

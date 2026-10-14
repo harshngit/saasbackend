@@ -32,6 +32,7 @@ from app.models import (
     SalesOrderItem,
     Supplier,
     SupplierPayment,
+    User,
     WarehouseStock,
 )
 from app.schemas.dashboard import (
@@ -577,6 +578,26 @@ from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import func, select
+
+DP_ORDER_SORTABLE_FIELDS = {
+    "order_number": SalesOrder.order_number,
+    "customer": select(Customer.name).where(Customer.id == SalesOrder.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == SalesOrder.customer_id).scalar_subquery(),
+    "order_date": SalesOrder.order_date,
+    "sales_officer": select(User.name).where(User.id == func.coalesce(SalesOrder.salesperson_id, SalesOrder.created_by)).scalar_subquery(),
+    "total": SalesOrder.total,
+    "total_amount": SalesOrder.total,
+    "status": SalesOrder.status,
+    "order_status": SalesOrder.status,
+    "fulfilment_status": SalesOrder.fulfilment_status,
+    "delivery_status": SalesOrder.fulfilment_status,
+    "delivery_date": SalesOrder.delivery_date,
+    "created_at": SalesOrder.created_at,
+}
+
+
 def list_delivery_partner_company_orders(
     db: Session,
     org_id: str,
@@ -586,6 +607,8 @@ def list_delivery_partner_company_orders(
     fulfilment_status: str | None = None,
     customer_id: str | None = None,
     search: str | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
 ) -> PaginatedResponse[SalesOrder]:
     query = db.query(SalesOrder).filter(SalesOrder.organization_id == org_id)
 
@@ -608,6 +631,13 @@ def list_delivery_partner_company_orders(
     if search:
         query = query.filter(SalesOrder.order_number.ilike(f"%{search.strip()}%"))
 
-    query = query.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=DP_ORDER_SORTABLE_FIELDS,
+        default_order=[SalesOrder.created_at.desc(), SalesOrder.id.desc()],
+        secondary_key=SalesOrder.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 

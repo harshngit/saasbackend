@@ -1,13 +1,14 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
 from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
 from app.core import scoping, workflow
+from app.core.sorting import apply_sorting
 from app.models.enums import UserRole
 from app.models import (
     Customer,
@@ -82,6 +83,64 @@ customer_payments_router = APIRouter(
 _view = require_permission("deliveries", "view")
 _edit = require_permission("deliveries", "edit")
 
+DELIVERY_SORTABLE_FIELDS = {
+    "delivery_number": Delivery.delivery_note_number,
+    "delivery_note_number": Delivery.delivery_note_number,
+    "order_number": select(SalesOrder.order_number).where(SalesOrder.id == Delivery.sales_order_id).scalar_subquery(),
+    "customer": select(Customer.name).where(Customer.id == Delivery.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == Delivery.customer_id).scalar_subquery(),
+    "delivery_partner": select(User.name).where(User.id == Delivery.delivery_partner_id).scalar_subquery(),
+    "vehicle": select(Vehicle.vehicle_number).where(Vehicle.id == Delivery.vehicle_id).scalar_subquery(),
+    "sales_officer": select(User.name).select_from(SalesOrder).join(User, User.id == func.coalesce(SalesOrder.salesperson_id, SalesOrder.created_by)).where(SalesOrder.id == Delivery.sales_order_id).scalar_subquery(),
+    "delivery_date": Delivery.delivery_date,
+    "date": Delivery.delivery_date,
+    "scheduled_date": Delivery.scheduled_date,
+    "status": Delivery.status,
+    "delivery_status": Delivery.delivery_status,
+    "created_at": Delivery.created_at,
+}
+
+ASSIGNED_DELIVERY_SORTABLE_FIELDS = {
+    "order_number": SalesOrder.order_number,
+    "order_date": SalesOrder.order_date,
+    "date": SalesOrder.order_date,
+    "customer": select(Customer.name).where(Customer.id == SalesOrder.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == SalesOrder.customer_id).scalar_subquery(),
+    "sales_officer": select(User.name).where(User.id == func.coalesce(SalesOrder.salesperson_id, SalesOrder.created_by)).scalar_subquery(),
+    "total": SalesOrder.total,
+    "total_amount": SalesOrder.total,
+    "status": SalesOrder.status,
+    "delivery_status": SalesOrder.fulfilment_status,
+    "delivery_date": SalesOrder.delivery_date,
+    "created_at": SalesOrder.created_at,
+}
+
+DELIVERY_NOTE_SORTABLE_FIELDS = {
+    "delivery_note_number": Delivery.delivery_note_number,
+    "delivery_number": Delivery.delivery_note_number,
+    "delivery_date": Delivery.delivery_date,
+    "customer": select(Customer.name).where(Customer.id == Delivery.customer_id).scalar_subquery(),
+    "status": Delivery.status,
+    "created_at": Delivery.created_at,
+}
+
+DELIVERY_COLLECTION_SORTABLE_FIELDS = {
+    "collected_at": DeliveryCollection.collected_at,
+    "business_date": DeliveryCollection.collected_at,
+    "date": DeliveryCollection.collected_at,
+    "reference": DeliveryCollection.reference,
+    "payment_reference": DeliveryCollection.reference,
+    "amount": DeliveryCollection.amount,
+    "payment_mode": DeliveryCollection.payment_mode,
+    "payment_method": DeliveryCollection.payment_mode,
+    "status": DeliveryCollection.reconciliation_status,
+    "reconciliation_status": DeliveryCollection.reconciliation_status,
+    "collector": select(User.name).where(User.id == DeliveryCollection.delivery_partner_id).scalar_subquery(),
+    "delivery_partner": select(User.name).where(User.id == DeliveryCollection.delivery_partner_id).scalar_subquery(),
+    "customer": select(Customer.name).where(Customer.id == DeliveryCollection.customer_id).scalar_subquery(),
+    "created_at": DeliveryCollection.created_at,
+}
+
 
 def _org_id(user: User) -> str:
     if not user.organization_id:
@@ -119,6 +178,8 @@ def _owned_order(db: Session, id: str, user: User) -> SalesOrder:
 def list_assigned_deliveries(
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[OrderOut]:
@@ -135,7 +196,14 @@ def list_assigned_deliveries(
             ),
         )
     )
-    q = q.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=ASSIGNED_DELIVERY_SORTABLE_FIELDS,
+        default_order=[SalesOrder.created_at.desc(), SalesOrder.id.desc()],
+        secondary_key=SalesOrder.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[order_service._order_out(db, o) for o in items],
@@ -365,6 +433,8 @@ def list_deliveries(
     search: str | None = Query(default=None, description="matches delivery_number or notes"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[DeliveryOut]:
     """The firm's deliveries, newest first. A field role sees only their own."""
@@ -387,7 +457,14 @@ def list_deliveries(
             )
         )
     query = scoping.owned_by(query, db, user, Delivery.delivery_partner_id, team_columns=())
-    query = query.order_by(Delivery.created_at.desc(), Delivery.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=DELIVERY_SORTABLE_FIELDS,
+        default_order=[Delivery.created_at.desc(), Delivery.id.desc()],
+        secondary_key=Delivery.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[_delivery_out(db, d) for d in items],
@@ -983,6 +1060,8 @@ def create_delivery_note(
 def list_delivery_notes(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = None,
     order_id: str | None = None,
     customer_id: str | None = None,
@@ -1009,7 +1088,14 @@ def list_delivery_notes(
             )
         )
 
-    q = q.order_by(Delivery.delivery_date.desc().nullslast(), Delivery.created_at.desc(), Delivery.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=DELIVERY_NOTE_SORTABLE_FIELDS,
+        default_order=[Delivery.delivery_date.desc().nullslast(), Delivery.created_at.desc(), Delivery.id.desc()],
+        secondary_key=Delivery.id.desc(),
+    )
     return paginate(q, page=page, page_size=page_size)
 
 
@@ -1055,6 +1141,8 @@ def _is_delivery_partner(user: User) -> bool:
 def list_delivery_collections(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = None,
     status: str | None = None,
     delivery_partner_id: str | None = None,
@@ -1089,7 +1177,14 @@ def list_delivery_collections(
             )
         )
 
-    q = q.order_by(DeliveryCollection.collected_at.desc().nullslast(), DeliveryCollection.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=DELIVERY_COLLECTION_SORTABLE_FIELDS,
+        default_order=[DeliveryCollection.collected_at.desc().nullslast(), DeliveryCollection.id.desc()],
+        secondary_key=DeliveryCollection.id.desc(),
+    )
     return paginate(q, page=page, page_size=page_size)
 
 

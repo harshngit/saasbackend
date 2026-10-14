@@ -60,6 +60,8 @@ def list_supplier_payments(
     search: str | None = Query(default=None, description="matches payment_number, reference, or supplier name"),
     page: int | None = Query(default=None, ge=1),
     page_size: int | None = Query(default=None, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> SupplierPaymentListResponse:
     """GET /supplier-payments: List supplier payments with filtering and pagination."""
@@ -75,6 +77,8 @@ def list_supplier_payments(
         search=search,
         page=page,
         page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

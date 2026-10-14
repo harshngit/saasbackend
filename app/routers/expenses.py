@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import safe_delete_unreferenced_file, save_upload
+from app.core.sorting import apply_sorting
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
@@ -24,6 +26,25 @@ _create = require_permission("expenses", "create")
 _edit = require_permission("expenses", "edit")
 _approve = require_permission("expenses", "approve")
 _delete = require_permission("expenses", "delete")
+
+EXPENSE_SORTABLE_FIELDS = {
+    "expense_date": Expense.expense_date,
+    "date": Expense.expense_date,
+    "category": Expense.category,
+    "vendor": Expense.payee_name,
+    "payee": Expense.payee_name,
+    "payee_name": Expense.payee_name,
+    "amount": Expense.amount,
+    "payment_method": Expense.payment_mode,
+    "payment_mode": Expense.payment_mode,
+    "status": Expense.status,
+    "expense_status": Expense.expense_status,
+    "approval_status": Expense.approval_status,
+    "payment_status": Expense.payment_status,
+    "expense_number": Expense.expense_number,
+    "expense_id": Expense.expense_id,
+    "created_at": Expense.created_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -195,6 +216,8 @@ def list_expenses(
     search: str | None = Query(default=None, description="matches expense_number, expense_id, description, payee_name"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[ExpenseOut]:
     org_id = _org_id(user)
@@ -234,7 +257,14 @@ def list_expenses(
         )
 
     q = scoping.owned_by(q, db, user, Expense.submitted_by, team_columns=())
-    q = q.order_by(Expense.expense_date.desc(), Expense.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=EXPENSE_SORTABLE_FIELDS,
+        default_order=[Expense.expense_date.desc(), Expense.id.desc()],
+        secondary_key=Expense.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[ExpenseOut.model_validate(e) for e in items],

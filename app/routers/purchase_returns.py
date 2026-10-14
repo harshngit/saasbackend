@@ -63,6 +63,8 @@ def list_purchase_returns(
     date_to: datetime | None = Query(default=None, description="Filter to return date"),
     page: int | None = Query(default=None, ge=1),
     page_size: int | None = Query(default=None, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PurchaseReturnListResponse:
     """List purchase returns with filtering, search, and pagination."""
@@ -78,6 +80,8 @@ def list_purchase_returns(
         date_to=date_to,
         page=page,
         page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
-from app.models import NumberSequence, Product, ProductVariant, User, WarehouseTransfer, WarehouseTransferItem
+from app.models import NumberSequence, Product, ProductVariant, User, Warehouse, WarehouseTransfer, WarehouseTransferItem
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.transfer import (
     WarehouseTransferCreate,
@@ -130,6 +130,20 @@ def create_transfer(
     return transfer
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import select
+
+TRANSFER_SORTABLE_FIELDS = {
+    "transfer_number": WarehouseTransfer.transfer_number,
+    "status": WarehouseTransfer.status,
+    "source_warehouse": select(Warehouse.name).where(Warehouse.id == WarehouseTransfer.source_warehouse_id).scalar_subquery(),
+    "destination_warehouse": select(Warehouse.name).where(Warehouse.id == WarehouseTransfer.destination_warehouse_id).scalar_subquery(),
+    "dispatched_at": WarehouseTransfer.dispatched_at,
+    "received_at": WarehouseTransfer.received_at,
+    "created_at": WarehouseTransfer.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[WarehouseTransferOut])
 def list_transfers(
     page: int = Query(1, ge=1),
@@ -138,6 +152,8 @@ def list_transfers(
     status_filter: str | None = Query(default=None, alias="status"),
     source_warehouse_id: str | None = Query(default=None),
     destination_warehouse_id: str | None = Query(default=None),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[WarehouseTransferOut]:
@@ -160,7 +176,14 @@ def list_transfers(
             )
         )
 
-    query = query.order_by(WarehouseTransfer.created_at.desc(), WarehouseTransfer.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=TRANSFER_SORTABLE_FIELDS,
+        default_order=[WarehouseTransfer.created_at.desc(), WarehouseTransfer.id.desc()],
+        secondary_key=WarehouseTransfer.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

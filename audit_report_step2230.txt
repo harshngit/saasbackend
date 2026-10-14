@@ -1,0 +1,51 @@
+# Backend Sorting — Verification-Only Audit Report
+
+**Audit Type**: Read-Only Architecture & Implementation Verification  
+**Audit Scope**: All server-side listing, filtering, and pagination endpoints across the SaaS CRM/ERP backend  
+**Repository State**: `main` (Verified against current source code, models, schemas, and queries)
+
+---
+
+## Executive Summary
+
+1. **44 server-side paginated routes** (spanning 42 distinct handlers) were inspected across the entire application.
+2. **0 standard CRUD/business listing endpoints** currently accept or support `sort_by` or `sort_order` parameters. All standard listing queries currently use hardcoded SQL `order_by` clauses.
+3. **1 endpoint (`GET /reports/{report_type}`)** accepts `sort_by` and `sort_order`, but:
+   - It only applies sorting for `gst-summary` in transaction mode.
+   - It performs in-memory Python sorting (`rows.sort(...)`) after building records, rather than database-level sorting.
+   - All other 16 reports are structured aggregation / financial statements (Profit & Loss, Balance Sheet, Cash Flow, Statement of P&L, Notes to P&L) and are **Out of Scope** per explicit instructions.
+4. **1 endpoint (`GET /accounts-payable`)** applies SQL ordering (`SupplierInvoice.supplier_invoice_date.asc(), SupplierInvoice.id.asc()`), but fetches all open invoices with `.all()`, computes aging summaries in Python, and slices the page in memory.
+5. **1 endpoint (`GET /warehouses/stock`)** exhibits hybrid pagination: when `low_stock_only=False`, it paginates `Product` in SQL and expands variants in Python; when `low_stock_only=True`, it loads all products, calculates stock positions in Python, and slices in memory.
+6. **2 endpoints currently lack stable secondary tie-breaking ordering (`Model.id`)**:
+   - `GET /purchase-returns`: orders solely by `PurchaseReturn.created_at.desc()`.
+   - `GET /supplier-payments`: orders solely by `SupplierPayment.paid_on.desc(), SupplierPayment.created_at.desc()`.
+
+---
+
+## 1. Classification of All Inspected Endpoints
+
+| Category | Count | Descr
+<truncated 45378 bytes>
+date`, `status`, `created_at` |
+| 17 | `GET /deliveries` | Deliveries | `delivery_note_number`, `delivery_date`, `scheduled_date`, `status`, `created_at` |
+| 18 | `GET /deliveries/notes` | Delivery Notes | `delivery_note_number`, `delivery_date`, `status`, `created_at` |
+| 19 | `GET /deliveries/collections` | Delivery Collections | `collected_at`, `amount`, `payment_mode`, `reconciliation_status`, `created_at` |
+| 20 | `GET /vehicles` | Fleet Vehicles | `vehicle_number`, `vehicle_type`, `capacity_kg`, `status`, `created_at` |
+| 21 | `GET /vehicle-stock` | Loading Sessions | `date`, `status`, `created_at` |
+| 22 | `GET /warehouses/{id}/movements` | Stock Movements | `created_at`, `quantity`, `balance_after`, `movement_type` |
+| 23 | `GET /transfers` | Warehouse Transfers | `transfer_number`, `status`, `dispatched_at`, `received_at`, `created_at` |
+| 24 | `GET /cash-reconciliation` | Cash Reconciliations | `reconciliation_date`, `status`, `total_actual_collections`, `actual_cash_on_hand`, `created_at` |
+| 25 | `GET /expenses` | Expenses | `expense_number`, `expense_date`, `category`, `amount`, `status`, `approval_status`, `created_at` |
+| 26 | `GET /users` | Staff / Users | `name`, `email`, `employee_id`, `designation`, `date_of_joining`, `created_at` |
+| 27 | `GET /attendance` | Staff Attendance | `day`, `office_check_in`, `final_check_out`, `created_at` |
+| 28 | `GET /leaves` | Staff Leaves | `start_date`, `end_date`, `days_count`, `leave_type`, `status`, `created_at` |
+| 29 | `GET /visits` | Field Visits | `visit_date`, `visit_type`, `status`, `created_at` |
+| 30 | `GET /follow-ups` | Follow-ups | `due_date`, `title`, `priority`, `status`, `completed_at`, `created_at` |
+
+---
+
+## 7. Status & Next Steps
+
+This verification audit is complete and read-only. No application code, schemas, or tests were modified.
+
+**Awaiting instruction**: Once the frontend team confirms which specific endpoints and sortable table columns from the list above require sorting, implementation can proceed strictly on those agreed endpoints.

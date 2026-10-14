@@ -111,6 +111,47 @@ def create_supplier(
     return supplier
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import func
+
+SUPPLIER_SORTABLE_FIELDS = {
+    "name": Supplier.name,
+    "supplier_name": Supplier.name,
+    "contact_person": Supplier.contact_person,
+    "company_name": Supplier.company_name,
+    "supplier_code": Supplier.supplier_code,
+    "phone": Supplier.phone,
+    "email": Supplier.email,
+    "location": Supplier.city,
+    "city": Supplier.city,
+    "outstanding": (
+        (func.coalesce(Supplier.opening_balance, 0) + func.coalesce(Supplier.total_purchases, 0))
+        - func.coalesce(Supplier.total_paid, 0)
+    ),
+    "outstanding_payable": (
+        (func.coalesce(Supplier.opening_balance, 0) + func.coalesce(Supplier.total_purchases, 0))
+        - func.coalesce(Supplier.total_paid, 0)
+    ),
+    "outstanding_balance": (
+        (func.coalesce(Supplier.opening_balance, 0) + func.coalesce(Supplier.total_purchases, 0))
+        - func.coalesce(Supplier.total_paid, 0)
+    ),
+    "payable": (
+        (func.coalesce(Supplier.opening_balance, 0) + func.coalesce(Supplier.total_purchases, 0))
+        - func.coalesce(Supplier.total_paid, 0)
+    ),
+    "balance": (
+        (func.coalesce(Supplier.opening_balance, 0) + func.coalesce(Supplier.total_purchases, 0))
+        - func.coalesce(Supplier.total_paid, 0)
+    ),
+    "total_purchases": Supplier.total_purchases,
+    "total_paid": Supplier.total_paid,
+    "status": Supplier.is_active,
+    "is_active": Supplier.is_active,
+    "created_at": Supplier.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[SupplierOut])
 def list_suppliers(
     user: User = Depends(_view),
@@ -119,6 +160,8 @@ def list_suppliers(
     is_active: bool | None = Query(default=None),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[SupplierOut]:
     org_id = _org_id(user)
@@ -139,7 +182,15 @@ def list_suppliers(
     if is_active is not None:
         query = query.filter(Supplier.is_active == is_active)
 
-    query = query.order_by(Supplier.name.asc(), Supplier.id.asc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=SUPPLIER_SORTABLE_FIELDS,
+        default_order=[Supplier.name.asc(), Supplier.id.asc()],
+        secondary_key=Supplier.id.asc(),
+        default_sort_order="asc",
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[SupplierOut.model_validate(s) for s in items],

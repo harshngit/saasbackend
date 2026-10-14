@@ -73,6 +73,53 @@ def _apply_movement(
 from datetime import datetime, timedelta, timezone
 from app.schemas.pagination import PaginatedResponse
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
+from app.models import StockBatch
+from sqlalchemy import func, select
+
+EXPIRING_STOCK_SORTABLE_FIELDS = {
+    "expiry_date": StockBatch.expiry_date,
+    "batch_number": StockBatch.batch_number,
+    "manufacturing_date": StockBatch.manufacturing_date,
+    "quantity": StockBatch.quantity,
+    "received_quantity": StockBatch.received_quantity,
+    "mrp": StockBatch.mrp,
+    "created_at": StockBatch.created_at,
+    "product": select(Product.name).where(Product.id == StockBatch.product_id).scalar_subquery(),
+    "product_name": select(Product.name).where(Product.id == StockBatch.product_id).scalar_subquery(),
+    "warehouse": select(Warehouse.name).where(Warehouse.id == StockBatch.warehouse_id).scalar_subquery(),
+    "warehouse_name": select(Warehouse.name).where(Warehouse.id == StockBatch.warehouse_id).scalar_subquery(),
+}
+
+from app.models.warehouse import StockReservation
+
+_inv_reserved_subquery = select(
+    func.coalesce(func.sum(StockReservation.reserved_quantity - StockReservation.consumed_quantity), 0.0)
+).where(
+    StockReservation.product_id == Product.id,
+    StockReservation.status == "active",
+).scalar_subquery()
+_inv_available_subquery = Product.total_inventory - _inv_reserved_subquery
+
+INVENTORY_BOARD_SORTABLE_FIELDS = {
+    "name": Product.name,
+    "product_name": Product.name,
+    "sku": Product.sku,
+    "brand": Product.brand,
+    "reorder_level": Product.reorder_level,
+    "current_stock": Product.total_inventory,
+    "total_stock": Product.total_inventory,
+    "total_inventory": Product.total_inventory,
+    "stock": Product.total_inventory,
+    "total": Product.total_inventory,
+    "reserved_stock": _inv_reserved_subquery,
+    "reserved": _inv_reserved_subquery,
+    "available_stock": _inv_available_subquery,
+    "available": _inv_available_subquery,
+    "status": Product.is_active,
+    "is_active": Product.is_active,
+    "created_at": Product.created_at,
+}
 
 
 @router.get("/expiring", response_model=PaginatedResponse[ExpiringBatch])
@@ -84,6 +131,8 @@ def expiring_stock(
     product_id: str | None = None,
     within_days: int = Query(default=30, ge=0, le=3650, description="How far ahead to look"),
     include_expired: bool = Query(default=True),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[ExpiringBatch]:
@@ -110,7 +159,15 @@ def expiring_stock(
         s = f"%{search.strip()}%"
         q = q.filter(StockBatch.batch_number.ilike(s))
 
-    q = q.order_by(StockBatch.expiry_date.asc(), StockBatch.id.asc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=EXPIRING_STOCK_SORTABLE_FIELDS,
+        default_order=[StockBatch.expiry_date.asc(), StockBatch.id.asc()],
+        secondary_key=StockBatch.id.asc(),
+        default_sort_order="asc",
+    )
     p = paginate(q, page=page, page_size=page_size)
 
     out = []
@@ -145,6 +202,8 @@ def stock_board(
     search: str | None = Query(default=None, description="matches name / sku / brand"),
     category_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[InventoryItemOut]:
     """Stock board: every product with its current available stock (and per-variant)."""
@@ -157,7 +216,15 @@ def stock_board(
         query = query.filter(Product.category_id == category_id)
     if is_active is not None:
         query = query.filter(Product.is_active == is_active)
-    query = query.order_by(Product.name.asc(), Product.id.asc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=INVENTORY_BOARD_SORTABLE_FIELDS,
+        default_order=[Product.name.asc(), Product.id.asc()],
+        secondary_key=Product.id.asc(),
+        default_sort_order="asc",
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

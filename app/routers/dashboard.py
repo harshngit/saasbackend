@@ -94,6 +94,8 @@ def list_delivery_partner_company_orders(
     ),
     customer_id: str | None = Query(default=None),
     search: str | None = Query(default=None, description="matches order_number"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[SalesOrder]:
@@ -108,5 +110,7 @@ def list_delivery_partner_company_orders(
         fulfilment_status=fulfilment_status,
         customer_id=customer_id,
         search=search,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 

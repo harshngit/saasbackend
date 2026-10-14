@@ -301,7 +301,20 @@ def extract_failure_reason(event: dict) -> str | None:
 
 from sqlalchemy import or_
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting, validate_sort_params
 from app.schemas.pagination import PaginatedResponse
+
+PAYMENT_BILLING_SORTABLE_FIELDS = {
+    "created_at": SubscriptionPayment.created_at,
+    "paid_at": SubscriptionPayment.paid_at,
+    "amount_paise": SubscriptionPayment.amount_paise,
+    "amount": SubscriptionPayment.amount_paise,
+    "status": SubscriptionPayment.status,
+    "billing_cycle": SubscriptionPayment.billing_cycle,
+    "plan_name": Plan.name,
+    "razorpay_order_id": SubscriptionPayment.razorpay_order_id,
+    "razorpay_payment_id": SubscriptionPayment.razorpay_payment_id,
+}
 
 
 def list_payments(
@@ -311,11 +324,14 @@ def list_payments(
     page_size: int = 10,
     search: str | None = None,
     status: str | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = "desc",
 ) -> PaginatedResponse[SubscriptionPaymentOut]:
     """GET /billing/payments (organization_id always the caller's own org —
     enforced by the router, never client-supplied) and
     GET /superadmin/subscription-payments (organization_id optional —
     None lists across every organization)."""
+    validate_sort_params(sort_by, sort_order, PAYMENT_BILLING_SORTABLE_FIELDS)
     query = db.query(SubscriptionPayment, Plan.name).outerjoin(Plan, Plan.id == SubscriptionPayment.plan_id)
     if organization_id is not None:
         query = query.filter(SubscriptionPayment.organization_id == organization_id)
@@ -330,7 +346,14 @@ def list_payments(
                 Plan.name.ilike(s),
             )
         )
-    query = query.order_by(SubscriptionPayment.created_at.desc(), SubscriptionPayment.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=PAYMENT_BILLING_SORTABLE_FIELDS,
+        default_sort=SubscriptionPayment.created_at.desc(),
+        secondary_sort=SubscriptionPayment.id.desc(),
+    )
     p = paginate(query, page=page, page_size=page_size)
     items = [
         SubscriptionPaymentOut(

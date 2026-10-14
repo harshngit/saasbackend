@@ -1,13 +1,28 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from sqlalchemy import desc, or_
+from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.core import scoping
+from app.core.sorting import apply_sorting
 from app.core.workflow import VISIT_OUTCOMES, VISIT_STATUSES, VisitTransitionError, validate_visit_transition
-from app.models import Customer, User, Visit
+from app.models import Customer, Lead, User, Visit
 from app.schemas.visit import VisitCreate, VisitUpdate
 from app.services import lead_service
+
+VISIT_SORTABLE_FIELDS = {
+    "visit_date": Visit.visit_date,
+    "date": Visit.visit_date,
+    "status": Visit.status,
+    "visit_type": Visit.visit_type,
+    "purpose": Visit.purpose,
+    "location": Visit.location,
+    "customer": select(Customer.name).where(Customer.id == Visit.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == Visit.customer_id).scalar_subquery(),
+    "lead": select(Lead.name).where(Lead.id == Visit.lead_id).scalar_subquery(),
+    "lead_name": select(Lead.name).where(Lead.id == Visit.lead_id).scalar_subquery(),
+    "created_at": Visit.created_at,
+}
 
 
 def _now() -> datetime:
@@ -133,6 +148,8 @@ def list_visits(
     status_filter: str | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
 ) -> PaginatedResponse[Visit]:
     query = db.query(Visit).filter(Visit.organization_id == org_id)
 
@@ -160,7 +177,14 @@ def list_visits(
         )
 
     query = scoping.owned_by(query, db, user, Visit.user_id)
-    query = query.order_by(Visit.visit_date.desc().nullslast(), Visit.created_at.desc(), Visit.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=VISIT_SORTABLE_FIELDS,
+        default_order=[Visit.visit_date.desc().nullslast(), Visit.created_at.desc(), Visit.id.desc()],
+        secondary_key=Visit.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

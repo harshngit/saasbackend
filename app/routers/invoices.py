@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -9,6 +9,7 @@ from app.core import workflow
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import decode_data_url, get_bytes
 from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf
+from app.core.sorting import apply_sorting
 from app.models import (
     Customer,
     Delivery,
@@ -58,6 +59,25 @@ _view = require_permission("invoices", "view")
 _create = require_permission("invoices", "create")
 _edit = require_permission("invoices", "edit")
 _approve = require_permission("invoices", "approve")
+
+INVOICE_SORTABLE_FIELDS = {
+    "invoice_number": Invoice.invoice_number,
+    "customer": select(Customer.name).where(Customer.id == Invoice.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == Invoice.customer_id).scalar_subquery(),
+    "invoice_date": Invoice.invoice_date,
+    "date": Invoice.invoice_date,
+    "due_date": Invoice.due_date,
+    "total": Invoice.total,
+    "total_amount": Invoice.total,
+    "amount": Invoice.total,
+    "amount_paid": Invoice.amount_paid,
+    "outstanding_amount": (Invoice.total - Invoice.amount_paid),
+    "outstanding": (Invoice.total - Invoice.amount_paid),
+    "status": Invoice.status,
+    "invoice_status": Invoice.invoice_status,
+    "payment_status": Invoice.payment_status,
+    "created_at": Invoice.created_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -602,6 +622,8 @@ def list_invoices(
     search: str | None = Query(default=None, description="matches invoice_number"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[InvoiceOut]:
     org_id = _org_id(user)
@@ -615,7 +637,14 @@ def list_invoices(
     if search:
         q = q.filter(Invoice.invoice_number.ilike(f"%{search}%"))
 
-    q = q.order_by(Invoice.created_at.desc(), Invoice.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=INVOICE_SORTABLE_FIELDS,
+        default_order=[Invoice.created_at.desc(), Invoice.id.desc()],
+        secondary_key=Invoice.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[InvoiceOut.model_validate(inv) for inv in items],

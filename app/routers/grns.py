@@ -109,6 +109,19 @@ def create_grn(
     return grn
 
 
+from app.core.sorting import apply_sorting
+from app.models import Supplier
+from sqlalchemy import select
+
+GRN_SORTABLE_FIELDS = {
+    "grn_number": GoodsReceiptNote.grn_number,
+    "status": GoodsReceiptNote.status,
+    "received_date": GoodsReceiptNote.received_date,
+    "supplier": select(Supplier.name).where(Supplier.id == GoodsReceiptNote.supplier_id).scalar_subquery(),
+    "created_at": GoodsReceiptNote.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[GRNOut])
 def list_grns(
     page: int = Query(1, ge=1),
@@ -119,6 +132,8 @@ def list_grns(
     warehouse_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     search: str | None = Query(default=None, description="matches grn_number or notes"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[GRNOut]:
     org_id = _org_id(user)
@@ -140,7 +155,14 @@ def list_grns(
             )
         )
 
-    q = q.order_by(GoodsReceiptNote.created_at.desc(), GoodsReceiptNote.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=GRN_SORTABLE_FIELDS,
+        default_order=[GoodsReceiptNote.created_at.desc(), GoodsReceiptNote.id.desc()],
+        secondary_key=GoodsReceiptNote.id.desc(),
+    )
     return paginate(q, page=page, page_size=page_size)
 
 

@@ -283,6 +283,47 @@ def bulk_delete_products(
 
 
 
+from app.core.sorting import apply_sorting
+from app.models.warehouse import StockReservation
+from sqlalchemy import func
+
+_product_reserved_subquery = select(
+    func.coalesce(func.sum(StockReservation.reserved_quantity - StockReservation.consumed_quantity), 0.0)
+).where(
+    StockReservation.product_id == Product.id,
+    StockReservation.status == "active",
+).scalar_subquery()
+_product_available_subquery = Product.total_inventory - _product_reserved_subquery
+
+PRODUCT_SORTABLE_FIELDS = {
+    "name": Product.name,
+    "product_name": Product.name,
+    "sku": Product.sku,
+    "product_id": Product.product_id,
+    "brand": func.coalesce(
+        select(Brand.name).where(Brand.id == Product.brand_id).scalar_subquery(),
+        Product.brand,
+    ),
+    "category": select(Category.name).where(Category.id == Product.category_id).scalar_subquery(),
+    "price": Product.price,
+    "selling_price": Product.price,
+    "wholesale_price": Product.wholesale_price,
+    "mrp": Product.msrp_mrp,
+    "cost_price": Product.price,
+    "total_stock": Product.total_inventory,
+    "total_inventory": Product.total_inventory,
+    "stock": Product.total_inventory,
+    "total": Product.total_inventory,
+    "reserved_stock": _product_reserved_subquery,
+    "reserved": _product_reserved_subquery,
+    "available_stock": _product_available_subquery,
+    "available": _product_available_subquery,
+    "status": Product.status,
+    "is_active": Product.is_active,
+    "created_at": Product.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[ProductListItem])
 def list_products(
     user: User = Depends(_view),
@@ -298,6 +339,8 @@ def list_products(
     status_filter: str | None = Query(default=None, alias="status", description="active | inactive | discontinued"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[ProductListItem]:
     org_id = _org_id(user)
@@ -339,7 +382,14 @@ def list_products(
     if status_filter is not None:
         query = query.filter(Product.status == status_filter)
 
-    query = query.order_by(Product.created_at.desc(), Product.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=PRODUCT_SORTABLE_FIELDS,
+        default_order=[Product.created_at.desc(), Product.id.desc()],
+        secondary_key=Product.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[ProductListItem.model_validate(p) for p in items],

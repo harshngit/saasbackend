@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import User
 from app.models.cash_reconciliation import CashReconciliation
 from app.schemas.cash_reconciliation import (
@@ -26,6 +27,29 @@ _view = require_permission("payments", "view")
 _create = require_permission("payments", "create")
 _edit = require_permission("payments", "edit")
 _delete = require_permission("payments", "delete")
+
+from sqlalchemy import select
+
+CASH_RECONCILIATION_SORTABLE_FIELDS = {
+    "reconciliation_date": CashReconciliation.reconciliation_date,
+    "business_date": CashReconciliation.reconciliation_date,
+    "date": CashReconciliation.reconciliation_date,
+    "total_expected_collections": CashReconciliation.total_expected_collections,
+    "expected_amount": CashReconciliation.total_expected_collections,
+    "total_actual_collections": CashReconciliation.total_actual_collections,
+    "actual_amount": CashReconciliation.total_actual_collections,
+    "amount": CashReconciliation.total_actual_collections,
+    "collections_variance": CashReconciliation.collections_variance,
+    "variance": CashReconciliation.collections_variance,
+    "actual_cash_on_hand": CashReconciliation.actual_cash_on_hand,
+    "closing_cash": CashReconciliation.actual_cash_on_hand,
+    "created_by": select(User.name).where(User.id == CashReconciliation.created_by_id).scalar_subquery(),
+    "closed_by": select(User.name).where(User.id == CashReconciliation.closed_by_id).scalar_subquery(),
+    "collector": select(User.name).where(User.id == CashReconciliation.created_by_id).scalar_subquery(),
+    "status": CashReconciliation.status,
+    "closed_at": CashReconciliation.closed_at,
+    "created_at": CashReconciliation.created_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -94,6 +118,8 @@ def list_reconciliations(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
+    sort_by: Optional[str] = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[CashReconciliationOut]:
@@ -108,8 +134,17 @@ def list_reconciliations(
     if status_filter:
         query = query.filter(CashReconciliation.status == status_filter.strip().lower())
 
-    query = query.order_by(
-        CashReconciliation.reconciliation_date.desc(), CashReconciliation.created_at.desc()
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=CASH_RECONCILIATION_SORTABLE_FIELDS,
+        default_order=[
+            CashReconciliation.reconciliation_date.desc(),
+            CashReconciliation.created_at.desc(),
+            CashReconciliation.id.desc(),
+        ],
+        secondary_key=CashReconciliation.id.desc(),
     )
 
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)

@@ -676,6 +676,32 @@ def get_purchase_return_detail(
     return record
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import func, select
+
+_purchase_return_num_subquery = select(
+    func.coalesce(PurchaseInvoice.purchase_number, PurchaseInvoice.invoice_number)
+).where(PurchaseInvoice.id == PurchaseReturn.purchase_id).scalar_subquery()
+
+PURCHASE_RETURN_SORTABLE_FIELDS = {
+    "return_number": PurchaseReturn.return_number,
+    "supplier": select(Supplier.name).where(Supplier.id == PurchaseReturn.supplier_id).scalar_subquery(),
+    "supplier_name": select(Supplier.name).where(Supplier.id == PurchaseReturn.supplier_id).scalar_subquery(),
+    "purchase_number": _purchase_return_num_subquery,
+    "purchase": _purchase_return_num_subquery,
+    "related_purchase": _purchase_return_num_subquery,
+    "related_purchase_number": _purchase_return_num_subquery,
+    "purchase_invoice": _purchase_return_num_subquery,
+    "purchase_invoice_number": _purchase_return_num_subquery,
+    "return_date": PurchaseReturn.return_date,
+    "date": PurchaseReturn.return_date,
+    "amount": PurchaseReturn.total_amount,
+    "total_amount": PurchaseReturn.total_amount,
+    "status": PurchaseReturn.status,
+    "created_at": PurchaseReturn.created_at,
+}
+
+
 def list_purchase_returns(
     db: Session,
     org_id: str,
@@ -687,6 +713,8 @@ def list_purchase_returns(
     date_to: datetime | None = None,
     page: int | None = None,
     page_size: int | None = None,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
 ) -> PurchaseReturnListResponse:
     """List purchase returns with tenant scoping, filtering, search, and pagination."""
     q = db.query(PurchaseReturn).filter(PurchaseReturn.organization_id == org_id)
@@ -718,7 +746,14 @@ def list_purchase_returns(
         )
 
     total = q.count()
-    q = q.order_by(PurchaseReturn.created_at.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=PURCHASE_RETURN_SORTABLE_FIELDS,
+        default_order=[PurchaseReturn.created_at.desc(), PurchaseReturn.id.desc()],
+        secondary_key=PurchaseReturn.id.desc(),
+    )
 
     if page is not None and page_size is not None:
         offset = (page - 1) * page_size

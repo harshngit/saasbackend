@@ -390,6 +390,29 @@ def bulk_delete_orders(
     return BulkDeleteResult(deleted=len(orders))
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import func, select
+
+ORDER_SORTABLE_FIELDS = {
+    "order_number": SalesOrder.order_number,
+    "customer": select(Customer.name).where(Customer.id == SalesOrder.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == SalesOrder.customer_id).scalar_subquery(),
+    "order_date": SalesOrder.order_date,
+    "date": SalesOrder.order_date,
+    "sales_officer": select(User.name).where(User.id == func.coalesce(SalesOrder.salesperson_id, SalesOrder.created_by)).scalar_subquery(),
+    "delivery_partner": select(User.name).where(User.id == SalesOrder.assigned_delivery_partner_id).scalar_subquery(),
+    "vehicle": select(Vehicle.vehicle_number).select_from(Delivery).join(Vehicle, Vehicle.id == Delivery.vehicle_id).where(Delivery.sales_order_id == SalesOrder.id, Delivery.status != "cancelled").limit(1).scalar_subquery(),
+    "total": SalesOrder.total,
+    "total_amount": SalesOrder.total,
+    "status": SalesOrder.status,
+    "order_status": SalesOrder.status,
+    "fulfilment_status": SalesOrder.fulfilment_status,
+    "delivery_status": SalesOrder.fulfilment_status,
+    "delivery_date": SalesOrder.delivery_date,
+    "created_at": SalesOrder.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[OrderOut])
 def list_orders(
     user: User = Depends(_view),
@@ -407,6 +430,8 @@ def list_orders(
     search: str | None = Query(default=None, description="matches order_number"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[OrderOut]:
     org_id = _org_id(user)
@@ -433,7 +458,14 @@ def list_orders(
         SalesOrder.created_by, SalesOrder.salesperson_id, SalesOrder.assigned_delivery_partner_id,
         team_columns=(SalesOrder.salesperson_id,),
     )
-    query = query.order_by(SalesOrder.created_at.desc(), SalesOrder.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=ORDER_SORTABLE_FIELDS,
+        default_order=[SalesOrder.created_at.desc(), SalesOrder.id.desc()],
+        secondary_key=SalesOrder.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[_order_out(db, o) for o in items],

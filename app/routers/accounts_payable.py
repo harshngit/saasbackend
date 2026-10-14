@@ -40,6 +40,8 @@ def list_accounts_payable(
     search: str | None = Query(default=None, description="matches supplier_invoice_number or supplier name"),
     page: int | None = Query(default=None, ge=1),
     page_size: int | None = Query(default=None, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> APListResponse:
     """GET /accounts-payable: List open payable invoices derived from recorded SupplierInvoices."""
@@ -54,6 +56,8 @@ def list_accounts_payable(
         search=search,
         page=page,
         page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

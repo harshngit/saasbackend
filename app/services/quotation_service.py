@@ -174,6 +174,48 @@ def create_quotation(db: Session, org_id: str, user: User, payload: QuotationCre
     return quotation
 
 
+from app.core.sorting import apply_sorting
+from app.models.quotation import QuotationItem
+from sqlalchemy import case, func, select
+
+_quotation_gross = QuotationItem.quantity * QuotationItem.unit_price
+_quotation_disc = case(
+    (QuotationItem.discount > 0, QuotationItem.discount),
+    (QuotationItem.discount_percent > 0, _quotation_gross * QuotationItem.discount_percent / 100.0),
+    else_=0.0,
+)
+_quotation_net = _quotation_gross - _quotation_disc
+_quotation_line_total = _quotation_net * (1.0 + func.coalesce(QuotationItem.tax_rate, 0.0) / 100.0)
+_quotation_amount_subquery = select(func.coalesce(func.sum(_quotation_line_total), 0.0)).where(
+    QuotationItem.quotation_id == Quotation.id
+).scalar_subquery()
+
+QUOTATION_SORTABLE_FIELDS = {
+    "quotation_number": Quotation.quotation_number,
+    "quotation_date": Quotation.quotation_date,
+    "date": Quotation.quotation_date,
+    "valid_until": Quotation.valid_until,
+    "expiry_date": Quotation.valid_until,
+    "status": Quotation.status,
+    "created_at": Quotation.created_at,
+    "customer": func.coalesce(
+        select(Customer.name).where(Customer.id == Quotation.customer_id).scalar_subquery(),
+        select(Lead.name).where(Lead.id == Quotation.lead_id).scalar_subquery(),
+    ),
+    "customer_name": func.coalesce(
+        select(Customer.name).where(Customer.id == Quotation.customer_id).scalar_subquery(),
+        select(Lead.name).where(Lead.id == Quotation.lead_id).scalar_subquery(),
+    ),
+    "prospect": func.coalesce(
+        select(Customer.name).where(Customer.id == Quotation.customer_id).scalar_subquery(),
+        select(Lead.name).where(Lead.id == Quotation.lead_id).scalar_subquery(),
+    ),
+    "salesperson": select(User.name).where(User.id == Quotation.salesperson_id).scalar_subquery(),
+    "amount": _quotation_amount_subquery,
+    "total": _quotation_amount_subquery,
+}
+
+
 def list_quotations(
     db: Session,
     org_id: str,
@@ -185,6 +227,8 @@ def list_quotations(
     search: str | None = None,
     page: int = 1,
     page_size: int = 10,
+    sort_by: str | None = None,
+    sort_order: str | None = None,
 ) -> tuple[list[Quotation], int, int, int, int]:
     from app.core.pagination import paginate
     from sqlalchemy import or_
@@ -208,7 +252,14 @@ def list_quotations(
         )
     # A field role sees only their own quotations.
     query = scoping.owned_by(query, db, user, Quotation.salesperson_id)
-    query = query.order_by(Quotation.created_at.desc(), Quotation.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=QUOTATION_SORTABLE_FIELDS,
+        default_order=[Quotation.created_at.desc(), Quotation.id.desc()],
+        secondary_key=Quotation.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

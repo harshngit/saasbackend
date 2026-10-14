@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.core.sorting import apply_sorting
 from app.models import (
     Delivery,
     Product,
@@ -41,6 +43,18 @@ router = APIRouter(
 _view = require_permission("vehicle_stock", "view")
 _create = require_permission("vehicle_stock", "create")
 _edit = require_permission("vehicle_stock", "edit")
+
+VEHICLE_LOADING_SORTABLE_FIELDS = {
+    "date": VehicleLoading.date,
+    "session_date": VehicleLoading.date,
+    "status": VehicleLoading.status,
+    "vehicle": select(Vehicle.vehicle_number).where(Vehicle.id == VehicleLoading.vehicle_id).scalar_subquery(),
+    "vehicle_number": select(Vehicle.vehicle_number).where(Vehicle.id == VehicleLoading.vehicle_id).scalar_subquery(),
+    "delivery_partner": select(User.name).where(User.id == VehicleLoading.delivery_partner_id).scalar_subquery(),
+    "created_at": VehicleLoading.created_at,
+    "updated_at": VehicleLoading.updated_at,
+    "updated_time": VehicleLoading.updated_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -505,6 +519,8 @@ def get_session_reconciliations(
 def list_all_loadings(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = Query(default=None),
     delivery_partner_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
@@ -523,6 +539,13 @@ def list_all_loadings(
         q = q.filter(VehicleLoading.status == status_filter)
     # team_columns=(): Vehicle Stock is explicitly excluded from Team Scope.
     q = scoping.owned_by(q, db, user, VehicleLoading.delivery_partner_id, team_columns=())
-    q = q.order_by(VehicleLoading.date.desc(), VehicleLoading.created_at.desc(), VehicleLoading.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=VEHICLE_LOADING_SORTABLE_FIELDS,
+        default_order=[VehicleLoading.date.desc(), VehicleLoading.created_at.desc(), VehicleLoading.id.desc()],
+        secondary_key=VehicleLoading.id.desc(),
+    )
     return paginate(q, page=page, page_size=page_size)
 

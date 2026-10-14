@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import Notification, User
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.notification import MessageResponse, NotificationOut, UnreadCount
@@ -12,11 +13,19 @@ from app.schemas.pagination import PaginatedResponse
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
+NOTIFICATION_SORTABLE_FIELDS = {
+    "created_at": Notification.created_at,
+    "title": Notification.title,
+    "is_read": Notification.is_read,
+}
+
 
 @router.get("", response_model=PaginatedResponse[NotificationOut])
 def list_notifications(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = Query(default=None),
     user: User = Depends(get_current_user),
     unread_only: bool = Query(default=False),
@@ -33,7 +42,14 @@ def list_notifications(
                 Notification.body.ilike(s),
             )
         )
-    q = q.order_by(Notification.created_at.desc(), Notification.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=NOTIFICATION_SORTABLE_FIELDS,
+        default_order=[Notification.created_at.desc(), Notification.id.desc()],
+        secondary_key=Notification.id.desc(),
+    )
     return paginate(q, page=page, page_size=page_size)
 
 

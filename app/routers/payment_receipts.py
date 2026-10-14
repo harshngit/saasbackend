@@ -7,13 +7,15 @@ invoice, the same balance and the same ledger.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import Customer, CustomerPayment, Invoice, User
 from app.schemas.customer import CollectorBrief
-from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.payment_receipt import (
     PaymentReceiptCreate,
@@ -33,6 +35,26 @@ _view = require_permission("payment_receipts", "view")
 _create = require_permission("payment_receipts", "create")
 _edit = require_permission("payment_receipts", "edit")
 _delete = require_permission("payment_receipts", "delete")
+
+PAYMENT_RECEIPT_SORTABLE_FIELDS = {
+    "receipt_number": CustomerPayment.receipt_number,
+    "received_on": CustomerPayment.received_on,
+    "receipt_date": CustomerPayment.received_on,
+    "business_date": CustomerPayment.received_on,
+    "date": CustomerPayment.received_on,
+    "customer": select(Customer.name).where(Customer.id == CustomerPayment.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == CustomerPayment.customer_id).scalar_subquery(),
+    "collector": select(User.name).where(User.id == CustomerPayment.collected_by_user_id).scalar_subquery(),
+    "collected_by": select(User.name).where(User.id == CustomerPayment.collected_by_user_id).scalar_subquery(),
+    "amount": CustomerPayment.amount,
+    "amount_received": CustomerPayment.amount,
+    "amount_collected": CustomerPayment.amount,
+    "payment_mode": CustomerPayment.payment_mode,
+    "payment_method": CustomerPayment.payment_mode,
+    "reference": CustomerPayment.reference,
+    "transaction_reference": CustomerPayment.reference,
+    "created_at": CustomerPayment.created_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -189,6 +211,8 @@ def list_receipts(
     search: str | None = Query(default=None, description="matches receipt_number, reference, or note"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[PaymentReceiptOut]:
     """Every payment this firm has received, newest first."""
@@ -200,7 +224,6 @@ def list_receipts(
         query = query.filter(CustomerPayment.invoice_id == invoice_id)
     if search:
         s = f"%{search}%"
-        from sqlalchemy import or_
         query = query.filter(
             or_(
                 CustomerPayment.receipt_number.ilike(s),
@@ -208,7 +231,14 @@ def list_receipts(
                 CustomerPayment.note.ilike(s),
             )
         )
-    query = query.order_by(CustomerPayment.received_on.desc(), CustomerPayment.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=PAYMENT_RECEIPT_SORTABLE_FIELDS,
+        default_order=[CustomerPayment.received_on.desc(), CustomerPayment.id.desc()],
+        secondary_key=CustomerPayment.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[_out(db, row) for row in items],

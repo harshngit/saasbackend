@@ -181,6 +181,25 @@ def create_sales_return(
     return sales_return
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import select
+
+SALES_RETURN_SORTABLE_FIELDS = {
+    "return_number": SalesReturn.return_number,
+    "customer": select(Customer.name).where(Customer.id == SalesReturn.customer_id).scalar_subquery(),
+    "customer_name": select(Customer.name).where(Customer.id == SalesReturn.customer_id).scalar_subquery(),
+    "invoice_number": select(Invoice.invoice_number).where(Invoice.id == SalesReturn.invoice_reference_id).scalar_subquery(),
+    "return_date": SalesReturn.return_date,
+    "date": SalesReturn.return_date,
+    "amount": SalesReturn.credit_amount,
+    "total_amount": SalesReturn.credit_amount,
+    "credit_amount": SalesReturn.credit_amount,
+    "status": SalesReturn.return_status,
+    "return_status": SalesReturn.return_status,
+    "created_at": SalesReturn.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[SalesReturnOut])
 def list_sales_returns(
     user: User = Depends(_view),
@@ -190,6 +209,8 @@ def list_sales_returns(
     search: str | None = Query(default=None, description="matches return_number or reason"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[SalesReturnOut]:
     query = db.query(SalesReturn).filter(SalesReturn.organization_id == _org_id(user))
@@ -208,7 +229,14 @@ def list_sales_returns(
                 SalesReturn.reason.ilike(s),
             )
         )
-    query = query.order_by(SalesReturn.return_date.desc(), SalesReturn.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=SALES_RETURN_SORTABLE_FIELDS,
+        default_order=[SalesReturn.return_date.desc(), SalesReturn.id.desc()],
+        secondary_key=SalesReturn.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[SalesReturnOut.model_validate(r) for r in items],

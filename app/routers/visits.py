@@ -40,6 +40,8 @@ def create_visit(
 def list_visits(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = Query(default=None),
     customer_id: str | None = Query(default=None),
     lead_id: str | None = Query(default=None),
@@ -64,6 +66,8 @@ def list_visits(
         status_filter=status,
         date_from=date_from,
         date_to=date_to,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

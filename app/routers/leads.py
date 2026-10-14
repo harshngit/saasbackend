@@ -59,6 +59,8 @@ def list_leads(
     created_to: datetime | None = Query(default=None, description="Leads created on or before this timestamp"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[LeadOut]:
     items, total, page, page_size, total_pages = lead_service.list_leads(
@@ -73,6 +75,8 @@ def list_leads(
         created_to=created_to,
         page=page,
         page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
     return PaginatedResponse(
         items=[LeadOut.model_validate(l) for l in items],

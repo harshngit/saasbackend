@@ -40,6 +40,7 @@ from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
 from app.schemas.user import UserOut
 from app.schemas.pagination import PaginatedResponse
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting, validate_sort_params
 from app.core.entitlements import normalize_entitlement_key
 from app.services import (
     activity_service,
@@ -204,6 +205,24 @@ def delete_super_admin(
     db.commit()
 
 
+ORGANIZATION_SORTABLE_FIELDS = {
+    "name": Organization.name,
+    "email": Organization.email,
+    "phone": Organization.phone,
+    "status": Organization.status,
+    "business_type": Organization.business_type,
+    "gst_number": Organization.gst_number,
+    "pan_number": Organization.pan_number,
+    "plan_id": Organization.plan_id,
+    "billing_cycle": Organization.billing_cycle,
+    "upgrade_status": Organization.upgrade_status,
+    "created_at": Organization.created_at,
+    "trial_ends_at": Organization.trial_ends_at,
+    "plan_expires_at": Organization.plan_expires_at,
+    "company_code": Organization.company_code,
+}
+
+
 @router.get("/organizations", response_model=PaginatedResponse[OrganizationOut])
 def list_organizations(
     page: int = Query(1, ge=1),
@@ -211,9 +230,12 @@ def list_organizations(
     search: str | None = Query(default=None),
     status_filter: OrganizationStatus | None = Query(default=None, alias="status"),
     upgrade_status: UpgradeStatus | None = Query(default=None),
+    sort_by: str | None = Query(default=None),
+    sort_order: str | None = Query(default="desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[OrganizationOut]:
     """List all organizations, optionally filtered by ?status= and ?upgrade_status=."""
+    validate_sort_params(sort_by, sort_order, ORGANIZATION_SORTABLE_FIELDS)
     query = db.query(Organization)
     if status_filter is not None:
         query = query.filter(Organization.status == status_filter)
@@ -228,7 +250,14 @@ def list_organizations(
                 Organization.email.ilike(s),
             )
         )
-    query = query.order_by(Organization.created_at.desc(), Organization.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=ORGANIZATION_SORTABLE_FIELDS,
+        default_sort=Organization.created_at.desc(),
+        secondary_sort=Organization.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 
@@ -795,6 +824,8 @@ def list_subscription_payments(
     search: str | None = Query(default=None),
     status: str | None = Query(default=None),
     organization_id: str | None = Query(default=None),
+    sort_by: str | None = Query(default=None),
+    sort_order: str | None = Query(default="desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[SubscriptionPaymentOut]:
     """Every Razorpay subscription payment, optionally filtered by
@@ -806,4 +837,6 @@ def list_subscription_payments(
         page_size=page_size,
         search=search,
         status=status,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )

@@ -1,14 +1,25 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from sqlalchemy import asc, desc, or_
+from sqlalchemy import asc, desc, or_, select
 from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import Customer, FollowUp, Lead, User, Visit
 from app.schemas.follow_up import FollowUpComplete, FollowUpCreate, FollowUpUpdate
 from app.schemas.pagination import PaginatedResponse
 from app.services import lead_service
+
+FOLLOW_UP_SORTABLE_FIELDS = {
+    "due_date": FollowUp.due_date,
+    "priority": FollowUp.priority,
+    "status": FollowUp.status,
+    "title": FollowUp.title,
+    "completed_at": FollowUp.completed_at,
+    "assigned_to": select(User.name).where(User.id == FollowUp.assigned_to_id).scalar_subquery(),
+    "created_at": FollowUp.created_at,
+}
 
 
 def _now() -> datetime:
@@ -161,6 +172,8 @@ def list_follow_ups(
     priority: str | None = None,
     due_before: datetime | None = None,
     due_after: datetime | None = None,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
 ) -> PaginatedResponse[FollowUp]:
     query = db.query(FollowUp).filter(FollowUp.organization_id == org_id)
 
@@ -190,7 +203,14 @@ def list_follow_ups(
         )
 
     query = scoping.owned_by(query, db, user, FollowUp.assigned_to_id)
-    query = query.order_by(FollowUp.due_date.asc().nullslast(), FollowUp.created_at.desc(), FollowUp.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=FOLLOW_UP_SORTABLE_FIELDS,
+        default_order=[FollowUp.due_date.asc().nullslast(), FollowUp.created_at.desc(), FollowUp.id.desc()],
+        secondary_key=FollowUp.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

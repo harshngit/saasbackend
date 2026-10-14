@@ -58,6 +58,8 @@ def list_quotations(
     search: str | None = Query(default=None, description="matches quotation_number or notes"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[QuotationListItem]:
     items, total, page, page_size, total_pages = quotation_service.list_quotations(
@@ -71,6 +73,8 @@ def list_quotations(
         search=search,
         page=page,
         page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
     return PaginatedResponse(
         items=[QuotationListItem.model_validate(q) for q in items],

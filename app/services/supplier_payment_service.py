@@ -3,6 +3,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.core.sorting import apply_sorting
 from app.models.purchase_invoice import PurchaseInvoice
 from app.models.supplier import Supplier, SupplierPayment
 from app.models.supplier_invoice import SupplierInvoice
@@ -15,6 +16,24 @@ from app.schemas.supplier_payment import (
     SupplierPaymentOut,
 )
 from app.services import numbering_service
+
+SUPPLIER_PAYMENT_SORTABLE_FIELDS = {
+    "payment_number": SupplierPayment.payment_number,
+    "reference": SupplierPayment.reference,
+    "supplier": Supplier.name,
+    "supplier_name": Supplier.name,
+    "paid_on": SupplierPayment.paid_on,
+    "payment_date": SupplierPayment.paid_on,
+    "date": SupplierPayment.paid_on,
+    "amount": SupplierPayment.amount,
+    "unallocated_amount": SupplierPayment.unallocated_amount,
+    "outstanding_amount": SupplierPayment.unallocated_amount,
+    "outstanding": SupplierPayment.unallocated_amount,
+    "payment_method": SupplierPayment.payment_method,
+    "payment_mode": SupplierPayment.payment_mode,
+    "status": SupplierPayment.status,
+    "created_at": SupplierPayment.created_at,
+}
 
 
 def _now() -> datetime:
@@ -362,6 +381,8 @@ def list_supplier_payments(
     search: str | None = None,
     page: int | None = None,
     page_size: int | None = None,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
 ) -> SupplierPaymentListResponse:
     """List tenant supplier payments with filtering and pagination."""
     q = (
@@ -396,7 +417,14 @@ def list_supplier_payments(
         )
 
     total_count = q.count()
-    q = q.order_by(SupplierPayment.paid_on.desc(), SupplierPayment.created_at.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=SUPPLIER_PAYMENT_SORTABLE_FIELDS,
+        default_order=[SupplierPayment.paid_on.desc(), SupplierPayment.created_at.desc(), SupplierPayment.id.desc()],
+        secondary_key=SupplierPayment.id.desc(),
+    )
 
     if page is not None and page_size is not None:
         offset = (page - 1) * page_size

@@ -1,11 +1,12 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.core.sorting import apply_sorting
 from app.models import (
     PurchaseInvoice,
     Supplier,
@@ -36,6 +37,30 @@ _create = require_permission("supplier_invoices", "create")
 _edit = require_permission("supplier_invoices", "edit")
 _approve = require_permission("supplier_invoices", "approve")
 _delete = require_permission("supplier_invoices", "delete")
+
+SUPPLIER_INVOICE_SORTABLE_FIELDS = {
+    "supplier_invoice_number": SupplierInvoice.supplier_invoice_number,
+    "invoice_number": SupplierInvoice.supplier_invoice_number,
+    "supplier": select(Supplier.name).where(Supplier.id == SupplierInvoice.supplier_id).scalar_subquery(),
+    "supplier_name": select(Supplier.name).where(Supplier.id == SupplierInvoice.supplier_id).scalar_subquery(),
+    "supplier_invoice_date": SupplierInvoice.supplier_invoice_date,
+    "invoice_date": SupplierInvoice.supplier_invoice_date,
+    "date": SupplierInvoice.supplier_invoice_date,
+    "due_date": SupplierInvoice.due_date,
+    "grand_total": SupplierInvoice.grand_total,
+    "total": SupplierInvoice.grand_total,
+    "total_amount": SupplierInvoice.grand_total,
+    "amount": SupplierInvoice.grand_total,
+    "amount_paid": SupplierInvoice.amount_paid,
+    "return_amount": SupplierInvoice.return_amount,
+    "outstanding_amount": (SupplierInvoice.grand_total - func.coalesce(SupplierInvoice.return_amount, 0.0) - func.coalesce(SupplierInvoice.amount_paid, 0.0)),
+    "outstanding": (SupplierInvoice.grand_total - func.coalesce(SupplierInvoice.return_amount, 0.0) - func.coalesce(SupplierInvoice.amount_paid, 0.0)),
+    "status": SupplierInvoice.status,
+    "verification_status": SupplierInvoice.verification_status,
+    "payment_status": SupplierInvoice.payment_status,
+    "created_at": SupplierInvoice.created_at,
+    "updated_at": SupplierInvoice.updated_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -150,6 +175,8 @@ def list_supplier_invoices(
     search: str | None = Query(default=None, description="matches supplier_invoice_number"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[SupplierInvoiceOut]:
     org_id = _org_id(user)
@@ -169,7 +196,14 @@ def list_supplier_invoices(
         s = f"%{search}%"
         q = q.filter(SupplierInvoice.supplier_invoice_number.ilike(s))
 
-    q = q.order_by(SupplierInvoice.created_at.desc(), SupplierInvoice.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=SUPPLIER_INVOICE_SORTABLE_FIELDS,
+        default_order=[SupplierInvoice.created_at.desc(), SupplierInvoice.id.desc()],
+        secondary_key=SupplierInvoice.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[SupplierInvoiceOut.model_validate(inv) for inv in items],

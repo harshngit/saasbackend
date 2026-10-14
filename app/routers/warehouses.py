@@ -120,6 +120,27 @@ def create_warehouse(
     return warehouse
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import select
+
+WAREHOUSE_STOCK_SORTABLE_FIELDS = {
+    "name": Product.name,
+    "product_name": Product.name,
+    "sku": Product.sku,
+    "brand": Product.brand,
+    "price": Product.price,
+    "created_at": Product.created_at,
+}
+
+WAREHOUSE_MOVEMENT_SORTABLE_FIELDS = {
+    "created_at": StockMovement.created_at,
+    "quantity": StockMovement.quantity,
+    "balance_after": StockMovement.balance_after,
+    "movement_type": StockMovement.movement_type,
+    "product": select(Product.name).where(Product.id == StockMovement.product_id).scalar_subquery(),
+}
+
+
 @router.get("/stock", response_model=PaginatedResponse[StockRow])
 def stock_positions(
     page: int = Query(1, ge=1),
@@ -129,6 +150,8 @@ def stock_positions(
     product_id: str | None = Query(default=None),
     search: str | None = Query(default=None),
     low_stock_only: bool = Query(default=False, description="Only items at or below their minimum level"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[StockRow]:
     """On hand, reserved and available for every item in a warehouse.
@@ -155,7 +178,45 @@ def stock_positions(
             )
         )
 
-    products_query = products_query.order_by(Product.name.asc(), Product.id.asc())
+    from app.models.warehouse import WarehouseStock, StockReservation
+    from sqlalchemy import func
+
+    wh_on_hand = select(
+        func.coalesce(func.sum(WarehouseStock.on_hand_quantity), 0.0)
+    ).where(
+        WarehouseStock.product_id == Product.id,
+        WarehouseStock.warehouse_id == warehouse.id,
+    ).scalar_subquery()
+
+    wh_reserved = select(
+        func.coalesce(func.sum(StockReservation.reserved_quantity - StockReservation.consumed_quantity), 0.0)
+    ).where(
+        StockReservation.product_id == Product.id,
+        StockReservation.warehouse_id == warehouse.id,
+        StockReservation.status == "active",
+    ).scalar_subquery()
+
+    wh_available = wh_on_hand - wh_reserved
+
+    wh_sortable = {
+        **WAREHOUSE_STOCK_SORTABLE_FIELDS,
+        "on_hand": wh_on_hand,
+        "stock": wh_on_hand,
+        "reserved": wh_reserved,
+        "reserved_stock": wh_reserved,
+        "available": wh_available,
+        "available_stock": wh_available,
+    }
+
+    products_query = apply_sorting(
+        products_query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=wh_sortable,
+        default_order=[Product.name.asc(), Product.id.asc()],
+        secondary_key=Product.id.asc(),
+        default_sort_order="asc",
+    )
 
     if not low_stock_only:
         p = paginate(products_query, page=page, page_size=page_size)
@@ -383,6 +444,8 @@ def list_warehouse_movements(
     product_id: str | None = Query(default=None),
     variant_id: str | None = Query(default=None),
     movement_type: str | None = Query(default=None),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     user: User = Depends(_view),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[StockMovementOut]:
@@ -409,7 +472,14 @@ def list_warehouse_movements(
             )
         )
 
-    query = query.order_by(StockMovement.created_at.desc(), StockMovement.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=WAREHOUSE_MOVEMENT_SORTABLE_FIELDS,
+        default_order=[StockMovement.created_at.desc(), StockMovement.id.desc()],
+        secondary_key=StockMovement.id.desc(),
+    )
     p = paginate(query, page=page, page_size=page_size)
 
     results = []

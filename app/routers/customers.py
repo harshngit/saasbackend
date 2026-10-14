@@ -201,6 +201,45 @@ def import_customers(
 
 
 
+from app.core.sorting import apply_sorting
+from app.models import SalesOrder, Visit
+from app.services.report_service import SALE_STATUSES
+from sqlalchemy import func, select
+
+CUSTOMER_SORTABLE_FIELDS = {
+    "name": Customer.name,
+    "customer_name": Customer.name,
+    "business_name": Customer.business_name,
+    "customer_id": Customer.customer_id,
+    "code": Customer.customer_id,
+    "customer_code": Customer.customer_id,
+    "phone": Customer.phone,
+    "email": Customer.email,
+    "contact_person": Customer.primary_contact_person,
+    "primary_contact_person": Customer.primary_contact_person,
+    "location": Customer.city,
+    "city": Customer.city,
+    "category": Customer.category,
+    "outstanding_balance": Customer.outstanding_balance,
+    "balance": Customer.outstanding_balance,
+    "credit_limit": Customer.credit_limit,
+    "status": Customer.is_active,
+    "is_active": Customer.is_active,
+    "created_at": Customer.created_at,
+    "sales_officer": select(User.name).where(User.id == Customer.assigned_sales_officer_id).scalar_subquery(),
+    "assigned_sales_officer": select(User.name).where(User.id == Customer.assigned_sales_officer_id).scalar_subquery(),
+    "last_order": select(func.max(func.coalesce(SalesOrder.order_date, SalesOrder.created_at))).where(
+        SalesOrder.organization_id == Customer.organization_id,
+        SalesOrder.customer_id == Customer.id,
+        SalesOrder.status.in_(SALE_STATUSES),
+    ).scalar_subquery(),
+    "last_visit": select(func.max(Visit.visit_date)).where(
+        Visit.organization_id == Customer.organization_id,
+        Visit.customer_id == Customer.id,
+    ).scalar_subquery(),
+}
+
+
 @router.get("", response_model=PaginatedResponse[CustomerOut])
 def list_customers(
     user: User = Depends(_view),
@@ -211,6 +250,8 @@ def list_customers(
     has_outstanding: bool | None = Query(default=None, description="Filter customers with outstanding balance > 0"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[CustomerOut]:
     org_id = _org_id(user)
@@ -239,7 +280,14 @@ def list_customers(
     if not _is_delivery_partner(user):
         query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
 
-    query = query.order_by(Customer.created_at.desc(), Customer.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=CUSTOMER_SORTABLE_FIELDS,
+        default_order=[Customer.created_at.desc(), Customer.id.desc()],
+        secondary_key=Customer.id.desc(),
+    )
     customers, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
 
     if customers:

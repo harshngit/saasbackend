@@ -1,6 +1,6 @@
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -8,6 +8,7 @@ from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
+from app.core.sorting import apply_sorting
 from app.models import Leave, SystemRole, User
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.leave import LeaveCreate, LeaveOut, LeaveRejectBody, LeaveUpdate
@@ -25,6 +26,23 @@ _create = require_permission("leaves", "create")
 _edit = require_permission("leaves", "edit")
 _approve = require_permission("leaves", "approve")
 _delete = require_permission("leaves", "delete")
+
+LEAVE_SORTABLE_FIELDS = {
+    "leave_type": Leave.leave_type,
+    "type": Leave.leave_type,
+    "start_date": Leave.start_date,
+    "date": Leave.start_date,
+    "end_date": Leave.end_date,
+    "days_count": Leave.days_count,
+    "days": Leave.days_count,
+    "number_of_days": Leave.days_count,
+    "status": Leave.status,
+    "employee": select(User.name).where(User.id == Leave.user_id).scalar_subquery(),
+    "employee_name": select(User.name).where(User.id == Leave.user_id).scalar_subquery(),
+    "user": select(User.name).where(User.id == Leave.user_id).scalar_subquery(),
+    "name": select(User.name).where(User.id == Leave.user_id).scalar_subquery(),
+    "created_at": Leave.created_at,
+}
 
 
 def _org_id(user: User) -> str:
@@ -87,6 +105,8 @@ def create_leave(
 def my_leaves(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     user: User = Depends(_view),
     status_filter: str | None = Query(default=None, alias="status"),
     db: Session = Depends(get_db),
@@ -95,7 +115,14 @@ def my_leaves(
     query = db.query(Leave).filter(Leave.organization_id == org_id, Leave.user_id == user.id)
     if status_filter:
         query = query.filter(Leave.status == status_filter)
-    query = query.order_by(Leave.created_at.desc(), Leave.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=LEAVE_SORTABLE_FIELDS,
+        default_order=[Leave.created_at.desc(), Leave.id.desc()],
+        secondary_key=Leave.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 
@@ -103,6 +130,8 @@ def my_leaves(
 def list_leaves(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = Query(default=None),
     user_id: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
@@ -137,7 +166,14 @@ def list_leaves(
             )
         )
 
-    query = query.order_by(Leave.created_at.desc(), Leave.id.desc())
+    query = apply_sorting(
+        query,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=LEAVE_SORTABLE_FIELDS,
+        default_order=[Leave.created_at.desc(), Leave.id.desc()],
+        secondary_key=Leave.id.desc(),
+    )
     return paginate(query, page=page, page_size=page_size)
 
 

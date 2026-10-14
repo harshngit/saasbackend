@@ -1,0 +1,769 @@
+# Backend Sorting — Verification-Only Audit Report
+
+**Audit Type**: Read-Only Architecture & Implementation Verification  
+**Audit Scope**: All server-side listing, filtering, and pagination endpoints across the SaaS CRM/ERP backend  
+**Repository State**: `main` (Verified against current source code, models, schemas, and queries)
+
+---
+
+## Executive Summary
+
+1. **44 server-side paginated routes** (spanning 42 distinct handlers) were inspected across the entire application.
+2. **0 standard CRUD/business listing endpoints** currently accept or support `sort_by` or `sort_order` parameters. All standard listing queries currently use hardcoded SQL `order_by` clauses.
+3. **1 endpoint (`GET /reports/{report_type}`)** accepts `sort_by` and `sort_order`, but:
+   - It only applies sorting for `gst-summary` in transaction mode.
+   - It performs in-memory Python sorting (`rows.sort(...)`) after building records, rather than database-level sorting.
+   - All other 16 reports are structured aggregation / financial statements (Profit & Loss, Balance Sheet, Cash Flow, Statement of P&L, Notes to P&L) and are **Out of Scope** per explicit instructions.
+4. **1 endpoint (`GET /accounts-payable`)** applies SQL ordering (`SupplierInvoice.supplier_invoice_date.asc(), SupplierInvoice.id.asc()`), but fetches all open invoices with `.all()`, computes aging summaries in Python, and slices the page in memory.
+5. **1 endpoint (`GET /warehouses/stock`)** exhibits hybrid pagination: when `low_stock_only=False`, it paginates `Product` in SQL and expands variants in Python; when `low_stock_only=True`, it loads all products, calculates stock positions in Python, and slices in memory.
+6. **2 endpoints currently lack stable secondary tie-breaking ordering (`Model.id`)**:
+   - `GET /purchase-returns`: orders solely by `PurchaseReturn.created_at.desc()`.
+   - `GET /supplier-payments`: orders solely by `SupplierPayment.paid_on.desc(), SupplierPayment.created_at.desc()`.
+
+---
+
+## 1. Classification of All Inspected Endpoints
+
+| Category | Count | Description |
+| :--- | :---: | :--- |
+| **Already Supported** | **0** | No standard listing endpoint currently supports correct, dynamic database-level `sort_by` / `sort_order`. |
+| **Missing Sorting** | **39** | Standard server-side paginated listing endpoints returning `PaginatedResponse[T]` that filter in SQL, apply hardcoded SQL `order_by`, and paginate via SQL `LIMIT`/`OFFSET`, but lack dynamic `sort_by` and `sort_order` parameters. |
+| **Incorrect / Incomplete Sorting** | **2** | `GET /accounts-payable` (in-memory slicing after SQL fetch) and `GET /warehouses/stock` (hybrid SQL/in-memory variant expansion). |
+| **Out of Scope** | **3** | `GET /reports/{report_type}` (screen) and `GET /reports/{report_type}/export` (export) — structured financial/operational reports protected from general table sorting; and unpaginated collection endpoints. |
+
+---
+
+## 2. Detailed Endpoint Inventory & Audit
+
+### A. CRM & Sales
+
+#### 1. `GET /customers`
+- **File & Handler**: [app/routers/customers.py:204](file:///c:/saasbackend/app/routers/customers.py#L204) (`list_customers`)
+- **Query Model**: `Customer` ([app/models/customer.py](file:///c:/saasbackend/app/models/customer.py))
+- **Existing Filters**: `search`, `category`, `is_active`, `assigned_sales_officer_id`, `has_outstanding`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[CustomerOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Customer.created_at.desc(), Customer.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"name"`: `Customer.name`
+  - `"business_name"`: `Customer.business_name`
+  - `"customer_id"`: `Customer.customer_id`
+  - `"phone"`: `Customer.phone`
+  - `"email"`: `Customer.email`
+  - `"category"`: `Customer.category`
+  - `"outstanding_balance"`: `Customer.outstanding_balance`
+  - `"credit_limit"`: `Customer.credit_limit`
+  - `"city"`: `Customer.city`
+  - `"status"`: `Customer.status`
+  - `"is_active"`: `Customer.is_active`
+  - `"created_at"`: `Customer.created_at`
+- **Unsuitable Fields**: `assigned_sales_officer_name` (unjoined relation), `customer_tags` (JSON), `favorite_product_ids` (JSON).
+
+#### 2. `GET /leads`
+- **File & Handler**: [app/routers/leads.py:51](file:///c:/saasbackend/app/routers/leads.py#L51) (`list_leads`) -> [app/services/lead_service.py:180](file:///c:/saasbackend/app/services/lead_service.py#L180) (`lead_service.list_leads`)
+- **Query Model**: `Lead` ([app/models/lead.py](file:///c:/saasbackend/app/models/lead.py))
+- **Existing Filters**: `status_filter`, `assigned_salesperson_id`, `lead_source`, `search`, `created_from`, `created_to`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[LeadOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Lead.created_at.desc(), Lead.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"lead_id"`: `Lead.lead_id`
+  - `"name"`: `Lead.name`
+  - `"contact_person"`: `Lead.contact_person`
+  - `"mobile_number"`: `Lead.mobile_number`
+  - `"email"`: `Lead.email`
+  - `"lead_source"`: `Lead.lead_source`
+  - `"status"` / `"lead_status"`: `Lead.lead_status`
+  - `"lead_type"`: `Lead.lead_type`
+  - `"created_at"`: `Lead.created_at`
+- **Unsuitable Fields**: `assigned_salesperson_name` (unjoined user table), `interested_product` (unjoined relation).
+
+#### 3. `GET /quotations`
+- **File & Handler**: [app/routers/quotations.py:51](file:///c:/saasbackend/app/routers/quotations.py#L51) (`list_quotations`) -> [app/services/quotation_service.py:177](file:///c:/saasbackend/app/services/quotation_service.py#L177) (`quotation_service.list_quotations`)
+- **Query Model**: `Quotation` ([app/models/quotation.py](file:///c:/saasbackend/app/models/quotation.py))
+- **Existing Filters**: `status_filter`, `customer_id`, `lead_id`, `salesperson_id`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[QuotationListItem]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Quotation.created_at.desc(), Quotation.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"quotation_number"`: `Quotation.quotation_number`
+  - `"quotation_date"`: `Quotation.quotation_date`
+  - `"valid_until"`: `Quotation.valid_until`
+  - `"status"`: `Quotation.status`
+  - `"created_at"`: `Quotation.created_at`
+- **Unsuitable Fields**: `total_amount` (computed in Python by summing line items, not stored as a column on `quotations`), `customer_name`/`lead_name` (unjoined foreign tables).
+
+#### 4. `GET /visits`
+- **File & Handler**: [app/routers/visits.py:39](file:///c:/saasbackend/app/routers/visits.py#L39) (`list_visits`) -> `visit_service.list_visits`
+- **Query Model**: `Visit` ([app/models/visit.py](file:///c:/saasbackend/app/models/visit.py))
+- **Existing Filters**: `search`, `customer_id`, `lead_id`, `salesperson_id`, `status`, `date_from`, `date_to`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[VisitOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Visit.visit_date.desc().nullslast(), Visit.created_at.desc(), Visit.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"visit_date"`: `Visit.visit_date`
+  - `"visit_type"`: `Visit.visit_type`
+  - `"status"`: `Visit.status`
+  - `"created_at"`: `Visit.created_at`
+
+#### 5. `GET /follow-ups`
+- **File & Handler**: [app/routers/follow_ups.py:44](file:///c:/saasbackend/app/routers/follow_ups.py#L44) (`list_follow_ups`) -> `follow_up_service.list_follow_ups`
+- **Query Model**: `FollowUp` ([app/models/follow_up.py](file:///c:/saasbackend/app/models/follow_up.py))
+- **Existing Filters**: `search`, `customer_id`, `lead_id`, `visit_id`, `assigned_to_id`, `status`, `priority`, `due_before`, `due_after`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[FollowUpOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `FollowUp.due_date.asc().nullslast(), FollowUp.created_at.desc(), FollowUp.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"due_date"`: `FollowUp.due_date`
+  - `"title"`: `FollowUp.title`
+  - `"priority"`: `FollowUp.priority`
+  - `"status"`: `FollowUp.status`
+  - `"completed_at"`: `FollowUp.completed_at`
+  - `"created_at"`: `FollowUp.created_at`
+
+---
+
+### B. Products & Inventory
+
+#### 6. `GET /products`
+- **File & Handler**: [app/routers/products.py:286](file:///c:/saasbackend/app/routers/products.py#L286) (`list_products`)
+- **Query Model**: `Product` ([app/models/product.py](file:///c:/saasbackend/app/models/product.py))
+- **Existing Filters**: `search`, `barcode`, `category_id`, `sub_category_id`, `brand_id`, `preferred_supplier_id`, `is_active`, `status_filter`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[ProductListItem]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Product.created_at.desc(), Product.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"name"`: `Product.name`
+  - `"product_id"`: `Product.product_id`
+  - `"sku"`: `Product.sku`
+  - `"price"`: `Product.price`
+  - `"wholesale_price"`: `Product.wholesale_price`
+  - `"status"`: `Product.status`
+  - `"total_inventory"`: `Product.total_inventory`
+  - `"is_active"`: `Product.is_active`
+  - `"created_at"`: `Product.created_at`
+- **Unsuitable Fields**: `category_name`, `brand_name`, `supplier_name` (unjoined foreign tables), `images`/`variant_attributes` (JSON).
+
+#### 7. `GET /inventory` (Stock Board)
+- **File & Handler**: [app/routers/inventory.py:140](file:///c:/saasbackend/app/routers/inventory.py#L140) (`stock_board`)
+- **Query Model**: `Product` ([app/models/product.py](file:///c:/saasbackend/app/models/product.py))
+- **Existing Filters**: `search`, `category_id`, `is_active`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[InventoryItemOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Product.name.asc(), Product.id.asc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"name"`: `Product.name`
+  - `"sku"`: `Product.sku`
+  - `"brand"`: `Product.brand`
+  - `"total_inventory"`: `Product.total_inventory`
+  - `"created_at"`: `Product.created_at`
+
+#### 8. `GET /inventory/expiring`
+- **File & Handler**: [app/routers/inventory.py:78](file:///c:/saasbackend/app/routers/inventory.py#L78) (`expiring_stock`)
+- **Query Model**: `StockBatch` ([app/models/stock_batch.py](file:///c:/saasbackend/app/models/stock_batch.py))
+- **Existing Filters**: `search`, `warehouse_id`, `product_id`, `within_days`, `include_expired`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[ExpiringBatch]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `StockBatch.expiry_date.asc(), StockBatch.id.asc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"expiry_date"`: `StockBatch.expiry_date`
+  - `"batch_number"`: `StockBatch.batch_number`
+  - `"manufacturing_date"`: `StockBatch.manufacturing_date`
+  - `"quantity"`: `StockBatch.quantity`
+  - `"created_at"`: `StockBatch.created_at`
+
+#### 9. `GET /warehouses/stock`
+- **File & Handler**: [app/routers/warehouses.py:123](file:///c:/saasbackend/app/routers/warehouses.py#L123) (`stock_positions`)
+- **Query Model**: `Product` + dynamic variant expansion
+- **Existing Filters**: `warehouse_id`, `product_id`, `search`, `low_stock_only`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[StockRow]`
+- **Current Behavior**:
+  - When `low_stock_only=False`: sorts `Product.name.asc(), Product.id.asc()`, paginates Products in SQL, then expands variants.
+  - When `low_stock_only=True`: executes `.all()` in SQL, computes stock in Python, and slices in memory.
+- **Classification**: **Incorrect / Incomplete Sorting**
+- **Recommended Sortable Fields**:
+  - `"name"` / `"product_name"`: `Product.name`
+  - `"sku"`: `Product.sku`
+- **Unsuitable Fields**: `on_hand`, `reserved`, `available` (dynamically calculated per warehouse in Python via `stock_service.stock_summary`, not stored on `Product`).
+
+#### 10. `GET /warehouses/{warehouse_id}/movements`
+- **File & Handler**: [app/routers/warehouses.py:377](file:///c:/saasbackend/app/routers/warehouses.py#L377) (`list_warehouse_movements`)
+- **Query Model**: `StockMovement` ([app/models/stock_movement.py](file:///c:/saasbackend/app/models/stock_movement.py))
+- **Existing Filters**: `warehouse_id`, `search`, `product_id`, `variant_id`, `movement_type`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[StockMovementOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `StockMovement.created_at.desc(), StockMovement.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"created_at"`: `StockMovement.created_at`
+  - `"quantity"`: `StockMovement.quantity`
+  - `"balance_after"`: `StockMovement.balance_after`
+  - `"movement_type"`: `StockMovement.movement_type`
+
+#### 11. `GET /transfers`
+- **File & Handler**: [app/routers/transfers.py:133](file:///c:/saasbackend/app/routers/transfers.py#L133) (`list_transfers`)
+- **Query Model**: `WarehouseTransfer` ([app/models/transfer.py](file:///c:/saasbackend/app/models/transfer.py))
+- **Existing Filters**: `search`, `status_filter`, `source_warehouse_id`, `destination_warehouse_id`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[WarehouseTransferOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `WarehouseTransfer.created_at.desc(), WarehouseTransfer.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"transfer_number"`: `WarehouseTransfer.transfer_number`
+  - `"status"`: `WarehouseTransfer.status`
+  - `"dispatched_at"`: `WarehouseTransfer.dispatched_at`
+  - `"received_at"`: `WarehouseTransfer.received_at`
+  - `"created_at"`: `WarehouseTransfer.created_at`
+
+---
+
+### C. Sales Orders & Logistics
+
+#### 12. `GET /orders`
+- **File & Handler**: [app/routers/sales_orders.py:393](file:///c:/saasbackend/app/routers/sales_orders.py#L393) (`list_orders`)
+- **Query Model**: `SalesOrder` ([app/models/order.py](file:///c:/saasbackend/app/models/order.py))
+- **Existing Filters**: `status_filter`, `fulfilment_status`, `customer_id`, `assigned_delivery_partner_id`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[OrderOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SalesOrder.created_at.desc(), SalesOrder.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"order_number"`: `SalesOrder.order_number`
+  - `"order_date"`: `SalesOrder.order_date`
+  - `"status"`: `SalesOrder.status`
+  - `"fulfilment_status"`: `SalesOrder.fulfilment_status`
+  - `"total"`: `SalesOrder.total`
+  - `"delivery_date"`: `SalesOrder.delivery_date`
+  - `"created_at"`: `SalesOrder.created_at`
+- **Unsuitable Fields**: `customer_name` (unjoined relation), `items_count` (relation length).
+
+#### 13. `GET /dashboard/delivery-partner/orders`
+- **File & Handler**: [app/routers/dashboard.py:81](file:///c:/saasbackend/app/routers/dashboard.py#L81) (`list_delivery_partner_company_orders`) -> [app/services/dashboard_service.py:580](file:///c:/saasbackend/app/services/dashboard_service.py#L580)
+- **Query Model**: `SalesOrder` ([app/models/order.py](file:///c:/saasbackend/app/models/order.py))
+- **Existing Filters**: `status_filter`, `fulfilment_status`, `customer_id`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[OrderOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SalesOrder.created_at.desc(), SalesOrder.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**: Same as `GET /orders` (`order_number`, `order_date`, `status`, `fulfilment_status`, `total`, `delivery_date`, `created_at`).
+
+#### 14. `GET /deliveries`
+- **File & Handler**: [app/routers/deliveries.py:354](file:///c:/saasbackend/app/routers/deliveries.py#L354) (`list_deliveries`)
+- **Query Model**: `Delivery` ([app/models/delivery.py](file:///c:/saasbackend/app/models/delivery.py))
+- **Existing Filters**: `status_filter`, `order_id`, `delivery_partner_id`, `open_only`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[DeliveryOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Delivery.created_at.desc(), Delivery.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"delivery_note_number"`: `Delivery.delivery_note_number`
+  - `"delivery_date"`: `Delivery.delivery_date`
+  - `"scheduled_date"`: `Delivery.scheduled_date`
+  - `"status"`: `Delivery.status`
+  - `"delivery_status"`: `Delivery.delivery_status`
+  - `"created_at"`: `Delivery.created_at`
+
+#### 15. `GET /deliveries/assigned`
+- **File & Handler**: [app/routers/deliveries.py:118](file:///c:/saasbackend/app/routers/deliveries.py#L118) (`list_assigned_deliveries`)
+- **Query Model**: `SalesOrder` ([app/models/order.py](file:///c:/saasbackend/app/models/order.py))
+- **Existing Filters**: None (scopes to `assigned_delivery_partner_id == current_user.id`)
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[OrderOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SalesOrder.created_at.desc(), SalesOrder.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**: `"order_number"`, `"delivery_date"`, `"fulfilment_status"`, `"created_at"`.
+
+#### 16. `GET /deliveries/notes`
+- **File & Handler**: [app/routers/deliveries.py:982](file:///c:/saasbackend/app/routers/deliveries.py#L982) (`list_delivery_notes`)
+- **Query Model**: `Delivery` ([app/models/delivery.py](file:///c:/saasbackend/app/models/delivery.py))
+- **Existing Filters**: `search`, `order_id`, `customer_id`, `status`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[DeliveryNoteOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Delivery.delivery_date.desc(), Delivery.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**: `"delivery_note_number"`, `"delivery_date"`, `"status"`, `"created_at"`.
+
+#### 17. `GET /deliveries/collections` and `GET /deliveries/collections/all`
+- **File & Handler**: [app/routers/deliveries.py:1053](file:///c:/saasbackend/app/routers/deliveries.py#L1053) (`list_delivery_collections`)
+- **Query Model**: `DeliveryCollection` ([app/models/delivery_collection.py](file:///c:/saasbackend/app/models/delivery_collection.py))
+- **Existing Filters**: `search`, `status`, `delivery_partner_id`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[DeliveryCollectionOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `DeliveryCollection.collected_at.desc(), DeliveryCollection.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"collected_at"`: `DeliveryCollection.collected_at`
+  - `"amount"`: `DeliveryCollection.amount`
+  - `"payment_mode"`: `DeliveryCollection.payment_mode`
+  - `"reconciliation_status"`: `DeliveryCollection.reconciliation_status`
+  - `"created_at"`: `DeliveryCollection.created_at`
+
+---
+
+### D. Vehicles & Vehicle Stock
+
+#### 18. `GET /vehicles`
+- **File & Handler**: [app/routers/vehicles.py:74](file:///c:/saasbackend/app/routers/vehicles.py#L74) (`list_vehicles`)
+- **Query Model**: `Vehicle` ([app/models/vehicle.py](file:///c:/saasbackend/app/models/vehicle.py))
+- **Existing Filters**: `search`, `is_active`, `status_filter`, `default_driver_id`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[VehicleOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Vehicle.vehicle_number.asc(), Vehicle.id.asc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"vehicle_number"`: `Vehicle.vehicle_number`
+  - `"vehicle_type"`: `Vehicle.vehicle_type`
+  - `"capacity_kg"`: `Vehicle.capacity_kg`
+  - `"status"`: `Vehicle.status`
+  - `"is_active"`: `Vehicle.is_active`
+  - `"created_at"`: `Vehicle.created_at`
+
+#### 19. `GET /vehicle-stock` (Loading Sessions)
+- **File & Handler**: [app/routers/vehicle_stock.py:504](file:///c:/saasbackend/app/routers/vehicle_stock.py#L504) (`list_all_loadings`)
+- **Query Model**: `VehicleLoading` ([app/models/vehicle_stock.py](file:///c:/saasbackend/app/models/vehicle_stock.py))
+- **Existing Filters**: `search`, `delivery_partner_id`, `status_filter`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[VehicleLoadingOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `VehicleLoading.date.desc(), VehicleLoading.created_at.desc(), VehicleLoading.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"date"`: `VehicleLoading.date`
+  - `"status"`: `VehicleLoading.status`
+  - `"created_at"`: `VehicleLoading.created_at`
+
+---
+
+### E. Purchases & Supplier Workflows
+
+#### 20. `GET /suppliers`
+- **File & Handler**: [app/routers/suppliers.py:114](file:///c:/saasbackend/app/routers/suppliers.py#L114) (`list_suppliers`)
+- **Query Model**: `Supplier` ([app/models/supplier.py](file:///c:/saasbackend/app/models/supplier.py))
+- **Existing Filters**: `search`, `category`, `is_active`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[SupplierOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Supplier.name.asc(), Supplier.id.asc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"name"`: `Supplier.name`
+  - `"supplier_code"`: `Supplier.supplier_code`
+  - `"company_name"`: `Supplier.company_name`
+  - `"contact_person"`: `Supplier.contact_person`
+  - `"phone"`: `Supplier.phone`
+  - `"email"`: `Supplier.email`
+  - `"total_purchases"`: `Supplier.total_purchases`
+  - `"total_paid"`: `Supplier.total_paid`
+  - `"is_active"`: `Supplier.is_active`
+  - `"created_at"`: `Supplier.created_at`
+
+#### 21. `GET /purchases` and `GET /purchase-invoices`
+- **File & Handler**: [app/routers/purchases.py:241](file:///c:/saasbackend/app/routers/purchases.py#L241) (`list_purchases`)
+- **Query Model**: `PurchaseInvoice` ([app/models/purchase.py](file:///c:/saasbackend/app/models/purchase.py))
+- **Existing Filters**: `supplier_id`, `status_filter`, `payment_status`, `purchase_type`, `receiving_status`, `warehouse_id`, `cost_center_id`, `project_id`, `tag`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[PurchaseOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `PurchaseInvoice.created_at.desc(), PurchaseInvoice.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"purchase_number"`: `PurchaseInvoice.purchase_number`
+  - `"purchase_id"`: `PurchaseInvoice.purchase_id`
+  - `"invoice_number"`: `PurchaseInvoice.invoice_number`
+  - `"purchase_date"`: `PurchaseInvoice.purchase_date`
+  - `"status"`: `PurchaseInvoice.status`
+  - `"payment_status"`: `PurchaseInvoice.payment_status`
+  - `"receiving_status"`: `PurchaseInvoice.receiving_status`
+  - `"total"`: `PurchaseInvoice.total`
+  - `"amount_paid"`: `PurchaseInvoice.amount_paid`
+  - `"due_date"`: `PurchaseInvoice.due_date`
+  - `"created_at"`: `PurchaseInvoice.created_at`
+
+#### 22. `GET /grns`
+- **File & Handler**: [app/routers/grns.py:112](file:///c:/saasbackend/app/routers/grns.py#L112) (`list_grns`)
+- **Query Model**: `GoodsReceiptNote` ([app/models/grn.py](file:///c:/saasbackend/app/models/grn.py))
+- **Existing Filters**: `purchase_id`, `supplier_id`, `warehouse_id`, `status_filter`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[GRNOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `GoodsReceiptNote.created_at.desc(), GoodsReceiptNote.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"grn_number"`: `GoodsReceiptNote.grn_number`
+  - `"status"`: `GoodsReceiptNote.status`
+  - `"received_date"`: `GoodsReceiptNote.received_date`
+  - `"created_at"`: `GoodsReceiptNote.created_at`
+
+#### 23. `GET /supplier-invoices`
+- **File & Handler**: [app/routers/supplier_invoices.py:142](file:///c:/saasbackend/app/routers/supplier_invoices.py#L142) (`list_supplier_invoices`)
+- **Query Model**: `SupplierInvoice` ([app/models/supplier_invoice.py](file:///c:/saasbackend/app/models/supplier_invoice.py))
+- **Existing Filters**: `supplier_id`, `purchase_id`, `status_filter`, `verification_status`, `payment_status`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[SupplierInvoiceOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SupplierInvoice.created_at.desc(), SupplierInvoice.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"supplier_invoice_number"`: `SupplierInvoice.supplier_invoice_number`
+  - `"supplier_invoice_date"`: `SupplierInvoice.supplier_invoice_date`
+  - `"due_date"`: `SupplierInvoice.due_date`
+  - `"status"`: `SupplierInvoice.status`
+  - `"verification_status"`: `SupplierInvoice.verification_status`
+  - `"payment_status"`: `SupplierInvoice.payment_status`
+  - `"grand_total"`: `SupplierInvoice.grand_total`
+  - `"amount_paid"`: `SupplierInvoice.amount_paid`
+  - `"created_at"`: `SupplierInvoice.created_at`
+
+#### 24. `GET /accounts-payable`
+- **File & Handler**: [app/routers/accounts_payable.py:33](file:///c:/saasbackend/app/routers/accounts_payable.py#L33) (`list_accounts_payable`) -> [app/services/accounts_payable_service.py:122](file:///c:/saasbackend/app/services/accounts_payable_service.py#L122)
+- **Query Model**: `SupplierInvoice` ([app/models/supplier_invoice.py](file:///c:/saasbackend/app/models/supplier_invoice.py))
+- **Existing Filters**: `supplier_id`, `payment_status`, `verification_status`, `overdue_only`, `search`
+- **Pagination & Return Type**: `page: int | None`, `page_size: int | None` -> `APListResponse`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Ordering**: SQL query executes `order_by(SupplierInvoice.supplier_invoice_date.asc(), SupplierInvoice.id.asc()).all()`. Then in-memory list is sliced: `paginated_items = items[start:end]`.
+- **Classification**: **Incorrect / Incomplete Sorting** (Slices in Python after executing `.all()` in SQL to compute global aging summary)
+- **Recommended Sortable Fields**:
+  - `"invoice_date"`: `SupplierInvoice.supplier_invoice_date`
+  - `"due_date"`: `SupplierInvoice.due_date`
+  - `"grand_total"`: `SupplierInvoice.grand_total`
+  - `"created_at"`: `SupplierInvoice.created_at`
+
+#### 25. `GET /supplier-payments`
+- **File & Handler**: [app/routers/supplier_payments.py:52](file:///c:/saasbackend/app/routers/supplier_payments.py#L52) (`list_supplier_payments`) -> [app/services/supplier_payment_service.py:354](file:///c:/saasbackend/app/services/supplier_payment_service.py#L354)
+- **Query Model**: `SupplierPayment` ([app/models/supplier_payment.py](file:///c:/saasbackend/app/models/supplier_payment.py))
+- **Existing Filters**: `supplier_id`, `status`, `payment_method`, `date_from`, `date_to`, `search`
+- **Pagination & Return Type**: `page: int | None`, `page_size: int | None` -> `SupplierPaymentListResponse`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SupplierPayment.paid_on.desc(), SupplierPayment.created_at.desc()` (**Lacks stable secondary `id` tie-breaker**)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"paid_on"` / `"payment_date"`: `SupplierPayment.paid_on`
+  - `"payment_number"`: `SupplierPayment.payment_number`
+  - `"amount"`: `SupplierPayment.amount`
+  - `"status"`: `SupplierPayment.status`
+  - `"created_at"`: `SupplierPayment.created_at`
+
+#### 26. `GET /purchase-returns`
+- **File & Handler**: [app/routers/purchase_returns.py:55](file:///c:/saasbackend/app/routers/purchase_returns.py#L55) (`list_purchase_returns`) -> [app/services/purchase_return_service.py:679](file:///c:/saasbackend/app/services/purchase_return_service.py#L679)
+- **Query Model**: `PurchaseReturn` ([app/models/purchase_return.py](file:///c:/saasbackend/app/models/purchase_return.py))
+- **Existing Filters**: `status_filter`, `supplier_id`, `purchase_id`, `search`, `date_from`, `date_to`
+- **Pagination & Return Type**: `page: int | None`, `page_size: int | None` -> `PurchaseReturnListResponse`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `PurchaseReturn.created_at.desc()` (**Lacks stable secondary `id` tie-breaker**)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"return_number"`: `PurchaseReturn.return_number`
+  - `"return_date"`: `PurchaseReturn.return_date`
+  - `"status"`: `PurchaseReturn.status`
+  - `"created_at"`: `PurchaseReturn.created_at`
+
+---
+
+### F. Invoices, Payments & Sales Returns
+
+#### 27. `GET /invoices`
+- **File & Handler**: [app/routers/invoices.py:596](file:///c:/saasbackend/app/routers/invoices.py#L596) (`list_invoices`)
+- **Query Model**: `Invoice` ([app/models/invoice.py](file:///c:/saasbackend/app/models/invoice.py))
+- **Existing Filters**: `customer_id`, `order_id`, `status_filter`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[InvoiceOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Invoice.created_at.desc(), Invoice.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"invoice_number"`: `Invoice.invoice_number`
+  - `"invoice_date"`: `Invoice.invoice_date`
+  - `"due_date"`: `Invoice.due_date`
+  - `"status"`: `Invoice.status`
+  - `"payment_status"`: `Invoice.payment_status`
+  - `"total"`: `Invoice.total`
+  - `"amount_paid"`: `Invoice.amount_paid`
+  - `"created_at"`: `Invoice.created_at`
+
+#### 28. `GET /payment-receipts`
+- **File & Handler**: [app/routers/payment_receipts.py:184](file:///c:/saasbackend/app/routers/payment_receipts.py#L184) (`list_receipts`)
+- **Query Model**: `CustomerPayment` ([app/models/payment.py](file:///c:/saasbackend/app/models/payment.py))
+- **Existing Filters**: `customer_id`, `invoice_id`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[PaymentReceiptOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `CustomerPayment.received_on.desc(), CustomerPayment.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"received_on"`: `CustomerPayment.received_on`
+  - `"receipt_number"`: `CustomerPayment.receipt_number`
+  - `"amount"`: `CustomerPayment.amount`
+  - `"payment_mode"`: `CustomerPayment.payment_mode`
+  - `"created_at"`: `CustomerPayment.created_at`
+
+#### 29. `GET /sales-returns`
+- **File & Handler**: [app/routers/sales_returns.py:184](file:///c:/saasbackend/app/routers/sales_returns.py#L184) (`list_sales_returns`)
+- **Query Model**: `SalesReturn` ([app/models/sales_return.py](file:///c:/saasbackend/app/models/sales_return.py))
+- **Existing Filters**: `status_filter`, `customer_id`, `invoice_id`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[SalesReturnOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SalesReturn.return_date.desc(), SalesReturn.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"return_date"`: `SalesReturn.return_date`
+  - `"return_number"`: `SalesReturn.return_number`
+  - `"return_status"` / `"status"`: `SalesReturn.return_status`
+  - `"credit_amount"`: `SalesReturn.credit_amount`
+  - `"created_at"`: `SalesReturn.created_at`
+
+---
+
+### G. Finance, Cash & Expenses
+
+#### 30. `GET /cash-reconciliation`
+- **File & Handler**: [app/routers/cash_reconciliation.py:90](file:///c:/saasbackend/app/routers/cash_reconciliation.py#L90) (`list_reconciliations`)
+- **Query Model**: `CashReconciliation` ([app/models/cash_reconciliation.py](file:///c:/saasbackend/app/models/cash_reconciliation.py))
+- **Existing Filters**: `date_from`, `date_to`, `status_filter`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[CashReconciliationOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `CashReconciliation.reconciliation_date.desc(), CashReconciliation.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"reconciliation_date"`: `CashReconciliation.reconciliation_date`
+  - `"status"`: `CashReconciliation.status`
+  - `"total_actual_collections"`: `CashReconciliation.total_actual_collections`
+  - `"collections_variance"`: `CashReconciliation.collections_variance`
+  - `"actual_cash_on_hand"`: `CashReconciliation.actual_cash_on_hand`
+  - `"created_at"`: `CashReconciliation.created_at`
+
+#### 31. `GET /expenses`
+- **File & Handler**: [app/routers/expenses.py:181](file:///c:/saasbackend/app/routers/expenses.py#L181) (`list_expenses`)
+- **Query Model**: `Expense` ([app/models/expense.py](file:///c:/saasbackend/app/models/expense.py))
+- **Existing Filters**: `category`, `status_filter`, `submitted_by`, `vendor_id`, `branch_id`, `department_id`, `cost_center_id`, `project_id`, `payment_status`, `is_recurring`, `tag`, `search`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[ExpenseOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Expense.expense_date.desc(), Expense.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"expense_date"`: `Expense.expense_date`
+  - `"expense_number"`: `Expense.expense_number`
+  - `"category"`: `Expense.category`
+  - `"amount"`: `Expense.amount`
+  - `"status"`: `Expense.status`
+  - `"approval_status"`: `Expense.approval_status`
+  - `"payment_status"`: `Expense.payment_status`
+  - `"created_at"`: `Expense.created_at`
+
+---
+
+### H. Staff, HR, Attendance & Leaves
+
+#### 32. `GET /users`
+- **File & Handler**: [app/routers/users.py:248](file:///c:/saasbackend/app/routers/users.py#L248) (`list_staff`)
+- **Query Model**: `User` ([app/models/user.py](file:///c:/saasbackend/app/models/user.py))
+- **Existing Filters**: `role_id`, `is_active`, `search`, `designation`, `employment_type`, `employee_status`, `account_status`, `work_location`, `reporting_manager_id`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[UserOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `User.created_at.desc(), User.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"name"`: `User.name`
+  - `"email"`: `User.email`
+  - `"employee_id"`: `User.employee_id`
+  - `"designation"`: `User.designation`
+  - `"employment_type"`: `User.employment_type`
+  - `"employee_status"`: `User.employee_status`
+  - `"date_of_joining"`: `User.date_of_joining`
+  - `"is_active"`: `User.is_active`
+  - `"created_at"`: `User.created_at`
+
+#### 33. `GET /attendance` and `GET /attendance/me`
+- **File & Handler**: [app/routers/attendance.py:71, 90](file:///c:/saasbackend/app/routers/attendance.py#L71) (`my_attendance`, `all_attendance`)
+- **Query Model**: `Attendance` ([app/models/attendance.py](file:///c:/saasbackend/app/models/attendance.py))
+- **Existing Filters**: `date_from`, `date_to`, `user_id` (admin route)
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[AttendanceOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Attendance.day.desc(), Attendance.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"day"`: `Attendance.day`
+  - `"office_check_in"`: `Attendance.office_check_in`
+  - `"final_check_out"`: `Attendance.final_check_out`
+  - `"created_at"`: `Attendance.created_at`
+
+#### 34. `GET /leaves` and `GET /leaves/me`
+- **File & Handler**: [app/routers/leaves.py:86, 102](file:///c:/saasbackend/app/routers/leaves.py#L86) (`my_leaves`, `list_leaves`)
+- **Query Model**: `Leave` ([app/models/leave.py](file:///c:/saasbackend/app/models/leave.py))
+- **Existing Filters**: `search`, `user_id`, `status_filter`, `leave_type`, `date_from`, `date_to`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[LeaveOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Leave.created_at.desc(), Leave.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"start_date"`: `Leave.start_date`
+  - `"end_date"`: `Leave.end_date`
+  - `"days_count"`: `Leave.days_count`
+  - `"leave_type"`: `Leave.leave_type`
+  - `"status"`: `Leave.status`
+  - `"created_at"`: `Leave.created_at`
+
+---
+
+### I. Platform & Notifications
+
+#### 35. `GET /notifications`
+- **File & Handler**: [app/routers/notifications.py:16](file:///c:/saasbackend/app/routers/notifications.py#L16) (`list_notifications`)
+- **Query Model**: `Notification` ([app/models/notification.py](file:///c:/saasbackend/app/models/notification.py))
+- **Existing Filters**: `search`, `unread_only`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[NotificationOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Notification.created_at.desc(), Notification.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"created_at"`: `Notification.created_at`
+  - `"title"`: `Notification.title`
+  - `"is_read"`: `Notification.is_read`
+
+#### 36. `GET /billing/payments` and `GET /superadmin/subscription-payments`
+- **File & Handler**: [app/routers/billing.py:149](file:///c:/saasbackend/app/routers/billing.py#L149), [app/routers/superadmin.py:791](file:///c:/saasbackend/app/routers/superadmin.py#L791) -> `billing_service.list_payments`
+- **Query Model**: `SubscriptionPayment` ([app/models/subscription_payment.py](file:///c:/saasbackend/app/models/subscription_payment.py))
+- **Existing Filters**: `search`, `status`, `organization_id` (admin only)
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[SubscriptionPaymentOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `SubscriptionPayment.created_at.desc(), SubscriptionPayment.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"created_at"`: `SubscriptionPayment.created_at`
+  - `"paid_at"`: `SubscriptionPayment.paid_at`
+  - `"amount_paise"`: `SubscriptionPayment.amount_paise`
+  - `"status"`: `SubscriptionPayment.status`
+
+#### 37. `GET /superadmin/organizations`
+- **File & Handler**: [app/routers/superadmin.py:207](file:///c:/saasbackend/app/routers/superadmin.py#L207) (`list_organizations`)
+- **Query Model**: `Organization` ([app/models/organization.py](file:///c:/saasbackend/app/models/organization.py))
+- **Existing Filters**: `search`, `status_filter`, `upgrade_status`
+- **Pagination & Return Type**: `page: int = 1`, `page_size: int = 10` -> `PaginatedResponse[OrganizationOut]`
+- **Existing `sort_by` / `sort_order`**: None
+- **Current Default Ordering**: `Organization.created_at.desc(), Organization.id.desc()` (Stable)
+- **Classification**: **Missing sorting**
+- **Recommended Sortable Fields**:
+  - `"name"`: `Organization.name`
+  - `"company_code"`: `Organization.company_code`
+  - `"status"`: `Organization.status`
+  - `"created_at"`: `Organization.created_at`
+
+---
+
+### J. Out of Scope Endpoints
+
+#### 38. `GET /reports/{report_type}` and `GET /reports/{report_type}/export`
+- **File & Handler**: [app/routers/reports.py:238, 261](file:///c:/saasbackend/app/routers/reports.py#L238)
+- **Classification**: **Out of scope**
+- **Rationale**: Financial reports and statements (Statement of P&L, Notes to P&L, Balance Sheet, Cash Flow, Customer Outstanding, Stock Balance, Tax Summary, Sales Summary, etc.) follow specific accounting and aggregation architectures. Sorting must not be introduced into structured financial statements.
+
+---
+
+## 3. Query Execution Order & Determinism Analysis
+
+All standard listing endpoints in the codebase currently follow this execution flow:
+```
+1. Base Query: db.query(Model).filter(Model.organization_id == org_id)
+2. Filters: Apply where clauses (search, status, date_from, date_to, etc.)
+3. Hardcoded Order By: query.order_by(PrimaryColumn.desc(), Model.id.desc())
+4. Pagination: paginate(query, page, page_size) -> applies order_by(None).count() then offset().limit().all()
+```
+
+### Required Implementation Architecture for Dynamic Sorting:
+When dynamic sorting is added to any confirmed endpoint, the SQL execution order must be:
+```
+1. search/filter (SQL WHERE clauses with tenant isolation preserved)
+2. sort (Dynamic validated field .asc() or .desc() from whitelist)
+3. stable secondary sort (Model.id.desc() or Model.id.asc() tie-breaker)
+4. pagination (SQL COUNT -> SQL OFFSET -> SQL LIMIT)
+```
+
+**Tie-Breaking Rule**: When sorting by non-unique columns (e.g. `status`, `category`, `due_date`, `created_at`), multiple rows can have identical sort values. Without a secondary unique ordering (`Model.id`), SQL engines produce non-deterministic row sequences across pages, causing duplicate or skipped rows. Every dynamic sort must be followed by `Model.id.desc()` or `Model.id.asc()`.
+
+---
+
+## 4. Security, Tenant-Isolation, and Compatibility Risks
+
+1. **SQL Injection & Attribute Exploitation Prevention**:
+   - `sort_by` must NEVER be resolved dynamically via `getattr(Model, sort_by)` without an explicit, hardcoded whitelist dictionary:
+     ```python
+     SORTABLE_FIELDS = {
+         "created_at": Model.created_at,
+         "name": Model.name,
+     }
+     ```
+   - Attempting to pass unknown or non-whitelisted attributes must raise `HTTP 400 Bad Request` or `HTTP 422 Unprocessable Entity` with a clear message: `"Invalid sort_by '{sort_by}'. Allowed: [...]"`.
+2. **Order Direction Validation**:
+   - `sort_order` must accept only `"asc"` or `"desc"` (case-insensitive). Any other value must raise `HTTP 400 Bad Request` (`"sort_order must be 'asc' or 'desc'"`). Default to `"desc"` or `"asc"` depending on the entity's natural default.
+3. **Tenant Isolation Invariance**:
+   - Organization scoping (`Model.organization_id == org_id`) must remain the first and unconditional filter in SQLAlchemy, unaffected by any sorting parameters.
+4. **Backward Compatibility**:
+   - When `sort_by` is omitted or `None`, the endpoint must fall back to its exact pre-existing default ordering.
+   - The response schema `PaginatedResponse[T]` (`items`, `total`, `page`, `page_size`, `total_pages`) must remain unchanged so existing frontend consumers do not break.
+
+---
+
+## 5. Existing Test Coverage & Required Implementation Tests
+
+### Existing Tests:
+- Currently, **0 tests exist for sorting on standard business listing endpoints**.
+- The only sorting tests in the entire codebase exist in `tests/test_reports_hardened.py` line 1480 for GST summary transaction sorting.
+
+### Required Tests to be Implemented for Confirmed Endpoints:
+1. **Default Ordering Regression**: Verify default pagination when `sort_by` is omitted.
+2. **Ascending Sort**: `?sort_by=name&sort_order=asc`.
+3. **Descending Sort**: `?sort_by=name&sort_order=desc`.
+4. **Search + Sorting**: `?search=term&sort_by=created_at&sort_order=desc`.
+5. **Filters + Sorting**: `?status=active&sort_by=created_at&sort_order=asc`.
+6. **Pagination + Sorting**: `?page=2&page_size=5&sort_by=amount&sort_order=desc`.
+7. **Tie-Breaking Determinism**: Multiple rows with identical sort values across page boundaries.
+8. **Invalid Sort Field**: `?sort_by=unknown_field` -> `HTTP 400` / `422`.
+9. **Invalid Sort Order**: `?sort_order=invalid` -> `HTTP 400`.
+10. **Tenant Isolation**: Confirm cross-tenant data is never accessible or sortable.
+
+---
+
+## 6. Exact Candidate Endpoint List for Frontend Confirmation
+
+The following **25 primary tables / 30 listing routes** represent the standard paginated business APIs that the frontend team may select from for sorting support:
+
+| # | Endpoint Route | Entity / Table | Primary Sort Candidates |
+| :-: | :--- | :--- | :--- |
+| 1 | `GET /customers` | Customers | `name`, `customer_id`, `category`, `outstanding_balance`, `created_at` |
+| 2 | `GET /leads` | Leads | `name`, `lead_id`, `lead_source`, `status`, `created_at` |
+| 3 | `GET /quotations` | Quotations | `quotation_number`, `quotation_date`, `valid_until`, `status`, `created_at` |
+| 4 | `GET /orders` | Sales Orders | `order_number`, `order_date`, `status`, `fulfilment_status`, `total`, `created_at` |
+| 5 | `GET /invoices` | Sales Invoices | `invoice_number`, `invoice_date`, `due_date`, `status`, `payment_status`, `total`, `created_at` |
+| 6 | `GET /payment-receipts` | Customer Payments | `receipt_number`, `received_on`, `amount`, `payment_mode`, `created_at` |
+| 7 | `GET /sales-returns` | Sales Returns | `return_number`, `return_date`, `return_status`, `credit_amount`, `created_at` |
+| 8 | `GET /products` | Products Catalog | `name`, `product_id`, `sku`, `price`, `total_inventory`, `status`, `created_at` |
+| 9 | `GET /inventory` | Stock Board | `name`, `sku`, `brand`, `total_inventory`, `created_at` |
+| 10 | `GET /inventory/expiring` | Expiring Stock | `expiry_date`, `batch_number`, `manufacturing_date`, `quantity`, `created_at` |
+| 11 | `GET /suppliers` | Suppliers | `name`, `supplier_code`, `total_purchases`, `total_paid`, `created_at` |
+| 12 | `GET /purchases` | Purchase Orders / Invoices | `purchase_number`, `purchase_date`, `status`, `payment_status`, `total`, `due_date`, `created_at` |
+| 13 | `GET /grns` | Goods Receipt Notes | `grn_number`, `received_date`, `status`, `created_at` |
+| 14 | `GET /supplier-invoices` | Supplier Invoices | `supplier_invoice_number`, `supplier_invoice_date`, `due_date`, `status`, `grand_total`, `created_at` |
+| 15 | `GET /supplier-payments` | Supplier Payments | `payment_number`, `paid_on`, `amount`, `status`, `created_at` |
+| 16 | `GET /purchase-returns` | Purchase Returns | `return_number`, `return_date`, `status`, `created_at` |
+| 17 | `GET /deliveries` | Deliveries | `delivery_note_number`, `delivery_date`, `scheduled_date`, `status`, `created_at` |
+| 18 | `GET /deliveries/notes` | Delivery Notes | `delivery_note_number`, `delivery_date`, `status`, `created_at` |
+| 19 | `GET /deliveries/collections` | Delivery Collections | `collected_at`, `amount`, `payment_mode`, `reconciliation_status`, `created_at` |
+| 20 | `GET /vehicles` | Fleet Vehicles | `vehicle_number`, `vehicle_type`, `capacity_kg`, `status`, `created_at` |
+| 21 | `GET /vehicle-stock` | Loading Sessions | `date`, `status`, `created_at` |
+| 22 | `GET /warehouses/{id}/movements` | Stock Movements | `created_at`, `quantity`, `balance_after`, `movement_type` |
+| 23 | `GET /transfers` | Warehouse Transfers | `transfer_number`, `status`, `dispatched_at`, `received_at`, `created_at` |
+| 24 | `GET /cash-reconciliation` | Cash Reconciliations | `reconciliation_date`, `status`, `total_actual_collections`, `actual_cash_on_hand`, `created_at` |
+| 25 | `GET /expenses` | Expenses | `expense_number`, `expense_date`, `category`, `amount`, `status`, `approval_status`, `created_at` |
+| 26 | `GET /users` | Staff / Users | `name`, `email`, `employee_id`, `designation`, `date_of_joining`, `created_at` |
+| 27 | `GET /attendance` | Staff Attendance | `day`, `office_check_in`, `final_check_out`, `created_at` |
+| 28 | `GET /leaves` | Staff Leaves | `start_date`, `end_date`, `days_count`, `leave_type`, `status`, `created_at` |
+| 29 | `GET /visits` | Field Visits | `visit_date`, `visit_type`, `status`, `created_at` |
+| 30 | `GET /follow-ups` | Follow-ups | `due_date`, `title`, `priority`, `status`, `completed_at`, `created_at` |
+
+---
+
+## 7. Status & Next Steps
+
+This verification audit is complete and read-only. No application code, schemas, or tests were modified.
+
+**Awaiting instruction**: Once the frontend team confirms which specific endpoints and sortable table columns from the list above require sorting, implementation can proceed strictly on those agreed endpoints.

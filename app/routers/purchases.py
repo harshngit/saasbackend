@@ -238,6 +238,30 @@ def create_purchase(
     return inv
 
 
+from app.core.sorting import apply_sorting
+from sqlalchemy import select
+
+PURCHASE_SORTABLE_FIELDS = {
+    "purchase_number": PurchaseInvoice.purchase_number,
+    "purchase_id": PurchaseInvoice.purchase_id,
+    "invoice_number": PurchaseInvoice.invoice_number,
+    "supplier": select(Supplier.name).where(Supplier.id == PurchaseInvoice.supplier_id).scalar_subquery(),
+    "supplier_name": select(Supplier.name).where(Supplier.id == PurchaseInvoice.supplier_id).scalar_subquery(),
+    "purchase_date": PurchaseInvoice.purchase_date,
+    "date": PurchaseInvoice.purchase_date,
+    "total": PurchaseInvoice.total,
+    "total_amount": PurchaseInvoice.total,
+    "amount": PurchaseInvoice.total,
+    "amount_paid": PurchaseInvoice.amount_paid,
+    "payment_status": PurchaseInvoice.payment_status,
+    "status": PurchaseInvoice.status,
+    "purchase_status": PurchaseInvoice.status,
+    "receiving_status": PurchaseInvoice.receiving_status,
+    "due_date": PurchaseInvoice.due_date,
+    "created_at": PurchaseInvoice.created_at,
+}
+
+
 @router.get("", response_model=PaginatedResponse[PurchaseOut])
 def list_purchases(
     user: User = Depends(_view),
@@ -253,6 +277,8 @@ def list_purchases(
     search: str | None = Query(default=None, description="matches invoice_number, purchase_number, or reference_number"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[PurchaseOut]:
     org_id = _org_id(user)
@@ -286,7 +312,14 @@ def list_purchases(
                 PurchaseInvoice.reference_number.ilike(s),
             )
         )
-    q = q.order_by(PurchaseInvoice.created_at.desc(), PurchaseInvoice.id.desc())
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        allowed_fields=PURCHASE_SORTABLE_FIELDS,
+        default_order=[PurchaseInvoice.created_at.desc(), PurchaseInvoice.id.desc()],
+        secondary_key=PurchaseInvoice.id.desc(),
+    )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
     return PaginatedResponse(
         items=[PurchaseOut.model_validate(inv) for inv in items],
