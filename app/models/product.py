@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, event, select
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.database import Base
 
@@ -223,14 +223,29 @@ class ProductPricing(Base):
 
 
 class ProductVariant(Base):
-    """An individually stock-trackable variant of a product (size/spec)."""
+    """An individually stock-trackable variant of a product (size/spec).
+
+    Three identifiers, never interchangeable: `id` is the internal UUID every other
+    table references; `variant_code` is the server-issued business ID (VAR-0001,
+    numbered per organization, never reset or reissued); `sku` is the optional,
+    user-defined stock-keeping code.
+    """
 
     __tablename__ = "product_variants"
+    __table_args__ = (
+        Index("uq_product_variants_org_variant_code", "organization_id", "variant_code", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     product_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Always the owning product's organization (see _variant_org_matches_product).
+    # Stored on the row so variant_code can be unique per firm at the database level.
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    variant_code: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     barcode: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
@@ -238,8 +253,58 @@ class ProductVariant(Base):
     width: Mapped[float | None] = mapped_column(Float, nullable=True)
     height: Mapped[float | None] = mapped_column(Float, nullable=True)
     weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The variant's selling price -- what orders and quotations bill by default.
+    # Exposed as pricing.selling_price too; there is no second selling-price column.
     price: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     inventory: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Variant pricing, mirroring ProductPricing. Nullable: an unset value is unknown,
+    # never filled in from the parent product or a guess.
+    purchase_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mrp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wholesale_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dealer_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tax_inclusive: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
     product: Mapped["Product"] = relationship(back_populates="variations")
+
+    @validates("organization_id", "variant_code")
+    def _immutable_once_set(self, key: str, value: str | None) -> str | None:
+        current = getattr(self, key)
+        if current and value != current:
+            raise ValueError(f"ProductVariant.{key} cannot be changed once set")
+        return value
+
+    @property
+    def pricing(self) -> dict:
+        return {
+            "purchase_price": self.purchase_price,
+            "selling_price": self.price,
+            "mrp": self.mrp,
+            "wholesale_price": self.wholesale_price,
+            "dealer_price": self.dealer_price,
+            "discount_percent": self.discount_percent,
+            "tax_inclusive": self.tax_inclusive,
+            "currency": self.currency,
+        }
+
+
+@event.listens_for(ProductVariant, "before_insert")
+def _variant_org_matches_product(mapper, connection, target: ProductVariant) -> None:  # noqa: ANN001
+    """A variant always belongs to its product's organization, so its business ID is
+    drawn from -- and unique within -- that firm's sequence and nobody else's."""
+    product_org = connection.execute(
+        select(Product.organization_id).where(Product.id == target.product_id)
+    ).scalar()
+    if target.organization_id is None:
+        target.organization_id = product_org
+    elif product_org is not None and target.organization_id != product_org:
+        raise ValueError("ProductVariant.organization_id must match its product's organization")
+    if not target.variant_code:
+        raise ValueError(
+            "ProductVariant inserted without a variant_code; allocate one with "
+            "numbering_service.next_variant_code()"
+        )

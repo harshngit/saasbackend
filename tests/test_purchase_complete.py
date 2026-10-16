@@ -15,6 +15,7 @@ from app.main import app
 from app.core.database import SessionLocal
 from app.models.organization import Organization
 from app.models.product import Product, ProductVariant
+from app.services import numbering_service
 from app.models.supplier import Supplier
 from app.models.user import User
 from app.models.warehouse import Warehouse
@@ -113,6 +114,7 @@ try:
     db.flush()
 
     var2 = ProductVariant(
+        variant_code=numbering_service.next_variant_code(db, prod2.organization_id),
         product_id=prod2.id,
         name="Synthetic 5W-40",
         sku="OIL-SYN-5W40",

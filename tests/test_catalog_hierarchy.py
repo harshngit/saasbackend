@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from app.main import app
 from app.core.database import Base, engine
+from app.services import numbering_service
 from app.models import (
     Brand,
     Category,
@@ -216,7 +217,7 @@ def test_brand_category_crud(client, test_setup, db_session: Session):
     prod_bc = Product(id=str(uuid.uuid4()), organization_id=org_a.id, name="Test Prod BC", price=20.0, brand_id=b1.id, category_id=c1.id)
     db_session.add(prod_bc)
     db_session.commit()
-    var_bc = ProductVariant(id=str(uuid.uuid4()), product_id=prod_bc.id, name="Var 1", sku=f"SKU-{uuid.uuid4().hex[:6]}", price=20.0)
+    var_bc = ProductVariant(variant_code=numbering_service.next_variant_code(db_session, org_a.id), id=str(uuid.uuid4()), product_id=prod_bc.id, name="Var 1", sku=f"SKU-{uuid.uuid4().hex[:6]}", price=20.0)
     db_session.add(var_bc)
     db_session.commit()
 

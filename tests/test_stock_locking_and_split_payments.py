@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.seed import main as seed_main
 from app.core.database import SessionLocal
+from app.services import numbering_service
 from app.models import (
     Customer,
     CustomerPayment,
@@ -124,8 +125,8 @@ def test_suite():
     db.refresh(p2)
     db.refresh(p_variant_parent)
 
-    v1 = ProductVariant(product_id=p_variant_parent.id, name="Variant Red", sku=f"VRED-{uuid.uuid4().hex[:6]}", price=150.0, inventory=0)
-    v2 = ProductVariant(product_id=p_variant_parent.id, name="Variant Blue", sku=f"VBLUE-{uuid.uuid4().hex[:6]}", price=160.0, inventory=0)
+    v1 = ProductVariant(variant_code=numbering_service.next_variant_code(db, org_id), product_id=p_variant_parent.id, name="Variant Red", sku=f"VRED-{uuid.uuid4().hex[:6]}", price=150.0, inventory=0)
+    v2 = ProductVariant(variant_code=numbering_service.next_variant_code(db, org_id), product_id=p_variant_parent.id, name="Variant Blue", sku=f"VBLUE-{uuid.uuid4().hex[:6]}", price=160.0, inventory=0)
     db.add_all([v1, v2])
     db.commit()
     db.refresh(v1)

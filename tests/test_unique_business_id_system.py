@@ -648,3 +648,308 @@ def test_45_org_custom_timezone_support(db_session: Session):
     # Jan 01, 2027 02:00:00 UTC -> Dec 31, 2026 21:00:00 EST -> Year 2026 in New York!
     dt_ny_2026 = datetime(2027, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
     assert numbering_service.get_business_year(db_session, org.id, dt=dt_ny_2026) == 2026
+
+
+# ---------------------------------------------------------------------------
+# Product variant business IDs (variant_code, VAR-0001)
+# ---------------------------------------------------------------------------
+
+from app.models import ProductVariant  # noqa: E402
+
+_VAR_RE = r"VAR-\d{4,}"
+
+
+def _client_for_new_org(db_session: Session, name: str):
+    org = Organization(id=str(uuid.uuid4()), name=name, company_code="CMP-10001")
+    db_session.add(org)
+    db_session.flush()
+    user = User(
+        id=str(uuid.uuid4()), organization_id=org.id, email=f"adm_{uuid.uuid4().hex[:8]}@x.com",
+        name="Admin", password_hash="h", role="admin", system_role="admin", is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    client = TestClient(app)
+    client.headers = {"Authorization": f"Bearer {create_access_token(user.id, role='admin', organization_id=org.id)}"}
+    return client, org
+
+
+def test_46_variant_codes_generated_on_create_and_distinct(auth_client, db_session: Session):
+    import re
+    client, org, _ = auth_client
+    res = client.post("/products", json={
+        "name": "Battery",
+        "variations": [
+            {"name": "Small", "sku": "HAV-BAT-20W-S", "inventory": 10, "variant_code": "VAR-9999"},
+            {"name": "Medium", "inventory": 10, "variant_id": "VAR-8888"},
+            {"name": "Large"},
+        ],
+    })
+    assert res.status_code == 201, res.text
+    variants = res.json()["variations"]
+    codes = [v["variant_code"] for v in variants]
+    assert all(re.fullmatch(_VAR_RE, c) for c in codes)
+    assert sorted(codes) == ["VAR-0001", "VAR-0002", "VAR-0003"]  # fresh org starts at 0001
+    assert "VAR-9999" not in codes and "VAR-8888" not in codes  # client values ignored
+    # Three separate concepts: UUID, business ID, SKU
+    small = next(v for v in variants if v["name"] == "Small")
+    assert str(uuid.UUID(small["id"])) == small["id"]
+    assert small["sku"] == "HAV-BAT-20W-S" and small["variant_code"] != small["sku"]
+    db_variant = db_session.get(ProductVariant, small["id"])
+    assert db_variant.organization_id == org.id
+
+
+def test_47_patch_preserves_existing_code_and_numbers_new_variant(auth_client, db_session: Session):
+    client, org, _ = auth_client
+    created = client.post("/products", json={"name": "Tee", "variations": [{"name": "S", "sku": "TEE-S"}]}).json()
+    existing = created["variations"][0]
+
+    res = client.patch(f"/products/{created['id']}", json={"variations": [
+        {"id": existing["id"], "name": "Small", "sku": "TEE-SMALL", "price": 99, "inventory": 4,
+         "barcode": "123", "length": 1.5, "variant_code": "VAR-HACK"},
+        {"name": "M", "variant_code": "VAR-7777"},
+    ]})
+    assert res.status_code == 200, res.text
+    by_id = {v["id"]: v for v in res.json()["variations"]}
+    updated = by_id[existing["id"]]
+    assert updated["variant_code"] == existing["variant_code"]  # immutable
+    assert (updated["name"], updated["sku"], updated["price"], updated["inventory"]) == ("Small", "TEE-SMALL", 99, 4)
+    new = next(v for v in by_id.values() if v["id"] != existing["id"])
+    assert new["variant_code"] == "VAR-0002" and new["variant_code"] != "VAR-7777"
+    assert str(uuid.UUID(new["id"])) == new["id"]
+
+    # Omitting `variations` leaves the variant set untouched
+    res = client.patch(f"/products/{created['id']}", json={"name": "Tee 2"})
+    assert sorted(v["variant_code"] for v in res.json()["variations"]) == ["VAR-0001", "VAR-0002"]
+
+
+def test_48_variant_code_in_list_and_detail(auth_client, db_session: Session):
+    client, org, _ = auth_client
+    created = client.post("/products", json={"name": "Listed", "variations": [{"name": "One"}]}).json()
+    code = created["variations"][0]["variant_code"]
+    detail = client.get(f"/products/{created['id']}").json()
+    assert detail["variations"][0]["variant_code"] == code
+    listed = client.get("/products", params={"search": "Listed"}).json()["items"]
+    assert next(p for p in listed if p["id"] == created["id"])["variations"][0]["variant_code"] == code
+
+
+def test_49_variant_codes_are_org_scoped(auth_client, db_session: Session):
+    client_a, org_a, _ = auth_client
+    client_b, org_b = _client_for_new_org(db_session, "Variant Org B")
+    a = client_a.post("/products", json={"name": "A", "variations": [{"name": "1"}, {"name": "2"}]}).json()
+    b = client_b.post("/products", json={"name": "B", "variations": [{"name": "1"}]}).json()
+    assert sorted(v["variant_code"] for v in a["variations"]) == ["VAR-0001", "VAR-0002"]
+    assert [v["variant_code"] for v in b["variations"]] == ["VAR-0001"]
+
+    # Org B can neither read nor edit org A's product or its variants
+    assert client_b.get(f"/products/{a['id']}").status_code == 404
+    assert client_b.patch(f"/products/{a['id']}", json={"name": "x"}).status_code == 404
+    hijack = client_b.patch(f"/products/{b['id']}", json={"variations": [{"id": a["variations"][0]["id"], "name": "x"}]})
+    assert hijack.status_code == 400
+    assert client_b.delete(f"/products/{a['id']}/variants/{a['variations'][0]['id']}").status_code == 404
+    db_session.expire_all()
+    assert db_session.get(ProductVariant, a["variations"][0]["id"]).name == "1"
+
+
+def test_50_variant_code_unique_per_org_at_db_level(db_session: Session):
+    org = Organization(id=str(uuid.uuid4()), name="Uniq Org", company_code="CMP-10001")
+    other = Organization(id=str(uuid.uuid4()), name="Uniq Other", company_code="CMP-10002")
+    db_session.add_all([org, other])
+    db_session.flush()
+    p1 = Product(organization_id=org.id, name="P1")
+    p2 = Product(organization_id=other.id, name="P2")
+    db_session.add_all([p1, p2])
+    db_session.flush()
+    db_session.add(ProductVariant(product_id=p1.id, name="a", variant_code="VAR-0001"))
+    db_session.add(ProductVariant(product_id=p2.id, name="a", variant_code="VAR-0001"))  # other firm: fine
+    db_session.commit()
+
+    db_session.add(ProductVariant(product_id=p1.id, name="dup", variant_code="VAR-0001"))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+
+def test_51_variant_org_must_match_product_and_code_is_required(db_session: Session):
+    org = Organization(id=str(uuid.uuid4()), name="Guard Org", company_code="CMP-10001")
+    other = Organization(id=str(uuid.uuid4()), name="Guard Other", company_code="CMP-10002")
+    db_session.add_all([org, other])
+    db_session.flush()
+    product = Product(organization_id=org.id, name="P")
+    db_session.add(product)
+    db_session.commit()
+
+    db_session.add(ProductVariant(product_id=product.id, organization_id=other.id, name="x", variant_code="VAR-0001"))
+    with pytest.raises(ValueError):
+        db_session.flush()
+    db_session.rollback()
+
+    db_session.add(ProductVariant(product_id=product.id, name="no code"))
+    with pytest.raises(ValueError):
+        db_session.flush()
+    db_session.rollback()
+
+    v = ProductVariant(product_id=product.id, name="ok", variant_code=numbering_service.next_variant_code(db_session, org.id))
+    db_session.add(v)
+    db_session.commit()
+    assert v.organization_id == org.id
+    with pytest.raises(ValueError):
+        v.variant_code = "VAR-0099"
+
+
+def test_52_concurrent_variant_code_allocation_is_unique(db_session: Session):
+    org = Organization(id=str(uuid.uuid4()), name="Concurrent Variant Org", company_code="CMP-10001")
+    db_session.add(org)
+    db_session.commit()
+
+    allocated, lock = [], threading.Lock()
+
+    def worker():
+        for _ in range(20):
+            local = Session(bind=engine)
+            try:
+                code = numbering_service.next_variant_code(local, org.id)
+                local.commit()
+                with lock:
+                    allocated.append(code)
+                return
+            except Exception:
+                local.rollback()
+                time.sleep(0.05)
+            finally:
+                local.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(allocated) >= 2
+    assert len(set(allocated)) == len(allocated)
+
+
+def test_53_deleted_variant_code_is_never_reissued(auth_client, db_session: Session):
+    client, org, _ = auth_client
+    created = client.post("/products", json={"name": "Del", "variations": [{"name": "a"}, {"name": "b"}]}).json()
+    last = max(created["variations"], key=lambda v: v["variant_code"])
+    assert client.delete(f"/products/{created['id']}/variants/{last['id']}").status_code == 204
+    res = client.patch(f"/products/{created['id']}", json={"variations": [{"name": "c"}]})
+    codes = sorted(v["variant_code"] for v in res.json()["variations"])
+    assert last["variant_code"] not in codes
+    assert codes[-1] == "VAR-0003"
+
+
+def test_54_variant_migration_backfills_idempotently_and_syncs_sequence(tmp_path):
+    """Runs the real a5b6c7d8e9f0 migration against a database whose
+    product_variants table still has its pre-migration shape."""
+    import importlib.util
+    import pathlib
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "alembic" / "versions" / "a5b6c7d8e9f0_product_variant_codes_and_pricing.py"
+    )
+    spec = importlib.util.spec_from_file_location("variant_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    legacy_engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    Base.metadata.create_all(
+        legacy_engine, tables=[t for t in Base.metadata.sorted_tables if t.name != "product_variants"]
+    )
+    with legacy_engine.begin() as conn:
+        conn.execute(sa.text(
+            "CREATE TABLE product_variants (id VARCHAR(36) PRIMARY KEY, product_id VARCHAR(36) NOT NULL, "
+            "name VARCHAR(150) NOT NULL, sku VARCHAR(100), barcode VARCHAR(100), length FLOAT, width FLOAT, "
+            "height FLOAT, weight FLOAT, price FLOAT NOT NULL, inventory INTEGER NOT NULL, image_url TEXT)"
+        ))
+
+    s = Session(bind=legacy_engine)
+    org_a = Organization(id=str(uuid.uuid4()), name="Legacy A", company_code="CMP-10001")
+    org_b = Organization(id=str(uuid.uuid4()), name="Legacy B", company_code="CMP-10002")
+    s.add_all([org_a, org_b])
+    s.flush()
+    pa1 = Product(organization_id=org_a.id, name="A1", created_at=datetime(2025, 1, 1, tzinfo=timezone.utc))
+    pa2 = Product(organization_id=org_a.id, name="A2", created_at=datetime(2025, 2, 1, tzinfo=timezone.utc))
+    pb = Product(organization_id=org_b.id, name="B1")
+    s.add_all([pa1, pa2, pb])
+    s.flush()
+    # Read before commit: reloading a Product eager-joins the (still legacy) variant table.
+    org_a_id, org_b_id = org_a.id, org_b.id
+    pa1_id, pa2_id, pb_id = pa1.id, pa2.id, pb.id
+    s.commit()
+    s.close()
+
+    rows = [  # (product_id, name, sku, price, inventory)
+        (pa2_id, "Later product", "SKU-A2", 5.0, 3),
+        (pa1_id, "Medium", None, 20.0, 10),
+        (pa1_id, "Small", "HAV-BAT-20W-S", 10.0, 10),
+        (pb_id, "Only", "SKU-A2", 7.0, 1),
+    ]
+    ids = {}
+    with legacy_engine.begin() as conn:
+        for product_id, name, sku, price, inventory in rows:
+            vid = str(uuid.uuid4())
+            ids[(product_id, name)] = vid
+            conn.execute(sa.text(
+                "INSERT INTO product_variants (id, product_id, name, sku, price, inventory) "
+                "VALUES (:id, :p, :n, :sku, :price, :inv)"
+            ), {"id": vid, "p": product_id, "n": name, "sku": sku, "price": price, "inv": inventory})
+
+    def run_upgrade():
+        with legacy_engine.begin() as conn:
+            with Operations.context(MigrationContext.configure(conn)):
+                migration.upgrade()
+
+    def snapshot():
+        with legacy_engine.connect() as conn:
+            return {
+                r.id: tuple(r) for r in conn.execute(sa.text(
+                    "SELECT id, product_id, organization_id, variant_code, sku, price, inventory, mrp, purchase_price "
+                    "FROM product_variants"
+                ))
+            }
+
+    run_upgrade()
+    after = snapshot()
+
+    def code(product_id, name):
+        return after[ids[(product_id, name)]][3]
+
+    # Deterministic: product created_at, then variant name; numbered per organization
+    assert (code(pa1_id, "Medium"), code(pa1_id, "Small"), code(pa2_id, "Later product")) == (
+        "VAR-0001", "VAR-0002", "VAR-0003"
+    )
+    assert code(pb_id, "Only") == "VAR-0001"
+    for (product_id, name), vid in ids.items():
+        _, pid, org_id, _, _, _, _, mrp, purchase_price = after[vid]
+        assert pid == product_id  # UUIDs and relationships preserved
+        assert org_id == (org_b_id if product_id == pb_id else org_a_id)
+        assert mrp is None and purchase_price is None  # nothing invented
+    small = after[ids[(pa1_id, "Small")]]
+    assert (small[4], small[5], small[6]) == ("HAV-BAT-20W-S", 10.0, 10)  # sku, price, inventory kept
+
+    with legacy_engine.connect() as conn:
+        seq = dict(conn.execute(sa.text(
+            "SELECT organization_id, last_number FROM number_sequences WHERE series = 'VAR' AND year = 0"
+        )).fetchall())
+        index_sql = conn.execute(sa.text(
+            "SELECT sql FROM sqlite_master WHERE name = 'uq_product_variants_org_variant_code'"
+        )).scalar()
+    assert seq == {org_a_id: 3, org_b_id: 1}
+    assert "UNIQUE" in index_sql
+
+    # Idempotent: a second run changes nothing
+    run_upgrade()
+    assert snapshot() == after
+
+    # The next runtime allocation continues after the backfilled numbers
+    s = Session(bind=legacy_engine)
+    assert numbering_service.next_variant_code(s, org_a_id) == "VAR-0004"
+    assert numbering_service.next_variant_code(s, org_b_id) == "VAR-0002"
+    s.rollback()
+    s.close()
+    legacy_engine.dispose()

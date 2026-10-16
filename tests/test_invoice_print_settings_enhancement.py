@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import SessionLocal
+from app.services import numbering_service
 from app.models import (
     Organization,
     User,
@@ -268,6 +269,7 @@ def run_tests():
         db.add(p1)
 
         v1 = ProductVariant(
+            variant_code=numbering_service.next_variant_code(db, org1.id),
             id=str(uuid.uuid4()),
             product_id=p1.id,
             name="16GB RAM",

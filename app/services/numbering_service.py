@@ -2,7 +2,7 @@
 
 Canonical formats:
 - Transactional: PREFIX-COMPANY_NUMBER-YEAR-SEQUENCE (e.g. CS-10001-2026-0001)
-- Master: PREFIX-SEQUENCE (e.g. SUP-0001, PRD-0001)
+- Master: PREFIX-SEQUENCE (e.g. SUP-0001, PRD-0001, VAR-0001)
 - Company: CMP-SEQUENCE (e.g. CMP-10001)
 
 Deliberately derived from atomic counters stored in NumberSequence, initialized from the highest
@@ -50,11 +50,13 @@ CANONICAL_PREFIXES: dict[str, str] = {
     "product": "PRD",
     "prod": "PRD",
     "prd": "PRD",
+    "variant": "VAR",
+    "var": "VAR",
     "company": "CMP",
     "cmp": "CMP",
 }
 
-MASTER_SERIES = {"SUP", "PRD"}
+MASTER_SERIES = {"SUP", "PRD", "VAR"}
 TRANSACTIONAL_SERIES = {"CS", "IN", "SO", "DO", "PO", "EMP", "L", "QT"}
 
 
@@ -165,7 +167,7 @@ def _highest_issued(db: Session, org_id: str, column, stem: str) -> int:
 
 def prefix_for(db: Session, org_id: str, series: str) -> str:
     """The firm's prefix for a series — its Company Settings override, else the
-    canonical series name (CS, IN, SO, DO, PO, EMP, L, QT, SUP, PRD, CMP)."""
+    canonical series name (CS, IN, SO, DO, PO, EMP, L, QT, SUP, PRD, VAR, CMP)."""
     from app.models.organization import Organization
 
     canonical = normalize_series(series)
@@ -254,6 +256,14 @@ def next_master_number(db: Session, org_id: str, column, series: str) -> str:
     prefix = prefix_for(db, org_id, canonical)
     stem = f"{prefix}-"
     return _allocate_next(db, org_id, column, canonical, 0, stem)
+
+
+def next_variant_code(db: Session, org_id: str) -> str:
+    """Next VAR-0001-style business ID for a product variant, from the firm's own
+    master sequence. `org_id` must be the owning product's organization."""
+    from app.models.product import ProductVariant
+
+    return next_master_number(db, org_id, ProductVariant.variant_code, "VAR")
 
 
 def next_number(

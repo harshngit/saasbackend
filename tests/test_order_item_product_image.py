@@ -13,6 +13,7 @@ from app.core.database import SessionLocal
 from app.models.sales_order import SalesOrder, SalesOrderItem
 from app.models.customer import Customer
 from app.models.product import Product, ProductVariant
+from app.services import numbering_service
 from app.models.user import User
 
 client = TestClient(app)
@@ -79,6 +80,7 @@ def test_order_item_product_image_resolution():
         db.flush()
 
         var_2_with_img = ProductVariant(
+            variant_code=numbering_service.next_variant_code(db, org_id),
             product_id=prod_2.id,
             name="Red - 1L",
             sku=f"VAR-2A-{uuid.uuid4().hex[:6]}",
@@ -86,6 +88,7 @@ def test_order_item_product_image_resolution():
             image_url="/files/var-red-789.png",
         )
         var_2_no_img = ProductVariant(
+            variant_code=numbering_service.next_variant_code(db, org_id),
             product_id=prod_2.id,
             name="Blue - 1L",
             sku=f"VAR-2B-{uuid.uuid4().hex[:6]}",
@@ -107,6 +110,7 @@ def test_order_item_product_image_resolution():
         db.flush()
 
         var_3_no_img = ProductVariant(
+            variant_code=numbering_service.next_variant_code(db, org_id),
             product_id=prod_3.id,
             name="Standard",
             sku=f"VAR-3-{uuid.uuid4().hex[:6]}",

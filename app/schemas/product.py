@@ -2,12 +2,41 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from app.models.enums import ProductStatus
 
 
+class VariantPricingIn(BaseModel):
+    """A variant's own pricing — same fields as the product's `pricing` object.
+    `selling_price` is the variant's `price`; anything left out stays unset."""
+
+    purchase_price: float | None = Field(default=None, ge=0)
+    selling_price: float | None = Field(default=None, ge=0)
+    mrp: float | None = Field(default=None, ge=0)
+    wholesale_price: float | None = Field(default=None, ge=0)
+    dealer_price: float | None = Field(default=None, ge=0)
+    discount_percent: float | None = Field(default=None, ge=0, le=100)
+    tax_inclusive: bool | None = None
+    currency: str | None = Field(default=None, max_length=10)
+
+
+class VariantPricingOut(BaseModel):
+    purchase_price: float | None = None
+    selling_price: float = 0.0
+    mrp: float | None = None
+    wholesale_price: float | None = None
+    dealer_price: float | None = None
+    discount_percent: float | None = None
+    tax_inclusive: bool | None = None
+    currency: str | None = None
+
+
 class VariantIn(BaseModel):
+    """`id` is the internal UUID: send it to update that variant, leave it out to
+    create one. The business ID (`variant_code`) is issued by the server and is not
+    accepted here — a client-sent value is ignored."""
+
     id: str | None = None
     name: str = Field(min_length=1, max_length=150)
     sku: str | None = Field(default=None, max_length=100)
@@ -16,15 +45,25 @@ class VariantIn(BaseModel):
     width: float | None = None
     height: float | None = None
     weight: float | None = None
+    # Legacy selling price, kept for existing clients; same value as pricing.selling_price.
     price: float = Field(default=0, ge=0)
+    pricing: VariantPricingIn | None = None
     inventory: int = Field(default=0, ge=0)
     image_url: str | None = None
+
+    @model_validator(mode="after")
+    def _price_matches_selling_price(self) -> "VariantIn":
+        selling = self.pricing.selling_price if self.pricing else None
+        if selling is not None and "price" in self.model_fields_set and self.price != selling:
+            raise ValueError("price and pricing.selling_price disagree; send one, or the same value in both")
+        return self
 
 
 class VariantOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
+    variant_code: str | None = None
     name: str
     sku: str | None
     barcode: str | None
@@ -33,8 +72,16 @@ class VariantOut(BaseModel):
     height: float | None
     weight: float | None
     price: float
+    pricing: VariantPricingOut | None = None
     inventory: int
     image_url: str | None = None
+
+    @model_validator(mode="after")
+    def _default_pricing(self) -> "VariantOut":
+        # Built from a plain dict without pricing: selling_price is still `price`.
+        if self.pricing is None:
+            self.pricing = VariantPricingOut(selling_price=self.price)
+        return self
 
     @field_validator("image_url", mode="after")
     @classmethod

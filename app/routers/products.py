@@ -94,8 +94,67 @@ def _validate_brand(db: Session, org_id: str, brand_id: str | None) -> None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="brand_id is not a brand in your firm")
 
 
-def _build_variants(variations: list[VariantIn]) -> list[ProductVariant]:
-    return [ProductVariant(**v.model_dump()) for v in variations]
+def _validate_classification(
+    db: Session, org_id: str, category_id: str | None, sub_category_id: str | None
+) -> None:
+    """Category -> Sub Category: a sub category is a child Category of the chosen one."""
+    if sub_category_id is None:
+        return
+    sub = db.get(Category, sub_category_id)
+    if category_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="sub_category_id requires category_id"
+        )
+    if sub is None or sub.organization_id != org_id or sub.parent_id != category_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sub_category_id is not a sub category of category_id",
+        )
+
+
+def _validate_product_type(db: Session, org_id: str, product_type: str | None) -> None:
+    """Product Type is its own value, never a Category id -- category and sub category
+    go in category_id / sub_category_id."""
+    if not product_type:
+        return
+    is_category = (
+        db.query(Category.id)
+        .filter(Category.organization_id == org_id, Category.id == product_type.strip())
+        .first()
+    )
+    if is_category is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="product_type must be a product type, not a category id; send categories as "
+            "category_id / sub_category_id",
+        )
+
+
+def _variant_columns(variant: dict) -> dict:
+    """A VariantIn dump as ProductVariant column values: the nested pricing object is
+    flattened (selling_price is the `price` column) and the internal id is dropped."""
+    fields = {k: v for k, v in variant.items() if k not in ("id", "pricing")}
+    for key, value in (variant.get("pricing") or {}).items():
+        if key == "selling_price":
+            if value is not None:
+                fields["price"] = value
+        else:
+            fields[key] = value
+    return fields
+
+
+def _new_variant(db: Session, org_id: str, fields: dict, **extra: object) -> ProductVariant:
+    """A new variant with its business ID drawn from the owning firm's VAR sequence."""
+    return ProductVariant(
+        organization_id=org_id,
+        variant_code=numbering_service.next_variant_code(db, org_id),
+        **extra,
+        **fields,
+    )
+
+
+def _build_variants(db: Session, org_id: str, variations: list[VariantIn]) -> list[ProductVariant]:
+    return [_new_variant(db, org_id, _variant_columns(v.model_dump())) for v in variations]
 
 
 _VARIANT_REFERENCES: list[tuple[str, str]] = [
@@ -192,6 +251,8 @@ def create_product(
     org_id = _org_id(user)
     _validate_category(db, org_id, payload.category_id)
     _validate_category(db, org_id, payload.sub_category_id)
+    _validate_classification(db, org_id, payload.category_id, payload.sub_category_id)
+    _validate_product_type(db, org_id, payload.product_type)
     _validate_supplier(db, org_id, payload.preferred_supplier_id)
     _validate_brand(db, org_id, payload.brand_id)
     catalog_hierarchy_service.validate_product_catalog_hierarchy(
@@ -216,7 +277,7 @@ def create_product(
     purchase_p = pricing_data.get("purchase_price", 0.0)
     data["price"] = selling_p
     product = Product(organization_id=org_id, **data)
-    product.variations = _build_variants([VariantIn(**v) for v in variations])
+    product.variations = _build_variants(db, org_id, payload.variations)
     # Left unset, the toggle just follows whether variants were actually sent.
     product.has_variants = bool(variations) if has_variants is None else has_variants
     # Keep the legacy is_active boolean in sync with the new status field.
@@ -476,6 +537,15 @@ def update_product(
         _validate_supplier(db, org_id, data["preferred_supplier_id"])
     if "brand_id" in data:
         _validate_brand(db, org_id, data["brand_id"])
+    if "category_id" in data or "sub_category_id" in data:
+        _validate_classification(
+            db,
+            org_id,
+            data.get("category_id", product.category_id),
+            data.get("sub_category_id", product.sub_category_id),
+        )
+    if "product_type" in data:
+        _validate_product_type(db, org_id, data["product_type"])
 
     effective_supplier_id = data.get("preferred_supplier_id", product.preferred_supplier_id)
     effective_brand_id = data.get("brand_id", product.brand_id)
@@ -573,16 +643,14 @@ def update_product(
                 variant = db.get(ProductVariant, vid)
                 if variant is None or variant.product_id != product.id:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="variant id not found or does not belong to this product")
-                # Update only fields provided in the incoming dict
-                for key, val in v.items():
-                    if key == "id":
-                        continue
+                # Update only fields provided in the incoming dict. variant_code is
+                # not a VariantIn field, so the business ID is never rewritten here.
+                for key, val in _variant_columns(v).items():
                     setattr(variant, key, val)
                 new_variants_list.append(variant)
             else:
-                # Create new variant and attach to the product
-                new_data = {k: val for k, val in v.items() if k != "id"}
-                variant = ProductVariant(product_id=product.id, **new_data)
+                # Create new variant (new UUID, next VAR code) and attach to the product
+                variant = _new_variant(db, org_id, _variant_columns(v), product_id=product.id)
                 new_variants_list.append(variant)
 
         # Whatever the payload did not mention stays exactly as it was: the variants

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import SessionLocal
+from app.services import numbering_service
 from app.models import Product, ProductVariant, PurchaseInvoice, PurchaseInvoiceItem, StockMovement, Supplier, User, Warehouse, WarehouseStock
 from app.models.purchase_return import PurchaseReturn, PurchaseReturnItem
 from app.seed import main as seed_main
@@ -96,6 +97,7 @@ def setup_base_data(auth, org_id):
         db.add(product2)
 
         variant2 = ProductVariant(
+            variant_code=numbering_service.next_variant_code(db, org_id),
             id=str(uuid.uuid4()),
             product_id=product2.id,
             name="Variant Red",

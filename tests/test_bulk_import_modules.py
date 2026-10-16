@@ -14,6 +14,7 @@ from app.main import app
 from app.core.database import SessionLocal
 from app.models.customer import Customer
 from app.models.product import Product, ProductVariant
+from app.services import numbering_service
 from app.models.purchase_invoice import PurchaseInvoice
 from app.models.sales_order import SalesOrder
 from app.models.supplier import Supplier
@@ -350,6 +351,7 @@ def run_purchase_import_tests(org_id: str, headers: dict):
     db.refresh(prod2)
 
     var1 = ProductVariant(
+        variant_code=numbering_service.next_variant_code(db, prod2.organization_id),
         product_id=prod2.id,
         name="10mm Fitting",
         sku="VAL-HYD-02-10MM",

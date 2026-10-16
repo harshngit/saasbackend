@@ -22,6 +22,7 @@ from app.core.database import SessionLocal
 from app.core.files import normalize_file_url
 from app.main import app
 from app.models.product import Product, ProductVariant
+from app.services import numbering_service
 from app.models.quotation import Quotation, QuotationItem
 from app.models.user import User
 from app.schemas.category import CategoryOut
@@ -286,6 +287,7 @@ def test_quotation_item_product_image_url_normalizes_bare_variant_id():
         db.add(product)
         db.flush()
         variant = ProductVariant(
+            variant_code=numbering_service.next_variant_code(db, org_id),
             product_id=product.id, name="Only Size", sku=f"VAR-{uuid.uuid4().hex[:6]}",
             price=50.0, image_url="bare-variant-file-id",
         )
