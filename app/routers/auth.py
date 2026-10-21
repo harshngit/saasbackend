@@ -2,6 +2,7 @@ import jwt
 from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -53,20 +54,32 @@ class GoogleIdentityConflict(Exception):
     """
 
 
+class GoogleAccountAmbiguous(Exception):
+    """Raised when a verified Google email matches more than one CRM user once
+    casing is ignored. Linking either one would be a guess, so the attempt is
+    rejected and nothing is linked, logged in, or ticketed."""
+
+
 def _resolve_google_identity(db: Session, google_sub: str, google_email: str) -> User | None:
     """Resolve a verified Google identity to an existing CRM user.
 
-    Priority: (1) exact `google_id` match, (2) `email` match — auto-linking
-    `google_id` only when the matched user has none set yet. Raises
+    Priority: (1) exact `google_id` match, (2) case-insensitive `email` match —
+    auto-linking `google_id` only when the matched user has none set yet. Raises
     GoogleIdentityConflict instead of linking when the matched user's
     `google_id` is already set to a *different* sub than the one just
-    verified. Returns None when no user matches by either key (new user).
+    verified, and GoogleAccountAmbiguous when the email matches several users.
+    Returns None when no user matches by either key (new user).
     """
     user = db.query(User).filter(User.google_id == google_sub).first()
     if user is not None:
         return user
 
-    user = db.query(User).filter(User.email == google_email).first()
+    # Google emails arrive lowercased; stored emails may not be (staff accounts keep
+    # the casing they were created with).
+    matches = db.query(User).filter(func.lower(User.email) == google_email.strip().lower()).limit(2).all()
+    if len(matches) > 1:
+        raise GoogleAccountAmbiguous()
+    user = matches[0] if matches else None
     if user is None:
         return None
 
@@ -173,6 +186,9 @@ def google_oauth_callback(
         # overwrite, link, log in, or start a new registration — send the user
         # back to the frontend with a distinct, actionable error indicator.
         target = f"{settings.frontend_url}/auth/callback?error={quote('google_identity_conflict')}"
+        return RedirectResponse(url=target, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    except GoogleAccountAmbiguous:
+        target = f"{settings.frontend_url}/auth/callback?error={quote('google_account_ambiguous')}"
         return RedirectResponse(url=target, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
     if user is None:
@@ -310,6 +326,14 @@ def google_sign_in(
             detail={
                 "error": "google_identity_conflict",
                 "message": "This account is already linked to a different Google identity.",
+            },
+        )
+    except GoogleAccountAmbiguous:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "google_account_ambiguous",
+                "message": "More than one account uses this email. Sign in with your password or contact your administrator.",
             },
         )
 

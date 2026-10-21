@@ -356,6 +356,199 @@ def test_google_auth_missing_claims():
         assert "missing required identity claims" in res.json()["detail"].lower()
 
 
+# ---------------------------------------------------------------------------
+# Audience hardening and case-insensitive account matching
+# ---------------------------------------------------------------------------
+
+TEST_WEB_CLIENT_ID = "test-web-client.apps.googleusercontent.com"
+
+
+def _signed_google_token(audience: str, **overrides) -> tuple[str, dict]:
+    """A real RS256 ID token signed with a throwaway key, plus the certs mapping that
+    google-auth should trust -- so verify_oauth2_token runs for real, offline."""
+    import time
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from google.auth import crypt
+    from google.auth import jwt as google_jwt
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    public_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    now = int(time.time())
+    claims = {
+        "iss": "https://accounts.google.com",
+        "aud": audience,
+        "sub": f"gid_{uuid.uuid4().hex[:12]}",
+        "email": f"signed_{uuid.uuid4().hex[:6]}@example.com",
+        "email_verified": True,
+        "name": "Signed User",
+        "iat": now,
+        "exp": now + 600,
+        **overrides,
+    }
+    signer = crypt.RSASigner.from_string(private_pem, key_id="test-key")
+    token = google_jwt.encode(signer, claims).decode()
+    return token, {"test-key": public_pem.decode()}
+
+
+def test_configured_client_id_is_the_expected_audience():
+    """The configured web client ID is what the token's `aud` is checked against."""
+    fake_claims = {"iss": "accounts.google.com", "sub": "aud-check", "email": "aud@example.com",
+                   "email_verified": True, "name": "Aud"}
+    with patch("app.services.google_auth_service.settings.google_client_id", f"  {TEST_WEB_CLIENT_ID}  "), \
+            patch("google.oauth2.id_token.verify_oauth2_token", return_value=fake_claims) as verify:
+        client.post("/auth/google", json={"credential": "some.google.token"})
+    assert verify.call_args.kwargs["audience"] == TEST_WEB_CLIENT_ID
+
+
+def test_missing_client_id_fails_closed_with_503():
+    """No configured audience: never verify (google-auth would skip the aud check)."""
+    for unset in ("", "   ", None):
+        with patch("app.services.google_auth_service.settings.google_client_id", unset), \
+                patch("google.oauth2.id_token.verify_oauth2_token") as verify:
+            res = client.post("/auth/google", json={"credential": "some.google.token"})
+        assert res.status_code == 503
+        assert res.json()["detail"] == "Google sign-in is not configured"
+        verify.assert_not_called()
+
+
+def test_real_signature_check_accepts_matching_and_rejects_other_audience():
+    """Real google-auth verification (offline certs): right audience in, other app's token out."""
+    good, certs = _signed_google_token(TEST_WEB_CLIENT_ID)
+    other_app, other_certs = _signed_google_token("some-other-app.apps.googleusercontent.com")
+    expired, expired_certs = _signed_google_token(TEST_WEB_CLIENT_ID, iat=1_000_000, exp=1_000_600)
+    with patch("app.services.google_auth_service.settings.google_client_id", TEST_WEB_CLIENT_ID):
+        with patch("google.oauth2.id_token._fetch_certs", return_value=certs):
+            ok = client.post("/auth/google", json={"credential": good})
+        with patch("google.oauth2.id_token._fetch_certs", return_value=other_certs):
+            wrong = client.post("/auth/google", json={"credential": other_app})
+        with patch("google.oauth2.id_token._fetch_certs", return_value=expired_certs):
+            stale = client.post("/auth/google", json={"credential": expired})
+        with patch("google.oauth2.id_token._fetch_certs", return_value=other_certs):
+            forged = client.post("/auth/google", json={"credential": good})  # signed by a key Google doesn't hold
+    assert ok.status_code == 200 and ok.json()["status"] == "registration_required"
+    for res in (wrong, stale, forged):
+        assert res.status_code == 401
+        assert "Invalid or expired Google token" in res.json()["detail"]
+
+
+def test_mixed_case_staff_email_matches_and_keeps_account():
+    """A staff account stored as Ravi.X@Firm.com signs in with Google's ravi.x@firm.com."""
+    tag = uuid.uuid4().hex[:6]
+    stored_email = f"Ravi.{tag}@Firm-Example.COM"
+    org, user = _create_test_org_and_user(email=stored_email, role=UserRole.SALES_OFFICER)
+    gid = f"gid_{uuid.uuid4().hex[:12]}"
+    fake_claims = {"iss": "accounts.google.com", "sub": gid, "email": stored_email.lower(),
+                   "email_verified": True, "name": "Ravi"}
+
+    db = SessionLocal()
+    users_before = db.query(User).count()
+    db.close()
+
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=fake_claims):
+        res = client.post("/auth/google", json={"credential": "valid.google.token"})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["user"]["id"] == user.id
+    assert data["organization"]["id"] == org.id
+    assert data["user"]["system_role"] == "staff" and data["user"]["role"] == UserRole.SALES_OFFICER.value
+    # (UserOut's EmailStr lowercases the domain when serializing; the stored row is checked below)
+    assert data["user"]["email"].lower() == stored_email.lower()
+
+    db = SessionLocal()
+    try:
+        linked = db.get(User, user.id)
+        assert linked.google_id == gid and linked.email == stored_email
+        assert db.query(User).count() == users_before  # no new account
+    finally:
+        db.close()
+
+
+def test_mixed_case_email_linked_to_other_google_identity_still_conflicts():
+    tag = uuid.uuid4().hex[:6]
+    stored_email = f"Linked.{tag}@Example.com"
+    _, user = _create_test_org_and_user(email=stored_email, google_id=f"gid_{uuid.uuid4().hex[:12]}")
+    fake_claims = {"iss": "accounts.google.com", "sub": "a-different-google-account",
+                   "email": stored_email.lower(), "email_verified": True, "name": "Other"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=fake_claims):
+        res = client.post("/auth/google", json={"credential": "valid.google.token"})
+    assert res.status_code == 409
+    assert res.json()["detail"]["error"] == "google_identity_conflict"
+    db = SessionLocal()
+    try:
+        assert db.get(User, user.id).google_id != "a-different-google-account"
+    finally:
+        db.close()
+
+
+def test_duplicate_case_insensitive_emails_are_not_linked():
+    """Two rows differing only by email casing: refuse rather than pick one.
+
+    Runs the resolver on its own in-memory database, since the shared test database
+    may enforce case-insensitive email uniqueness and refuse to hold such rows."""
+    import pytest
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+
+    from app.core.database import Base
+    from app.routers.auth import GoogleAccountAmbiguous, _resolve_google_identity
+
+    mem = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(mem)
+    db = Session(bind=mem)
+    try:
+        db.add_all([
+            User(name="A", email="dup@example.com", password_hash="h", system_role="staff", is_active=True),
+            User(name="B", email="DUP@example.com", password_hash="h", system_role="staff", is_active=True),
+        ])
+        db.commit()
+        with pytest.raises(GoogleAccountAmbiguous):
+            _resolve_google_identity(db, "gid-dup", "dup@example.com")
+        assert all(u.google_id is None for u in db.query(User).all())  # nothing linked
+
+        # An exact google_id link still wins over the ambiguous email
+        db.query(User).filter(User.name == "B").update({"google_id": "gid-b"})
+        db.commit()
+        assert _resolve_google_identity(db, "gid-b", "dup@example.com").name == "B"
+    finally:
+        db.close()
+        mem.dispose()
+
+    # The endpoint turns the ambiguity into the documented 409
+    with patch("app.routers.auth._resolve_google_identity", side_effect=GoogleAccountAmbiguous()), \
+            patch("google.oauth2.id_token.verify_oauth2_token", return_value={
+                "iss": "accounts.google.com", "sub": "gid-dup", "email": "dup@example.com",
+                "email_verified": True, "name": "Dup"}):
+        res = client.post("/auth/google", json={"credential": "valid.google.token"})
+    assert res.status_code == 409
+    assert res.json()["detail"]["error"] == "google_account_ambiguous"
+
+
+def test_no_matching_account_still_requires_registration():
+    fake_claims = {"iss": "accounts.google.com", "sub": f"gid_{uuid.uuid4().hex[:12]}",
+                   "email": f"Brand.New.{uuid.uuid4().hex[:6]}@example.com".lower(),
+                   "email_verified": True, "name": "New"}
+    db = SessionLocal()
+    users_before = db.query(User).count()
+    db.close()
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=fake_claims):
+        res = client.post("/auth/google", json={"credential": "valid.google.token"})
+    assert res.status_code == 200
+    assert res.json()["status"] == "registration_required" and res.json()["registration_code"]
+    db = SessionLocal()
+    try:
+        assert db.query(User).count() == users_before
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     test_google_auth_endpoint_exists()
     print("  PASS  test_google_auth_endpoint_exists")

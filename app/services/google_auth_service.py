@@ -114,7 +114,7 @@ def verify_google_id_token(credential: str, client_id: str | None = None) -> dic
     Validates:
     - Signature via Google public certificates (handled by google-auth)
     - Expiration (handled by google-auth)
-    - Audience (`aud`) against settings.google_client_id (if configured)
+    - Audience (`aud`) against settings.google_client_id -- required; 503 when unset
     - Issuer (`iss`) is Google
     - `email_verified` is True
     - Required claims (`sub`, `email`) are present
@@ -125,7 +125,12 @@ def verify_google_id_token(credential: str, client_id: str | None = None) -> dic
     if not credential or not credential.strip():
         raise GoogleAuthError("Missing Google ID token credential", status_code=400)
 
-    target_audience = client_id if client_id is not None else (settings.google_client_id or None)
+    # Never verify without an expected audience: google-auth skips the `aud` check
+    # when it is None/empty, which would accept a valid token minted for any app.
+    target_audience = str((client_id if client_id is not None else settings.google_client_id) or "").strip()
+    if not target_audience:
+        logger.error("Google ID token verification attempted without GOOGLE_CLIENT_ID configured")
+        raise GoogleAuthError("Google sign-in is not configured", status_code=503)
 
     try:
         id_info = id_token.verify_oauth2_token(
