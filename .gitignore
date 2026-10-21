@@ -24,3 +24,5 @@ saas_changes.md
 PROJECT_KNOWLEDGE_REPORT.md
 new_crm_changes.md
 delivery_app_surplus_redistribution.md 
+# Local frontend source for invoice PDF comparison
+frontend-reference/

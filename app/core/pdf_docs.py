@@ -6,8 +6,6 @@ from io import BytesIO
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
-from app.core.workflow import REGULAR_THEMES_BY_ID
-
 
 def _s(text) -> str:
     """Make text safe for fpdf's latin-1 core fonts (replace unencodable chars)."""
@@ -520,61 +518,14 @@ def _normalize_thermal_layout(layout_name: str | None) -> str:
     return "thermal-compact"
 
 
-def _regular_theme(settings: dict) -> dict | None:
-    """The catalog theme named by `template_variant`, or None (unset, unknown, or a
-    thermal firm) -- in which case the base `template` alone decides the look."""
-    if str(settings.get("template") or "").strip().lower() == "thermal":
-        return None
-    return REGULAR_THEMES_BY_ID.get(str(settings.get("template_variant") or "").strip().lower())
-
-
-# How each catalog style axis maps onto the FPDF renderer. Every key has a default in
-# the renderer that reproduces the plain base template, so a firm with no theme -- or
-# one of the three base themes -- prints exactly as before.
-_THEME_TABLE_BORDERS = {"bordered": 1, "grid": 1, "lined": "B", "wide": "B", "banded": "B", "minimal": 0}
-_THEME_BANDED_HEADERS = {"band": 1.0, "band-sm": 0.7, "banner": 1.3, "banner-split": 1.3}
-
-
-def _themed_style(base: dict, theme: dict) -> dict:
-    style = dict(base)
-    density = theme["density"]
-    if density == "compact":
-        style["row_height"] = max(base["row_height"] - 1.5, 4.5)
-        style["gap"] = 2
-    elif density == "spacious":
-        style["row_height"] = base["row_height"] + 1.5
-        style["gap"] = base["gap"] + 3
-
-    style["border"] = _THEME_TABLE_BORDERS.get(theme["table"], base["border"])
-    style["header_fill"] = theme["table"] in ("grid", "banded")
-    style["zebra"] = theme["table"] == "banded"
-
-    header = theme["header"]
-    style["header_band"] = header in _THEME_BANDED_HEADERS
-    style["band_scale"] = _THEME_BANDED_HEADERS.get(header, 1.0)
-    style["title_align"] = "R" if header in ("split", "split-alt", "banner-split") else "L"
-    style["title_gap"] = 3 if header == "plain-spacious" else 0
-
-    style["totals"] = theme["totals"]
-    style["accent"] = theme["accent"]
-    style["theme_id"] = theme["id"]
-    return style
-
-
 def _style(settings: dict) -> dict:
-    """The look this firm has chosen: its catalog theme over that theme's base
-    template, else the base template alone, defaulting to classic."""
+    """The thermal receipt's look. (Regular A4/A5 themes are drawn by
+    invoice_regular_pdf, which resolves the catalog theme itself.)"""
     name = str(settings.get("template") or "classic").strip().lower()
     if name == "thermal":
         thermal_cfg = settings.get("thermal_print") or {}
         layout = _normalize_thermal_layout(thermal_cfg.get("layout"))
         return dict(_THERMAL_LAYOUT_STYLES[layout])
-    theme = _regular_theme(settings)
-    if theme is not None:
-        base = _TEMPLATE_STYLES[theme["base_template"]]
-        if theme["id"] == theme["base_template"]:
-            return base  # classic / modern / compact: the plain base look
-        return _themed_style(base, theme)
     return _TEMPLATE_STYLES.get(name, _TEMPLATE_STYLES["classic"])
 
 
@@ -939,6 +890,21 @@ def _get_item_cell_value(item, col_key: str) -> str:
     return "-"
 
 
+def _is_thermal(settings: dict) -> bool:
+    """Same test _invoice_pdf_page uses to pick the thermal page."""
+    template = str(settings.get("template") or "").strip().lower()
+    return template == "thermal" or str(settings.get("paper_size") or "").strip().lower() == "thermal"
+
+
+def _regular(org, customer, invoice, settings, simple, logo, signature, qr, stamp, letterhead, item_images) -> bytes:
+    from app.core.invoice_regular_pdf import render_regular_invoice
+
+    return render_regular_invoice(
+        _invoice_pdf_page(settings), org, customer, invoice, settings, simple=simple,
+        logo=logo, signature=signature, qr=qr, stamp=stamp, letterhead=letterhead, item_images=item_images,
+    )
+
+
 def invoice_simple_pdf(
     org,
     customer,
@@ -953,7 +919,12 @@ def invoice_simple_pdf(
 ) -> bytes:
     """The short customer copy.
     No payment status badge, row, or balance due rows are printed.
+
+    A regular (A4/A5) invoice renders through invoice_regular_pdf, the theme-aware layout
+    shared with the detailed format; the code below is the thermal receipt only.
     """
+    if not _is_thermal(settings):
+        return _regular(org, customer, invoice, settings, True, logo, signature, qr, stamp, letterhead, item_images)
     fields = settings.get("fields") or {}
     style = _style(settings)
     pdf = _invoice_pdf_page(settings)
@@ -1071,7 +1042,12 @@ def invoice_detailed_pdf(
 ) -> bytes:
     """The full tax invoice: dynamic typography, item table columns, visibility toggles,
     custom paper and orientation, with all payment status/paid/balance elements omitted.
+
+    A regular (A4/A5) invoice renders through invoice_regular_pdf; the code below is the
+    thermal receipt only.
     """
+    if not _is_thermal(settings):
+        return _regular(org, customer, invoice, settings, False, logo, signature, qr, stamp, letterhead, item_images)
     fields = settings.get("fields") or {}
     style = _style(settings)
     pdf = _invoice_pdf_page(settings)

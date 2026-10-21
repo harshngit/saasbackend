@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.core import pdf_docs, workflow
+from app.core import invoice_regular_pdf, pdf_docs, workflow
 from app.core.database import Base, engine
 from app.core.security import create_access_token
 from app.main import app
@@ -90,13 +90,14 @@ def _invoice(db: Session, org: Organization) -> Invoice:
 def style_spy(monkeypatch):
     """Records which theme the PDF renderer resolved for each render."""
     seen: list[str | None] = []
-    original = pdf_docs._style
+    original = invoice_regular_pdf.resolve_theme
 
     def spy(settings):
-        seen.append((pdf_docs._regular_theme(settings) or {}).get("id"))
-        return original(settings)
+        theme = original(settings)
+        seen.append(theme["id"])
+        return theme
 
-    monkeypatch.setattr(pdf_docs, "_style", spy)
+    monkeypatch.setattr(invoice_regular_pdf, "resolve_theme", spy)
     return seen
 
 
@@ -164,7 +165,7 @@ def test_legacy_unknown_stored_variant_falls_back(db_session: Session, style_spy
     inv = _invoice(db_session, org)
     res = client.get(f"/invoices/{inv.id}/pdf")
     assert res.status_code == 200 and res.content.startswith(b"%PDF")
-    assert pdf_docs._style({"template": "modern", "template_variant": "removed-theme"}) == pdf_docs._TEMPLATE_STYLES["modern"]
+    assert invoice_regular_pdf.resolve_theme({"template": "modern", "template_variant": "removed-theme"})["id"] == "modern"
 
 
 # ----------------------------------- PDFs -----------------------------------
@@ -225,12 +226,15 @@ def test_every_regular_theme_renders(theme_id, fmt):
     assert 1 <= pages <= 6  # 50 lines paginate, nothing runs away
 
 
-def test_base_and_unthemed_styles_unchanged():
+def test_theme_resolution_matches_frontend_fallbacks():
+    """resolveRegularPresetId(): saved variant, else the base template's own theme, else classic."""
+    resolve = invoice_regular_pdf.resolve_theme
     for name in ("classic", "modern", "compact"):
-        assert pdf_docs._style({"template": name}) is pdf_docs._TEMPLATE_STYLES[name]
-        assert pdf_docs._style({"template": name, "template_variant": name}) is pdf_docs._TEMPLATE_STYLES[name]
-    themed = pdf_docs._style({"template": "classic", "template_variant": "tally"})
-    assert themed["border"] == 1 and themed["header_fill"] and themed["row_height"] < pdf_docs._TEMPLATE_STYLES["classic"]["row_height"]
+        assert resolve({"template": name})["id"] == name
+        assert resolve({"template": name, "template_variant": "removed-theme"})["id"] == name
+    assert resolve({"template": "classic", "template_variant": "tally"})["id"] == "tally"
+    assert resolve({"template": "modern", "template_variant": "GST-5"})["id"] == "gst-5"
+    assert resolve({})["id"] == "classic"
 
 
 @pytest.mark.parametrize("layout", THERMAL_IDS)
@@ -242,6 +246,232 @@ def test_thermal_rendering_unchanged(layout):
     settings = workflow.invoice_settings(org)
     settings.update({"template": "thermal", "template_variant": "gst-5"})
     settings["thermal_print"] = {**settings["thermal_print"], "layout": layout}
-    assert pdf_docs._regular_theme(settings) is None  # a regular theme never leaks into thermal
+    assert pdf_docs._is_thermal(settings)  # a regular theme never leaks into thermal
     for builder in pdf_docs.INVOICE_PDF_FORMATS.values():
         assert builder(org, None, inv, settings).startswith(b"%PDF")
+
+
+# ------------------------- frontend layout parity (regular) -------------------------
+# The regular renderer mirrors invoiceTemplates.jsx's RegularInvoiceDocument. These tests
+# record what it draws (text with colour and position, boxes, images) and assert the
+# frontend's layout rules, independent of PDF text extraction.
+
+BRAND = "#1F6FEB"
+BRAND_RGB = (0x1F, 0x6F, 0xEB)
+NEUTRAL_600 = invoice_regular_pdf.NEUTRAL[600]
+
+
+def _png(size, color=(30, 30, 200)) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _parity_invoice(items: int = 5, *, shipping: str | None = "Warehouse 7, Doddaballapur", extras: bool = True,
+                    gstin: str | None = "29XYZAB5678C1Z2"):
+    from app.models import Product, ProductPricing, ProductVariant
+
+    org = Organization(id=str(uuid.uuid4()), name="Parity Org", company_code="CMP-10001", city="Bangalore",
+                       state="Karnataka", pin_code="560095", registered_address="123 Business Park",
+                       gst_number="29ABCDE1234F1Z5", phone="+91 98765 43210", email="billing@parity.in",
+                       bank_name="HDFC Bank", bank_account_details="50200012345678", bank_ifsc="HDFC0001234",
+                       upi_id="parity@hdfc")
+    customer = Customer(name="Hotel Grand Meridian", phone="+91 90000 12345", gst_number=gstin,
+                        billing_address="45 Residency Road, Bangalore", delivery_address=shipping)
+    inv = Invoice(invoice_number="IN-PARITY-0001", invoice_date=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                  due_date=datetime(2026, 7, 16, tzinfo=timezone.utc), status="unpaid", subtotal=123456.0,
+                  discount=250.0, tax=696.8, additional_charges=150.0 if extras else 0, round_off=0.2 if extras else 0,
+                  total=124053.0, amount_paid=0.0, billing_address="45 Residency Road, Bangalore", notes="Handle with care")
+    rows = []
+    for i in range(items):
+        item = InvoiceItem(id=f"line-{i}", product_name=f"Product line {i}", hsn_code="22011010", quantity=2,
+                           unit_price=90.0, discount=20.0 if i == 0 else 0.0, tax=8.0, tax_amount=8.0, tax_rate=5.0,
+                           line_total=160.0, uom="Jar")
+        if i == 0:
+            item.variant = ProductVariant(name="1L", mrp=150.0)  # MRP from the variant
+        elif i == 1:
+            product = Product(name="P")
+            product.pricing = ProductPricing(purchase_price=1, selling_price=90, mrp=120.0)
+            item.product = product  # MRP from product pricing
+        rows.append(item)
+    inv.items = rows
+    return org, customer, inv
+
+
+def _parity_settings(theme_id: str, **overrides):
+    theme = workflow.REGULAR_THEMES_BY_ID[theme_id]
+    settings = workflow.invoice_settings(Organization(invoice_template_settings={}))
+    settings.update({"template": theme["base_template"], "template_variant": theme_id})
+    settings["branding"] = {**settings["branding"], "primary_color": BRAND}
+    settings["footer"] = {**settings["footer"], "terms": "Pay within 15 days", "footer_text": "Thank you!"}
+    for key, value in overrides.items():
+        settings[key] = {**settings.get(key, {}), **value} if isinstance(value, dict) else value
+    return settings
+
+
+@pytest.fixture
+def drawn(monkeypatch):
+    """Everything the regular renderer draws: text, boxes and images, in order."""
+    record = {"text": [], "box": [], "image": [], "pages": 0}
+    doc_cls = invoice_regular_pdf._Doc
+    original_text, original_box = doc_cls.text, doc_cls.box
+    original_image = pdf_docs.FPDF.image
+
+    def text(self, x, y, width, value, size_px, **kw):
+        record["text"].append({"text": str(value), "x": x, "y": y, "color": tuple(kw.get("color", NEUTRAL_600)),
+                               "style": kw.get("style", ""), "page": self.pdf.page})
+        return original_text(self, x, y, width, value, size_px, **kw)
+
+    def box(self, x, y, w, h, **kw):
+        record["box"].append({"y": y, "h": h, "w": w, "fill": kw.get("fill"), "page": self.pdf.page})
+        return original_box(self, x, y, w, h, **kw)
+
+    def image(self, name, x=None, y=None, w=0, h=0, **kw):
+        record["image"].append({"x": x, "y": y, "w": w, "h": h, "page": self.page})
+        return original_image(self, name, x=x, y=y, w=w, h=h, **kw)
+
+    monkeypatch.setattr(doc_cls, "text", text)
+    monkeypatch.setattr(doc_cls, "box", box)
+    monkeypatch.setattr(pdf_docs.FPDF, "image", image)
+
+    def render(theme_id="classic", fmt="detailed", invoice=None, settings=None, **assets):
+        record["text"].clear(), record["box"].clear(), record["image"].clear()
+        org, customer, inv = invoice or _parity_invoice()
+        pdf = pdf_docs.INVOICE_PDF_FORMATS[fmt](org, customer, inv, settings or _parity_settings(theme_id), **assets)
+        record["pages"] = pdf.count(b"/Type /Page") - pdf.count(b"/Type /Pages")
+        record["pdf"] = pdf
+        record["strings"] = [t["text"] for t in record["text"]]
+        return record
+
+    return render
+
+
+def _find(record, needle):
+    return [t for t in record["text"] if needle in t["text"]]
+
+
+def test_inr_formatting_matches_frontend_money():
+    inr = invoice_regular_pdf.inr
+    assert inr(123456) == "₹ 1,23,456.00"
+    assert inr(1234567.5) == "₹ 12,34,567.50"
+    assert inr(999) == "₹ 999.00"
+    assert inr(0.2) == "₹ 0.20"
+    assert inr(-0.3) == "₹ -0.30"  # money(-0.3) in the frontend
+    assert inr(None) == "₹ 0.00"
+
+
+@pytest.mark.parametrize("theme_id", REGULAR_IDS)
+@pytest.mark.parametrize("fmt", ["detailed", "simple"])
+def test_every_theme_follows_frontend_section_layout(drawn, theme_id, fmt):
+    rec = drawn(theme_id, fmt)
+    s = rec["strings"]
+    theme = workflow.REGULAR_THEMES_BY_ID[theme_id]
+    # Title treatment per header axis
+    if theme["header"] in ("band", "band-sm", "banner"):
+        assert "INVOICE" in s and "TAX INVOICE" not in s
+    else:
+        assert "TAX INVOICE" in s
+    # Header block, metadata, Bill To + Ship To, default frontend columns
+    for needle in ("Parity Org", "Invoice No: IN-PARITY-0001", "Date: 01 Jul 2026", "Due: 16 Jul 2026",
+                   "Bill To", "Hotel Grand Meridian", "Ship To", "ITEM", "HSN/SAC", "QUANTITY", "RATE", "AMOUNT"):
+        assert _find(rec, needle), needle
+    assert "DISCOUNT" not in s and not _find(rec, "Not Provided") and "Grand Total" not in s
+    # Totals: frontend labels, stored figures, Additional Charges and Round Off preserved
+    joined = " ".join(s)
+    for needle in ("Subtotal", "Total", "₹ 1,23,456.00", "Additional Charges", "Round Off", "₹ 1,24,053.00"):
+        assert needle in joined, needle
+    # Simple hides payment details, terms, footer text and signature; the note stays
+    footer_only = ("Bank: HDFC Bank", "Scan to pay via UPI", "Terms: ", "Thank you!", "Authorised Signatory")
+    for needle in footer_only:
+        assert bool(_find(rec, needle)) == (fmt == "detailed"), needle
+    assert _find(rec, "Note: ")
+    assert rec["pages"] >= 1 and b"DMSans" in rec["pdf"]  # rupee glyph font embedded
+
+
+@pytest.mark.parametrize("theme_id", REGULAR_IDS)
+def test_table_header_never_brand_filled_and_accent_rules(drawn, theme_id):
+    rec = drawn(theme_id)
+    theme = workflow.REGULAR_THEMES_BY_ID[theme_id]
+    header_row_y = _find(rec, "ITEM")[0]["y"]
+    assert not [b for b in rec["box"] if b["fill"] == BRAND_RGB and abs(b["y"] - header_row_y) < 0.5]
+    bill_to = _find(rec, "Bill To")[0]["color"]
+    item_head = _find(rec, "ITEM")[0]["color"]
+    if theme["accent"] == "bold":
+        assert bill_to == BRAND_RGB and item_head == BRAND_RGB
+    else:  # standard / minimal / title-only are identical in the frontend
+        assert bill_to == NEUTRAL_600 and item_head == invoice_regular_pdf.NEUTRAL[400]
+    on_color = theme["header"] in ("band", "band-sm", "banner", "banner-split")
+    assert (_find(rec, "Parity Org")[0]["color"] == BRAND_RGB) == (not on_color)
+    if theme["totals"] in ("plain", "boxed", "grid"):
+        assert [t for t in rec["text"] if t["text"] == "Total"][0]["color"] == BRAND_RGB  # minimal/title-only keep colour
+
+
+def test_default_primary_color_when_unset(drawn):
+    settings = _parity_settings("classic")
+    settings["branding"] = {**settings["branding"], "primary_color": None}
+    rec = drawn(settings=settings)
+    assert _find(rec, "Parity Org")[0]["color"] == (0x00, 0x09, 0x2A)  # frontend '#00092A'
+
+
+def test_item_cells_mrp_discount_tax_rate(drawn):
+    settings = _parity_settings("classic", item_table={"columns": ["product", "mrp", "discount", "tax_rate", "amount"]})
+    rec = drawn(settings=settings)
+    for needle in ("MRP", "DISCOUNT", "TAX RATE"):
+        assert needle in rec["strings"]
+    assert "₹ 150.00" in rec["strings"]  # variant MRP, not the 90.00 sale price
+    assert "₹ 120.00" in rec["strings"]  # product pricing MRP
+    assert "₹ 20.00" in rec["strings"]   # stored discount amount
+    assert "5%" in rec["strings"]
+    assert rec["strings"].count("—") >= 3  # no MRP / no discount print a dash
+
+
+def test_letterhead_reserves_space_and_images_keep_aspect(drawn):
+    letterhead, logo = _png((1200, 150)), _png((240, 120))
+    rec = drawn("classic", letterhead=letterhead, logo=logo, signature=_png((240, 80)), stamp=_png((120, 120)), qr=_png((200, 200)))
+    head = rec["image"][0]
+    assert abs(head["w"] / head["h"] - 8.0) < 0.01  # 1200x150 drawn at 8:1
+    company_y = _find(rec, "Parity Org")[0]["y"]
+    assert company_y >= head["y"] + head["h"]  # header starts below the letterhead
+    for img in rec["image"][1:]:
+        assert img["w"] > 0 and img["h"] > 0
+    assert any(abs(i["w"] / i["h"] - 2.0) < 0.01 for i in rec["image"])  # 2:1 logo not squashed square
+
+
+def test_ship_to_only_when_present_and_missing_optional_fields(drawn):
+    rec = drawn(invoice=_parity_invoice(shipping=None, gstin=None, extras=False))
+    assert not _find(rec, "Ship To") and not _find(rec, "GSTIN: 29XYZ")
+    assert not _find(rec, "Additional Charges") and not _find(rec, "Round Off")
+    assert _find(rec, "Bill To") and _find(rec, "Hotel Grand Meridian")
+
+
+def test_long_invoice_repeats_table_heading_without_overlap(drawn):
+    org, customer, inv = _parity_invoice(60)
+    rec = drawn("gst-4", invoice=(org, customer, inv))
+    assert rec["pages"] >= 2
+    headings = _find(rec, "ITEM")
+    assert len({h["page"] for h in headings}) >= rec["pages"] - 1  # every table page has its heading
+    assert len([t for t in rec["text"] if t["text"] == "₹ 160.00"]) == 60  # no row dropped
+    for page in {t["page"] for t in rec["text"]}:
+        ys = [t["y"] for t in rec["text"] if t["page"] == page]
+        assert max(ys) < 297  # nothing below the A4 page
+
+
+def test_missing_and_invalid_assets_are_skipped(drawn):
+    rec = drawn("modern", logo=b"not an image", signature=b"", qr=None, stamp=b"\x89PNG broken", letterhead=b"junk")
+    assert rec["pdf"].startswith(b"%PDF")
+    assert "Signature" in rec["strings"] and "Payment QR unavailable" in rec["strings"]
+
+
+def test_thermal_never_uses_regular_renderer(monkeypatch):
+    called = []
+    monkeypatch.setattr(invoice_regular_pdf, "render_regular_invoice", lambda *a, **k: called.append(1))
+    org, customer, inv = _parity_invoice()
+    settings = _parity_settings("gst-5")
+    settings["template"] = "thermal"
+    for builder in pdf_docs.INVOICE_PDF_FORMATS.values():
+        assert builder(org, customer, inv, settings).startswith(b"%PDF")
+    assert not called

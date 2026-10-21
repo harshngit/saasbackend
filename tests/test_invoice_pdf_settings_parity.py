@@ -341,10 +341,12 @@ def run_all_tests():
         else:
             fail("Vehicle number missing from Simple PDF")
 
-        if "HDFC Bank" in simple_text and "50200012345678" in simple_text:
-            ok("Bank details rendered in Simple PDF (hardcoded omission fixed)")
+        # The simple format follows the frontend's simple view (InvoicePrintView.jsx):
+        # payment details are hidden there; the detailed format (checked above) keeps them.
+        if "HDFC Bank" not in simple_text and "50200012345678" not in simple_text:
+            ok("Bank details omitted from Simple PDF, matching the frontend simple view")
         else:
-            fail("Bank details missing from Simple PDF")
+            fail("Bank details printed on Simple PDF")
 
         # -------------------------------------------------------------
         # 3. DIRECT INVOICE VEHICLE OVERRIDE

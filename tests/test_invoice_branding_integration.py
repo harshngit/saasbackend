@@ -355,6 +355,9 @@ def run_tests():
             fail("Org 2 rendered cross-tenant branding!")
 
         print("\n--- 10. STAMP / SEAL INTEGRATION ---")
+        # Same invoice and template (the style loop above left it on thermal), no stamp yet:
+        # the size comparison below must not straddle two different layouts.
+        res_before_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
         # 10.1 Valid stamp fallback from Organization.stamp_url
         stamp_bytes = _create_test_image((128, 0, 128), (90, 90))
         stored_stamp = StoredFile(
@@ -374,10 +377,10 @@ def run_tests():
         res_stamp = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "detailed"})
         assert_eq(res_stamp.status_code, 200, "PDF with Company Settings stamp returns 200")
         assert_eq(res_stamp.content[:5], b"%PDF-", "Content is valid PDF")
-        if len(res_stamp.content) > len(res_qr.content):
+        if len(res_stamp.content) > len(res_before_stamp.content):
             ok("PDF size increased with stamp embedded alongside signature and QR")
         else:
-            fail("PDF size did not increase with stamp", f"{len(res_stamp.content)} <= {len(res_qr.content)}")
+            fail("PDF size did not increase with stamp", f"{len(res_stamp.content)} <= {len(res_before_stamp.content)}")
 
         # 10.2 Stamp in simple format
         res_stamp_simple = client.get(f"/invoices/{inv1.id}/pdf", headers=auth1, params={"format": "simple"})
