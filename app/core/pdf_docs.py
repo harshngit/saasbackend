@@ -6,6 +6,8 @@ from io import BytesIO
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
+from app.core.workflow import REGULAR_THEMES_BY_ID
+
 
 def _s(text) -> str:
     """Make text safe for fpdf's latin-1 core fonts (replace unencodable chars)."""
@@ -518,14 +520,76 @@ def _normalize_thermal_layout(layout_name: str | None) -> str:
     return "thermal-compact"
 
 
+def _regular_theme(settings: dict) -> dict | None:
+    """The catalog theme named by `template_variant`, or None (unset, unknown, or a
+    thermal firm) -- in which case the base `template` alone decides the look."""
+    if str(settings.get("template") or "").strip().lower() == "thermal":
+        return None
+    return REGULAR_THEMES_BY_ID.get(str(settings.get("template_variant") or "").strip().lower())
+
+
+# How each catalog style axis maps onto the FPDF renderer. Every key has a default in
+# the renderer that reproduces the plain base template, so a firm with no theme -- or
+# one of the three base themes -- prints exactly as before.
+_THEME_TABLE_BORDERS = {"bordered": 1, "grid": 1, "lined": "B", "wide": "B", "banded": "B", "minimal": 0}
+_THEME_BANDED_HEADERS = {"band": 1.0, "band-sm": 0.7, "banner": 1.3, "banner-split": 1.3}
+
+
+def _themed_style(base: dict, theme: dict) -> dict:
+    style = dict(base)
+    density = theme["density"]
+    if density == "compact":
+        style["row_height"] = max(base["row_height"] - 1.5, 4.5)
+        style["gap"] = 2
+    elif density == "spacious":
+        style["row_height"] = base["row_height"] + 1.5
+        style["gap"] = base["gap"] + 3
+
+    style["border"] = _THEME_TABLE_BORDERS.get(theme["table"], base["border"])
+    style["header_fill"] = theme["table"] in ("grid", "banded")
+    style["zebra"] = theme["table"] == "banded"
+
+    header = theme["header"]
+    style["header_band"] = header in _THEME_BANDED_HEADERS
+    style["band_scale"] = _THEME_BANDED_HEADERS.get(header, 1.0)
+    style["title_align"] = "R" if header in ("split", "split-alt", "banner-split") else "L"
+    style["title_gap"] = 3 if header == "plain-spacious" else 0
+
+    style["totals"] = theme["totals"]
+    style["accent"] = theme["accent"]
+    style["theme_id"] = theme["id"]
+    return style
+
+
 def _style(settings: dict) -> dict:
-    """The look this firm has chosen, defaulting to classic."""
+    """The look this firm has chosen: its catalog theme over that theme's base
+    template, else the base template alone, defaulting to classic."""
     name = str(settings.get("template") or "classic").strip().lower()
     if name == "thermal":
         thermal_cfg = settings.get("thermal_print") or {}
         layout = _normalize_thermal_layout(thermal_cfg.get("layout"))
         return dict(_THERMAL_LAYOUT_STYLES[layout])
+    theme = _regular_theme(settings)
+    if theme is not None:
+        base = _TEMPLATE_STYLES[theme["base_template"]]
+        if theme["id"] == theme["base_template"]:
+            return base  # classic / modern / compact: the plain base look
+        return _themed_style(base, theme)
     return _TEMPLATE_STYLES.get(name, _TEMPLATE_STYLES["classic"])
+
+
+def _accent_rgb(settings: dict, style: dict, part: str) -> tuple[int, int, int] | None:
+    """The brand colour for one part of the page ('title', 'table' or 'total'),
+    or None where the theme's accent leaves that part uncoloured."""
+    rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
+    accent = style.get("accent", "standard")
+    if accent == "minimal":
+        return None
+    if accent == "title-only":
+        return rgb if part == "title" else None
+    if part == "table":
+        return rgb if accent == "bold" else None
+    return rgb
 
 
 def _hex_rgb(value) -> tuple[int, int, int] | None:
@@ -649,23 +713,67 @@ def _branded_title(pdf: FPDF, settings: dict, title: str) -> None:
     No payment status badge is rendered.
     """
     style = _style(settings)
-    rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
+    rgb = _accent_rgb(settings, style, "title")
     heading_size = float((settings.get("typography") or {}).get("heading_size", 16))
-    
+    align = style.get("title_align", "L")
+
     _font(pdf, settings, "B", "heading")
     if style["header_band"]:
-        band = rgb or (33, 37, 41)
+        band = _hex_rgb((settings.get("branding") or {}).get("primary_color")) or (33, 37, 41)
         pdf.set_fill_color(*band)
         pdf.set_text_color(255, 255, 255)
+        text = f"  {title}  " if align == "R" else f"  {title}"
         pdf.cell(
-            0, heading_size * 0.75, _s(f"  {title}"), fill=True,
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT,
+            0, heading_size * 0.75 * style.get("band_scale", 1.0), _s(text), fill=True,
+            align=align, new_x=XPos.LMARGIN, new_y=YPos.NEXT,
         )
     else:
         if rgb:
             pdf.set_text_color(*rgb)
-        pdf.cell(0, 8, _s(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 8, _s(title), align=align, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(0, 0, 0)
+    if style.get("title_gap"):
+        pdf.ln(style["title_gap"])
+
+
+def _table_header_fill(pdf: FPDF, settings: dict, style: dict) -> bool:
+    """Shade the item-table header row when the theme calls for it."""
+    if not style.get("header_fill"):
+        return False
+    rgb = _accent_rgb(settings, style, "table")
+    if rgb:
+        pdf.set_fill_color(*rgb)
+        pdf.set_text_color(255, 255, 255)
+    else:
+        pdf.set_fill_color(235, 235, 235)
+    return True
+
+
+def _zebra(pdf: FPDF, style: dict, index: int) -> bool:
+    """Alternate row shading for banded tables."""
+    if not style.get("zebra") or index % 2 == 0:
+        return False
+    pdf.set_fill_color(245, 245, 245)
+    return True
+
+
+def _grand_total_row(
+    pdf: FPDF, label: str, value, width: float, settings: dict, style: dict
+) -> None:
+    """The closing total, framed or banded per the theme's totals style."""
+    brand_rgb = _accent_rgb(settings, style, "total")
+    totals = style.get("totals", "plain")
+    height = 7
+    box_w = min(90, width)
+    x, y = pdf.l_margin + width - box_w, pdf.get_y()
+    if totals == "banded":
+        pdf.set_fill_color(*(_hex_rgb((settings.get("branding") or {}).get("primary_color")) or (33, 37, 41)))
+        pdf.rect(x, y, box_w, height, style="F")
+        pdf.set_text_color(255, 255, 255)
+        brand_rgb = None
+    elif totals in ("boxed", "grid"):
+        pdf.rect(x, y, box_w, height)
+    _amount_row(pdf, label, value, width, height=height, brand_rgb=brand_rgb, settings=settings)
 
 
 def _two_column_rows(
@@ -904,23 +1012,25 @@ def invoice_simple_pdf(
     row_h = max(style.get("row_height", 6), tbl_font_sz * 0.55 + 1.5, 4.0)
     table_border = style.get("border", 1)
     _font(pdf, settings, "B", "table")
+    header_fill = _table_header_fill(pdf, settings, style)
     for w, header, align in zip(widths, ["Item", "Qty", "Rate", "Amount"], "LRRR"):
-        pdf.cell(w, row_h + 1, header, border=table_border, align=align)
+        pdf.cell(w, row_h + 1, header, border=table_border, align=align, fill=header_fill)
+    pdf.set_text_color(0, 0, 0)
     pdf.ln(row_h + 1)
 
     _font(pdf, settings, "", "table")
-    for item in invoice.items:
+    for index, item in enumerate(invoice.items):
         cells = [
             _s(item.product_name)[:44],
             f"{item.quantity:g}",
             _money(item.unit_price),
             _money(item.line_total),
         ]
+        shade = _zebra(pdf, style, index)
         for w, text, align in zip(widths, cells, "LRRR"):
-            pdf.cell(w, row_h, text, border=table_border, align=align)
+            pdf.cell(w, row_h, text, border=table_border, align=align, fill=shade)
         pdf.ln(row_h)
 
-    brand_rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
     pdf.ln(2)
     _font(pdf, settings, "", "body")
     _amount_row(pdf, "Subtotal", invoice.subtotal, width, settings=settings)
@@ -929,7 +1039,7 @@ def invoice_simple_pdf(
     if invoice.tax:
         _amount_row(pdf, "Tax", invoice.tax, width, settings=settings)
     _font(pdf, settings, "B", "body", offset=2)
-    _amount_row(pdf, "Total", invoice.total, width, height=7, brand_rgb=brand_rgb, settings=settings)
+    _grand_total_row(pdf, "Total", invoice.total, width, settings, style)
 
     _invoice_footer(
         pdf, org, settings, fields,
@@ -1072,17 +1182,20 @@ def invoice_detailed_pdf(
     row_height = max(base_h, 12) if has_img_col else base_h
 
     _font(pdf, settings, "B", "table")
+    header_fill = _table_header_fill(pdf, settings, style)
     for w, c in zip(col_widths, active_cols):
-        pdf.cell(w, row_height + 1, COLUMN_HEADERS[c], border=style["border"], align=COLUMN_ALIGNS[c])
+        pdf.cell(w, row_height + 1, COLUMN_HEADERS[c], border=style["border"], align=COLUMN_ALIGNS[c], fill=header_fill)
+    pdf.set_text_color(0, 0, 0)
     pdf.ln(row_height + 1)
 
     _font(pdf, settings, "", "table")
-    for item in invoice.items:
+    for index, item in enumerate(invoice.items):
         cell_y = pdf.get_y()
+        shade = _zebra(pdf, style, index)
         for w, c in zip(col_widths, active_cols):
             cell_x = pdf.get_x()
             if c == "product_image":
-                pdf.cell(w, row_height, "", border=style["border"])
+                pdf.cell(w, row_height, "", border=style["border"], fill=shade)
                 if item_images and item.id in item_images:
                     try:
                         img_bytes = item_images[item.id]
@@ -1096,10 +1209,9 @@ def invoice_detailed_pdf(
                 pdf.set_xy(cell_x + w, cell_y)
             else:
                 val = _get_item_cell_value(item, c)
-                pdf.cell(w, row_height, val, border=style["border"], align=COLUMN_ALIGNS[c])
+                pdf.cell(w, row_height, val, border=style["border"], align=COLUMN_ALIGNS[c], fill=shade)
         pdf.ln(row_height)
 
-    brand_rgb = _hex_rgb((settings.get("branding") or {}).get("primary_color"))
     pdf.ln(2)
     _font(pdf, settings, "", "body")
     _amount_row(pdf, "Subtotal", invoice.subtotal, width, settings=settings)
@@ -1112,7 +1224,7 @@ def invoice_detailed_pdf(
     if invoice.round_off:
         _amount_row(pdf, "Round Off", invoice.round_off, width, settings=settings)
     _font(pdf, settings, "B", "body", offset=2)
-    _amount_row(pdf, "Grand Total", invoice.total, width, height=7, brand_rgb=brand_rgb, settings=settings)
+    _grand_total_row(pdf, "Grand Total", invoice.total, width, settings, style)
 
     _invoice_footer(pdf, org, settings, fields, signature=signature, qr=qr, stamp=stamp)
 

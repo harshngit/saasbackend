@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core import workflow
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_system_role
+from app.core.deps import get_current_user, require_entitlement, require_permission, require_system_role
 from app.core.files import save_upload
 from app.models import Organization, StoredFile, SystemRole, User
 from app.schemas.theme import OrganizationThemeOut, OrganizationThemeUpdate
@@ -19,6 +19,7 @@ from app.schemas.payment_gateway import PaymentGatewayIn, PaymentGatewayOut
 from app.schemas.workflow_settings import (
     InvoiceSettings,
     InvoiceSettingsUpdate,
+    InvoiceTemplateCatalog,
 )
 from app.services import activity_service, theme_service
 
@@ -48,6 +49,37 @@ def _apply(stored: dict | None, changes: dict) -> dict:
 
 
 # --------------------------- invoice template ------------------------------
+
+
+@router.get(
+    "/invoice-templates",
+    response_model=InvoiceTemplateCatalog,
+    dependencies=[Depends(require_entitlement("invoice.sales_invoices"))],
+)
+def list_invoice_templates(
+    user: User = Depends(require_permission("invoices", "view")),
+) -> InvoiceTemplateCatalog:
+    """Every invoice theme and its stable id, plus which ones this firm has chosen.
+
+    Readable by anyone who can view invoices (unlike /invoice-settings, which is
+    admin-only); changing the choice still goes through PATCH /invoice-settings.
+    """
+    stored = workflow.invoice_settings(_org(user))
+    variant = str(stored.get("template_variant") or "").strip().lower()
+    layout = str((stored.get("thermal_print") or {}).get("layout") or "").strip().lower()
+    return InvoiceTemplateCatalog(
+        selected={
+            "template": stored.get("template") or "classic",
+            "template_variant": stored.get("template_variant"),
+            # What the PDF actually renders: the stored theme if the catalog knows it,
+            # else the base template's own theme.
+            "resolved_template_variant": variant if variant in workflow.REGULAR_THEMES_BY_ID
+            else (stored.get("template") if stored.get("template") in workflow.REGULAR_THEMES_BY_ID else "classic"),
+            "thermal_layout": layout if layout in workflow.THERMAL_LAYOUTS else "thermal-compact",
+        },
+        regular=list(workflow.REGULAR_THEMES),
+        thermal=list(workflow.THERMAL_THEMES),
+    )
 
 
 @router.get("/invoice-settings", response_model=InvoiceSettings)

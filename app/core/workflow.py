@@ -128,16 +128,40 @@ ALLOWED_ITEM_COLUMNS = (
     "amount",
 )
 THERMAL_PAPER_WIDTHS = ("58mm", "80mm", "110mm")
-THERMAL_LAYOUTS = (
-    "thermal-compact",
-    "thermal-advanced",
-    "thermal-simple",
-    "thermal-classic",
-    "thermal-theme-1",
-    "thermal-theme-2",
-    "thermal-theme-3",
-    "thermal-theme-4",
+# Invoice theme catalog -- the same ids and style axes as the frontend's
+# src/features/invoices/invoiceThemePresets.js. A regular theme is persisted as
+# `template_variant` (with its `base_template` as `template`); a thermal theme as
+# `thermal_print.layout`. Shared by GET /invoice-templates, settings validation and
+# the PDF renderer, so web and mobile resolve a theme id the same way.
+REGULAR_THEMES: tuple[dict[str, str], ...] = (
+    {"id": "classic", "name": "Classic", "base_template": "classic", "header": "plain", "table": "bordered", "totals": "plain", "accent": "standard", "density": "normal"},
+    {"id": "modern", "name": "Modern", "base_template": "modern", "header": "band", "table": "lined", "totals": "boxed", "accent": "bold", "density": "normal"},
+    {"id": "compact", "name": "Compact", "base_template": "compact", "header": "plain", "table": "lined", "totals": "plain", "accent": "minimal", "density": "compact"},
+    {"id": "tally", "name": "Tally Theme", "base_template": "classic", "header": "plain", "table": "grid", "totals": "grid", "accent": "minimal", "density": "compact"},
+    {"id": "landscape-1", "name": "Landscape Theme 1", "base_template": "modern", "header": "split", "table": "wide", "totals": "inline", "accent": "standard", "density": "normal"},
+    {"id": "landscape-2", "name": "Landscape Theme 2", "base_template": "modern", "header": "split-alt", "table": "wide", "totals": "boxed", "accent": "standard", "density": "normal"},
+    {"id": "gst-1", "name": "GST Theme 1", "base_template": "classic", "header": "plain", "table": "grid", "totals": "grid", "accent": "standard", "density": "normal"},
+    {"id": "gst-2", "name": "GST Theme 2", "base_template": "classic", "header": "split", "table": "grid", "totals": "grid", "accent": "standard", "density": "normal"},
+    {"id": "gst-3", "name": "GST Theme 3", "base_template": "compact", "header": "band-sm", "table": "lined", "totals": "boxed", "accent": "bold", "density": "compact"},
+    {"id": "gst-4", "name": "GST Theme 4", "base_template": "modern", "header": "band", "table": "grid", "totals": "grid", "accent": "bold", "density": "normal"},
+    {"id": "gst-5", "name": "GST Theme 5", "base_template": "modern", "header": "banner", "table": "lined", "totals": "banded", "accent": "bold", "density": "normal"},
+    {"id": "gst-6", "name": "GST Theme 6", "base_template": "classic", "header": "plain", "table": "grid", "totals": "banded", "accent": "bold", "density": "compact"},
+    {"id": "double-divine", "name": "Double Divine", "base_template": "modern", "header": "banner-split", "table": "banded", "totals": "banded", "accent": "bold", "density": "normal"},
+    {"id": "french-elite", "name": "French Elite", "base_template": "classic", "header": "plain-spacious", "table": "minimal", "totals": "plain", "accent": "title-only", "density": "spacious"},
 )
+REGULAR_THEMES_BY_ID: dict[str, dict[str, str]] = {theme["id"]: theme for theme in REGULAR_THEMES}
+
+THERMAL_THEMES: tuple[dict[str, object], ...] = (
+    {"id": "thermal-compact", "name": "Compact", "layout": "compact", "variant": None, "show_extras": False},
+    {"id": "thermal-advanced", "name": "Advanced", "layout": "standard", "variant": None, "show_extras": True},
+    {"id": "thermal-simple", "name": "Simple", "layout": "simple", "variant": None, "show_extras": False},
+    {"id": "thermal-classic", "name": "Classic", "layout": "classic", "variant": None, "show_extras": False},
+    {"id": "thermal-theme-1", "name": "Theme 1", "layout": "standard", "variant": 1, "show_extras": False},
+    {"id": "thermal-theme-2", "name": "Theme 2", "layout": "compact", "variant": 2, "show_extras": False},
+    {"id": "thermal-theme-3", "name": "Theme 3", "layout": "simple", "variant": 3, "show_extras": False},
+    {"id": "thermal-theme-4", "name": "Theme 4", "layout": "classic", "variant": 4, "show_extras": False},
+)
+THERMAL_LAYOUTS = tuple(theme["id"] for theme in THERMAL_THEMES)
 
 TYPOGRAPHY_DEFAULTS: dict[str, object] = {
     "font_family": "Helvetica",

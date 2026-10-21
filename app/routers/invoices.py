@@ -808,6 +808,46 @@ def _resolve_letterhead_file(db: Session, org_id: str, org) -> bytes | None:
     return None
 
 
+def _with_pdf_overrides(
+    settings: dict, template_variant: str | None, thermal_layout: str | None
+) -> dict:
+    """A copy of the firm's invoice settings with this download's theme override
+    applied. The stored settings are never touched."""
+    variant = (template_variant or "").strip().lower() or None
+    layout = (thermal_layout or "").strip().lower() or None
+    if variant and layout:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Send template_variant or thermal_layout, not both",
+        )
+    if variant:
+        theme = workflow.REGULAR_THEMES_BY_ID.get(variant)
+        if theme is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown template_variant '{template_variant}'",
+            )
+        paper = settings.get("paper_size")
+        return {
+            **settings,
+            "template": theme["base_template"],
+            "template_variant": variant,
+            "paper_size": "A4" if str(paper or "").lower() == "thermal" else paper,
+        }
+    if layout:
+        if layout not in workflow.THERMAL_LAYOUTS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown thermal_layout '{thermal_layout}'",
+            )
+        return {
+            **settings,
+            "template": "thermal",
+            "thermal_print": {**(settings.get("thermal_print") or {}), "layout": layout},
+        }
+    return settings
+
+
 @router.get("/{id}/pdf")
 def download_invoice_pdf(
     id: str,
@@ -816,6 +856,14 @@ def download_invoice_pdf(
         default="detailed",
         pattern="^(simple|detailed)$",
         description="`detailed` is the full tax invoice; `simple` is the short customer copy",
+    ),
+    template_variant: str | None = Query(
+        default=None,
+        description="This download only: a regular theme id from GET /invoice-templates. Not saved.",
+    ),
+    thermal_layout: str | None = Query(
+        default=None,
+        description="This download only: print as a thermal receipt in this thermal theme. Not saved.",
     ),
     db: Session = Depends(get_db),
 ) -> Response:
@@ -838,7 +886,9 @@ def download_invoice_pdf(
     """
     org_id = _org_id(user)
     invoice = _owned(db, id, org_id)
-    settings = workflow.invoice_settings(user.organization)
+    settings = _with_pdf_overrides(
+        workflow.invoice_settings(user.organization), template_variant, thermal_layout
+    )
     builder = invoice_simple_pdf if format == "simple" else invoice_detailed_pdf
 
     item_images: dict[str, bytes] = {}

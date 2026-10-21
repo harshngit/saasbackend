@@ -7,13 +7,14 @@ still behaves predictably and a setting added later needs no migration.
 
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 
 from app.core.workflow import (
     ALLOWED_ITEM_COLUMNS,
     FONT_FAMILIES,
     INVOICE_TEMPLATES,
     PAPER_SIZES,
+    REGULAR_THEMES_BY_ID,
     THERMAL_LAYOUTS,
     THERMAL_PAPER_WIDTHS,
 )
@@ -420,3 +421,60 @@ class InvoiceSettingsUpdate(BaseModel):
     footer: FooterSettingsUpdate | None = None
     regular_print: RegularPrintSettingsUpdate | None = None
     thermal_print: ThermalPrintSettingsUpdate | None = None
+
+    @field_validator("template_variant", mode="before")
+    @classmethod
+    def _known_variant(cls, value: object) -> object:
+        """A newly saved regular theme must be one the catalog knows. (Reading stays
+        lenient: an older stored value falls back to the base template.)"""
+        value = _lower(value)
+        if value in (None, ""):
+            return None
+        if value not in REGULAR_THEMES_BY_ID:
+            raise ValueError(f"unknown template_variant; expected one of {', '.join(REGULAR_THEMES_BY_ID)}")
+        return value
+
+    @model_validator(mode="after")
+    def _variant_matches_template(self) -> "InvoiceSettingsUpdate":
+        # Thermal is excluded: a thermal firm still keeps a regular theme for its A4 copy.
+        if self.template and self.template != "thermal" and self.template_variant:
+            base = REGULAR_THEMES_BY_ID[self.template_variant]["base_template"]
+            if base != self.template:
+                raise ValueError(
+                    f"template_variant '{self.template_variant}' belongs to template '{base}', not '{self.template}'"
+                )
+        return self
+
+
+class RegularThemeOut(BaseModel):
+    id: str
+    name: str
+    base_template: str
+    header: str
+    table: str
+    totals: str
+    accent: str
+    density: str
+
+
+class ThermalThemeOut(BaseModel):
+    id: str
+    name: str
+    layout: str
+    variant: int | None = None
+    show_extras: bool = False
+
+
+class InvoiceTemplateSelection(BaseModel):
+    template: str
+    template_variant: str | None = Field(default=None, description="Exactly what is saved, possibly a legacy value")
+    resolved_template_variant: str = Field(description="The regular theme the PDF renders")
+    thermal_layout: str = Field(description="The thermal theme the receipt renders")
+
+
+class InvoiceTemplateCatalog(BaseModel):
+    """GET /invoice-templates: the theme catalog and this firm's current choice."""
+
+    selected: InvoiceTemplateSelection
+    regular: list[RegularThemeOut]
+    thermal: list[ThermalThemeOut]
