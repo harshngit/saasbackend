@@ -28,6 +28,14 @@ class InventoryItemOut(BaseModel):
     total_stock: int              # effective available stock
     is_active: bool
     variations: list[VariantStock]
+    # The product's own cover image, so the stock screens need no extra /products call.
+    cover_image: str | None = None
+
+    @field_validator("cover_image", mode="after")
+    @classmethod
+    def _normalize_cover_image(cls, v: str | None) -> str | None:
+        from app.core.files import normalize_file_url
+        return normalize_file_url(v)
 
 
 class StockMovementOut(BaseModel):

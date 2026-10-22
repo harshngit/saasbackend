@@ -1112,3 +1112,83 @@ def test_scope_reconciliation_fields(setup_test_data):
         assert res_bad.status_code == 400, f"Expected 400 for {endpoint}, got {res_bad.status_code}"
 
 
+def test_inventory_exposes_product_cover_image(setup_test_data, monkeypatch):
+    """GET /inventory and /inventory/{id} carry the product's cover image, normalised like
+    the product API, so the stock screens need no /products call (or products.view)."""
+    from app.core import files
+
+    db: Session = setup_test_data["db"]
+    org_a, org_b = setup_test_data["org_a"], setup_test_data["org_b"]
+    monkeypatch.setattr(files.settings, "public_base_url", "https://api.example.com", raising=False)
+
+    tag = uuid.uuid4().hex[:6]
+    file_id = str(uuid.uuid4())
+    covers = {
+        "bare": file_id,                                  # a stored bare file id
+        "relative": f"/files/{file_id}",                  # a relative files path
+        "absolute": "https://cdn.example.com/p.png",      # already absolute: unchanged
+        "none": None,                                     # no image
+    }
+    products = {}
+    for key, cover in covers.items():
+        product = Product(organization_id=org_a.id, name=f"ImgStock {tag} {key}", sku=f"IMG-{tag}-{key}",
+                          cover_image=cover, total_inventory=7)
+        db.add(product)
+        products[key] = product
+    # Filler rows so some image products land beyond page one
+    for i in range(12):
+        db.add(Product(organization_id=org_a.id, name=f"ImgStock {tag} filler {i:02d}", sku=f"IMG-{tag}-f{i}",
+                       cover_image=f"https://cdn.example.com/f{i}.png"))
+    other = Product(organization_id=org_b.id, name=f"ImgStock {tag} other", cover_image="https://cdn.example.com/b.png")
+    db.add(other)
+    db.commit()
+
+    expected = {
+        "bare": f"https://api.example.com/files/{file_id}",
+        "relative": f"https://api.example.com/files/{file_id}",
+        "absolute": "https://cdn.example.com/p.png",
+        "none": None,
+    }
+    for key, product in products.items():  # the helper the product API's schemas use
+        assert files.normalize_file_url(product.cover_image) == expected[key]
+
+    # A staff role with inventory.view but no products permission
+    role = Role(organization_id=org_a.id, name=f"Stock viewer {tag}", permissions={"inventory": {"view": True}})
+    db.add(role)
+    db.flush()
+    staff = User(email=f"stock-{tag}@sorting-a.example.com", name="Stock Viewer", password_hash="x",
+                 organization_id=org_a.id, system_role=SystemRole.STAFF.value, role_id=role.id, is_active=True)
+    db.add(staff)
+    db.commit()
+
+    try:
+        app.dependency_overrides[get_current_user] = lambda: staff
+        assert client.get("/products").status_code == 403  # the old image source is out of reach
+
+        seen = {}
+        for page in (1, 2, 3):
+            res = client.get("/inventory", params={"search": f"ImgStock {tag}", "page": page, "page_size": 6,
+                                                   "sort_by": "name", "sort_order": "asc"})
+            assert res.status_code == 200, res.text
+            body = res.json()
+            assert body["total"] == 16
+            for row in body["items"]:
+                seen[row["id"]] = row
+        assert len(seen) == 16  # pagination covers every product, beyond page one too
+        for key, product in products.items():
+            row = seen[product.id]
+            assert row["cover_image"] == expected[key], key
+            assert row["total_stock"] == 7 and row["sku"] == f"IMG-{tag}-{key}"  # existing fields unchanged
+            assert set(row) >= {"id", "name", "sku", "product_type", "brand", "category_id", "total_inventory",
+                                "total_stock", "is_active", "variations", "cover_image"}
+        assert other.id not in seen  # tenant isolation
+
+        detail = client.get(f"/inventory/{products['bare'].id}")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["cover_image"] == expected["bare"] and "movements" in detail.json()
+        assert client.get(f"/inventory/{products['none'].id}").json()["cover_image"] is None
+        assert client.get(f"/inventory/{other.id}").status_code == 404  # other firm's product
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
