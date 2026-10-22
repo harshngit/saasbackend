@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -6,10 +6,12 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.pagination import paginate
 from app.core.sorting import apply_sorting
-from app.models import Notification, User
+from app.models import Notification, PushDevice, User
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.notification import MessageResponse, NotificationOut, UnreadCount
 from app.schemas.pagination import PaginatedResponse
+from app.schemas.push import PushDeviceOut, PushDeviceRegister, PushTestResult
+from app.services import push_service
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -137,3 +139,68 @@ def delete_notification(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found")
     db.delete(n)
     db.commit()
+
+
+# ------------------------------ push devices (FCM) ------------------------------
+
+
+@router.post("/devices/register", response_model=PushDeviceOut)
+def register_push_device(
+    payload: PushDeviceRegister,
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PushDevice:
+    """Register this browser / Android install for push, or refresh its token.
+
+    The owner is always the signed-in user (and their organization). A token already registered
+    by another user of the same organization moves to the current user -- whoever holds the
+    device now gets its pushes. A token registered in a different organization is not moved:
+    409, and the existing registration is left as it is (the previous user must unregister the
+    device on logout, or the client must request a fresh FCM token).
+    201 when a new registration is created, 200 when an existing one is refreshed. The response
+    never contains the token, only its last 6 characters."""
+    try:
+        device, created = push_service.register_device(db, user, payload.token, payload.platform, payload.label)
+    except push_service.PushTokenConflict:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This device is registered to another organization. Unregister it there first, "
+            "or request a new push token on the device.",
+        )
+    db.commit()
+    db.refresh(device)
+    response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    return device
+
+
+@router.delete("/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_push_device(
+    device_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Unregister one of the current user's devices (e.g. on logout). Someone else's device,
+    or one already removed, is 404."""
+    device = db.get(PushDevice, device_id)
+    if device is None or device.user_id != user.id or device.organization_id != user.organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    db.delete(device)
+    db.commit()
+
+
+@router.post("/devices/test", response_model=PushTestResult)
+def send_test_push(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> PushTestResult:
+    """Send a test notification to the current user's own registered devices -- for checking a
+    web / Android integration end to end. It can only ever reach the caller's devices."""
+    result = push_service.send_to_user(
+        db, user, "Test notification", "Push notifications are working for this device.",
+        data={"type": "push_test"},
+    )
+    db.commit()  # persists removal of any token Firebase reported as invalid
+    return PushTestResult(
+        enabled=result.enabled, attempted=result.attempted, accepted=result.accepted,
+        invalid_tokens_removed=result.invalid_tokens_removed, transient_failures=result.transient_failures,
+        detail=result.detail,
+    )

@@ -123,6 +123,14 @@ class Settings(BaseSettings):
     smtp_from: str = "CRM SaaS <no-reply@crm-saas.local>"
     smtp_use_tls: bool = True
 
+    # Push notifications (Firebase Cloud Messaging). Off unless explicitly enabled.
+    # FIREBASE_SERVICE_ACCOUNT_JSON is the service-account key JSON (raw, or base64 of it),
+    # supplied as a runtime secret -- never Application Default Credentials. FIREBASE_PROJECT_ID
+    # is optional; when set it must match the key's project_id.
+    push_notifications_enabled: bool = False
+    firebase_service_account_json: str = ""
+    firebase_project_id: str = ""
+
     super_admin_email: str = "superadmin@demo.com"
     # No default on purpose: a known password baked into source code would be
     # a working production credential for anyone who reads the repo. Set

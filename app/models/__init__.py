@@ -19,6 +19,7 @@ from app.models.category import Category
 from app.models.customer import Customer, CustomerDocument, CustomerPayment, CustomerPaymentAllocation, PaymentSplit
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense, ExpenseItem
 from app.models.notification import Notification
+from app.models.push_device import PUSH_PLATFORMS, PushDevice
 from app.models.number_sequence import NumberSequence
 from app.models.stored_file import StoredFile
 from app.models.storage_usage import OrganizationStorageUsage
@@ -175,6 +176,8 @@ __all__ = [
     "EXPENSE_STATUSES",
     "EXPENSE_CATEGORIES",
     "Notification",
+    "PushDevice",
+    "PUSH_PLATFORMS",
     "Invoice",
     "InvoiceItem",
     "VehicleLoading",
