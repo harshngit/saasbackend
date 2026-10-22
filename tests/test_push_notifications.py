@@ -208,7 +208,7 @@ def test_register_refresh_and_multiple_devices(db_session):
 
 
 @pytest.mark.parametrize("payload", [
-    {"token": "x" * 40, "platform": "ios"},
+    {"token": "x" * 40, "platform": "blackberry"},
     {"token": "x" * 40, "platform": "WEB"},
     {"token": "short", "platform": "web"},
     {"token": "x" * 1025, "platform": "web"},
@@ -551,4 +551,305 @@ def test_push_devices_migration_up_and_down(tmp_path):
     assert any(u["column_names"] == ["token"] for u in inspector.get_unique_constraints("push_devices"))
     run(migration.downgrade)
     assert "push_devices" not in sa.inspect(mig_engine).get_table_names()
+    mig_engine.dispose()
+
+
+# ------------------------------------------------------------------ iOS and the payload contract
+
+
+def test_ios_registration_and_apns_payload(db_session):
+    _, client = _user(db_session)
+    res = client.post("/notifications/devices/register", json={"token": _token("i"), "platform": "ios"})
+    assert res.status_code == 201 and res.json()["platform"] == "ios"
+
+    ios = SimpleNamespace(token=_token("i"), platform="ios")
+    msg = push_service.build_message(ios, "Order completed", "SO-1", {"type": "order_status_changed"})
+    assert msg.android is None and msg.webpush is None
+    assert msg.apns.payload.aps.alert.title == "Order completed" and msg.apns.payload.aps.alert.body == "SO-1"
+    assert msg.apns.payload.aps.sound == "default"
+    # Web and Android carry no APNs block.
+    for platform in ("web", "android"):
+        assert push_service.build_message(SimpleNamespace(token=_token(), platform=platform), "T").apns is None
+
+
+def test_build_data_contract():
+    from app.core import notification_types as nt
+
+    assert nt.build_data(nt.ORDER_STATUS_CHANGED, order_id=12, status="completed") == {
+        "event": "order_status_changed", "order_id": "12", "status": "completed"}
+    assert nt.build_data(nt.PAYMENT_RECEIVED, payment_id="p", invoice_id=None) == {
+        "event": "payment_received", "payment_id": "p"}
+    with pytest.raises(ValueError):
+        nt.build_data("not_an_event")
+    with pytest.raises(ValueError):
+        nt.build_data(nt.ORDER_CREATED, order_id="o", customer_phone="98765")
+    assert set(nt.EVENT_CATEGORY) == set(nt.ALL_EVENTS)
+
+
+# ------------------------------------------------------------------ in-app fields
+
+
+def _member(db: Session, org_id: str, role: str = "sales_officer", system_role: str | None = "staff",
+            active: bool = True) -> User:
+    user = User(id=str(uuid.uuid4()), organization_id=org_id, email=f"m_{uuid.uuid4().hex[:8]}@x.com",
+                name="Member", password_hash="h", role=role, system_role=system_role, is_active=active)
+    db.add(user)
+    db.commit()
+    return user
+
+
+def test_notification_data_read_at_and_read_all(db_session):
+    from app.core import notification_types as nt
+    from app.models import Notification
+    from app.services import notification_service
+
+    user, client = _user(db_session)
+    n = notification_service.notify(db_session, user.id, "Leave approved",
+                                    data=nt.build_data(nt.LEAVE_STATUS_CHANGED, leave_id="L1", status="approved"))
+    notification_service.notify(db_session, user.id, "Second", event=nt.PUSH_TEST)
+    db_session.commit()
+    assert n.type == "leave" and n.organization_id == user.organization_id and n.read_at is None
+
+    listed = client.get("/notifications").json()
+    items = listed["items"] if isinstance(listed, dict) else listed
+    row = next(i for i in items if i["id"] == n.id)
+    assert row["data"] == {"event": "leave_status_changed", "leave_id": "L1", "status": "approved"}
+    assert row["read_at"] is None
+
+    assert client.patch(f"/notifications/{n.id}/read").status_code == 200
+    db_session.expire_all()
+    stamped = db_session.get(Notification, n.id).read_at
+    assert stamped is not None
+    client.patch(f"/notifications/{n.id}/read")
+    db_session.expire_all()
+    assert db_session.get(Notification, n.id).read_at == stamped  # first read wins
+
+    assert client.post("/notifications/read-all").status_code == 200
+    assert client.patch("/notifications/read-all").status_code == 200  # idempotent, both verbs
+    db_session.expire_all()
+    rows = db_session.query(Notification).filter(Notification.user_id == user.id).all()
+    assert len(rows) == 2 and all(r.is_read and r.read_at is not None for r in rows)
+    assert db_session.get(Notification, n.id).read_at == stamped
+
+
+def test_org_admins_uses_the_effective_role(db_session):
+    from app.services import notification_service
+
+    owner, _ = _user(db_session)
+    org_id = owner.organization_id
+    legacy_admin = _member(db_session, org_id, role="admin", system_role=None)
+    demoted = _member(db_session, org_id, role="admin", system_role="staff")  # legacy role still says admin
+    promoted = _member(db_session, org_id, role="accountant", system_role="admin")
+    _member(db_session, org_id, role="admin", system_role="admin", active=False)
+    _member(db_session, org_id)
+    other_org_admin, _ = _user(db_session)
+
+    ids = {u.id for u in notification_service.org_admins(db_session, org_id)}
+    assert ids == {owner.id, legacy_admin.id, promoted.id}
+    assert demoted.id not in ids and other_org_admin.id not in ids
+
+    created = notification_service.notify_org_admins(db_session, org_id, "Hi", exclude_user_id=owner.id)
+    assert {n.user_id for n in created} == {legacy_admin.id, promoted.id}
+    db_session.rollback()
+
+
+# ------------------------------------------------------------------ push after commit
+
+
+@pytest.fixture
+def inline_push(monkeypatch):
+    """Push enabled, the worker pool replaced by an inline call, and send_to_user recorded."""
+    monkeypatch.setattr(push_service.settings, "push_notifications_enabled", True)
+    sent = []
+
+    def fake_send(db, user, title, body=None, data=None, link=None):
+        sent.append({"user_id": user.id, "title": title, "data": data})
+        return push_service.PushResult(enabled=True, attempted=1, accepted=1)
+
+    monkeypatch.setattr(push_service, "send_to_user", fake_send)
+    monkeypatch.setattr(push_service, "_dispatch", push_service.deliver_notification_pushes)
+    return sent
+
+
+def test_push_is_sent_only_after_commit_with_the_same_id_and_type(db_session, inline_push):
+    from app.core import notification_types as nt
+    from app.services import notification_service
+
+    user, _ = _user(db_session)
+    n = notification_service.notify(db_session, user.id, "Order completed", "SO-1",
+                                    data=nt.build_data(nt.ORDER_STATUS_CHANGED, order_id="o1", status="completed"))
+    db_session.flush()
+    assert inline_push == []  # nothing before commit
+    db_session.commit()
+    assert len(inline_push) == 1
+    data = inline_push[0]["data"]
+    assert data["notification_id"] == n.id and data["type"] == "order_status_changed"
+    assert data["category"] == "order" and data["order_id"] == "o1" and data["status"] == "completed"
+    assert all(isinstance(v, str) for v in data.values())
+
+    db_session.commit()  # a later commit does not resend
+    assert len(inline_push) == 1
+
+
+def test_rollback_discards_the_push(db_session, inline_push):
+    from app.models import Notification
+    from app.services import notification_service
+
+    user, _ = _user(db_session)
+    n = notification_service.notify(db_session, user.id, "Rolled back")
+    db_session.rollback()
+    db_session.commit()
+    assert inline_push == [] and db_session.get(Notification, n.id) is None
+
+
+def test_push_failure_keeps_the_in_app_notification(db_session, inline_push, monkeypatch):
+    from app.models import Notification
+    from app.services import notification_service
+
+    def boom(*a, **k):
+        raise RuntimeError("firebase down")
+
+    monkeypatch.setattr(push_service, "send_to_user", boom)
+    user, _ = _user(db_session)
+    n = notification_service.notify(db_session, user.id, "Still here")
+    db_session.commit()  # must not raise
+    db_session.expire_all()
+    assert db_session.get(Notification, n.id) is not None
+
+
+def test_push_disabled_still_creates_in_app_notifications(db_session, monkeypatch):
+    from app.models import Notification
+    from app.services import notification_service
+
+    monkeypatch.setattr(push_service.settings, "push_notifications_enabled", False)
+    monkeypatch.setattr(push_service, "_dispatch", lambda ids: pytest.fail("must not push"))
+    user, _ = _user(db_session)
+    n = notification_service.notify(db_session, user.id, "In-app only")
+    db_session.commit()
+    assert db_session.get(Notification, n.id) is not None
+
+
+# ------------------------------------------------------------------ business events
+
+
+def test_order_status_changed_recipients_and_guards(db_session, inline_push):
+    from app.services import notification_service
+
+    owner, _ = _user(db_session)
+    other_admin = _member(db_session, owner.organization_id, role="admin", system_role="admin")
+    order = SimpleNamespace(id="o1", organization_id=owner.organization_id, order_number="SO-9", status="completed")
+
+    created = notification_service.notify_order_status_changed(db_session, order, "processing", actor_id=owner.id)
+    assert [n.user_id for n in created] == [other_admin.id]
+    assert created[0].data == {"event": "order_status_changed", "order_id": "o1", "status": "completed"}
+    assert notification_service.notify_order_status_changed(db_session, order, "completed") == []  # unchanged
+    order.status = "processing"
+    assert notification_service.notify_order_status_changed(db_session, order, "placed") == []  # not notified
+    db_session.commit()
+    assert [p["user_id"] for p in inline_push] == [other_admin.id]
+
+
+def test_delivery_status_changed_recipients_and_guards(db_session):
+    from app.services import notification_service
+
+    owner, _ = _user(db_session)
+    partner = _member(db_session, owner.organization_id, role="delivery_partner")
+    delivery = SimpleNamespace(id="d1", organization_id=owner.organization_id, delivery_number="DL-1",
+                               delivery_note_number=None, delivery_partner_id=partner.id, status="delivered")
+
+    created = notification_service.notify_delivery_status_changed(db_session, delivery, "in_transit", actor_id=partner.id)
+    assert [n.user_id for n in created] == [owner.id]
+    assert created[0].type == "delivery" and created[0].link == "d1"
+    delivery.status = "failed"
+    assert notification_service.notify_delivery_status_changed(db_session, delivery, "failed") == []
+
+    delivery.status = "cancelled"
+    created = notification_service.notify_delivery_status_changed(db_session, delivery, "planned", actor_id=owner.id)
+    assert [n.user_id for n in created] == [partner.id]
+    assert created[0].data == {"event": "delivery_status_changed", "delivery_id": "d1", "status": "cancelled"}
+    assert notification_service.notify_delivery_status_changed(db_session, delivery, "planned", actor_id=partner.id) == []
+    delivery.delivery_partner_id = None
+    assert notification_service.notify_delivery_status_changed(db_session, delivery, "planned") == []
+    db_session.rollback()
+
+
+def test_leave_decision_notifies_the_applicant_once(db_session, monkeypatch):
+    from datetime import date
+
+    from app.models import Leave, Notification
+    from app.services import entitlement_service
+
+    # The test firm has no plan; the leave module's plan gate is not what is under test.
+    monkeypatch.setattr(entitlement_service, "check_entitlement", lambda *a, **k: None)
+
+    admin, client = _user(db_session)
+    staff = _member(db_session, admin.organization_id)
+    leave = Leave(id=str(uuid.uuid4()), organization_id=admin.organization_id, user_id=staff.id,
+                  start_date=date(2026, 11, 2), end_date=date(2026, 11, 3), days_count=2)
+    db_session.add(leave)
+    db_session.commit()
+
+    assert client.patch(f"/leaves/{leave.id}/approve").status_code == 200
+    assert client.patch(f"/leaves/{leave.id}/approve").status_code == 400  # no longer pending
+    db_session.expire_all()
+    rows = db_session.query(Notification).filter(Notification.user_id == staff.id).all()
+    assert len(rows) == 1 and rows[0].type == "leave"
+    assert rows[0].data == {"event": "leave_status_changed", "leave_id": leave.id, "status": "approved"}
+    assert db_session.query(Notification).filter(Notification.user_id == admin.id).count() == 0
+
+
+def test_manual_payment_receipt_notifies_other_admins(db_session):
+    from app.models import Customer, Notification
+
+    recorder, client = _user(db_session)
+    other_admin = _member(db_session, recorder.organization_id, role="admin", system_role="admin")
+    customer = Customer(id=str(uuid.uuid4()), organization_id=recorder.organization_id, name="Cust")
+    db_session.add(customer)
+    db_session.commit()
+
+    res = client.post("/payment-receipts", json={"customer_id": customer.id, "amount_received": 100,
+                                                 "payment_method": "cash"})
+    assert res.status_code in (200, 201), res.text
+    db_session.expire_all()
+    rows = db_session.query(Notification).filter(
+        Notification.organization_id == recorder.organization_id, Notification.title == "Payment received").all()
+    assert [r.user_id for r in rows] == [other_admin.id]
+    assert rows[0].data == {"event": "payment_received", "payment_id": res.json()["id"]}
+
+
+def test_notifications_migration_up_and_down(tmp_path):
+    import importlib.util
+    import pathlib
+
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = (pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions"
+            / "c7d8e9f0a1b2_notifications_data_read_at.py")
+    spec = importlib.util.spec_from_file_location("notifications_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    index_names = {name for name, _ in migration._INDEXES}
+
+    mig_engine = sa.create_engine(f"sqlite:///{tmp_path / 'n.db'}")
+    with mig_engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE notifications (id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36), "
+                             "organization_id VARCHAR(36), title VARCHAR(200), is_read BOOLEAN, created_at DATETIME)"))
+        conn.execute(sa.text("INSERT INTO notifications (id, user_id, title, is_read) VALUES ('n1', 'u1', 'old', 0)"))
+
+    def run(step):
+        with mig_engine.begin() as conn:
+            with Operations.context(MigrationContext.configure(conn)):
+                step()
+
+    run(migration.upgrade)
+    run(migration.upgrade)  # idempotent
+    inspector = sa.inspect(mig_engine)
+    assert {"data", "read_at"} <= {c["name"] for c in inspector.get_columns("notifications")}
+    assert index_names <= {ix["name"] for ix in inspector.get_indexes("notifications")}
+    run(migration.downgrade)
+    assert not index_names & {ix["name"] for ix in sa.inspect(mig_engine).get_indexes("notifications")}
+    with mig_engine.connect() as conn:
+        assert conn.execute(sa.text("SELECT title FROM notifications WHERE id = 'n1'")).scalar() == "old"
     mig_engine.dispose()

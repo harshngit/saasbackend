@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -111,17 +113,25 @@ def mark_read(notification_id: str, user: User = Depends(get_current_user), db: 
     if n is None or n.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found")
     n.is_read = True
+    if n.read_at is None:  # first read only -- repeating the call keeps the original time
+        n.read_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(n)
     return n
 
 
 @router.patch("/read-all", response_model=MessageResponse)
+@router.post("/read-all", response_model=MessageResponse)
 def mark_all_read(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> MessageResponse:
+    """Mark every unread notification read (PATCH, or POST for clients that prefer it).
+    Already-read notifications keep their original read_at."""
     updated = (
         db.query(Notification)
         .filter(Notification.user_id == user.id, Notification.is_read.is_(False))
-        .update({Notification.is_read: True}, synchronize_session=False)
+        .update(
+            {Notification.is_read: True, Notification.read_at: datetime.now(timezone.utc)},
+            synchronize_session=False,
+        )
     )
     db.commit()
     return MessageResponse(detail=f"Marked {updated} notification(s) read")

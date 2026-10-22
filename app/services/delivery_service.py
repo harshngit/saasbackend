@@ -42,6 +42,7 @@ from app.models import (
     Warehouse,
 )
 from app.services.tracking_service import TrackingError
+from app.core import notification_types as nt
 from app.services import notification_service, numbering_service, stock_service
 
 
@@ -263,6 +264,7 @@ def notify_delivery_assignment(
         type="delivery",
         link=delivery.id,
         organization_id=delivery.organization_id,
+        data=nt.build_data(nt.DELIVERY_ASSIGNED, delivery_id=delivery.id),
     )
 
 
@@ -614,6 +616,9 @@ def cancel(db: Session, delivery: Delivery, reason: str | None = None, actor: Us
         delivery.notes = f"{delivery.notes}\n{note_text}" if delivery.notes else note_text
     record_history(
         db, delivery, "cancelled", actor=actor, previous_status=previous, new_status="cancelled", notes=reason
+    )
+    notification_service.notify_delivery_status_changed(
+        db, delivery, previous, actor_id=actor.id if actor else None
     )
     queue_event(
         db,
@@ -1000,6 +1005,7 @@ def confirm(
         order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
         if order is not None:
             order.fulfilment_status = "failed"
+        notification_service.notify_delivery_status_changed(db, delivery, previous, actor_id=user.id)
         return
 
     by_id = {item.id: item for item in delivery.items}
@@ -1059,7 +1065,8 @@ def confirm(
 
     order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
     if order is not None:
-        _settle_order_fulfilment(db, order)
+        _settle_order_fulfilment(db, order, actor_id=user.id)
+    notification_service.notify_delivery_status_changed(db, delivery, previous, actor_id=user.id)
 
     queue_event(
         db,
@@ -1076,15 +1083,17 @@ def confirm(
     )
 
 
-def _settle_order_fulfilment(db: Session, order: SalesOrder) -> None:
+def _settle_order_fulfilment(db: Session, order: SalesOrder, actor_id: str | None = None) -> None:
     """The order is delivered once every line has been, across all its deliveries."""
     ordered = sum(item.quantity or 0 for item in order.items)
     delivered = sum(item.delivered_quantity or 0 for item in order.items)
     if delivered <= 0:
         return
     if delivered + 0.001 >= ordered:
+        previous_status = order.status
         order.fulfilment_status = "delivered"
         order.status = "completed"
+        notification_service.notify_order_status_changed(db, order, previous_status, actor_id=actor_id)
     else:
         order.fulfilment_status = "partially_delivered"
         order.status = "processing"

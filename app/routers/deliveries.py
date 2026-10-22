@@ -28,6 +28,7 @@ from app.models import (
     DeliveryHistory,
     DeliveryItem,
 )
+from app.core import notification_types as nt
 from app.services import (
     delivery_redistribution_service,
     delivery_service,
@@ -703,6 +704,7 @@ def reject_delivery(
             body=f"{delivery.delivery_number} was rejected by the partner — needs reassignment",
             type="delivery",
             link=delivery.id,
+            data=nt.build_data(nt.DELIVERY_REJECTED, delivery_id=delivery.id),
         )
         db.commit()
     except Exception:
@@ -1663,6 +1665,7 @@ def update_delivery_status(
 
     # Deliver outcome mapping
     # choices: Delivered | Partial | Failed | Rescheduled
+    previous_order_status = order.status
     if payload.status == "Delivered":
         order.fulfilment_status = "delivered"
         order.status = "completed"
@@ -1755,6 +1758,7 @@ def update_delivery_status(
             if delivery_status == "failed":
                 delivery.failure_reason = payload.reason or delivery.failure_reason
 
+    notification_service.notify_order_status_changed(db, order, previous_order_status, actor_id=user.id)
     db.commit()
     db.refresh(order)
     return {

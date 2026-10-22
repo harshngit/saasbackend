@@ -9,7 +9,7 @@ class PushDeviceRegister(BaseModel):
     from the access token only -- there is no user or organization field to set."""
 
     token: str = Field(min_length=20, max_length=1024, description="FCM registration token from the client SDK")
-    platform: Literal["web", "android"]
+    platform: Literal["web", "android", "ios"]
     label: str | None = Field(default=None, max_length=100, description='Optional, e.g. "Chrome on Windows"')
 
     @field_validator("token")

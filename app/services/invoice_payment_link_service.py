@@ -39,6 +39,7 @@ from app.schemas.payment_gateway import (
     PaymentGatewayOut,
     REQUIRED_WEBHOOK_EVENTS,
 )
+from app.core import notification_types as nt
 from app.services import activity_service, notification_service, payment_service
 
 logger = logging.getLogger("crm.invoice_payment_link")
@@ -504,7 +505,7 @@ def record_online_payment(
 
     try:
         # 2. Record through canonical payment pipeline
-        payment_service.record(
+        payment = payment_service.record(
             db,
             org_id=link.organization_id,
             customer=invoice.customer,
@@ -533,6 +534,7 @@ def record_online_payment(
             body=f"Payment ID: {razorpay_payment_id}",
             type="success",
             link=f"/invoices/{invoice.id}",
+            data=nt.build_data(nt.PAYMENT_RECEIVED, payment_id=payment.id, invoice_id=invoice.id),
         )
 
         db.commit()

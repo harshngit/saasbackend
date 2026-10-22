@@ -4,6 +4,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core import notification_types as nt
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
@@ -13,7 +14,7 @@ from app.models import Leave, SystemRole, User
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.leave import LeaveCreate, LeaveOut, LeaveRejectBody, LeaveUpdate
 from app.schemas.pagination import PaginatedResponse
-from app.services import leave_service
+from app.services import leave_service, notification_service
 
 router = APIRouter(
     prefix="/leaves",
@@ -262,6 +263,17 @@ def update_leave(
     return leave
 
 
+def _notify_leave_decision(db: Session, leave: Leave, actor: User) -> None:
+    """Tell the applicant their leave was approved or rejected (not when they decided it themselves)."""
+    if leave.user_id == actor.id:
+        return
+    notification_service.notify(
+        db, leave.user_id, f"Leave {leave.status}", f"{leave.start_date} to {leave.end_date}",
+        organization_id=leave.organization_id,
+        data=nt.build_data(nt.LEAVE_STATUS_CHANGED, leave_id=leave.id, status=leave.status),
+    )
+
+
 @router.patch("/{id}/approve", response_model=LeaveOut)
 def approve_leave(
     id: str,
@@ -280,6 +292,7 @@ def approve_leave(
 
     leave.status = "approved"
     leave.approved_by = user.id
+    _notify_leave_decision(db, leave, user)
     db.commit()
     db.refresh(leave)
     return leave
@@ -305,6 +318,7 @@ def reject_leave(
     leave.status = "rejected"
     leave.approved_by = user.id
     leave.reject_reason = payload.reject_reason
+    _notify_leave_decision(db, leave, user)
     db.commit()
     db.refresh(leave)
     return leave

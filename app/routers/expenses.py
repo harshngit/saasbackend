@@ -13,6 +13,7 @@ from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.expense import BulkDelete, BulkDeleteResult, ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
+from app.core import notification_types as nt
 from app.services import expense_service, lookup_service, notification_service, numbering_service
 
 router = APIRouter(
@@ -173,7 +174,8 @@ def create_expense(
     db.flush()
     notification_service.notify_org_admins(
         db, expense.organization_id, "New expense submitted",
-        f"{expense.category}: Rs {expense.amount:,.2f}", type="expense", link=expense.id)
+        f"{expense.category}: Rs {expense.amount:,.2f}", type="expense", link=expense.id,
+        data=nt.build_data(nt.EXPENSE_CREATED, expense_id=expense.id))
     db.commit()
     db.refresh(expense)
     return expense
@@ -418,7 +420,8 @@ def request_clarification(
     if expense.submitted_by:
         notification_service.notify(
             db, expense.submitted_by, "Clarification requested on your expense",
-            payload.reason, type="expense", link=expense.id, organization_id=expense.organization_id)
+            payload.reason, type="expense", link=expense.id, organization_id=expense.organization_id,
+            data=nt.build_data(nt.EXPENSE_CLARIFICATION_REQUESTED, expense_id=expense.id))
     db.commit()
     db.refresh(expense)
     return expense

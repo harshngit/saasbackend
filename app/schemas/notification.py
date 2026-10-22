@@ -13,6 +13,9 @@ class NotificationOut(BaseModel):
     link: str | None
     is_read: bool
     created_at: datetime
+    # Added for push/in-app parity: the event and its identifiers, and when it was first read.
+    data: dict[str, str] | None = None
+    read_at: datetime | None = None
 
 
 class UnreadCount(BaseModel):

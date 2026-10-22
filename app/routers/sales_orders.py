@@ -41,7 +41,9 @@ from app.schemas.sales_order import (
     RejectBody,
     UserBrief,
 )
-from app.services import delivery_service, lookup_service, order_service, payment_service, stock_service
+from app.services import (
+    delivery_service, lookup_service, notification_service, order_service, payment_service, stock_service,
+)
 
 router = APIRouter(
     prefix="/orders",
@@ -852,9 +854,11 @@ def reject_order(
             detail="Only an order awaiting approval can be rejected",
         )
     stock_service.release_for_order(db, order.id)
+    previous_status = order.status
     order.status = "cancelled"
     order.fulfilment_status = "not_started"
     order.reject_reason = payload.reason
+    notification_service.notify_order_status_changed(db, order, previous_status, actor_id=user.id)
     db.commit()
     db.refresh(order)
     return _order_out(db, order)
@@ -995,10 +999,12 @@ def cancel_order(
     stock_service.release_for_order(db, order.id)
     for item in order.items:
         item.reserved_quantity = 0
+    previous_status = order.status
     order.status = "cancelled"
     order.fulfilment_status = "not_started"
     if payload.reason:
         order.reject_reason = payload.reason
+    notification_service.notify_order_status_changed(db, order, previous_status, actor_id=user.id)
 
     linked_deliveries = (
         db.query(Delivery)
@@ -1201,9 +1207,11 @@ def confirm_order_pickup(
                 item.delivered_quantity = qty
                 item.reserved_quantity = 0.0
 
+    previous_status = order.status
     order.pickup_status = "collected"
     order.fulfilment_status = "delivered"
     order.status = "completed"
+    notification_service.notify_order_status_changed(db, order, previous_status, actor_id=user.id)
     if payload:
         if payload.collected_by:
             order.collected_by = payload.collected_by

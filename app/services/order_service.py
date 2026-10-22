@@ -25,6 +25,7 @@ from app.core import scoping, workflow
 from app.core.realtime import queue_event
 from app.models import Customer, Delivery, Invoice, Organization, Product, ProductVariant, SalesOrder, SalesOrderItem, User
 from app.schemas.sales_order import OrderUpdate
+from app.core import notification_types as nt
 from app.services import entitlement_service, notification_service, numbering_service, stock_service
 
 
@@ -303,7 +304,7 @@ def place_order(
     if not create_as_draft:
         notification_service.notify_org_admins(
             db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
-            type="order", link=order.id,
+            type="order", link=order.id, data=nt.build_data(nt.ORDER_CREATED, order_id=order.id),
         )
 
     queue_event(
@@ -399,7 +400,7 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
     # Notify admins
     notification_service.notify_org_admins(
         db, org_id, "Sales order confirmed", f"{order.order_number} — Rs {order.total:,.2f}",
-        type="order", link=order.id,
+        type="order", link=order.id, data=nt.build_data(nt.ORDER_CONFIRMED, order_id=order.id),
     )
 
     queue_event(

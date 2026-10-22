@@ -22,14 +22,17 @@ app may handle the message silently).
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.firebase import FirebaseConfigError, get_app
-from app.models import PushDevice, User
+from app.models import Notification, PushDevice, User
 
 logger = logging.getLogger("crm.push")
 
@@ -100,6 +103,15 @@ def build_message(device: PushDevice, title: str, body: str | None = None, data:
     kwargs = {"token": device.token, "notification": notification, "data": payload or None}
     if device.platform == "android":
         kwargs["android"] = messaging.AndroidConfig(priority="high")
+    elif device.platform == "ios":
+        # APNs alert + default sound only; no Android options. No badge: the backend has no
+        # agreed per-device badge count, and a wrong badge is worse than none.
+        kwargs["apns"] = messaging.APNSConfig(
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(alert=messaging.ApsAlert(title=notification.title, body=notification.body),
+                                  sound="default")
+            )
+        )
     elif device.platform == "web":
         fcm_options = messaging.WebpushFCMOptions(link=link) if link and link.startswith("https://") else None
         kwargs["webpush"] = messaging.WebpushConfig(fcm_options=fcm_options)
@@ -229,3 +241,95 @@ def register_device(db: Session, user: User, token: str, platform: str, label: s
     for old in stale:
         db.delete(old)
     return device, created
+
+
+# --------------------------------------------------------------------------------------------
+# Push for in-app notifications: sent only after the notification's transaction commits.
+#
+# notification_service.notify() calls queue_notification_push(); the id waits in session.info
+# until COMMIT, then a small in-process worker pool sends it with its own session (SQL is not
+# allowed on the committing session inside after_commit, and a Firebase call must not block the
+# request). A rollback discards the queue, so nothing is pushed for a failed operation. Each
+# committed notification is dispatched exactly once; a push failure never touches the in-app row.
+# No new infrastructure: if the process exits mid-send that push is lost, the in-app record stays.
+# --------------------------------------------------------------------------------------------
+
+_PENDING_KEY = "_pending_push_notifications"
+_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="push")
+
+
+def queue_notification_push(db: Session, notification: Notification) -> None:
+    """Schedule a push for this (not yet committed) notification. No-op when push is off."""
+    if not settings.push_notifications_enabled or not hasattr(db, "info"):
+        return
+    pending = db.info.setdefault(_PENDING_KEY, [])
+    if notification.id not in pending:
+        pending.append(notification.id)
+
+
+def push_data(notification: Notification) -> dict[str, str]:
+    """The FCM data map for an in-app notification: its id, the event as `type`, the in-app
+    category, the organization and the event's identifiers -- all strings, nothing sensitive."""
+    stored = dict(notification.data or {})
+    event_name = stored.pop("event", None)
+    data = {
+        "notification_id": notification.id,
+        "type": event_name or notification.type,
+        "category": notification.type,
+        "organization_id": notification.organization_id or "",
+        **{k: str(v) for k, v in stored.items() if v is not None},
+    }
+    if notification.link:
+        data["link"] = notification.link
+    return {k: v for k, v in data.items() if v != ""}
+
+
+def deliver_notification_pushes(notification_ids: list[str]) -> list[PushResult]:
+    """Send the pushes for committed notifications, with a fresh session. Failures are logged
+    (no tokens, no payloads) and never raised -- the in-app notifications already exist."""
+    from app.core.database import SessionLocal
+
+    results = []
+    db = SessionLocal()
+    try:
+        for notification_id in notification_ids:
+            notification = db.get(Notification, notification_id)
+            user = db.get(User, notification.user_id) if notification else None
+            if notification is None or user is None or not user.is_active:
+                continue
+            try:
+                result = send_to_user(db, user, notification.title, notification.body, push_data(notification))
+                db.commit()  # persist removal of tokens Firebase reported as invalid
+            except Exception as exc:  # noqa: BLE001 -- isolate one notification from the next
+                db.rollback()
+                logger.warning("Push for notification %s failed (%s)", notification_id, type(exc).__name__)
+                continue
+            results.append(result)
+            if result.attempted:
+                logger.info(
+                    "Push for notification %s: %d accepted, %d invalid removed, %d transient failures",
+                    notification_id, result.accepted, result.invalid_tokens_removed, result.transient_failures,
+                )
+    finally:
+        db.close()
+    return results
+
+
+def _dispatch(notification_ids: list[str]) -> None:
+    """Hand committed notifications to the worker pool (tests replace this to run inline)."""
+    _executor.submit(deliver_notification_pushes, notification_ids)
+
+
+@event.listens_for(Session, "after_commit")
+def _send_queued_pushes(session: Session) -> None:
+    pending = session.info.pop(_PENDING_KEY, None)
+    if pending:
+        try:
+            _dispatch(list(pending))
+        except Exception as exc:  # noqa: BLE001 -- never let push break a committed request
+            logger.warning("Could not schedule %d pushes (%s)", len(pending), type(exc).__name__)
+
+
+@event.listens_for(Session, "after_rollback")
+def _drop_queued_pushes(session: Session) -> None:
+    session.info.pop(_PENDING_KEY, None)

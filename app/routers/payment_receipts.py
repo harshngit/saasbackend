@@ -23,7 +23,8 @@ from app.schemas.payment_receipt import (
     PaymentReceiptUpdate,
     PaymentSplitOut,
 )
-from app.services import payment_service
+from app.core import notification_types as nt
+from app.services import notification_service, payment_service
 
 router = APIRouter(
     prefix="/payment-receipts",
@@ -198,6 +199,13 @@ def create_receipt(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
+    notification_service.notify_org_admins(
+        db, org_id, "Payment received", payment.receipt_number,
+        type="success", link=f"/invoices/{invoice.id}" if invoice is not None else None,
+        data=nt.build_data(nt.PAYMENT_RECEIVED, payment_id=payment.id,
+                           invoice_id=invoice.id if invoice is not None else None),
+        exclude_user_id=user.id,
+    )
     db.commit()
     db.refresh(payment)
     return _out(db, payment)
