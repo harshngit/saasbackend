@@ -26,3 +26,6 @@ new_crm_changes.md
 delivery_app_surplus_redistribution.md 
 # Local frontend source for invoice PDF comparison
 frontend-reference/
+
+saas_firebase_web.md
+saas_firebase_flutter.md
