@@ -1192,3 +1192,55 @@ def test_inventory_exposes_product_cover_image(setup_test_data, monkeypatch):
         app.dependency_overrides.pop(get_current_user, None)
 
 
+def test_inventory_image_falls_back_to_first_additional_image(setup_test_data):
+    """Products saved with only "additional images" (no cover) still get an image on the stock
+    board -- the first one, as the product screens show -- and a cover always wins."""
+    from app.services import numbering_service
+
+    db: Session = setup_test_data["db"]
+    org_a = setup_test_data["org_a"]
+    tag = uuid.uuid4().hex[:6]
+    cover_only = Product(organization_id=org_a.id, name=f"ImgFb {tag} 1 cover", cover_image="/files/cover-1",
+                         images=["/files/extra-1"])
+    images_only = Product(organization_id=org_a.id, name=f"ImgFb {tag} 2 images", cover_image=None,
+                          images=["", "/files/extra-2a", "/files/extra-2b"])
+    nothing = Product(organization_id=org_a.id, name=f"ImgFb {tag} 3 none", cover_image="", images=[])
+    with_variants = Product(organization_id=org_a.id, name=f"ImgFb {tag} 4 variants", images=["/files/extra-4"])
+    db.add_all([cover_only, images_only, nothing, with_variants])
+    db.flush()
+    for name, qty in (("S", 10), ("M", 15)):
+        db.add(ProductVariant(product_id=with_variants.id, name=name, inventory=qty,
+                              variant_code=numbering_service.next_variant_code(db, org_a.id)))
+    db.commit()
+
+    role = Role(organization_id=org_a.id, name=f"Stock only {tag}", permissions={"inventory": {"view": True}})
+    db.add(role)
+    db.flush()
+    staff = User(email=f"stockfb-{tag}@sorting-a.example.com", name="Stock Fb", password_hash="x",
+                 organization_id=org_a.id, system_role=SystemRole.STAFF.value, role_id=role.id, is_active=True)
+    db.add(staff)
+    db.commit()
+
+    try:
+        app.dependency_overrides[get_current_user] = lambda: staff
+        res = client.get("/inventory", params={"search": f"ImgFb {tag}", "sort_by": "name", "sort_order": "asc"})
+        assert res.status_code == 200, res.text
+        rows = {row["name"].split()[2]: row for row in res.json()["items"]}
+        assert [rows[k]["cover_image"] for k in ("1", "2", "3", "4")] == [
+            "/files/cover-1", "/files/extra-2a", None, "/files/extra-4"]
+        assert "display_image" not in rows["1"]  # response key stays cover_image
+        variants = rows["4"]
+        assert variants["total_stock"] == 25 and sorted(v["inventory"] for v in variants["variations"]) == [10, 15]
+
+        detail = client.get(f"/inventory/{images_only.id}")
+        assert detail.status_code == 200 and detail.json()["cover_image"] == "/files/extra-2a"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    db.refresh(images_only)
+    assert images_only.cover_image is None  # nothing written back to the product
+
+    prop = app.openapi()["components"]["schemas"]["InventoryItemOut"]["properties"]["cover_image"]
+    assert "first additional image" in prop["description"]
+
+

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, computed_field, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, computed_field, ConfigDict, Field, field_validator
 
 from app.models import STOCK_MOVEMENT_TYPES
 
@@ -28,8 +28,18 @@ class InventoryItemOut(BaseModel):
     total_stock: int              # effective available stock
     is_active: bool
     variations: list[VariantStock]
-    # The product's own cover image, so the stock screens need no extra /products call.
-    cover_image: str | None = None
+    # The product's own image, so the stock screens need no extra /products call. Read from
+    # Product.display_image (cover image, else first additional image); a dict input -- e.g.
+    # the detail endpoint re-validating a dumped row -- keeps its `cover_image` key.
+    cover_image: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("display_image", "cover_image"),
+        description=(
+            "Product image URL: the product's cover image, or its first additional image when no "
+            "cover is set. Resolved like the product API's file URLs (/files/{id}, absolute when "
+            "PUBLIC_BASE_URL is configured). null when the product has no image."
+        ),
+    )
 
     @field_validator("cover_image", mode="after")
     @classmethod

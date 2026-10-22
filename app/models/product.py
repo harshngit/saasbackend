@@ -188,6 +188,17 @@ class Product(Base):
     brand_ref: Mapped["Brand | None"] = relationship(foreign_keys=[brand_id], lazy="joined")  # noqa: F821
 
     @property
+    def display_image(self) -> str | None:
+        """The image to show for this product in lists: the cover image, else the first
+        additional image (the same order the product screens use). Read-only; not stored."""
+        if self.cover_image and self.cover_image.strip():
+            return self.cover_image
+        for image in self.images or []:
+            if isinstance(image, str) and image.strip():
+                return image
+        return None
+
+    @property
     def total_stock(self) -> int:
         """Effective stock: sum of variant inventory if variants exist, else total_inventory."""
         if self.variations:
