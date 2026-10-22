@@ -172,7 +172,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "health-names-the-database-host"
+BUILD_TAG = "invoice-regular-renderer-simple-totals"
 
 
 @app.on_event("startup")

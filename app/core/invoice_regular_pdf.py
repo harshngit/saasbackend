@@ -68,7 +68,8 @@ COLUMNS = {
 DEFAULT_COLUMNS = ["product", "hsn_sac", "quantity", "rate", "amount"]
 
 # The frontend's only definition of the simple format (InvoicePrintView.jsx): the same
-# document with payment details and the footer's terms / footer text / signature hidden.
+# document with payment details, the footer's terms / footer text / signature, and the
+# Discount and Tax total rows hidden.
 
 
 # ------------------------------------------------------------------ formatting
@@ -649,15 +650,17 @@ def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None) -> None
         doc.y = y + row_h + doc.px(1)
 
 
-def _totals(doc: _Doc, invoice, settings: dict) -> None:
+def _totals(doc: _Doc, invoice, settings: dict, simple: bool = False) -> None:
     """SummaryTotals(). Every amount is the invoice's stored figure; Additional Charges and
-    Round Off are shown whenever set, since the Total includes them."""
+    Round Off are shown whenever set, since the Total includes them. The simple format hides
+    the Discount and Tax rows (InvoicePrintView.jsx's preset turns show_discount and
+    show_tax_amount off); the Total still includes both."""
     fields = settings.get("fields") or {}
     style = doc.theme["totals"]
     rows = [("Subtotal", inr(invoice.subtotal))]
-    if fields.get("show_discount", True) and invoice.discount:
+    if not simple and fields.get("show_discount", True) and invoice.discount:
         rows.append(("Discount", f"-{inr(invoice.discount)}"))
-    if fields.get("show_tax_amount", True) and invoice.tax:
+    if not simple and fields.get("show_tax_amount", True) and invoice.tax:
         rows.append(("Tax", inr(invoice.tax)))
     if invoice.additional_charges:
         rows.append(("Additional Charges", inr(invoice.additional_charges)))
@@ -848,7 +851,7 @@ def render_regular_invoice(
         doc.y += gap
     _table(doc, invoice, settings, item_images)
     doc.y += gap
-    _totals(doc, invoice, settings)
+    _totals(doc, invoice, settings, simple)
     doc.y += gap
     _footer(doc, org, invoice, settings, simple, signature, qr, stamp)
     return bytes(pdf.output())

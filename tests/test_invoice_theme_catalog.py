@@ -392,6 +392,31 @@ def test_every_theme_follows_frontend_section_layout(drawn, theme_id, fmt):
     assert rec["pages"] >= 1 and b"DMSans" in rec["pdf"]  # rupee glyph font embedded
 
 
+@pytest.mark.parametrize("theme_id", ["gst-3", "landscape-1", "gst-5", "classic"])  # boxed, inline, banded, plain
+def test_simple_totals_hide_discount_and_tax(drawn, theme_id):
+    import copy
+
+    settings = _parity_settings(theme_id)
+    assert settings["fields"]["show_discount"] and settings["fields"]["show_tax_amount"]
+    before = copy.deepcopy(settings)
+
+    detailed = " ".join(drawn(theme_id, "detailed", settings=settings)["strings"])
+    assert "Discount" in detailed and "-₹ 250.00" in detailed
+    assert "Tax" in detailed and "₹ 696.80" in detailed
+
+    simple = " ".join(drawn(theme_id, "simple", settings=settings)["strings"])
+    assert "Discount" not in simple and "-₹ 250.00" not in simple
+    assert "Tax" not in simple and "₹ 696.80" not in simple
+    for joined in (detailed, simple):  # hidden rows still count: the stored Total is unchanged
+        for needle in ("Subtotal", "₹ 1,23,456.00", "Additional Charges", "Round Off", "₹ 1,24,053.00"):
+            assert needle in joined, needle
+    assert settings == before  # the firm's settings are not rewritten to print the simple copy
+
+    hidden = _parity_settings(theme_id, fields={"show_discount": False, "show_tax_amount": False})
+    detailed_off = " ".join(drawn(theme_id, "detailed", settings=hidden)["strings"])
+    assert "Discount" not in detailed_off and "Tax" not in detailed_off and "₹ 1,24,053.00" in detailed_off
+
+
 @pytest.mark.parametrize("theme_id", REGULAR_IDS)
 def test_table_header_never_brand_filled_and_accent_rules(drawn, theme_id):
     rec = drawn(theme_id)
