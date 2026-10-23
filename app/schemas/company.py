@@ -512,8 +512,9 @@ class CompanyCompleteness(BaseModel):
 
 class FieldSettingsOut(BaseModel):
     """`available_fields[module]` keeps its `mandatory` / `optional` key lists and adds
-    `conditional` and per-field `fields` metadata; `field_settings` is the effective
-    visibility of every catalog field (see app.services.field_settings_service)."""
+    `conditional`, `non_configurable` and per-field `fields` metadata (with each field's
+    label and any `depends_on`); `field_settings` is the effective visibility of every
+    catalog field (see app.services.field_settings_service)."""
 
     field_settings: dict[str, dict[str, bool]]
     available_fields: dict[str, dict[str, Any]]

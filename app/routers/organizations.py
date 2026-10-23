@@ -507,16 +507,21 @@ AVAILABLE_FIELDS = field_settings_service.available_fields()
 
 @router.get("/settings/fields", response_model=FieldSettingsOut)
 def get_field_settings(
-    admin: User = Depends(_ADMIN),
-    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """The field catalog of every module, and which fields this firm's forms show.
 
-    `field_settings` is the effective visibility of every catalog field: mandatory and
-    conditional fields are always true; an optional field is true unless the firm saved
-    `false` for it. Visibility only shapes the forms -- every module API validates as before.
+    Readable by every signed-in member of the firm (forms need it); only an admin can
+    change it. The firm is always the caller's own.
+
+    `field_settings` is the effective visibility of every catalog field: locked fields
+    (mandatory, conditional, non-configurable) are always true; an optional field is true
+    unless the firm saved `false` for it, or the field it depends on is hidden. Visibility
+    only shapes the forms -- every module API validates as before.
     """
-    org = _admin_org(admin, db)
+    org = user.organization
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No organization")
     return {
         "field_settings": field_settings_service.effective_settings(org.field_settings),
         "available_fields": AVAILABLE_FIELDS,
@@ -532,12 +537,15 @@ def update_field_settings(
     """Show or hide optional fields -- send only the ones being changed.
 
     Everything not sent keeps its saved value. Unknown modules or fields, non-boolean
-    values, and hiding a mandatory or conditional field are rejected with 422, and nothing
-    is saved. Older names (`sales`, `expenses`, and the previous catalog's field keys) are
-    still accepted.
+    values, hiding a locked field, and showing a field whose parent stays hidden (e.g. a
+    product's Subcategory without its Category) are rejected with 422, and nothing is
+    saved. Hiding a parent alone is fine: its dependent fields are hidden with it. Older
+    names (`sales`, `expenses`, and the previous catalogs' field keys) are still accepted.
     """
     org = _admin_org(admin, db)
     updates, errors = field_settings_service.parse_update(payload.field_settings)
+    if not errors:
+        errors = field_settings_service.dependency_errors(org.field_settings, updates)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     org.field_settings = field_settings_service.merged(org.field_settings, updates)

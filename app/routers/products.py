@@ -529,6 +529,26 @@ def update_product(
     org_id = _org_id(user)
     product = _owned(db, product_id, org_id)
     data = payload.model_dump(exclude_unset=True)
+    # Stock changes only through the stock workflows (adjustments, purchases, returns,
+    # deliveries), which move warehouse stock and the movement log together and keep these
+    # counters in step. Writing a counter here would report stock that orders cannot see.
+    # Creating a product or a new variant still sets its opening stock (stock_service.on_hand).
+    if "total_inventory" in data:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="total_inventory cannot be changed by editing the product. Record a stock "
+                   "adjustment instead (POST /warehouses/{warehouse_id}/stock/adjust).",
+        )
+    for v in data.get("variations") or []:
+        existing = db.get(ProductVariant, v["id"]) if v.get("id") else None
+        if (existing is not None and existing.product_id == product.id and "inventory" in v
+                and v["inventory"] != (existing.inventory or 0)):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"The stock of existing variant '{existing.name}' cannot be changed by "
+                       "editing the product. Record a stock adjustment for that variant instead "
+                       "(POST /warehouses/{warehouse_id}/stock/adjust with its variant_id).",
+            )
     if "category_id" in data:
         _validate_category(db, org_id, data["category_id"])
     if "sub_category_id" in data:
@@ -644,8 +664,11 @@ def update_product(
                 if variant is None or variant.product_id != product.id:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="variant id not found or does not belong to this product")
                 # Update only fields provided in the incoming dict. variant_code is
-                # not a VariantIn field, so the business ID is never rewritten here.
-                for key, val in _variant_columns(v).items():
+                # not a VariantIn field, so the business ID is never rewritten here, and
+                # stock (checked unchanged above) is never written from here.
+                columns = _variant_columns(v)
+                columns.pop("inventory", None)
+                for key, val in columns.items():
                     setattr(variant, key, val)
                 new_variants_list.append(variant)
             else:

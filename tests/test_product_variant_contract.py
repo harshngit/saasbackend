@@ -150,11 +150,11 @@ def test_variant_inventory_is_independent_and_totals_correctly(ctx, db_session: 
     assert product["total_stock"] == 20  # not double-counted
     small, medium = _variant(product, "Small"), _variant(product, "Medium")
 
+    # Existing variant stock is not editable through the product: it moves via stock adjustments
     res = client.patch(f"/products/{product['id']}", json={"variations": [{"id": small["id"], "name": "Small", "inventory": 3}]})
-    patched = res.json()
-    assert _variant(patched, "Small")["inventory"] == 3
-    assert _variant(patched, "Medium")["inventory"] == 10
-    assert patched["total_stock"] == 13
+    assert res.status_code == 422 and "stock adjustment" in res.json()["detail"]
+    after = client.get(f"/products/{product['id']}").json()
+    assert _variant(after, "Small")["inventory"] == 10 and after["total_stock"] == 20
 
     neg = client.patch(f"/products/{product['id']}", json={"variations": [{"id": medium["id"], "name": "Medium", "inventory": -1}]})
     assert neg.status_code == 422
@@ -162,6 +162,97 @@ def test_variant_inventory_is_independent_and_totals_correctly(ctx, db_session: 
     assert client.delete(f"/products/{product['id']}/variants/{small['id']}").status_code == 204
     after = client.get(f"/products/{product['id']}").json()
     assert after["total_stock"] == 10 and [v["id"] for v in after["variations"]] == [medium["id"]]
+
+
+# --------------------------- Stock is not edited via PATCH ---------------------------
+
+
+def _stock_state(db_session: Session, product_id: str):
+    from app.models import StockMovement, WarehouseStock
+
+    db_session.expire_all()
+    product = db_session.get(Product, product_id)
+    variants = sorted((v.id, v.name, v.inventory) for v in
+                      db_session.query(ProductVariant).filter(ProductVariant.product_id == product_id))
+    warehouse = sorted((w.warehouse_id, w.variant_id, w.on_hand_quantity) for w in
+                       db_session.query(WarehouseStock).filter(WarehouseStock.product_id == product_id))
+    moves = db_session.query(StockMovement).filter(StockMovement.product_id == product_id).count()
+    return product.total_inventory, variants, warehouse, moves
+
+
+def _with_warehouse_stock(db_session: Session, org: Organization, product_id: str, variant_id=None):
+    from app.services import stock_service
+
+    warehouse = stock_service.default_warehouse(db_session, org.id)
+    stock_service.adjust_on_hand(db_session, org.id, warehouse.id, product_id, variant_id, 2, "adjustment")
+    db_session.commit()
+    return warehouse
+
+
+def test_product_stock_is_set_on_create_and_not_by_patch(ctx, db_session: Session):
+    client, org, _ = ctx
+    created = client.post("/products", json={"name": "Counted", "total_inventory": 10})
+    assert created.status_code == 201 and created.json()["total_inventory"] == 10  # opening stock kept
+    product_id = created.json()["id"]
+    warehouse = _with_warehouse_stock(db_session, org, product_id)  # the first movement adopts the opening stock
+    before = _stock_state(db_session, product_id)
+    assert before[0] == 12 and before[2][0][2] == 12 and before[3] == 1
+
+    for value in (500, 0, None):
+        res = client.patch(f"/products/{product_id}", json={"total_inventory": value})
+        assert res.status_code == 422, value
+        assert "stock adjustment" in res.json()["detail"]
+        assert _stock_state(db_session, product_id) == before
+    # Nothing else in a rejected request is applied either
+    res = client.patch(f"/products/{product_id}", json={"name": "Renamed", "total_inventory": 1})
+    assert res.status_code == 422
+    db_session.expire_all()
+    assert db_session.get(Product, product_id).name == "Counted"
+
+    # Ordinary edits still work and leave stock alone
+    res = client.patch(f"/products/{product_id}", json={"name": "Renamed", "description": "d"})
+    assert res.status_code == 200 and res.json()["name"] == "Renamed"
+    assert _stock_state(db_session, product_id) == before
+
+    # The supported path still moves warehouse stock, the movement log and the counter together
+    res = client.post(f"/warehouses/{warehouse.id}/stock/adjust",
+                      json={"product_id": product_id, "quantity": 3, "movement_type": "adjustment"})
+    assert res.status_code in (200, 201), res.text
+    after = _stock_state(db_session, product_id)
+    assert after[0] == 15 and sum(row[2] for row in after[2]) == 15 and after[3] == 2
+
+
+def test_existing_variant_stock_is_not_edited_by_patch(ctx, db_session: Session):
+    client, org, _ = ctx
+    product = client.post("/products", json={
+        "name": "Shirt", "variations": [{"name": "S", "inventory": 5}, {"name": "M", "inventory": 4}],
+    }).json()
+    small, medium = _variant(product, "S"), _variant(product, "M")
+    _with_warehouse_stock(db_session, org, product["id"], small["id"])
+    before = _stock_state(db_session, product["id"])
+
+    res = client.patch(f"/products/{product['id']}", json={"variations": [
+        {"id": medium["id"], "name": "Medium"},                       # a valid edit alongside...
+        {"id": small["id"], "name": "S", "inventory": 50},            # ...a stock change
+    ]})
+    assert res.status_code == 422 and "existing variant 'S'" in res.json()["detail"]
+    assert _stock_state(db_session, product["id"]) == before          # nothing applied, nothing recreated
+
+    # Other variant fields still update; re-sending the unchanged stock is not a change
+    res = client.patch(f"/products/{product['id']}", json={"variations": [
+        {"id": small["id"], "name": "Small", "sku": "SH-S", "inventory": 7},
+        {"id": medium["id"], "name": "Medium", "price": 120},
+    ]})
+    assert res.status_code == 200, res.text
+    assert _variant(res.json(), "Small")["sku"] == "SH-S" and _variant(res.json(), "Medium")["price"] == 120
+    after = _stock_state(db_session, product["id"])
+    assert after[2] == before[2] and after[3] == before[3]
+    assert sorted((v[0], v[2]) for v in after[1]) == sorted((v[0], v[2]) for v in before[1])  # same ids, same stock
+
+    # A new variant added through PATCH still takes its opening stock
+    res = client.patch(f"/products/{product['id']}", json={"variations": [{"name": "L", "inventory": 9}]})
+    assert res.status_code == 200 and _variant(res.json(), "L")["inventory"] == 9
+    assert {v["id"] for v in res.json()["variations"]} >= {small["id"], medium["id"]}
 
 
 # ------------------------- Order / Quotation (UUID refs) -------------------------

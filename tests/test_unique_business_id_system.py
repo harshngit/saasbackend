@@ -705,7 +705,7 @@ def test_47_patch_preserves_existing_code_and_numbers_new_variant(auth_client, d
     existing = created["variations"][0]
 
     res = client.patch(f"/products/{created['id']}", json={"variations": [
-        {"id": existing["id"], "name": "Small", "sku": "TEE-SMALL", "price": 99, "inventory": 4,
+        {"id": existing["id"], "name": "Small", "sku": "TEE-SMALL", "price": 99,
          "barcode": "123", "length": 1.5, "variant_code": "VAR-HACK"},
         {"name": "M", "variant_code": "VAR-7777"},
     ]})
@@ -713,7 +713,7 @@ def test_47_patch_preserves_existing_code_and_numbers_new_variant(auth_client, d
     by_id = {v["id"]: v for v in res.json()["variations"]}
     updated = by_id[existing["id"]]
     assert updated["variant_code"] == existing["variant_code"]  # immutable
-    assert (updated["name"], updated["sku"], updated["price"], updated["inventory"]) == ("Small", "TEE-SMALL", 99, 4)
+    assert (updated["name"], updated["sku"], updated["price"], updated["inventory"]) == ("Small", "TEE-SMALL", 99, 0)
     new = next(v for v in by_id.values() if v["id"] != existing["id"])
     assert new["variant_code"] == "VAR-0002" and new["variant_code"] != "VAR-7777"
     assert str(uuid.UUID(new["id"])) == new["id"]
