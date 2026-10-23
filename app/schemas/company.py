@@ -2,7 +2,7 @@ import json
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import (
     AliasChoices,
@@ -511,11 +511,18 @@ class CompanyCompleteness(BaseModel):
 
 
 class FieldSettingsOut(BaseModel):
+    """`available_fields[module]` keeps its `mandatory` / `optional` key lists and adds
+    `conditional` and per-field `fields` metadata; `field_settings` is the effective
+    visibility of every catalog field (see app.services.field_settings_service)."""
+
     field_settings: dict[str, dict[str, bool]]
-    available_fields: dict[str, dict[str, list[str]]]
+    available_fields: dict[str, dict[str, Any]]
 
 
 class FieldSettingsUpdate(BaseModel):
-    field_settings: dict[str, dict[str, bool]]
+    """{module: {field: bool}} -- only the preferences being changed. Values are checked
+    in the endpoint (JSON booleans only), so they are taken here exactly as sent."""
+
+    field_settings: dict[str, dict[str, Any]]
 
 

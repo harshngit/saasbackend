@@ -38,6 +38,7 @@ from app.schemas.overview import CompanyOverviewOut
 from app.services import (
     activity_service,
     entitlement_service,
+    field_settings_service,
     numbering_service,
     org_service,
     overview_service,
@@ -500,51 +501,8 @@ def clear_business_document(
 
 # ------------------------------- Field Settings -------------------------------
 
-AVAILABLE_FIELDS = {
-    "company": {
-        "mandatory": [
-            "name", "legal_name", "business_type", "industry", "primary_mobile", "email",
-            "registered_address", "city", "state", "country", "pin_code",
-            "logo_url", "signature_url", "payment_qr_url",
-            "currency", "timezone", "language", "tax_configuration", "invoice_settings",
-            "auth_person_name", "auth_person_designation", "auth_person_mobile", "auth_person_email",
-            "company_status"
-        ],
-        "optional": [
-            "date_of_incorporation", "cin_number", "gstin_pan", "description",
-            "alternate_mobile", "landline", "website", "customer_support_number",
-            "branch_address", "stamp_url", "letterhead_url", "banner_url",
-            "upi_id", "bank_account_details", "bank_account_holder", "bank_ifsc", "bank_name",
-            "facebook_url", "instagram_url", "linkedin_url", "twitter_url", "youtube_url", "whatsapp_number",
-            "financial_year",
-            "doc_gst_url", "doc_pan_url", "doc_coi_url", "doc_trade_license_url", "doc_msme_url", "doc_fssai_url",
-            "doc_other_url", "doc_other_files",
-            "auth_person_photo_url", "auth_person_signature_url",
-            "employee_count", "business_hours", "mission_vision", "notes",
-            "employee_id_prefix", "branch_addresses"
-        ]
-    },
-    "customer": {
-        "mandatory": ["name"],
-        "optional": ["business_name", "phone", "email", "gst_number", "billing_address", "delivery_address", "category", "notes", "credit_limit", "opening_balance"]
-    },
-    "product": {
-        "mandatory": ["name", "price"],
-        "optional": ["brand", "description", "category_id", "tax_rate", "min_stock", "barcode"]
-    },
-    "sales": {
-        "mandatory": ["customer_id", "items"],
-        "optional": ["discount", "tax", "notes", "source", "assigned_delivery_partner_id"]
-    },
-    "purchase": {
-        "mandatory": ["invoice_number", "supplier_id", "items"],
-        "optional": ["invoice_date", "discount", "tax", "notes", "attachment_url"]
-    },
-    "expenses": {
-        "mandatory": ["category", "amount"],
-        "optional": ["description", "receipt_url", "payment_mode", "expense_date"]
-    }
-}
+# The canonical catalog of configurable form fields; see app/services/field_settings_service.py.
+AVAILABLE_FIELDS = field_settings_service.available_fields()
 
 
 @router.get("/settings/fields", response_model=FieldSettingsOut)
@@ -552,21 +510,16 @@ def get_field_settings(
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Retrieve the current configurable fields setting and available fields metadata."""
+    """The field catalog of every module, and which fields this firm's forms show.
+
+    `field_settings` is the effective visibility of every catalog field: mandatory and
+    conditional fields are always true; an optional field is true unless the firm saved
+    `false` for it. Visibility only shapes the forms -- every module API validates as before.
+    """
     org = _admin_org(admin, db)
-    current_settings = org.field_settings or {}
-    
-    # Initialize dictionary structure with defaults if not present
-    initialized_settings = {}
-    for module, fields_info in AVAILABLE_FIELDS.items():
-        initialized_settings[module] = {}
-        saved_module = current_settings.get(module, {})
-        for opt_field in fields_info["optional"]:
-            initialized_settings[module][opt_field] = saved_module.get(opt_field, False)
-            
     return {
-        "field_settings": initialized_settings,
-        "available_fields": AVAILABLE_FIELDS
+        "field_settings": field_settings_service.effective_settings(org.field_settings),
+        "available_fields": AVAILABLE_FIELDS,
     }
 
 
@@ -576,23 +529,21 @@ def update_field_settings(
     admin: User = Depends(_ADMIN),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Update enabling/disabling status of optional fields for each module."""
+    """Show or hide optional fields -- send only the ones being changed.
+
+    Everything not sent keeps its saved value. Unknown modules or fields, non-boolean
+    values, and hiding a mandatory or conditional field are rejected with 422, and nothing
+    is saved. Older names (`sales`, `expenses`, and the previous catalog's field keys) are
+    still accepted.
+    """
     org = _admin_org(admin, db)
-    
-    # Clean/validate payload to ensure only valid optional fields are updated
-    cleaned_settings = {}
-    for module, fields_info in AVAILABLE_FIELDS.items():
-        cleaned_settings[module] = {}
-        payload_module = payload.field_settings.get(module, {})
-        for opt_field in fields_info["optional"]:
-            cleaned_settings[module][opt_field] = payload_module.get(opt_field, False)
-            
-    org.field_settings = cleaned_settings
+    updates, errors = field_settings_service.parse_update(payload.field_settings)
+    if errors:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
+    org.field_settings = field_settings_service.merged(org.field_settings, updates)
     db.commit()
     db.refresh(org)
-    
     return {
-        "field_settings": org.field_settings,
-        "available_fields": AVAILABLE_FIELDS
+        "field_settings": field_settings_service.effective_settings(org.field_settings),
+        "available_fields": AVAILABLE_FIELDS,
     }
-
