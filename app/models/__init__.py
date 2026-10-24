@@ -58,6 +58,7 @@ from app.models.team import Team
 from app.models.tracking import ProductSerial, StockBatch
 from app.models.supplier import Supplier, SupplierPayment, SupplierProduct
 from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
+from app.models.subcategory_variant import SubcategoryVariant
 from app.models.supplier_payment_allocation import SupplierPaymentAllocation
 from app.models.user import User
 from app.models.invoice import Invoice, InvoiceItem
@@ -109,6 +110,7 @@ __all__ = [
     "PURCHASE_RETURN_STATUSES",
     "SupplierBrand",
     "BrandCategory",
+    "SubcategoryVariant",
     "WarehouseTransfer",
     "WarehouseTransferItem",
     "Leave",

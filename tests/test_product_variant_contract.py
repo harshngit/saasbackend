@@ -384,3 +384,192 @@ def test_cross_tenant_category_rejected(ctx, db_session: Session):
     foreign_cat, foreign_sub, _ = _categories(other_client)
     assert client.post("/products", json={"name": "x", "category_id": foreign_cat["id"]}).status_code == 400
     assert client.post("/products", json={"name": "x", "category_id": foreign_cat["id"], "sub_category_id": foreign_sub["id"]}).status_code == 400
+
+
+# ------------------- Sub category Product Types (Category -> Sub -> Type) -------------------
+
+
+def _footwear(client):
+    tag = uuid.uuid4().hex[:6]
+    root = client.post("/categories", json={"name": f"Footwear-{tag}"}).json()
+    casual = client.post("/categories", json={"name": f"Casual-{tag}", "parent_id": root["id"]}).json()
+    sports = client.post("/categories", json={"name": f"Sports-{tag}", "parent_id": root["id"]}).json()
+    return root, casual, sports
+
+
+def _types_url(sub_id: str) -> str:
+    return f"/categories/{sub_id}/variants"
+
+
+def _add_types(client, sub_id: str, *names: str) -> dict:
+    out = {}
+    for name in names:
+        res = client.post(_types_url(sub_id), json={"name": name})
+        assert res.status_code == 201, res.text
+        out[name] = res.json()
+    return out
+
+
+def test_subcategory_product_types_crud(ctx):
+    client, _, _ = ctx
+    root, casual, sports = _footwear(client)
+    assert client.get(_types_url(casual["id"])).json() == []  # nothing configured: nothing invented
+
+    types = _add_types(client, casual["id"], "Shoe", "Cheppal", "Sandal")
+    listed = client.get(_types_url(casual["id"])).json()
+    assert sorted(t["name"] for t in listed) == ["Cheppal", "Sandal", "Shoe"]
+    assert all(t["subcategory_id"] == casual["id"] and t["is_active"] for t in listed)
+
+    # Case-insensitive duplicates in one sub category are refused; another sub category may reuse a name
+    for dup in ("shoe", " SHOE "):
+        assert client.post(_types_url(casual["id"]), json={"name": dup}).status_code == 409
+    assert client.post(_types_url(sports["id"]), json={"name": "Shoe"}).status_code == 201
+    assert client.patch(f"{_types_url(casual['id'])}/{types['Sandal']['id']}", json={"name": "cheppal"}).status_code == 409
+
+    # Rename, reorder, deactivate (no delete endpoint)
+    res = client.patch(f"{_types_url(casual['id'])}/{types['Sandal']['id']}", json={"name": "Slipper", "sort_order": 5})
+    assert res.status_code == 200 and res.json()["name"] == "Slipper"
+    res = client.patch(f"{_types_url(casual['id'])}/{types['Cheppal']['id']}", json={"is_active": False})
+    assert res.status_code == 200 and res.json()["is_active"] is False
+    assert sorted(t["name"] for t in client.get(_types_url(casual["id"])).json()) == ["Shoe", "Slipper"]
+    all_types = client.get(_types_url(casual["id"]), params={"include_inactive": True}).json()
+    assert sorted(t["name"] for t in all_types) == ["Cheppal", "Shoe", "Slipper"]
+    assert client.delete(f"{_types_url(casual['id'])}/{types['Shoe']['id']}").status_code == 405
+
+    # Only a sub category carries Product Types; unknown ids are 404
+    assert client.get(_types_url(root["id"])).status_code == 422
+    assert client.post(_types_url(root["id"]), json={"name": "Shoe"}).status_code == 422
+    assert client.get(_types_url(str(uuid.uuid4()))).status_code == 404
+    assert client.patch(f"{_types_url(sports['id'])}/{types['Shoe']['id']}", json={"name": "x"}).status_code == 404
+    assert client.post(_types_url(casual["id"]), json={"name": "  "}).status_code == 422
+
+
+def test_subcategory_product_types_are_tenant_scoped(ctx, db_session: Session):
+    client, _, _ = ctx
+    other, _, _ = _org_client(db_session, "Product Type Other Org")
+    _, foreign_sub, _ = _footwear(other)
+    foreign = _add_types(other, foreign_sub["id"], "Shoe")["Shoe"]
+    root, casual, _ = _footwear(client)
+
+    assert client.get(_types_url(foreign_sub["id"])).status_code == 404
+    assert client.post(_types_url(foreign_sub["id"]), json={"name": "Boot"}).status_code == 404
+    assert client.patch(f"{_types_url(foreign_sub['id'])}/{foreign['id']}", json={"is_active": False}).status_code == 404
+    assert client.patch(f"{_types_url(casual['id'])}/{foreign['id']}", json={"name": "Mine"}).status_code == 404
+    # The same name in my own sub category is fine; the other firm's type stays untouched
+    assert client.post(_types_url(casual["id"]), json={"name": "Shoe"}).status_code == 201
+    assert [t["name"] for t in other.get(_types_url(foreign_sub["id"])).json()] == ["Shoe"]
+    # Its id cannot be put on my product
+    res = client.post("/products", json={"name": "x", "category_id": root["id"], "sub_category_id": casual["id"],
+                                         "product_type_id": foreign["id"]})
+    assert res.status_code == 422
+
+
+def test_category_parent_must_be_own_top_level_category(ctx, db_session: Session):
+    client, _, _ = ctx
+    other, _, _ = _org_client(db_session, "Parent Other Org")
+    foreign_root, _, _ = _footwear(other)
+    root, casual, sports = _footwear(client)
+    tag = uuid.uuid4().hex[:6]
+
+    assert client.post("/categories", json={"name": f"A-{tag}", "parent_id": foreign_root["id"]}).status_code == 400
+    assert client.post("/categories", json={"name": f"B-{tag}", "parent_id": str(uuid.uuid4())}).status_code == 400
+    assert client.post("/categories", json={"name": f"C-{tag}", "parent_id": casual["id"]}).status_code == 400  # no 3rd level
+    assert client.patch(f"/categories/{root['id']}", json={"parent_id": root["id"]}).status_code == 400  # self
+    assert client.patch(f"/categories/{casual['id']}", json={"parent_id": foreign_root["id"]}).status_code == 400
+    lone = client.post("/categories", json={"name": f"Lone-{tag}"}).json()
+    assert client.patch(f"/categories/{root['id']}", json={"parent_id": lone["id"]}).status_code == 400  # has children
+
+    # Valid operations keep working
+    assert client.patch(f"/categories/{lone['id']}", json={"parent_id": root["id"]}).status_code == 200
+    assert client.patch(f"/categories/{lone['id']}", json={"parent_id": None}).status_code == 200
+    assert client.patch(f"/categories/{casual['id']}", json={"description": "Everyday"}).status_code == 200
+    assert client.get(f"/categories/{casual['id']}").json()["parent_id"] == root["id"]
+    # Organization-wide name uniqueness is unchanged
+    assert client.post("/categories", json={"name": casual["name"], "parent_id": root["id"]}).status_code == 409
+
+
+def test_product_type_id_on_create(ctx):
+    client, _, _ = ctx
+    root, casual, sports = _footwear(client)
+    casual_types = _add_types(client, casual["id"], "Shoe", "Cheppal")
+    sports_shoe = _add_types(client, sports["id"], "Shoe")["Shoe"]
+    base = {"category_id": root["id"], "sub_category_id": casual["id"]}
+
+    res = client.post("/products", json={"name": "Loafer", **base, "product_type_id": casual_types["Shoe"]["id"],
+                                         "product_type": "physical", "variations": [{"name": "UK 8"}]})
+    assert res.status_code == 201, res.text
+    product = res.json()
+    assert product["product_type_id"] == casual_types["Shoe"]["id"]
+    assert product["product_type_ref"] == {"id": casual_types["Shoe"]["id"], "name": "Shoe"}
+    assert product["product_type"] == "physical"  # legacy text kept as sent, never overwritten
+    assert [v["name"] for v in product["variations"]] == ["UK 8"]  # product variants unaffected
+    listed = client.get("/products", params={"search": "Loafer"}).json()["items"]
+    assert listed[0]["product_type_ref"]["name"] == "Shoe" and listed[0]["product_type_id"] == product["product_type_id"]
+
+    # Without a Product Type, and with only legacy text, products work as before
+    plain = client.post("/products", json={"name": "Plain", **base}).json()
+    assert plain["product_type_id"] is None and plain["product_type_ref"] is None
+    assert client.post("/products", json={"name": "Legacy", "product_type": "service"}).status_code == 201
+
+    for bad in (sports_shoe["id"], str(uuid.uuid4())):  # another sub category's type, or none at all
+        assert client.post("/products", json={"name": "x", **base, "product_type_id": bad}).status_code == 422
+    assert client.post("/products", json={"name": "x", "category_id": root["id"],
+                                          "product_type_id": casual_types["Shoe"]["id"]}).status_code == 422
+    client.patch(f"{_types_url(casual['id'])}/{casual_types['Cheppal']['id']}", json={"is_active": False})
+    assert client.post("/products", json={"name": "x", **base, "product_type_id": casual_types["Cheppal"]["id"]}).status_code == 422
+
+    # A sub category is not a category_id (existing 400 convention)
+    assert client.post("/products", json={"name": "x", "category_id": casual["id"]}).status_code == 400
+
+
+def test_product_type_id_on_patch_uses_the_final_combination(ctx):
+    client, _, _ = ctx
+    root, casual, sports = _footwear(client)
+    shoe = _add_types(client, casual["id"], "Shoe")["Shoe"]
+    sneaker = _add_types(client, sports["id"], "Sneaker")["Sneaker"]
+    product = client.post("/products", json={"name": "Runner", "category_id": root["id"], "sub_category_id": casual["id"],
+                                             "product_type_id": shoe["id"], "product_type": "legacy-text"}).json()
+    url = f"/products/{product['id']}"
+
+    # Sub category changes but the old Product Type would remain: refused, nothing cleared silently
+    assert client.patch(url, json={"sub_category_id": sports["id"]}).status_code == 422
+    assert client.patch(url, json={"category_id": root["id"], "sub_category_id": None}).status_code == 422
+    # Only the Product Type changes: checked against the stored sub category
+    assert client.patch(url, json={"product_type_id": sneaker["id"]}).status_code == 422
+    after = client.get(url).json()
+    assert (after["sub_category_id"], after["product_type_id"]) == (casual["id"], shoe["id"])
+
+    # Changing both together, then clearing, works; unrelated fields are untouched
+    res = client.patch(url, json={"sub_category_id": sports["id"], "product_type_id": sneaker["id"]})
+    assert res.status_code == 200 and res.json()["product_type_ref"]["name"] == "Sneaker"
+    res = client.patch(url, json={"product_type_id": None})
+    assert res.status_code == 200 and res.json()["product_type_id"] is None
+    assert res.json()["product_type"] == "legacy-text" and res.json()["sub_category_id"] == sports["id"]
+    assert client.patch(url, json={"category_id": casual["id"]}).status_code == 400  # sub category as category
+
+    # A legacy product (text only, no product_type_id) edits normally
+    legacy = client.post("/products", json={"name": "Old", "category_id": root["id"], "sub_category_id": casual["id"],
+                                            "product_type": "physical"}).json()
+    res = client.patch(f"/products/{legacy['id']}", json={"name": "Old 2", "sub_category_id": sports["id"]})
+    assert res.status_code == 200 and res.json()["product_type"] == "physical" and res.json()["product_type_id"] is None
+
+
+def test_product_type_history_survives_deactivation_and_subcategory_removal(ctx):
+    client, _, _ = ctx
+    root, casual, _ = _footwear(client)
+    shoe = _add_types(client, casual["id"], "Shoe")["Shoe"]
+    product = client.post("/products", json={"name": "Classic", "category_id": root["id"],
+                                             "sub_category_id": casual["id"], "product_type_id": shoe["id"]}).json()
+    url = f"/products/{product['id']}"
+
+    assert client.patch(f"{_types_url(casual['id'])}/{shoe['id']}", json={"is_active": False}).status_code == 200
+    assert client.get(url).json()["product_type_ref"] == {"id": shoe["id"], "name": "Shoe"}
+    assert client.patch(url, json={"name": "Classic 2"}).status_code == 200  # unrelated edit
+    assert client.patch(url, json={"product_type_id": shoe["id"]}).status_code == 200  # kept, not newly chosen
+    assert client.patch(url, json={"sub_category_id": casual["id"]}).status_code == 200
+
+    # Deleting the sub category keeps the product's Product Type and its name
+    assert client.delete(f"/categories/{casual['id']}").status_code == 204
+    after = client.get(url).json()
+    assert after["sub_category_id"] is None
+    assert after["product_type_id"] == shoe["id"] and after["product_type_ref"]["name"] == "Shoe"

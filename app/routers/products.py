@@ -24,6 +24,7 @@ from app.models import (
 )
 from app.services import numbering_service, lookup_service, catalog_hierarchy_service
 from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
+from app.models.subcategory_variant import SubcategoryVariant
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.inventory import BatchOut, SerialOut
 
@@ -109,6 +110,46 @@ def _validate_classification(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="sub_category_id is not a sub category of category_id",
+        )
+
+
+def _validate_top_level_category(db: Session, category_id: str | None) -> None:
+    """category_id is a top-level category; a sub category goes in sub_category_id.
+    (Called after _validate_category, so the category is this firm's own.)"""
+    if category_id is None:
+        return
+    cat = db.get(Category, category_id)
+    if cat is not None and cat.parent_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="category_id must be a top-level category; send a sub category as sub_category_id",
+        )
+
+
+def _validate_product_type_ref(
+    db: Session, org_id: str, product_type_id: str | None, sub_category_id: str | None, newly_assigned: bool
+) -> None:
+    """product_type_id is one of this firm's Product Types configured under the product's
+    sub category. A newly chosen one must be active; one a product already has stays valid
+    after it is deactivated."""
+    if product_type_id is None:
+        return
+    product_type = db.get(SubcategoryVariant, product_type_id)
+    if product_type is None or product_type.organization_id != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="product_type_id is not a Product Type in your firm",
+        )
+    if sub_category_id is None or product_type.subcategory_id != sub_category_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="product_type_id is not a Product Type of the product's sub category "
+                   "(change or clear product_type_id together with sub_category_id)",
+        )
+    if newly_assigned and not product_type.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="This Product Type is inactive and cannot be chosen",
         )
 
 
@@ -251,8 +292,10 @@ def create_product(
     org_id = _org_id(user)
     _validate_category(db, org_id, payload.category_id)
     _validate_category(db, org_id, payload.sub_category_id)
+    _validate_top_level_category(db, payload.category_id)
     _validate_classification(db, org_id, payload.category_id, payload.sub_category_id)
     _validate_product_type(db, org_id, payload.product_type)
+    _validate_product_type_ref(db, org_id, payload.product_type_id, payload.sub_category_id, newly_assigned=True)
     _validate_supplier(db, org_id, payload.preferred_supplier_id)
     _validate_brand(db, org_id, payload.brand_id)
     catalog_hierarchy_service.validate_product_catalog_hierarchy(
@@ -551,6 +594,7 @@ def update_product(
             )
     if "category_id" in data:
         _validate_category(db, org_id, data["category_id"])
+        _validate_top_level_category(db, data["category_id"])
     if "sub_category_id" in data:
         _validate_category(db, org_id, data["sub_category_id"])
     if "preferred_supplier_id" in data:
@@ -566,6 +610,13 @@ def update_product(
         )
     if "product_type" in data:
         _validate_product_type(db, org_id, data["product_type"])
+    # The Product Type must fit the sub category the product ends up with.
+    if {"category_id", "sub_category_id", "product_type_id"} & data.keys():
+        new_type = data.get("product_type_id", product.product_type_id)
+        _validate_product_type_ref(
+            db, org_id, new_type, data.get("sub_category_id", product.sub_category_id),
+            newly_assigned="product_type_id" in data and new_type != product.product_type_id,
+        )
 
     effective_supplier_id = data.get("preferred_supplier_id", product.preferred_supplier_id)
     effective_brand_id = data.get("brand_id", product.brand_id)

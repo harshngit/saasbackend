@@ -33,6 +33,11 @@ class Product(Base):
     images: Mapped[list] = mapped_column(JSON, default=list, nullable=False)      # list of image URLs
 
     product_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # The Product Type chosen from the sub category's configured options. The free-text
+    # `product_type` above is kept as it was, for existing products and clients.
+    product_type_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("subcategory_variants.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     vendor: Mapped[str | None] = mapped_column(String(150), nullable=True)
     brand: Mapped[str | None] = mapped_column(String(150), nullable=True)
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
@@ -186,6 +191,9 @@ class Product(Base):
         foreign_keys=[preferred_supplier_id], lazy="joined"
     )
     brand_ref: Mapped["Brand | None"] = relationship(foreign_keys=[brand_id], lazy="joined")  # noqa: F821
+    product_type_ref: Mapped["SubcategoryVariant | None"] = relationship(  # noqa: F821
+        foreign_keys=[product_type_id], lazy="joined"
+    )
 
     @property
     def display_image(self) -> str | None:

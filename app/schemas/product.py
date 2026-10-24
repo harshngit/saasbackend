@@ -182,6 +182,12 @@ class ProductProfileIn(BaseModel):
     sub_category_id: str | None = Field(
         default=None, description="References another Category row (a child of category_id)"
     )
+    product_type_id: str | None = Field(
+        default=None,
+        description="One of the sub category's configured Product Types "
+                    "(GET /categories/{sub_category_id}/variants). Optional; the free-text "
+                    "`product_type` is kept separately for existing products.",
+    )
     brand_id: str | None = Field(default=None, description="References a Brand row")
     manufacturer: str | None = Field(default=None, max_length=150)
     model_number: str | None = Field(default=None, max_length=100)
@@ -275,7 +281,7 @@ class ProductProfileIn(BaseModel):
     compliance_certificate: str | None = None
     warranty_document: str | None = None
 
-    @field_validator("preferred_supplier_id", "sub_category_id", "brand_id", mode="before")
+    @field_validator("preferred_supplier_id", "sub_category_id", "brand_id", "product_type_id", mode="before")
     @classmethod
     def _blank_ref_to_none(cls, v: object) -> object:
         return None if v == "" else v
@@ -312,11 +318,13 @@ class ProductOut(ProductProfileIn):
     total_stock: int
     is_active: bool
     variations: list[VariantOut]
-    # Resolved from category_id / sub_category_id / brand_id / preferred_supplier_id.
+    # Resolved from category_id / sub_category_id / brand_id / preferred_supplier_id /
+    # product_type_id (the Product Type keeps its name even once deactivated).
     category: NamedRef | None = None
     subcategory: NamedRef | None = None
     brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
+    product_type_ref: NamedRef | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -377,6 +385,8 @@ class ProductListItem(BaseModel):
     subcategory: NamedRef | None = None
     brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
+    product_type_id: str | None = None
+    product_type_ref: NamedRef | None = None
     created_at: datetime
 
     # Profile fields that are cheap enough to carry in a list
