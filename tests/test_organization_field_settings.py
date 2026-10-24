@@ -501,6 +501,38 @@ def test_consolidated_legacy_keys(db_session):
     assert stored["company"]["address"] is False and stored["company"]["registered_address"] is True  # old key kept
 
 
+def test_product_type_setting_is_the_canonical_product_type_id(db_session):
+    product = fs.available_fields()["product"]
+    assert "product_type_id" in product["optional"] and "product_type" not in product["optional"]
+    assert _meta("product", "product_type_id")["label"] == "Product Type"
+    assert _meta("product", "product_type_id")["configurable"] is True
+    assert [f["label"] for f in product["fields"]].count("Product Type") == 1  # one toggle, not two
+
+    # Nothing saved: shown, like every optional field
+    _, client = _org(db_session)
+    assert client.get(URL).json()["field_settings"]["product"]["product_type_id"] is True
+
+    # A legacy `product_type` preference drives the canonical field, false and true alike
+    for saved in (False, True):
+        org, client = _org(db_session, {"product": {"product_type": saved, "brand_id": False}})
+        eff = client.get(URL).json()["field_settings"]["product"]
+        assert eff["product_type_id"] is saved and eff["brand_id"] is False
+        assert _stored(db_session, org) == {"product": {"product_type": saved, "brand_id": False}}  # GET writes nothing
+
+    # The canonical value wins when both are saved, either way round
+    for canonical, legacy in ((True, False), (False, True)):
+        eff = fs.effective_settings({"product": {"product_type": legacy, "product_type_id": canonical}})
+        assert eff["product"]["product_type_id"] is canonical
+
+    # A legacy false survives an unrelated partial update, and the legacy key still works on PUT
+    org, client = _org(db_session, {"product": {"product_type": False}})
+    eff = client.put(URL, json={"field_settings": {"product": {"brand_id": False}}}).json()["field_settings"]["product"]
+    assert eff["product_type_id"] is False and eff["brand_id"] is False
+    assert _stored(db_session, org)["product"]["product_type"] is False  # legacy key kept, not deleted
+    eff = client.put(URL, json={"field_settings": {"product": {"product_type": True}}}).json()["field_settings"]["product"]
+    assert eff["product_type_id"] is True
+
+
 # ------------------------------------------------------------------ business behaviour unchanged
 
 

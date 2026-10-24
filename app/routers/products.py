@@ -131,7 +131,8 @@ def _validate_product_type_ref(
 ) -> None:
     """product_type_id is one of this firm's Product Types configured under the product's
     sub category. A newly chosen one must be active; one a product already has stays valid
-    after it is deactivated."""
+    after it is deactivated. A Product Type whose sub category was deleted (subcategory_id
+    NULL) matches no sub category, so it can never be chosen again."""
     if product_type_id is None:
         return
     product_type = db.get(SubcategoryVariant, product_type_id)
@@ -610,12 +611,14 @@ def update_product(
         )
     if "product_type" in data:
         _validate_product_type(db, org_id, data["product_type"])
-    # The Product Type must fit the sub category the product ends up with.
-    if {"category_id", "sub_category_id", "product_type_id"} & data.keys():
-        new_type = data.get("product_type_id", product.product_type_id)
+    # The Product Type must fit the sub category the product ends up with -- checked when
+    # either of the two changes. Re-sending them unchanged leaves a product's existing
+    # reference alone, including one whose sub category has since been deleted.
+    new_type = data.get("product_type_id", product.product_type_id)
+    new_sub = data.get("sub_category_id", product.sub_category_id)
+    if new_type != product.product_type_id or new_sub != product.sub_category_id:
         _validate_product_type_ref(
-            db, org_id, new_type, data.get("sub_category_id", product.sub_category_id),
-            newly_assigned="product_type_id" in data and new_type != product.product_type_id,
+            db, org_id, new_type, new_sub, newly_assigned=new_type != product.product_type_id,
         )
 
     effective_supplier_id = data.get("preferred_supplier_id", product.preferred_supplier_id)

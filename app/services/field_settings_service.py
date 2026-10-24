@@ -224,9 +224,10 @@ CATALOG: dict[str, dict] = {
     },
     # ProductCreate / ProductUpdate; prices are only accepted under `pricing`. Left out:
     # product_id (generated), status / is_active (lifecycle), total_inventory (stock), and
-    # the legacy free-text columns `sub_category` and `brand` (the model keeps them only for
-    # backward compatibility; sub_category_id / brand_id are the canonical inputs). Variants
-    # belong to the product/variant workflow, so they cannot be hidden.
+    # the legacy free-text columns `sub_category`, `brand` and `product_type` (the model keeps
+    # them only for backward compatibility; sub_category_id / brand_id / product_type_id are
+    # the canonical inputs). Variants belong to the product/variant workflow, so they cannot
+    # be hidden.
     "product": {
         MANDATORY: {"name": "Product Name"},
         CONDITIONAL: {},
@@ -240,7 +241,7 @@ CATALOG: dict[str, dict] = {
             "description": "Description",
             "sku": "SKU",
             "barcode": "Barcode",
-            "product_type": "Product Type",
+            "product_type_id": "Product Type",
             "category_id": "Category",
             "sub_category_id": "Subcategory",
             "brand_id": "Brand",
@@ -506,6 +507,8 @@ LEGACY_FIELDS: dict[str, dict[str, str]] = {
         "min_stock": "minimum_stock_level",
         "sub_category": "sub_category_id",
         "brand": "brand_id",
+        # The Product Type field: free text before the sub category's Product Types existed.
+        "product_type": "product_type_id",
     },
     # POST /orders stores delivery_partner_id as assigned_delivery_partner_id.
     "sales_order": {"assigned_delivery_partner_id": "delivery_partner_id"},

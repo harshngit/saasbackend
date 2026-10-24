@@ -573,3 +573,62 @@ def test_product_type_history_survives_deactivation_and_subcategory_removal(ctx)
     after = client.get(url).json()
     assert after["sub_category_id"] is None
     assert after["product_type_id"] == shoe["id"] and after["product_type_ref"]["name"] == "Shoe"
+
+
+def test_orphaned_product_type_is_history_only(ctx, db_session: Session):
+    from app.models import SubcategoryVariant
+
+    client, _, _ = ctx
+    root, casual, sports = _footwear(client)
+    shoe = _add_types(client, casual["id"], "Shoe")["Shoe"]
+    sneaker = _add_types(client, sports["id"], "Sneaker")["Sneaker"]
+    product = client.post("/products", json={"name": "Historic", "category_id": root["id"],
+                                             "sub_category_id": casual["id"], "product_type_id": shoe["id"],
+                                             "product_type": "legacy"}).json()
+    other = client.post("/products", json={"name": "Other", "category_id": root["id"],
+                                           "sub_category_id": sports["id"]}).json()
+
+    # Deleting the sub category through the API orphans its Product Type, never deletes it
+    assert client.delete(f"/categories/{casual['id']}").status_code == 204
+    db_session.expire_all()
+    orphan = db_session.get(SubcategoryVariant, shoe["id"])
+    assert orphan is not None and orphan.subcategory_id is None and orphan.name == "Shoe"
+
+    # The historical product keeps its reference, its name and its legacy text
+    url = f"/products/{product['id']}"
+    after = client.get(url).json()
+    assert after["product_type_id"] == shoe["id"] and after["product_type_ref"] == {"id": shoe["id"], "name": "Shoe"}
+    assert after["product_type"] == "legacy" and after["sub_category_id"] is None
+    listed = client.get("/products", params={"search": "Historic"}).json()["items"][0]
+    assert listed["product_type_ref"]["name"] == "Shoe"
+
+    # It is not offered anywhere: the deleted sub category has no list, other lists don't include it
+    assert client.get(f"/categories/{casual['id']}/variants").status_code == 404
+    for params in ({}, {"include_inactive": True}):
+        names = [t["id"] for t in client.get(f"/categories/{sports['id']}/variants", params=params).json()]
+        assert shoe["id"] not in names and sneaker["id"] in names
+
+    # ...and cannot be chosen again, with or without a sub category
+    for body in ({"sub_category_id": sports["id"]}, {}):
+        res = client.post("/products", json={"name": "New", "category_id": root["id"], **body,
+                                             "product_type_id": shoe["id"]})
+        assert res.status_code == 422, body
+    res = client.patch(f"/products/{other['id']}", json={"product_type_id": shoe["id"]})
+    assert res.status_code == 422
+    assert client.get(f"/products/{other['id']}").json()["product_type_id"] is None
+
+    # Unrelated edits of the historical product work -- also when a form re-sends its values
+    for body in ({"name": "Historic 2"}, {"product_type_id": shoe["id"], "sub_category_id": None, "description": "d"},
+                 {"category_id": root["id"]}):
+        res = client.patch(url, json=body)
+        assert res.status_code == 200, (body, res.text)
+        assert res.json()["product_type_ref"] == {"id": shoe["id"], "name": "Shoe"}
+    # Moving it to a live sub category needs a type of that sub category (or none)
+    assert client.patch(url, json={"sub_category_id": sports["id"]}).status_code == 422
+    res = client.patch(url, json={"sub_category_id": sports["id"], "product_type_id": sneaker["id"]})
+    assert res.status_code == 200 and res.json()["product_type_ref"]["name"] == "Sneaker"
+
+    # Normal selection and assignment under a live sub category still work
+    res = client.post("/products", json={"name": "Fresh", "category_id": root["id"], "sub_category_id": sports["id"],
+                                         "product_type_id": sneaker["id"]})
+    assert res.status_code == 201 and res.json()["product_type_ref"]["name"] == "Sneaker"
