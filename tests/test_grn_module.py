@@ -8,9 +8,14 @@ import uuid
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 from app.main import app
 from app.core.database import SessionLocal
-from app.models import WarehouseStock, StockMovement
+from app.core.security import create_access_token, hash_password
+from app.models import Role, WarehouseStock, StockMovement
+from app.models.enums import SystemRole
 from app.models.product import Product
 from app.models import PurchaseInvoice, PurchaseInvoiceItem
 from app.models.supplier import Supplier
@@ -33,6 +38,50 @@ def check(description: str, condition: bool):
     else:
         print(f"  FAIL  {description}")
         failed_count += 1
+
+
+def postgres_unsafe_locks(action):
+    """Run `action()` and return (its result, the locking SELECTs it issued that Postgres rejects).
+
+    SQLite ignores FOR UPDATE, so this suite cannot hit the production failure directly.
+    Instead every ORM SELECT ... FOR UPDATE is compiled for PostgreSQL: one that carries a
+    LEFT OUTER JOIN (an eager-joined relationship) fails there with "FOR UPDATE cannot be
+    applied to the nullable side of an outer join" -- an HTTP 500.
+    """
+    unsafe = []
+
+    def _capture(state):
+        stmt = state.statement
+        if state.is_select and getattr(stmt, "_for_update_arg", None) is not None:
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            if "OUTER JOIN" in sql:
+                unsafe.append(sql)
+
+    event.listen(Session, "do_orm_execute", _capture)
+    try:
+        result = action()
+    finally:
+        event.remove(Session, "do_orm_execute", _capture)
+    return result, unsafe
+
+
+def stock_snapshot(org_id, warehouse_id, product_id):
+    """(on_hand, number of stock movements) for one product in one warehouse."""
+    db = SessionLocal()
+    try:
+        row = db.query(WarehouseStock).filter(
+            WarehouseStock.organization_id == org_id,
+            WarehouseStock.warehouse_id == warehouse_id,
+            WarehouseStock.product_id == product_id,
+        ).first()
+        movements = db.query(StockMovement).filter(
+            StockMovement.organization_id == org_id,
+            StockMovement.warehouse_id == warehouse_id,
+            StockMovement.product_id == product_id,
+        ).count()
+        return (row.on_hand_quantity if row else 0), movements
+    finally:
+        db.close()
 
 
 def register_org(name_prefix: str = "GRN Test Firm"):
@@ -175,8 +224,13 @@ def run_all_tests():
     # Test 2 — Confirm GRN
     # -------------------------------------------------------------
     print("\nTest 2 — Confirm GRN (Stock Inward + Purchase Rollup)")
-    r_conf = client.post(f"/grns/{grn_1_id}/confirm", headers=auth)
+    r_conf, unsafe_locks = postgres_unsafe_locks(
+        lambda: client.post(f"/grns/{grn_1_id}/confirm", headers=auth)
+    )
     check("Confirm GRN 1 returns 200", r_conf.status_code == 200)
+    # Regression: the Purchase row lock pulled in the eager-joined items/supplier, so on
+    # Postgres every confirm failed with HTTP 500 before touching any stock.
+    check("Confirm GRN issues no FOR UPDATE that Postgres rejects", not unsafe_locks)
     conf_1_data = r_conf.json()
     check("GRN 1 status is confirmed", conf_1_data["status"] == "confirmed")
 
@@ -345,15 +399,31 @@ def run_all_tests():
     check("Create GRN exceeding ordered_qty succeeds as Draft", r_over.status_code == 201)
     over_grn_id = r_over.json()["id"]
 
+    before = stock_snapshot(org_id, base["warehouse_id"], base["product_id"])
     r_over_conf = client.post(f"/grns/{over_grn_id}/confirm", headers=auth)
     check("Confirming over-receipt GRN blocked with 400", r_over_conf.status_code == 400)
+    check("Failed confirmation leaves stock and movements unchanged",
+          stock_snapshot(org_id, base["warehouse_id"], base["product_id"]) == before)
+    r_over_get = client.get(f"/grns/{over_grn_id}", headers=auth)
+    check("Failed confirmation leaves the GRN a Draft", r_over_get.json()["status"] == "draft")
 
     # -------------------------------------------------------------
     # Test 9 — Duplicate Confirmation Protection
     # -------------------------------------------------------------
     print("\nTest 9 — Duplicate Confirmation Protection")
+    before = stock_snapshot(org_id, base["warehouse_id"], base["product_id"])
     r_dup = client.post(f"/grns/{grn_1_id}/confirm", headers=auth)
     check("Confirming an already confirmed GRN blocked with 400", r_dup.status_code == 400)
+    check("Repeated confirmation adds no stock movement",
+          stock_snapshot(org_id, base["warehouse_id"], base["product_id"]) == before)
+
+    # Purchase detail and its Goods Receipts tab still load after confirmations
+    r_list = client.get("/grns", params={"purchase_id": base["purchase_id"]}, headers=auth)
+    check("Goods Receipts list for the purchase returns 200", r_list.status_code == 200)
+    listed = {g["id"]: g["status"] for g in r_list.json()["items"]}
+    check("Goods Receipts list shows the confirmed GRN", listed.get(grn_1_id) == "confirmed")
+    r_purch_detail = client.get(f"/purchases/{base['purchase_id']}", headers=auth)
+    check("Purchase detail returns 200 after confirmation", r_purch_detail.status_code == 200)
 
     # -------------------------------------------------------------
     # Test 10 — Cancel Draft GRN
@@ -400,6 +470,37 @@ def run_all_tests():
         ]
     }, headers=auth)
     check("Cross-tenant warehouse blocked with 400", r_cross.status_code == 400)
+
+    # Confirming another tenant's GRN, or confirming without grn.approve, is refused
+    r_iso = client.post("/grns", json={
+        "purchase_id": base["purchase_id"],
+        "supplier_id": base["supplier_id"],
+        "warehouse_id": base["warehouse_id"],
+        "items": [{"purchase_item_id": base["purchase_item_id"], "product_id": base["product_id"], "received_qty": 1}],
+    }, headers=auth)
+    iso_grn_id = r_iso.json()["id"]
+    before = stock_snapshot(org_id, base["warehouse_id"], base["product_id"])
+    check("Tenant B cannot confirm Tenant A's GRN (404)",
+          client.post(f"/grns/{iso_grn_id}/confirm", headers=auth_b).status_code == 404)
+    db = SessionLocal()
+    try:
+        role = Role(organization_id=org_id, name=f"GRN viewer {uuid.uuid4().hex[:6]}",
+                    permissions={"grn": {"view": True}})
+        db.add(role)
+        db.flush()
+        viewer = User(organization_id=org_id, email=f"grn_viewer_{uuid.uuid4().hex[:8]}@example.com",
+                      name="GRN Viewer", password_hash=hash_password("Password123!"),
+                      system_role=SystemRole.STAFF.value, role_id=role.id, is_active=True)
+        db.add(viewer)
+        db.commit()
+        viewer_auth = {"Authorization": f"Bearer {create_access_token(viewer.id, 'staff', org_id)}"}
+    finally:
+        db.close()
+    check("Staff without grn.approve cannot confirm (403)",
+          client.post(f"/grns/{iso_grn_id}/confirm", headers=viewer_auth).status_code == 403)
+    check("Refused confirmations leave stock unchanged",
+          stock_snapshot(org_id, base["warehouse_id"], base["product_id"]) == before)
+    client.delete(f"/grns/{iso_grn_id}", headers=auth)
 
     # -------------------------------------------------------------
     # Test 14 — Inactive Warehouse Blocked

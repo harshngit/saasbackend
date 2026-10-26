@@ -8,6 +8,7 @@ from app.models import Brand, User
 from app.models.catalog_hierarchy import BrandCategory
 from app.schemas.brand import (
     BrandCreate,
+    BrandListItem,
     BrandOut,
     BrandUpdate,
     BulkDelete,
@@ -78,13 +79,13 @@ def bulk_delete_brands(
     return BulkDeleteResult(deleted=deleted)
 
 
-@router.get("", response_model=list[BrandOut])
+@router.get("", response_model=list[BrandListItem])
 def list_brands(
     user: User = Depends(_view),
     search: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     db: Session = Depends(get_db),
-) -> list[Brand]:
+) -> list[BrandListItem]:
     org_id = _org_id(user)
     query = db.query(Brand).filter(Brand.organization_id == org_id)
     if search:
@@ -92,7 +93,13 @@ def list_brands(
         query = query.filter(or_(Brand.name.ilike(like), Brand.description.ilike(like)))
     if is_active is not None:
         query = query.filter(Brand.is_active == is_active)
-    return query.order_by(Brand.name).all()
+    brands = query.order_by(Brand.name).all()
+    # One query for every listed brand's categories, not one per brand.
+    categories = catalog_hierarchy_service.categories_by_brand(db, org_id, query.with_entities(Brand.id))
+    return [
+        BrandListItem(**BrandOut.model_validate(brand).model_dump(), categories=categories.get(brand.id, []))
+        for brand in brands
+    ]
 
 
 @router.get("/{brand_id}", response_model=BrandOut)

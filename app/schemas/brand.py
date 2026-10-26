@@ -15,6 +15,17 @@ class BrandOut(BaseModel):
     updated_at: datetime
 
 
+class BrandCategoryRef(BaseModel):
+    id: str
+    name: str
+
+
+class BrandListItem(BrandOut):
+    """GET /brands row: the brand plus the top-level categories it is mapped to."""
+
+    categories: list[BrandCategoryRef] = Field(default_factory=list)
+
+
 class BrandCreate(BaseModel):
     name: str = Field(min_length=1, max_length=150)
     description: str | None = None

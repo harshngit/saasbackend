@@ -21,6 +21,13 @@ class BrandCategoryLinkCreate(BaseModel):
     category_id: str = Field(min_length=1, description="UUID of the Category to link to the Brand")
 
 
+class CategoryBrandsReplace(BaseModel):
+    brand_ids: list[str] = Field(
+        description="The category's complete set of mapped Brand UUIDs; repeated ids count once, "
+                    "an empty list removes every mapping",
+    )
+
+
 class BrandCategoryOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

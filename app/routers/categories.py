@@ -5,8 +5,11 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.models import Category, SubcategoryVariant, User
+from app.models import Brand, Category, SubcategoryVariant, User
 from app.models.subcategory_variant import name_key
+from app.schemas.brand import BrandOut
+from app.schemas.catalog_hierarchy import CategoryBrandsReplace
+from app.services import catalog_hierarchy_service
 from app.schemas.category import (
     BulkDelete,
     BulkDeleteResult,
@@ -163,6 +166,59 @@ def delete_category(
     cat = _owned(db, category_id, _org_id(user))
     db.delete(cat)  # products in this category get category_id set to NULL (FK ON DELETE SET NULL)
     db.commit()
+
+
+# ------------------------------ Category Brands ------------------------------
+# Which brands apply to a top-level category -- the same brand_categories mapping that
+# /brands/{brand_id}/categories manages from the brand side.
+
+
+def _top_level(db: Session, category_id: str, org_id: str) -> Category:
+    cat = _owned(db, category_id, org_id)
+    if cat.parent_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=catalog_hierarchy_service.SUBCATEGORY_MAPPING_DETAIL,
+        )
+    return cat
+
+
+@router.get("/{category_id}/brands", response_model=list[BrandOut])
+def list_category_brands(
+    category_id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[Brand]:
+    """The active brands a product in this category can be given, by name: the mapped
+    ones, or every active brand of the firm while the category has no mappings."""
+    org_id = _org_id(user)
+    cat = _top_level(db, category_id, org_id)
+    return catalog_hierarchy_service.selectable_brands(db, org_id, cat.id)
+
+
+@router.put("/{category_id}/brands", response_model=list[BrandOut])
+def replace_category_brands(
+    category_id: str,
+    payload: CategoryBrandsReplace,
+    user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> list[Brand]:
+    """Replace the category's complete brand mapping set. Repeated ids count once; an empty
+    list removes every mapping, so the category offers every active brand again. Returns
+    the mapped brands by name, inactive ones included. Products are never changed."""
+    org_id = _org_id(user)
+    cat = _top_level(db, category_id, org_id)
+    try:
+        brands = catalog_hierarchy_service.replace_category_brands(db, org_id, cat, payload.brand_ids)
+        db.commit()
+    except IntegrityError:  # a concurrent request mapped the same brand first
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The category's brands were changed by another request; retry",
+        )
+    return brands
 
 
 # ------------------------- Sub category Product Types -------------------------

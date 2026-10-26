@@ -23,7 +23,7 @@ from app.models import (
     User,
 )
 from app.services import numbering_service, lookup_service, catalog_hierarchy_service
-from app.models.catalog_hierarchy import BrandCategory, SupplierBrand
+from app.models.catalog_hierarchy import SupplierBrand
 from app.models.subcategory_variant import SubcategoryVariant
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.inventory import BatchOut, SerialOut
@@ -641,21 +641,14 @@ def update_product(
                 detail="Brand is not associated with the selected supplier.",
             )
 
-    if ("brand_id" in data or "category_id" in data) and effective_brand_id and effective_category_id:
-        link = (
-            db.query(BrandCategory)
-            .filter(
-                BrandCategory.organization_id == org_id,
-                BrandCategory.brand_id == effective_brand_id,
-                BrandCategory.category_id == effective_category_id,
-            )
-            .first()
+    # Like the Product Type above: the brand must fit the category the product ends up
+    # with, checked only when either actually changes -- re-sending them unchanged keeps a
+    # historical (since unmapped or deactivated) brand valid for unrelated edits.
+    if effective_brand_id != product.brand_id or effective_category_id != product.category_id:
+        catalog_hierarchy_service.validate_category_brand(
+            db, org_id, effective_category_id, effective_brand_id,
+            newly_assigned_brand=effective_brand_id != product.brand_id,
         )
-        if link is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Category is not associated with the selected brand.",
-            )
 
     variations = data.pop("variations", None)
     pricing_data = data.pop("pricing", None)

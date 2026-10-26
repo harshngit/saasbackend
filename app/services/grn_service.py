@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.models.grn import GoodsReceiptNote, GoodsReceiptNoteItem
 from app.models.product import Product, ProductVariant
@@ -144,10 +144,14 @@ def confirm_grn(db: Session, grn: GoodsReceiptNote, org_id: str, user_id: str) -
             detail="Cannot confirm a cancelled GRN",
         )
 
-    # Lock PurchaseInvoice parent row to serialize concurrent GRN confirmations against the same purchase
+    # Lock PurchaseInvoice parent row to serialize concurrent GRN confirmations against the same purchase.
+    # lazyload() keeps the eager-joined `items` / `supplier` relationships out of this FOR UPDATE
+    # statement: Postgres refuses FOR UPDATE on the nullable side of their LEFT OUTER JOINs
+    # (same failure class as WarehouseStock locking in stock_service.move_tracked).
     purchase = (
         db.query(PurchaseInvoice)
         .filter(PurchaseInvoice.id == grn.purchase_id)
+        .options(lazyload(PurchaseInvoice.items), lazyload(PurchaseInvoice.supplier))
         .with_for_update()
         .first()
     )

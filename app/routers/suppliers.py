@@ -398,7 +398,9 @@ def link_supplier_product(
     # Auto-sync catalog hierarchy
     if product.brand_id:
         catalog_hierarchy_service.ensure_supplier_brand(db, org_id, supplier.id, product.brand_id)
-        if product.category_id:
+        # Brands map to top-level categories only; a legacy product filed under a sub
+        # category still links to the supplier, just without a category mapping.
+        if product.category_id and product.category is not None and product.category.parent_id is None:
             catalog_hierarchy_service.ensure_brand_category(db, org_id, product.brand_id, product.category_id)
 
     db.commit()
