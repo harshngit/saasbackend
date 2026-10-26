@@ -7,6 +7,9 @@ import uuid
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 from app.main import app
 from app.core.database import SessionLocal
 from app.models.product import Product
@@ -31,6 +34,30 @@ def check(description: str, condition: bool):
     else:
         print(f"  FAIL  {description}")
         failed += 1
+
+
+def postgres_unsafe_locks(action):
+    """Run `action()` and return (its result, the locking SELECTs it issued that Postgres rejects).
+
+    SQLite ignores FOR UPDATE, so every ORM SELECT ... FOR UPDATE is compiled for PostgreSQL
+    instead: one carrying a LEFT OUTER JOIN (an eager-joined relationship) fails there with
+    "FOR UPDATE cannot be applied to the nullable side of an outer join" -- an HTTP 500.
+    """
+    unsafe = []
+
+    def _capture(state):
+        stmt = state.statement
+        if state.is_select and getattr(stmt, "_for_update_arg", None) is not None:
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            if "OUTER JOIN" in sql:
+                unsafe.append(sql)
+
+    event.listen(Session, "do_orm_execute", _capture)
+    try:
+        result = action()
+    finally:
+        event.remove(Session, "do_orm_execute", _capture)
+    return result, unsafe
 
 
 def register_org(name_prefix: str = "Vendor Firm"):
@@ -198,8 +225,24 @@ r_grn_draft = client.post(
 grn_draft_id = r_grn_draft.json()["id"]
 
 # Attempt recording invoice when only Draft GRN exists -> fails cumulative protection (0 confirmed accepted)
-r_rec_unconf = client.post(f"/supplier-invoices/{sinv_id}/record", headers=auth)
+db = SessionLocal()
+try:
+    moves_before_fail = db.query(StockMovement).filter(StockMovement.organization_id == org_id).count()
+finally:
+    db.close()
+r_rec_unconf, unsafe_fail = postgres_unsafe_locks(
+    lambda: client.post(f"/supplier-invoices/{sinv_id}/record", headers=auth)
+)
 check("Recording invoice with 0 confirmed GRNs rejected (HTTP 400)", r_rec_unconf.status_code == 400)
+check("Failed record issues no FOR UPDATE that Postgres rejects", not unsafe_fail)
+r_after_fail = client.get(f"/supplier-invoices/{sinv_id}", headers=auth).json()
+check("Failed record leaves the invoice a draft (no partial write)", r_after_fail["status"] == "draft")
+db = SessionLocal()
+try:
+    check("Failed record creates no StockMovement",
+          db.query(StockMovement).filter(StockMovement.organization_id == org_id).count() == moves_before_fail)
+finally:
+    db.close()
 
 # Confirm GRN for 10 units
 client.post(f"/grns/{grn_draft_id}/confirm", headers=auth)
@@ -209,8 +252,13 @@ client.post(f"/grns/{grn_draft_id}/confirm", headers=auth)
 # -------------------------------------------------------------
 print("\n--- Focused Test 1: Exact 3-Way Match & Recording ---")
 # Invoice 1 billed_qty = 5 @ $50.0 (exact match on unit price)
-r_rec_succ = client.post(f"/supplier-invoices/{sinv_id}/record", headers=auth)
+r_rec_succ, unsafe_rec = postgres_unsafe_locks(
+    lambda: client.post(f"/supplier-invoices/{sinv_id}/record", headers=auth)
+)
 check("Record invoice returns HTTP 200", r_rec_succ.status_code == 200)
+# Regression: the PurchaseInvoice row lock pulled in its eager-joined items/supplier, so on
+# Postgres recording a supplier invoice failed with HTTP 500.
+check("Record invoice issues no FOR UPDATE that Postgres rejects", not unsafe_rec)
 rec_data = r_rec_succ.json()
 check("Status updated to recorded", rec_data["status"] == "recorded")
 check("Verification status is matched", rec_data["verification_status"] == "matched")
@@ -480,6 +528,13 @@ print("\n--- Test S: Tenant Isolation ---")
 auth_b, org_b = register_org("Firm B")
 r_cross_read = client.get(f"/supplier-invoices/{sinv2_id}", headers=auth_b)
 check("Cross-tenant invoice read rejected (HTTP 404)", r_cross_read.status_code == 404)
+own_before = client.get(f"/supplier-invoices/{sinv2_id}", headers=auth).json()
+r_cross_rec = client.post(f"/supplier-invoices/{sinv2_id}/record", headers=auth_b)
+check("Cross-tenant invoice record rejected (HTTP 404)", r_cross_rec.status_code == 404)
+own_after = client.get(f"/supplier-invoices/{sinv2_id}", headers=auth).json()
+check("Cross-tenant record attempt leaves the invoice unchanged",
+      (own_after["status"], own_after["grand_total"], own_after["amount_paid"])
+      == (own_before["status"], own_before["grand_total"], own_before["amount_paid"]))
 
 # =============================================================
 # AUTO-CREATION TARGETED TEST SUITE (Scenarios 1 - 12)

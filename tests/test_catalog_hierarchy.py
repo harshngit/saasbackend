@@ -24,7 +24,7 @@ Category -> Brand applicability (GET/PUT /categories/{id}/brands):
 19. Product create applicability (422) and inactive brands
 20. Product PATCH final-combination validation and historical products
 21. GET /brands categories enrichment without per-brand queries
-22. Supplier product auto-sync alongside category mappings
+22. Supplier product auto-sync creates SupplierBrand only, never Category <-> Brand mappings
 """
 import os
 import sys
@@ -341,7 +341,7 @@ def test_product_variants_preservation(client, test_setup, db_session: Session):
 
 
 def test_supplier_product_auto_sync(client, test_setup, db_session: Session):
-    """Scenario 10: SupplierProduct linking auto-syncs SupplierBrand and BrandCategory."""
+    """Scenario 10: SupplierProduct linking auto-syncs SupplierBrand, never BrandCategory."""
     headers_a = test_setup["headers_a"]
     org_a = test_setup["org_a"]
 
@@ -379,11 +379,9 @@ def test_supplier_product_auto_sync(client, test_setup, db_session: Session):
     ).first()
     assert sb is not None
 
-    # Verify BrandCategory was automatically created
-    bc = db_session.query(BrandCategory).filter(
-        BrandCategory.brand_id == brand.id, BrandCategory.category_id == cat.id
-    ).first()
-    assert bc is not None
+    # Category <-> Brand mappings are explicit only: linking a supplier product creates none
+    db_session.expire_all()
+    assert db_session.query(BrandCategory).filter(BrandCategory.category_id == cat.id).count() == 0
 
 
 def test_historical_product_compatibility_and_patch(client, test_setup, db_session: Session):
@@ -940,29 +938,47 @@ def test_brand_list_categories_enrichment(client, test_setup, db_session: Sessio
 
 
 def test_supplier_product_auto_sync_with_category_mapping(client, test_setup, db_session: Session):
-    """Auto-sync still maps a top-level category (which then restricts it), and still links a
-    legacy product filed under a sub category to its supplier, just without a category mapping."""
+    """Linking supplier products syncs SupplierBrand but never touches Category <-> Brand
+    mappings: an unmapped category keeps the all-active-brands fallback, and a manually
+    mapped one keeps exactly its mapping. Legacy products under a sub category link too."""
     headers_a = test_setup["headers_a"]
     org_id = test_setup["org_a"].id
     c = _catalog(db_session, org_id)
     sup = Supplier(id=str(uuid.uuid4()), organization_id=org_id, name="Sync Vendor", is_active=True)
     top = Product(id=str(uuid.uuid4()), organization_id=org_id, name="Top", price=1.0,
                   brand_id=c["beta"].id, category_id=c["lights"].id)
+    mapped = Product(id=str(uuid.uuid4()), organization_id=org_id, name="Mapped", price=1.0,
+                     brand_id=c["beta"].id, category_id=c["fans"].id)
     legacy = Product(id=str(uuid.uuid4()), organization_id=org_id, name="Legacy", price=1.0,
                      brand_id=c["alpha"].id, category_id=c["ceiling"].id)
-    db_session.add_all([sup, top, legacy])
+    db_session.add_all([sup, top, mapped, legacy])
     db_session.commit()
 
-    assert _names(client.get(f"/categories/{c['lights'].id}/brands", headers=headers_a)) == ["Alpha", "Beta"]
+    def mapping_rows() -> set[tuple[str, str]]:
+        db_session.expire_all()
+        return {(bc.brand_id, bc.category_id) for bc in db_session.query(BrandCategory).filter(
+            BrandCategory.organization_id == org_id)}
+
+    # Fans is mapped by hand to Alpha only; Lights is unmapped
+    assert client.put(f"/categories/{c['fans'].id}/brands", json={"brand_ids": [c["alpha"].id]},
+                      headers=headers_a).status_code == 200
+    manual = mapping_rows()
+    assert manual == {(c["alpha"].id, c["fans"].id)}
+
+    # Unmapped category: supplier link adds no mapping, fallback still offers every active brand
     assert client.post(f"/suppliers/{sup.id}/products", json={"product_id": top.id}, headers=headers_a).status_code == 201
-    assert _names(client.get(f"/categories/{c['lights'].id}/brands", headers=headers_a)) == ["Beta"]
+    assert _names(client.get(f"/categories/{c['lights'].id}/brands", headers=headers_a)) == ["Alpha", "Beta"]
+    # Mapped category: a product whose brand is not in the mapping does not widen it
+    assert client.post(f"/suppliers/{sup.id}/products", json={"product_id": mapped.id}, headers=headers_a).status_code == 201
+    assert _names(client.get(f"/categories/{c['fans'].id}/brands", headers=headers_a)) == ["Alpha"]
 
     r = client.post(f"/suppliers/{sup.id}/products", json={"product_id": legacy.id}, headers=headers_a)
     assert r.status_code == 201, r.text
+    # Every manual mapping is exactly as configured, and none was added
+    assert mapping_rows() == manual
     db_session.expire_all()
-    assert db_session.query(SupplierBrand).filter(SupplierBrand.supplier_id == sup.id,
-                                                  SupplierBrand.brand_id == c["alpha"].id).count() == 1
-    assert db_session.query(BrandCategory).filter(BrandCategory.category_id == c["ceiling"].id).count() == 0
+    assert {sb.brand_id for sb in db_session.query(SupplierBrand).filter(SupplierBrand.supplier_id == sup.id)} \
+        == {c["alpha"].id, c["beta"].id}
     # The legacy product stays readable and editable
     assert client.get(f"/products/{legacy.id}", headers=headers_a).status_code == 200
     assert client.patch(f"/products/{legacy.id}", json={"description": "x"}, headers=headers_a).status_code == 200

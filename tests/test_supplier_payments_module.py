@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session
 from app.main import app
 from app.core.database import SessionLocal
 from app.models.product import Product
@@ -32,6 +35,30 @@ def check(description: str, condition: bool):
     else:
         print(f"  FAIL  {description}")
         failed += 1
+
+
+def postgres_unsafe_locks(action):
+    """Run `action()` and return (its result, the locking SELECTs it issued that Postgres rejects).
+
+    SQLite ignores FOR UPDATE, so every ORM SELECT ... FOR UPDATE is compiled for PostgreSQL
+    instead: one carrying a LEFT OUTER JOIN (an eager-joined relationship) fails there with
+    "FOR UPDATE cannot be applied to the nullable side of an outer join" -- an HTTP 500.
+    """
+    unsafe = []
+
+    def _capture(state):
+        stmt = state.statement
+        if state.is_select and getattr(stmt, "_for_update_arg", None) is not None:
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            if "OUTER JOIN" in sql:
+                unsafe.append(sql)
+
+    event.listen(Session, "do_orm_execute", _capture)
+    try:
+        result = action()
+    finally:
+        event.remove(Session, "do_orm_execute", _capture)
+    return result, unsafe
 
 
 def register_org(name_prefix: str = "Payment Firm"):
@@ -144,7 +171,7 @@ wh_id, sup_id, prod_id = setup_procurement_env(auth, org_id)
 print("--- Scenario 1: Single Invoice Full Payment ---")
 inv1_id = create_recorded_invoice(auth, sup_id, wh_id, prod_id, "INV-SPAY-001", billed_qty=10, unit_price=100.0)
 
-r_pay1 = client.post(
+r_pay1, unsafe_pay1 = postgres_unsafe_locks(lambda: client.post(
     "/supplier-payments",
     headers=auth,
     json={
@@ -154,8 +181,11 @@ r_pay1 = client.post(
         "reference": "TXN-001",
         "allocations": [{"supplier_invoice_id": inv1_id, "amount": 1000.0}],
     },
-)
+))
 check("Record full payment returns HTTP 201", r_pay1.status_code == 201)
+# Regression: the SupplierInvoice row lock pulled in its eager-joined relationships, so on
+# Postgres every allocated payment failed with HTTP 500.
+check("Record payment issues no FOR UPDATE that Postgres rejects", not unsafe_pay1)
 pay1_data = r_pay1.json()
 check("Payment number generated (SPAY-...)", pay1_data["payment_number"].startswith("SPAY-"))
 check("Allocated amount is 1000.0", pay1_data["allocated_amount"] == 1000.0)
@@ -265,7 +295,8 @@ check("Allocations total exceeding payment amount rejected (HTTP 400)", r_pay5.s
 # -------------------------------------------------------------
 print("\n--- Scenario 6: Overpay Invoice Blocked ---")
 # inv4 has 400.0 outstanding remaining
-r_pay6 = client.post(
+inv4_before = client.get(f"/supplier-invoices/{inv4_id}", headers=auth).json()
+r_pay6, unsafe_pay6 = postgres_unsafe_locks(lambda: client.post(
     "/supplier-payments",
     headers=auth,
     json={
@@ -274,8 +305,14 @@ r_pay6 = client.post(
         "payment_method": "cash",
         "allocations": [{"supplier_invoice_id": inv4_id, "amount": 500.0}],
     },
-)
+))
 check("Allocation exceeding invoice outstanding rejected (HTTP 400)", r_pay6.status_code == 400)
+# This rejection happens after the invoice rows are locked, so it exercises the lock query.
+check("Rejected over-allocation issues no FOR UPDATE that Postgres rejects", not unsafe_pay6)
+inv4_after = client.get(f"/supplier-invoices/{inv4_id}", headers=auth).json()
+check("Rejected over-allocation leaves the invoice balance unchanged",
+      (inv4_after["amount_paid"], inv4_after["outstanding_amount"])
+      == (inv4_before["amount_paid"], inv4_before["outstanding_amount"]))
 
 # -------------------------------------------------------------
 # Scenario 7 — Wrong Supplier Invoice Allocation Blocked
@@ -381,21 +418,29 @@ r_pay9 = client.post(
 ).json()
 
 # Void payment 9
-r_void9 = client.post(
+r_void9, unsafe_void9 = postgres_unsafe_locks(lambda: client.post(
     f"/supplier-payments/{r_pay9['id']}/void",
     headers=auth,
     json={"reason": "Incorrect payment entry"},
-)
+))
 check("Void payment returns HTTP 200", r_void9.status_code == 200)
 check("Payment status is voided", r_void9.json()["status"] == "voided")
+# Regression: the SupplierPayment and SupplierInvoice row locks pulled in eager joins too.
+check("Void payment issues no FOR UPDATE that Postgres rejects", not unsafe_void9)
 
 # Attempting to void the payment a second time
-r_void9_second = client.post(
+inv9_before_second = client.get(f"/supplier-invoices/{inv9_id}", headers=auth).json()
+r_void9_second, unsafe_void9_second = postgres_unsafe_locks(lambda: client.post(
     f"/supplier-payments/{r_pay9['id']}/void",
     headers=auth,
     json={"reason": "Second void attempt"},
-)
+))
 check("Voiding an already voided payment is rejected (HTTP 400)", r_void9_second.status_code == 400)
+check("Repeated void issues no FOR UPDATE that Postgres rejects", not unsafe_void9_second)
+inv9_after_second = client.get(f"/supplier-invoices/{inv9_id}", headers=auth).json()
+check("Repeated void does not change the invoice balance again",
+      (inv9_after_second["amount_paid"], inv9_after_second["outstanding_amount"])
+      == (inv9_before_second["amount_paid"], inv9_before_second["outstanding_amount"]))
 
 r_inv9 = client.get(f"/supplier-invoices/{inv9_id}", headers=auth).json()
 check("Invoice amount_paid restored to 0.0", r_inv9["amount_paid"] == 0.0)
@@ -517,6 +562,17 @@ check("Cross-tenant payment detail read rejected (HTTP 404)", r_cross_pay.status
 
 r_cross_list = client.get(f"/supplier-payments?supplier_id={sup_id}", headers=auth_b).json()
 check("Cross-tenant payment list returns 0 items", len(r_cross_list["items"]) == 0)
+
+inv1_before_cross = client.get(f"/supplier-invoices/{inv1_id}", headers=auth).json()
+r_cross_void = client.post(f"/supplier-payments/{pay1_data['id']}/void", headers=auth_b,
+                           json={"reason": "Cross-tenant void attempt"})
+check("Cross-tenant payment void rejected (HTTP 404)", r_cross_void.status_code == 404)
+check("Cross-tenant void leaves the payment recorded",
+      client.get(f"/supplier-payments/{pay1_data['id']}", headers=auth).json()["status"] == "recorded")
+inv1_after_cross = client.get(f"/supplier-invoices/{inv1_id}", headers=auth).json()
+check("Cross-tenant void leaves the invoice balance unchanged",
+      (inv1_after_cross["amount_paid"], inv1_after_cross["outstanding_amount"])
+      == (inv1_before_cross["amount_paid"], inv1_before_cross["outstanding_amount"]))
 
 # -------------------------------------------------------------
 # Scenario 15 — Zero Inventory Side Effects

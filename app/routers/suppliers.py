@@ -395,13 +395,11 @@ def link_supplier_product(
     )
     db.add(link)
 
-    # Auto-sync catalog hierarchy
+    # Auto-sync the supplier's brands. Category <-> Brand mappings are deliberately NOT
+    # created here: a category's first mapping restricts it to the mapped brands, so it is
+    # only ever set through the explicit Category / Brand mapping APIs.
     if product.brand_id:
         catalog_hierarchy_service.ensure_supplier_brand(db, org_id, supplier.id, product.brand_id)
-        # Brands map to top-level categories only; a legacy product filed under a sub
-        # category still links to the supplier, just without a category mapping.
-        if product.category_id and product.category is not None and product.category.parent_id is None:
-            catalog_hierarchy_service.ensure_brand_category(db, org_id, product.brand_id, product.category_id)
 
     db.commit()
     db.refresh(link)

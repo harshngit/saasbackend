@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.models.grn import GoodsReceiptNote, GoodsReceiptNoteItem
 from app.models.product import Product, ProductVariant
@@ -112,13 +112,16 @@ def record_supplier_invoice(
             detail="Cannot record a cancelled supplier invoice",
         )
 
-    # Lock PurchaseInvoice header row via .with_for_update() to serialize concurrent invoice recording
+    # Lock PurchaseInvoice header row via .with_for_update() to serialize concurrent invoice recording.
+    # lazyload("*") keeps its eager-joined relationships out of this FOR UPDATE statement:
+    # Postgres refuses FOR UPDATE on the nullable side of a LEFT OUTER JOIN (see grn_service).
     purchase = (
         db.query(PurchaseInvoice)
         .filter(
             PurchaseInvoice.id == invoice.purchase_id,
             PurchaseInvoice.organization_id == org_id,
         )
+        .options(lazyload("*"))
         .with_for_update()
         .first()
     )

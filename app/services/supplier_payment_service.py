@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.core.sorting import apply_sorting
 from app.models.purchase_invoice import PurchaseInvoice
@@ -185,6 +185,7 @@ def record_supplier_payment(
                     SupplierInvoice.organization_id == org_id,
                     SupplierInvoice.id.in_(target_inv_ids),
                 )
+                .options(lazyload("*"))  # no eager OUTER JOINs in FOR UPDATE (Postgres rejects them)
                 .with_for_update()
                 .all()
             )
@@ -295,6 +296,7 @@ def void_supplier_payment(
         payment = (
             db.query(SupplierPayment)
             .filter(SupplierPayment.id == payment_id, SupplierPayment.organization_id == org_id)
+            .options(lazyload("*"))  # no eager OUTER JOINs in FOR UPDATE (Postgres rejects them)
             .with_for_update()
             .first()
         )
@@ -327,6 +329,7 @@ def void_supplier_payment(
                     SupplierInvoice.organization_id == org_id,
                     SupplierInvoice.id.in_(linked_inv_ids),
                 )
+                .options(lazyload("*"))  # no eager OUTER JOINs in FOR UPDATE (Postgres rejects them)
                 .with_for_update()
                 .all()
             )
