@@ -19,7 +19,7 @@ except (ImportError, AttributeError):
         pass
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.core.config import settings
 from app.core.encryption import decrypt_field, encrypt_field
@@ -256,10 +256,13 @@ def create_payment_link(
 
     client = get_org_razorpay_client(gateway)
 
-    # Concurrency protection: lock invoice & active links
+    # Concurrency protection: lock invoice & active links.
+    # lazyload("*") keeps Invoice's eager-joined relationships out of this FOR UPDATE statement:
+    # Postgres refuses FOR UPDATE on the nullable side of a LEFT OUTER JOIN (see grn_service).
     inv_locked = (
         db.query(Invoice)
         .filter(Invoice.id == invoice.id, Invoice.organization_id == org_id)
+        .options(lazyload("*"))
         .with_for_update(nowait=False)
         .first()
     )

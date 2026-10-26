@@ -720,3 +720,96 @@ def test_06_hardened_idempotency_and_link_replacement_safety(monkeypatch):
         assert len(pmts) == 1, "Only one CustomerPayment must exist for the Razorpay payment ID"
     finally:
         db.close()
+
+
+def _postgres_unsafe_locks(action):
+    """Run `action()` and return (its result, the locking SELECTs it issued that Postgres rejects).
+
+    SQLite ignores FOR UPDATE, so every ORM SELECT ... FOR UPDATE is compiled for PostgreSQL
+    instead: one carrying a LEFT OUTER JOIN (an eager-joined relationship) fails there with
+    "FOR UPDATE cannot be applied to the nullable side of an outer join" -- an HTTP 500.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.orm import Session
+
+    unsafe = []
+
+    def _capture(state):
+        stmt = state.statement
+        if state.is_select and getattr(stmt, "_for_update_arg", None) is not None:
+            sql = str(stmt.compile(dialect=postgresql.dialect()))
+            if "OUTER JOIN" in sql:
+                unsafe.append(sql)
+
+    event.listen(Session, "do_orm_execute", _capture)
+    try:
+        result = action()
+    finally:
+        event.remove(Session, "do_orm_execute", _capture)
+    return result, unsafe
+
+
+def test_07_payment_link_lock_is_postgres_safe_atomic_and_tenant_scoped(monkeypatch):
+    """Regression: creating a link locked the Invoice row with its eager-joined relationships,
+    which PostgreSQL rejects (HTTP 500). The lock must be outer-join free, a failure after it
+    must write nothing, and another firm must not reach the invoice."""
+    monkeypatch.setattr(settings, "field_encryption_key", _TEST_FERNET_KEY)
+    fake_client = _FakeOrgRazorpayClient()
+    from app.services import invoice_payment_link_service
+    monkeypatch.setattr(invoice_payment_link_service, "get_org_razorpay_client", lambda gw: fake_client)
+
+    auth, org_id, _ = _register_org("Lock Safety Org")
+    auth_other, _, _ = _register_org("Lock Safety Other Org")
+    client.put("/settings/payment-gateway",
+               json={"key_id": "rzp_test_lock", "key_secret": "s", "webhook_secret": "wh"}, headers=auth)
+    _, inv_id = _create_customer_and_invoice(auth, org_id, total=900.0)
+
+    def link_rows() -> int:
+        db = SessionLocal()
+        try:
+            return db.query(InvoicePaymentLink).filter(InvoicePaymentLink.invoice_id == inv_id).count()
+        finally:
+            db.close()
+
+    def invoice_state() -> tuple:
+        db = SessionLocal()
+        try:
+            inv = db.get(Invoice, inv_id)
+            return inv.status, inv.amount_paid, inv.balance_due if hasattr(inv, "balance_due") else None
+        finally:
+            db.close()
+
+    before = invoice_state()
+
+    # A Razorpay failure after the invoice is locked: 400, and nothing written
+    def failing_create(data=None):
+        raise RuntimeError("razorpay is down")
+
+    monkeypatch.setattr(fake_client.payment_link, "create", failing_create)
+    r_fail, unsafe_fail = _postgres_unsafe_locks(
+        lambda: client.post(f"/invoices/{inv_id}/payment-link", json={}, headers=auth))
+    assert r_fail.status_code == 400 and "Razorpay link creation failed" in r_fail.text
+    assert not unsafe_fail, "payment-link creation issues a FOR UPDATE that Postgres rejects"
+    assert link_rows() == 0
+    assert invoice_state() == before
+
+    # Another firm cannot create a link for this invoice, and nothing is written
+    r_cross, unsafe_cross = _postgres_unsafe_locks(
+        lambda: client.post(f"/invoices/{inv_id}/payment-link", json={}, headers=auth_other))
+    assert r_cross.status_code == 404
+    assert not unsafe_cross
+    assert link_rows() == 0
+
+    # The normal path still creates exactly one link, with an outer-join-free lock
+    monkeypatch.undo()
+    monkeypatch.setattr(settings, "field_encryption_key", _TEST_FERNET_KEY)
+    fake_client = _FakeOrgRazorpayClient()
+    monkeypatch.setattr(invoice_payment_link_service, "get_org_razorpay_client", lambda gw: fake_client)
+    r_ok, unsafe_ok = _postgres_unsafe_locks(
+        lambda: client.post(f"/invoices/{inv_id}/payment-link", json={}, headers=auth))
+    assert r_ok.status_code == 201, r_ok.text
+    assert not unsafe_ok
+    assert r_ok.json()["amount"] == 900.0 and r_ok.json()["status"] == "created"
+    assert link_rows() == 1
+    assert invoice_state() == before  # creating a link never settles the invoice
