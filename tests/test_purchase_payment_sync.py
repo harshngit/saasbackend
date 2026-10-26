@@ -1,0 +1,333 @@
+"""Purchase -> Supplier Invoice -> Supplier Payment -> Accounts Payable: one financial truth.
+
+Supplier payment allocations are the only record of payment. A supplier invoice's
+amount_paid is the sum of its allocations from recorded payments; a purchase's is the sum
+over its non-cancelled supplier invoices; Accounts Payable reads the supplier invoice. These
+tests drive the real API and check that purchase detail, purchase list, supplier invoice and
+Accounts Payable agree after every step.
+"""
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from fastapi.testclient import TestClient
+
+from app.core.database import SessionLocal
+from app.main import app
+from app.models import ActivityLog, Product, PurchaseInvoice, Supplier, SupplierPayment, User, Warehouse
+from app.models.supplier_invoice import SupplierInvoice
+from app.models.supplier_payment_allocation import SupplierPaymentAllocation
+from app.seed import main as seed_main
+from app.services import supplier_payment_service
+
+seed_main()
+client = TestClient(app)
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def _org(prefix: str = "Sync Firm"):
+    email = f"sync_{uuid.uuid4().hex[:10]}@example.com"
+    r = client.post("/auth/register", json={
+        "organization_name": f"{prefix} {uuid.uuid4().hex[:6]}", "admin_name": "Sync Admin",
+        "email": email, "password": "Password123!", "role": "admin",
+    })
+    assert r.status_code == 201, r.text
+    auth = {"Authorization": f"Bearer {r.json()['tokens']['access_token']}"}
+    db = SessionLocal()
+    try:
+        org_id = db.query(User).filter(User.email == email).first().organization_id
+        wh = Warehouse(organization_id=org_id, name="Main Warehouse", code=f"WH-{uuid.uuid4().hex[:4]}")
+        sup = Supplier(organization_id=org_id, name=f"Acme Supplies {uuid.uuid4().hex[:4]}", is_active=True)
+        prod = Product(organization_id=org_id, name="Widget", sku=f"SKU-{uuid.uuid4().hex[:6]}", price=1000.0)
+        db.add_all([wh, sup, prod])
+        db.commit()
+        return {"auth": auth, "org_id": org_id, "wh": wh.id, "wh_name": wh.name, "sup": sup.id,
+                "sup_name": sup.name, "prod": prod.id}
+    finally:
+        db.close()
+
+
+def _purchase(env, qty: int = 10, price: float = 1000.0, confirm: bool = True, **extra) -> dict:
+    body = {"invoice_number": f"TEST-PUR-{uuid.uuid4().hex[:6]}", "supplier_id": env["sup"],
+            "warehouse_id": env["wh"], "items": [{"product_id": env["prod"], "ordered_qty": qty, "purchase_price": price}]}
+    body.update(extra)
+    r = client.post("/purchases", json=body, headers=env["auth"])
+    assert r.status_code == 201, r.text
+    purchase = r.json()
+    if confirm:
+        assert client.post(f"/purchases/{purchase['id']}/confirm", headers=env["auth"]).status_code == 200
+    return purchase
+
+
+def _auto_invoice_id(env, purchase_id: str) -> str | None:
+    db = SessionLocal()
+    try:
+        inv = db.query(SupplierInvoice).filter(
+            SupplierInvoice.organization_id == env["org_id"], SupplierInvoice.purchase_id == purchase_id,
+            SupplierInvoice.status != "cancelled").first()
+        return inv.id if inv else None
+    finally:
+        db.close()
+
+
+def _receive(env, purchase: dict, qty: int) -> None:
+    item_id = purchase["items"][0]["id"]
+    grn = client.post("/grns", json={"purchase_id": purchase["id"], "supplier_id": env["sup"], "warehouse_id": env["wh"],
+                                     "items": [{"purchase_item_id": item_id, "product_id": env["prod"], "received_qty": qty}]},
+                      headers=env["auth"])
+    assert grn.status_code == 201, grn.text
+    assert client.post(f"/grns/{grn.json()['id']}/confirm", headers=env["auth"]).status_code == 200
+
+
+def _pay(env, allocations: list[tuple[str, float]]) -> dict:
+    amount = round(sum(a for _, a in allocations), 2)
+    r = client.post("/supplier-payments", json={
+        "supplier_id": env["sup"], "amount": amount, "payment_method": "bank_transfer",
+        "allocations": [{"supplier_invoice_id": i, "amount": a} for i, a in allocations]}, headers=env["auth"])
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _void(env, payment_id: str):
+    return client.post(f"/supplier-payments/{payment_id}/void", json={"reason": "test"}, headers=env["auth"])
+
+
+def _state(env, purchase_id: str, invoice_ids: list[str]) -> dict:
+    """Everything the API says about this purchase's money, from every angle."""
+    detail = client.get(f"/purchases/{purchase_id}", headers=env["auth"]).json()
+    listed = client.get("/purchases", params={"search": detail["purchase_number"]}, headers=env["auth"]).json()["items"]
+    row = next(p for p in listed if p["id"] == purchase_id)
+    invoices = [client.get(f"/supplier-invoices/{i}", headers=env["auth"]).json() for i in invoice_ids]
+    ap = client.get("/accounts-payable", params={"supplier_id": env["sup"]}, headers=env["auth"]).json()["items"]
+    ap_by_id = {a["supplier_invoice_id"]: a for a in ap}
+    return {"detail": detail, "row": row, "invoices": invoices, "ap": ap_by_id}
+
+
+def _money(p: dict) -> tuple:
+    return round(p["amount_paid"], 2), round(p["outstanding_balance"], 2), p["payment_status"]
+
+
+def _assert_in_sync(state: dict, paid: float, outstanding: float, status: str) -> None:
+    assert _money(state["detail"]) == (paid, outstanding, status), state["detail"]
+    assert _money(state["row"]) == _money(state["detail"])  # list == detail
+    assert round(sum(i["amount_paid"] for i in state["invoices"]), 2) == paid  # purchase == its invoices
+    for inv in state["invoices"]:
+        ap = state["ap"].get(inv["id"])
+        if inv["outstanding_amount"] > 0:  # open payables list
+            assert ap is not None
+            assert (round(ap["amount_paid"], 2), round(ap["outstanding_amount"], 2), ap["payment_status"]) == \
+                (round(inv["amount_paid"], 2), round(inv["outstanding_amount"], 2), inv["payment_status"])
+
+
+# ------------------------------------------------------------------ tests
+
+
+def test_new_purchase_is_unpaid_everywhere_and_invoice_carries_its_links():
+    env = _org()
+    inv_date = "2026-10-20T00:00:00+00:00"
+    purchase = _purchase(env, invoice_date=inv_date, purchase_date="2026-10-26T00:00:00+00:00")
+    si_id = _auto_invoice_id(env, purchase["id"])
+    assert si_id is not None
+
+    state = _state(env, purchase["id"], [si_id])
+    _assert_in_sync(state, 0.0, 10000.0, "unpaid")
+    si = state["invoices"][0]
+    assert si["supplier_id"] == env["sup"] and si["supplier_name"] == env["sup_name"]
+    assert si["purchase_id"] == purchase["id"] and si["purchase_number"] == purchase["purchase_number"]
+    assert si["supplier_invoice_number"] == purchase["invoice_number"]
+    # The supplier's invoice date as entered -- not the purchase date
+    assert si["supplier_invoice_date"].startswith("2026-10-20") and si["invoice_date"].startswith("2026-10-20")
+    assert si["grand_total"] == 10000.0 and si["verification_status"] == "matched"
+    assert (si["amount_paid"], si["outstanding_amount"], si["payment_status"]) == (0.0, 10000.0, "unpaid")
+    # Warehouse name in list and detail alike
+    assert state["detail"]["warehouse_name"] == env["wh_name"] == state["row"]["warehouse_name"]
+    assert state["row"]["warehouse_id"] == env["wh"]
+
+
+def test_partial_then_full_payment_and_voids_reverse_exactly_once():
+    env = _org()
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+    _receive(env, purchase, 4)
+    _receive(env, purchase, 6)
+
+    p1 = _pay(env, [(si, 4000.0)])
+    _assert_in_sync(_state(env, purchase["id"], [si]), 4000.0, 6000.0, "partially_paid")
+
+    # Remaining 6,000 from the purchase screen -> a real supplier payment
+    r = client.patch(f"/purchases/{purchase['id']}/payment-status", json={"payment_status": "paid"}, headers=env["auth"])
+    assert r.status_code == 200, r.text
+    _assert_in_sync(_state(env, purchase["id"], [si]), 10000.0, 0.0, "paid")
+    db = SessionLocal()
+    try:
+        payments = db.query(SupplierPayment).filter(SupplierPayment.organization_id == env["org_id"]).all()
+        assert sorted(p.amount for p in payments) == [4000.0, 6000.0]
+        p2_id = next(p.id for p in payments if p.amount == 6000.0)
+    finally:
+        db.close()
+
+    # Closed + fully received + paid; closing never required payment
+    assert client.post(f"/purchases/{purchase['id']}/close", headers=env["auth"]).status_code == 200
+    detail = client.get(f"/purchases/{purchase['id']}", headers=env["auth"]).json()
+    assert (detail["status"], detail["receiving_status"]) == ("closed", "fully_received")
+
+    assert _void(env, p2_id).status_code == 200
+    _assert_in_sync(_state(env, purchase["id"], [si]), 4000.0, 6000.0, "partially_paid")
+    assert _void(env, p2_id).status_code == 400  # second void refused...
+    _assert_in_sync(_state(env, purchase["id"], [si]), 4000.0, 6000.0, "partially_paid")  # ...and changed nothing
+    assert _void(env, p1["id"]).status_code == 200
+    _assert_in_sync(_state(env, purchase["id"], [si]), 0.0, 10000.0, "unpaid")  # never negative
+
+
+def test_closed_fully_received_unpaid_is_valid():
+    env = _org()
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+    _receive(env, purchase, 10)
+    assert client.post(f"/purchases/{purchase['id']}/close", headers=env["auth"]).status_code == 200
+    _assert_in_sync(_state(env, purchase["id"], [si]), 0.0, 10000.0, "unpaid")
+
+
+def test_purchase_payment_endpoint_only_records_real_supplier_payments():
+    env = _org()
+    # Payment can't be typed in at creation
+    r = client.post("/purchases", json={"invoice_number": "X-1", "supplier_id": env["sup"], "amount_paid": 500,
+                                        "items": [{"product_id": env["prod"], "ordered_qty": 1, "purchase_price": 500}]},
+                    headers=env["auth"])
+    assert r.status_code == 400 and "amount_paid" in r.text
+
+    draft = _purchase(env, confirm=False)
+    r = client.patch(f"/purchases/{draft['id']}/payment-status", json={"payment_status": "paid"}, headers=env["auth"])
+    assert r.status_code == 400 and "no recorded supplier invoice" in r.text
+
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+    url = f"/purchases/{purchase['id']}/payment-status"
+
+    def payments() -> list[tuple[float, list]]:
+        db = SessionLocal()
+        try:
+            rows = db.query(SupplierPayment).filter(SupplierPayment.organization_id == env["org_id"],
+                                                    SupplierPayment.status == "recorded").all()
+            return sorted((p.amount, [(a.supplier_invoice_id, a.amount) for a in p.allocations]) for p in rows)
+        finally:
+            db.close()
+
+    r = client.patch(url, json={"payment_status": "partial", "amount_paid": 2500, "payment_method": "upi",
+                                "payment_reference": "UTR123"}, headers=env["auth"])
+    assert r.status_code == 200, r.text
+    assert payments() == [(2500.0, [(si, 2500.0)])]
+    _assert_in_sync(_state(env, purchase["id"], [si]), 2500.0, 7500.0, "partially_paid")
+
+    # Re-sending the same total adds nothing
+    assert client.patch(url, json={"payment_status": "partially_paid", "amount_paid": 2500}, headers=env["auth"]).status_code == 200
+    assert payments() == [(2500.0, [(si, 2500.0)])]
+    # Lowering, overpaying or a partial without an amount are refused and change nothing
+    for body in ({"payment_status": "partial", "amount_paid": 1000},
+                 {"payment_status": "unpaid"},
+                 {"payment_status": "paid", "amount_paid": 20000},
+                 {"payment_status": "partially_paid"}):
+        assert client.patch(url, json=body, headers=env["auth"]).status_code == 400, body
+    assert payments() == [(2500.0, [(si, 2500.0)])]
+    _assert_in_sync(_state(env, purchase["id"], [si]), 2500.0, 7500.0, "partially_paid")
+
+
+def test_multiple_supplier_invoices_on_one_purchase():
+    env = _org()
+    purchase = _purchase(env)
+    auto = _auto_invoice_id(env, purchase["id"])
+    assert client.post(f"/supplier-invoices/{auto}/cancel", headers=env["auth"]).status_code == 200
+    _receive(env, purchase, 10)
+    item_id = purchase["items"][0]["id"]
+    ids = []
+    for qty, num in ((4, "SUP-A"), (6, "SUP-B")):
+        r = client.post("/supplier-invoices", json={"supplier_id": env["sup"], "purchase_id": purchase["id"],
+                                                    "supplier_invoice_number": f"{num}-{uuid.uuid4().hex[:4]}",
+                                                    "items": [{"purchase_item_id": item_id, "billed_qty": qty, "unit_price": 1000}]},
+                        headers=env["auth"])
+        assert r.status_code == 201, r.text
+        assert client.post(f"/supplier-invoices/{r.json()['id']}/record", headers=env["auth"]).status_code == 200
+        ids.append(r.json()["id"])
+    a, b = ids
+
+    _pay(env, [(a, 4000.0), (b, 1000.0)])
+    state = _state(env, purchase["id"], ids)
+    _assert_in_sync(state, 5000.0, 5000.0, "partially_paid")
+    assert [i["payment_status"] for i in state["invoices"]] == ["paid", "partially_paid"]
+
+    # Paying the rest from the purchase allocates only to what is still open (invoice B)
+    r = client.patch(f"/purchases/{purchase['id']}/payment-status", json={"payment_status": "paid"}, headers=env["auth"])
+    assert r.status_code == 200, r.text
+    db = SessionLocal()
+    try:
+        allocs = db.query(SupplierPaymentAllocation).filter(SupplierPaymentAllocation.organization_id == env["org_id"]).all()
+        assert sorted((x.supplier_invoice_id == b, x.amount) for x in allocs) == [(False, 4000.0), (True, 1000.0), (True, 5000.0)]
+    finally:
+        db.close()
+    _assert_in_sync(_state(env, purchase["id"], ids), 10000.0, 0.0, "paid")
+
+
+def test_legacy_purchase_figures_never_override_the_payment_ledger():
+    env = _org()
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+    other = _purchase(env)
+    other_si = _auto_invoice_id(env, other["id"])
+    # Simulate the production record: Paid on the purchase, nothing behind it; and an old
+    # auto-created invoice that copied a purchase amount with no allocation.
+    db = SessionLocal()
+    try:
+        db.get(PurchaseInvoice, purchase["id"]).amount_paid = 10000.0
+        db.get(PurchaseInvoice, purchase["id"]).payment_status = "paid"
+        db.get(SupplierInvoice, other_si).amount_paid = 3000.0
+        db.commit()
+    finally:
+        db.close()
+
+    findings = {f["id"]: f for f in supplier_payment_service.reconcile_purchase_payments(SessionLocal(), env["org_id"])}
+    assert findings[purchase["id"]]["stored_amount_paid"] == 10000.0
+    assert findings[purchase["id"]]["canonical_amount_paid"] == 0.0
+    assert findings[other_si]["canonical_amount_paid"] == 0.0
+    db = SessionLocal()
+    try:  # dry run wrote nothing, invented nothing
+        assert db.get(PurchaseInvoice, purchase["id"]).amount_paid == 10000.0
+        assert db.query(SupplierPayment).filter(SupplierPayment.organization_id == env["org_id"]).count() == 0
+    finally:
+        db.close()
+
+    # The next real payment is what counts
+    _pay(env, [(si, 4000.0)])
+    _assert_in_sync(_state(env, purchase["id"], [si]), 4000.0, 6000.0, "partially_paid")
+
+    # Apply reconciles the rest from the ledger, logs it, and still creates no payment
+    db = SessionLocal()
+    supplier_payment_service.reconcile_purchase_payments(db, env["org_id"], apply=True)
+    db.close()
+    _assert_in_sync(_state(env, other["id"], [other_si]), 0.0, 10000.0, "unpaid")
+    db = SessionLocal()
+    try:
+        assert db.query(SupplierPayment).filter(SupplierPayment.organization_id == env["org_id"]).count() == 1
+        logs = db.query(ActivityLog).filter(ActivityLog.organization_id == env["org_id"],
+                                           ActivityLog.title == "Payment summary reconciled").all()
+        assert any("3000" in (log.description or "") for log in logs)
+    finally:
+        db.close()
+    assert supplier_payment_service.reconcile_purchase_payments(SessionLocal(), env["org_id"]) == []
+
+
+def test_tenant_isolation():
+    env_a, env_b = _org("Firm A"), _org("Firm B")
+    purchase = _purchase(env_a)
+    si = _auto_invoice_id(env_a, purchase["id"])
+    assert client.patch(f"/purchases/{purchase['id']}/payment-status", json={"payment_status": "paid"},
+                        headers=env_b["auth"]).status_code == 404
+    assert client.get(f"/supplier-invoices/{si}", headers=env_b["auth"]).status_code == 404
+    assert client.get(f"/purchases/{purchase['id']}", headers=env_b["auth"]).status_code == 404
+    ap_b = client.get("/accounts-payable", headers=env_b["auth"]).json()["items"]
+    assert all(item["supplier_invoice_id"] != si for item in ap_b)
+    _assert_in_sync(_state(env_a, purchase["id"], [si]), 0.0, 10000.0, "unpaid")

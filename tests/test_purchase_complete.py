@@ -350,29 +350,40 @@ check("Receiving status is not_received", pur_gr["receiving_status"] == "not_rec
 
 # --- TEST 7: PAYMENT DETAILS & OUTSTANDING BALANCE ---
 print("\n--- TEST 7: Payment Details & Outstanding Balance ---")
-res_pay = client.post(
-    "/purchases",
-    headers=headers1,
-    json={
-        "invoice_number": "APEX-INV-9906",
-        "supplier_id": sup1_id,
-        "payment_method": "bank_transfer",
-        "payment_terms": "Net 30",
-        "payment_reference": "UTR-AXIS-998877",
-        "amount_paid": 2000.0,
-        "items": [{"product_id": prod1_id, "quantity": 5, "purchase_price": 1000.0}],  # Total 5000.0
-    },
-)
+# The amount paid is derived from supplier payments; it can't be typed in at creation.
+pay_body = {
+    "invoice_number": "APEX-INV-9906",
+    "supplier_id": sup1_id,
+    "payment_method": "bank_transfer",
+    "payment_terms": "Net 30",
+    "payment_reference": "UTR-AXIS-998877",
+    "items": [{"product_id": prod1_id, "quantity": 5, "purchase_price": 1000.0}],  # Total 5000.0
+}
+res_typed = client.post("/purchases", headers=headers1, json={**pay_body, "amount_paid": 2000.0})
+check("Create purchase with a typed-in amount_paid rejected (HTTP 400)", res_typed.status_code == 400)
+
+res_pay = client.post("/purchases", headers=headers1, json=pay_body)
 check("Create purchase with payment details (HTTP 201)", res_pay.status_code == 201)
 pur_p = res_pay.json()
 check("Payment method is bank_transfer", pur_p["payment_method"] == "bank_transfer")
 check("Payment terms is Net 30", pur_p["payment_terms"] == "Net 30")
 check("Payment reference is UTR-AXIS-998877", pur_p["payment_reference"] == "UTR-AXIS-998877")
-check("Payment status is partial", pur_p["payment_status"] == "partial")
-check("Amount paid is 2000.0", pur_p["amount_paid"] == 2000.0)
-check("Outstanding balance computed: 3000.0", pur_p["outstanding_balance"] == 3000.0)
+check("New purchase is unpaid", pur_p["payment_status"] == "unpaid" and pur_p["amount_paid"] == 0.0)
+check("Outstanding balance computed: 5000.0", pur_p["outstanding_balance"] == 5000.0)
+check("Confirm purchase (HTTP 200)",
+      client.post(f"/purchases/{pur_p['id']}/confirm", headers=headers1).status_code == 200)
 
-# Update payment status
+# Record payment from the purchase: each call records a real supplier payment for the difference
+res_part = client.patch(
+    f"/purchases/{pur_p['id']}/payment-status",
+    headers=headers1,
+    json={"payment_status": "partially_paid", "amount_paid": 2000.0},
+)
+check("Record 2000.0 paid (HTTP 200)", res_part.status_code == 200)
+check("Payment status is partially_paid", res_part.json()["payment_status"] == "partially_paid")
+check("Amount paid is 2000.0", res_part.json()["amount_paid"] == 2000.0)
+check("Outstanding balance computed: 3000.0", res_part.json()["outstanding_balance"] == 3000.0)
+
 res_pay_up = client.patch(
     f"/purchases/{pur_p['id']}/payment-status",
     headers=headers1,
@@ -381,6 +392,9 @@ res_pay_up = client.patch(
 check("Update payment status to paid (HTTP 200)", res_pay_up.status_code == 200)
 check("Payment status updated to paid", res_pay_up.json()["payment_status"] == "paid")
 check("Outstanding balance is now 0.0", res_pay_up.json()["outstanding_balance"] == 0.0)
+sp_list = client.get(f"/supplier-payments?supplier_id={sup1_id}", headers=headers1).json()
+check("Two real supplier payments back the purchase (2000 + 3000)",
+      sorted(p["amount"] for p in sp_list["items"] if p["status"] == "recorded") == [2000.0, 3000.0])
 
 # --- TEST 8: ACCOUNTING, TERMS & TAGS ---
 print("\n--- TEST 8: Accounting, Terms & Conditions, and Tags ---")

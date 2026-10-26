@@ -7,7 +7,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 PURCHASE_STATUSES = {"draft", "confirmed", "closed", "cancelled", "pending", "approved"}
-PAYMENT_STATUSES = {"unpaid", "partial", "paid"}
+# "partially_paid" is what the payment summary writes (same as supplier invoices); "partial"
+# is still accepted on input for older clients.
+PAYMENT_STATUSES = {"unpaid", "partial", "partially_paid", "paid"}
 
 
 def _uuid() -> str:
@@ -118,6 +120,19 @@ class PurchaseInvoice(Base):
         back_populates="invoice", cascade="all, delete-orphan", lazy="joined"
     )
     supplier: Mapped["Supplier | None"] = relationship(lazy="joined")  # noqa: F821
+    # Read-only: the receiving warehouse, so list and detail both carry its name. Loaded with
+    # one extra SELECT per batch (selectin), and only within the purchase's own firm.
+    warehouse: Mapped["Warehouse | None"] = relationship(  # noqa: F821
+        "Warehouse",
+        primaryjoin="and_(foreign(PurchaseInvoice.warehouse_id) == Warehouse.id, "
+                    "Warehouse.organization_id == PurchaseInvoice.organization_id)",
+        viewonly=True,
+        lazy="selectin",
+    )
+
+    @property
+    def warehouse_name(self) -> str | None:
+        return self.warehouse.name if self.warehouse is not None else None
 
     @property
     def outstanding_balance(self) -> float:

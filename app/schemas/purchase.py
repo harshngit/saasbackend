@@ -132,6 +132,7 @@ class PurchaseOut(BaseModel):
     grn_number: str | None = None
     received_date: datetime | None = None
     warehouse_id: str | None = None
+    warehouse_name: str | None = None
     received_by: str | None = None
     receiving_status: str | None = None
 
@@ -324,7 +325,11 @@ class PurchaseUpdate(BaseModel):
 
 
 class PaymentStatusUpdate(BaseModel):
-    payment_status: str = Field(description="unpaid | partial | paid")
+    """Record payment against a purchase. `amount_paid` is the new TOTAL paid; the backend
+    records a supplier payment for the difference. Without `amount_paid`, "paid" means pay the
+    whole outstanding balance and "unpaid" means nothing should be paid."""
+
+    payment_status: str = Field(description="unpaid | partially_paid | paid ('partial' accepted)")
     amount_paid: float | None = Field(default=None, ge=0)
     payment_method: str | None = None
     payment_reference: str | None = None

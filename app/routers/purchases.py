@@ -19,7 +19,17 @@ from app.models import (
     User,
     Warehouse,
 )
-from app.services import numbering_service, lookup_service, purchase_return_service, purchase_service, stock_service, supplier_invoice_service
+from app.services import (
+    activity_service,
+    entitlement_service,
+    lookup_service,
+    numbering_service,
+    purchase_return_service,
+    purchase_service,
+    stock_service,
+    supplier_invoice_service,
+    supplier_payment_service,
+)
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.purchase import (
@@ -133,14 +143,17 @@ def create_purchase(
     payee_gstin = payload.payee_gstin or (supplier.gst_number if supplier else None)
     billing_address = payload.billing_address or (supplier.address if supplier else None)
 
-    # Determine payment status if amount_paid passed
-    amt_paid = round(payload.amount_paid or 0.0, 2)
-    if amt_paid >= grand_total and grand_total > 0:
-        pay_status = "paid"
-    elif amt_paid > 0:
-        pay_status = "partial"
-    else:
-        pay_status = "unpaid"
+    # A purchase's amount paid is derived from supplier payments allocated to its supplier
+    # invoices; it cannot be typed in. Pay after confirming, via PATCH /{id}/payment-status
+    # (which records a real supplier payment) or POST /supplier-payments.
+    if round(payload.amount_paid or 0.0, 2) > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="amount_paid cannot be set when creating a purchase. Confirm the purchase, then record "
+                   "the payment (PATCH /purchases/{id}/payment-status or POST /supplier-payments).",
+        )
+    amt_paid = 0.0
+    pay_status = "unpaid"
 
     initial_status = "draft"
     if payload.purchase_status:
@@ -288,7 +301,9 @@ def list_purchases(
     if status_filter:
         q = q.filter(PurchaseInvoice.status == status_filter)
     if payment_status:
-        q = q.filter(PurchaseInvoice.payment_status == payment_status)
+        # "partial" (older rows / clients) and "partially_paid" (current) are the same status.
+        wanted = {"partial", "partially_paid"} if payment_status in ("partial", "partially_paid") else {payment_status}
+        q = q.filter(PurchaseInvoice.payment_status.in_(wanted))
     if purchase_type:
         q = q.filter(PurchaseInvoice.purchase_type == purchase_type)
     if receiving_status:
@@ -496,22 +511,72 @@ def set_payment_status(
     id: str,
     payload: PaymentStatusUpdate,
     user: User = Depends(_edit),
+    _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> PurchaseInvoice:
-    inv = _owned(db, id, _org_id(user))
+    """Record / update payment on a purchase -- through the supplier payment ledger.
+
+    The purchase's amount paid is never written directly: it is derived from supplier payments
+    allocated to its supplier invoices. `amount_paid` here is the new TOTAL the user says has
+    been paid; the backend records one real Supplier Payment for the difference (allocated to
+    the purchase's invoices, oldest first) and the summary follows from it. Lowering the total
+    is refused -- void the supplier payment instead, which keeps the history auditable.
+    """
+    org_id = _org_id(user)
+    inv = _owned(db, id, org_id)
     if payload.payment_status not in PAYMENT_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"payment_status must be one of {sorted(PAYMENT_STATUSES)}",
         )
-    inv.payment_status = payload.payment_status
+
+    stored = (round(inv.amount_paid or 0.0, 2), inv.payment_status)
+    supplier_payment_service.recalculate_purchase_payment(db, inv)
+    paid_now = round(inv.amount_paid or 0.0, 2)
+    if stored != (paid_now, inv.payment_status):
+        # An older figure typed straight onto the purchase, with no supplier payment behind
+        # it, is replaced by the ledger's -- and the replacement is logged, not silent.
+        activity_service.record(
+            db, org_id, user, "purchase", "Payment summary reconciled",
+            f"Purchase {inv.purchase_number or inv.invoice_number}: stored {stored[0]} ({stored[1]}) -> "
+            f"{paid_now} ({inv.payment_status}) from supplier payments",
+        )
+    payable = round(max((inv.total or 0.0) - (inv.return_amount or 0.0), 0.0), 2)
     if payload.amount_paid is not None:
-        inv.amount_paid = payload.amount_paid
+        target = round(payload.amount_paid, 2)
+    elif payload.payment_status == "paid":
+        target = payable
+    elif payload.payment_status == "unpaid":
+        target = 0.0
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="amount_paid is required to record a partial payment",
+        )
+
+    if target < paid_now - 0.005:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This purchase already has {paid_now} paid through supplier payments. To reduce it, "
+                   "void the supplier payment (POST /supplier-payments/{payment_id}/void).",
+        )
+    if target > paid_now + 0.005:
+        # A real supplier payment is created, so the same permission and plan feature apply as
+        # for POST /supplier-payments.
+        require_permission("supplier_payments", "create")(user=user, db=db)
+        entitlement_service.check_entitlement(db, user.organization, "finance.supplier_payments")
+        supplier_payment_service.pay_purchase(
+            db, org_id, inv, round(target - paid_now, 2),
+            payment_method=payload.payment_method, reference=payload.payment_reference, user_id=user.id,
+        )
+
+    inv = _owned(db, id, org_id)
     if payload.payment_method:
         inv.payment_method = payload.payment_method
     if payload.payment_reference:
         inv.payment_reference = payload.payment_reference
-
+    supplier_payment_service.recalculate_purchase_payment(db, inv)
     db.commit()
     db.refresh(inv)
     return inv

@@ -74,6 +74,22 @@ class SupplierInvoice(Base):
     def outstanding_amount(self) -> float:
         return round(max(self.grand_total - (self.return_amount or 0.0) - (self.amount_paid or 0.0), 0.0), 2)
 
+    # Read from the linked records, so the API can show who and what this invoice is for.
+    @property
+    def supplier_name(self) -> str | None:
+        return self.supplier.name if self.supplier is not None else None
+
+    @property
+    def purchase_number(self) -> str | None:
+        if self.purchase is None:
+            return None
+        return self.purchase.purchase_number or self.purchase.purchase_id
+
+    @property
+    def invoice_date(self) -> datetime:
+        """Same value as supplier_invoice_date (the supplier's invoice date)."""
+        return self.supplier_invoice_date
+
 
 class SupplierInvoiceItem(Base):
     __tablename__ = "supplier_invoice_items"

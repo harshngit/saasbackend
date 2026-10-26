@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, lazyload
 
 from app.core.sorting import apply_sorting
@@ -60,25 +60,47 @@ def recalculate_supplier_invoice(db: Session, invoice: SupplierInvoice) -> None:
     total_paid = round(sum(alloc.amount for alloc in allocations), 2)
     invoice.amount_paid = total_paid
 
-    total_settled = round(total_paid + (invoice.return_amount or 0.0), 2)
-    if total_settled <= 0:
-        invoice.payment_status = "unpaid"
-    elif total_settled + 0.01 >= invoice.grand_total and invoice.grand_total > 0:
-        invoice.payment_status = "paid"
-    else:
-        invoice.payment_status = "partially_paid"
+    invoice.payment_status = _payment_status(total_paid, invoice.return_amount, invoice.grand_total)
 
     if invoice.purchase_id:
+        db.flush()  # the purchase sum below must see this invoice's new figure
         purchase = db.get(PurchaseInvoice, invoice.purchase_id)
         if purchase:
-            purchase.amount_paid = total_paid
-            p_settled = round(total_paid + (purchase.return_amount or 0.0), 2)
-            if p_settled <= 0:
-                purchase.payment_status = "unpaid"
-            elif p_settled + 0.01 >= (purchase.total or 0.0) and (purchase.total or 0.0) > 0:
-                purchase.payment_status = "paid"
-            else:
-                purchase.payment_status = "partially_paid"
+            recalculate_purchase_payment(db, purchase)
+
+
+def _payment_status(paid: float, returned: float | None, total: float | None) -> str:
+    settled = round((paid or 0.0) + (returned or 0.0), 2)
+    if settled <= 0:
+        return "unpaid"
+    if settled + 0.01 >= (total or 0.0) and (total or 0.0) > 0:
+        return "paid"
+    return "partially_paid"
+
+
+def purchase_paid_from_invoices(db: Session, purchase: PurchaseInvoice) -> float:
+    """The canonical amount paid on a purchase: the sum of what its non-cancelled supplier
+    invoices have been paid. Each invoice's figure is in turn the sum of its allocations from
+    recorded (non-voided) supplier payments, so a payment counts exactly once, however many
+    invoices the purchase has."""
+    paid = (
+        db.query(func.coalesce(func.sum(SupplierInvoice.amount_paid), 0.0))
+        .filter(
+            SupplierInvoice.organization_id == purchase.organization_id,
+            SupplierInvoice.purchase_id == purchase.id,
+            SupplierInvoice.status != "cancelled",
+        )
+        .scalar()
+    )
+    return round(float(paid or 0.0), 2)
+
+
+def recalculate_purchase_payment(db: Session, purchase: PurchaseInvoice) -> None:
+    """Refresh the purchase's stored payment summary (amount_paid / payment_status) from its
+    supplier invoices -- the only place those two columns are written. They are a cache of
+    the supplier payment allocations, never an independent record of payment."""
+    purchase.amount_paid = purchase_paid_from_invoices(db, purchase)
+    purchase.payment_status = _payment_status(purchase.amount_paid, purchase.return_amount, purchase.total)
 
 
 def recalculate_supplier_total_paid(db: Session, supplier: Supplier) -> None:
@@ -480,3 +502,150 @@ def get_invoice_payment_history(
             )
         )
     return out
+
+
+# --------------------------------------------------------------------------------------
+# Paying a purchase, and reconciling legacy purchase payment summaries
+# --------------------------------------------------------------------------------------
+
+
+def pay_purchase(
+    db: Session,
+    org_id: str,
+    purchase: PurchaseInvoice,
+    amount: float,
+    payment_method: str | None = None,
+    reference: str | None = None,
+    user_id: str | None = None,
+) -> SupplierPaymentOut:
+    """Record a real Supplier Payment of `amount` for a purchase, allocated to its recorded
+    supplier invoices oldest first. Goes through record_supplier_payment, so every rule of
+    the canonical payment flow (locks, outstanding checks, totals) applies unchanged."""
+    if not purchase.supplier_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This purchase has no supplier, so no supplier payment can be recorded against it",
+        )
+    invoices = (
+        db.query(SupplierInvoice)
+        .filter(
+            SupplierInvoice.organization_id == org_id,
+            SupplierInvoice.purchase_id == purchase.id,
+            SupplierInvoice.status == "recorded",
+        )
+        .order_by(SupplierInvoice.supplier_invoice_date.asc(), SupplierInvoice.created_at.asc())
+        .all()
+    )
+    if not invoices:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This purchase has no recorded supplier invoice yet. Confirm the purchase "
+                   "(or record its supplier invoice) before recording a payment.",
+        )
+    remaining = round(amount, 2)
+    allocations = []
+    for inv in invoices:
+        recalculate_supplier_invoice(db, inv)
+        open_amount = round(inv.outstanding_amount, 2)
+        if open_amount <= 0 or remaining <= 0:
+            continue
+        portion = min(open_amount, remaining)
+        allocations.append({"supplier_invoice_id": inv.id, "amount": portion})
+        remaining = round(remaining - portion, 2)
+    if remaining > 0.01:
+        outstanding = round(sum(a["amount"] for a in allocations), 2)
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Payment ({round(amount, 2)}) exceeds the purchase's outstanding balance ({outstanding})",
+        )
+    payload = SupplierPaymentCreate(
+        supplier_id=purchase.supplier_id,
+        amount=round(amount, 2),
+        payment_method=payment_method or "cash",
+        reference=reference,
+        notes=f"Recorded from purchase {purchase.purchase_number or purchase.invoice_number}",
+        allocations=allocations,
+    )
+    return record_supplier_payment(db, org_id, payload, user_id=user_id)
+
+
+def reconcile_purchase_payments(db: Session, org_id: str | None = None, apply: bool = False) -> list[dict]:
+    """Compare stored payment summaries with what the supplier payment allocations say.
+
+    Reports every supplier invoice whose stored amount_paid differs from its allocations,
+    and every purchase whose stored amount_paid / payment_status differs from its supplier
+    invoices. With `apply=True` the stored figures are recalculated from allocations and
+    each change is written to the activity log. It never creates or deletes a payment:
+    an amount recorded only on the old purchase-level fields, with no supplier payment
+    behind it, is reported so the team can record the real payment if one was made.
+    """
+    from app.services import activity_service
+
+    findings: list[dict] = []
+    inv_q = db.query(SupplierInvoice).filter(SupplierInvoice.status != "cancelled")
+    pur_q = db.query(PurchaseInvoice)
+    if org_id:
+        inv_q = inv_q.filter(SupplierInvoice.organization_id == org_id)
+        pur_q = pur_q.filter(PurchaseInvoice.organization_id == org_id)
+
+    # 1. Canonical figures straight from the ledger, before anything is written, so a dry run
+    #    and an apply report exactly the same findings.
+    allocated_by_invoice = dict(
+        db.query(SupplierPaymentAllocation.supplier_invoice_id, func.coalesce(func.sum(SupplierPaymentAllocation.amount), 0.0))
+        .join(SupplierPayment, SupplierPayment.id == SupplierPaymentAllocation.supplier_payment_id)
+        .filter(SupplierPayment.status == "recorded")
+        .group_by(SupplierPaymentAllocation.supplier_invoice_id)
+        .all()
+    )
+    invoices = inv_q.all()
+    canonical_invoice = {inv.id: round(float(allocated_by_invoice.get(inv.id, 0.0) or 0.0), 2) for inv in invoices}
+    paid_by_purchase: dict[str, float] = {}
+    for inv in invoices:
+        paid_by_purchase[inv.purchase_id] = round(paid_by_purchase.get(inv.purchase_id, 0.0) + canonical_invoice[inv.id], 2)
+    purchases_with_invoice = set(paid_by_purchase)
+
+    stale_invoices = [inv for inv in invoices if abs(round(inv.amount_paid or 0.0, 2) - canonical_invoice[inv.id]) > 0.005]
+    for inv in stale_invoices:
+        findings.append({
+            "kind": "supplier_invoice", "organization_id": inv.organization_id, "id": inv.id,
+            "number": inv.supplier_invoice_number, "stored_amount_paid": round(inv.amount_paid or 0.0, 2),
+            "canonical_amount_paid": canonical_invoice[inv.id],
+        })
+    stale_purchases = []
+    for purchase in pur_q.all():
+        canonical_paid = paid_by_purchase.get(purchase.id, 0.0)
+        canonical_status = _payment_status(canonical_paid, purchase.return_amount, purchase.total)
+        stored_paid = round(purchase.amount_paid or 0.0, 2)
+        if abs(stored_paid - canonical_paid) > 0.005 or purchase.payment_status != canonical_status:
+            stale_purchases.append(purchase)
+            findings.append({
+                "kind": "purchase", "organization_id": purchase.organization_id, "id": purchase.id,
+                "number": purchase.purchase_number or purchase.invoice_number,
+                "stored_amount_paid": stored_paid, "stored_payment_status": purchase.payment_status,
+                "canonical_amount_paid": canonical_paid, "canonical_payment_status": canonical_status,
+                "has_supplier_invoice": purchase.id in purchases_with_invoice,
+            })
+
+    # 2. Apply: recalculate from the ledger (never create or remove a payment) and log each change.
+    if apply:
+        for inv in stale_invoices:
+            old = inv.amount_paid
+            recalculate_supplier_invoice(db, inv)
+            activity_service.record(
+                db, inv.organization_id, None, "supplier_invoice", "Payment summary reconciled",
+                f"Supplier invoice {inv.supplier_invoice_number}: stored amount paid {old} -> {inv.amount_paid} "
+                "(from recorded supplier payments)",
+            )
+        db.flush()
+        for purchase in stale_purchases:
+            old = next((f["stored_amount_paid"], f["stored_payment_status"]) for f in findings
+                       if f["kind"] == "purchase" and f["id"] == purchase.id)
+            recalculate_purchase_payment(db, purchase)
+            activity_service.record(
+                db, purchase.organization_id, None, "purchase", "Payment summary reconciled",
+                f"Purchase {purchase.purchase_number or purchase.invoice_number}: stored {old[0]} ({old[1]}) -> "
+                f"{purchase.amount_paid} ({purchase.payment_status}) from supplier payments",
+            )
+        db.commit()
+    return findings

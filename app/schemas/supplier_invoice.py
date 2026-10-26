@@ -71,9 +71,12 @@ class SupplierInvoiceOut(BaseModel):
     id: str
     organization_id: str
     supplier_id: str
+    supplier_name: str | None = None
     purchase_id: str
+    purchase_number: str | None = None  # the linked purchase's business number (PO-…)
     supplier_invoice_number: str
     supplier_invoice_date: datetime
+    invoice_date: datetime | None = None  # same as supplier_invoice_date
     due_date: datetime | None = None
     status: str
     verification_status: str

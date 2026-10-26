@@ -263,33 +263,29 @@ def auto_create_from_purchase(
         candidate_num = f"{candidate_num}-{purchase.id[:6]}"
     candidate_num = candidate_num[:100]
 
-    # 3. Determine payment status
-    amt_paid = round(purchase.amount_paid or 0.0, 2)
+    # 3. Payment: a new invoice has no supplier payment allocated to it, so it is unpaid.
+    # (The purchase's own amount_paid is a summary derived from supplier invoices and
+    # is never copied in -- doing so created payments with no transaction behind them.)
     grand_tot = round(purchase.total or 0.0, 2)
-    if amt_paid >= grand_tot and grand_tot > 0:
-        pay_status = "paid"
-    elif amt_paid > 0:
-        pay_status = "partially_paid"
-    else:
-        pay_status = "unpaid"
 
-    # 4. Construct SupplierInvoice header
+    # 4. Construct SupplierInvoice header. Its date is the supplier's invoice date as entered on
+    # the purchase (`invoice_date`), never the purchase date.
     now = datetime.now(timezone.utc)
     inv = SupplierInvoice(
         organization_id=org_id,
         supplier_id=purchase.supplier_id,
         purchase_id=purchase.id,
         supplier_invoice_number=candidate_num,
-        supplier_invoice_date=purchase.purchase_date or purchase.invoice_date or now,
+        supplier_invoice_date=purchase.invoice_date or now,
         due_date=purchase.due_date,
         status="recorded",
         verification_status="matched",
-        payment_status=pay_status,
+        payment_status="unpaid",
         subtotal=round(purchase.subtotal or 0.0, 2),
         tax_amount=round(purchase.tax or 0.0, 2),
         discount_amount=round(purchase.discount or 0.0, 2),
         grand_total=grand_tot,
-        amount_paid=amt_paid,
+        amount_paid=0.0,
         notes=purchase.notes or purchase.internal_remarks,
         attachment_url=purchase.supplier_invoice_url or purchase.attachment_url,
         created_by=user_id or purchase.created_by,
