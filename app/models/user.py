@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import false as sql_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -36,6 +37,17 @@ class User(Base):
     # so existing users / admins created before this field remain valid.
     username: Mapped[str | None] = mapped_column(String(50), nullable=True, unique=True, index=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # `phone` in canonical +91XXXXXXXXXX form, set for staff accounts only (admins and super
+    # admins stay NULL, so they may share a number). Unique platform-wide: one staff mobile
+    # number identifies one account for OTP login. See app.services.staff_phone_service.
+    staff_phone_e164: Mapped[str | None] = mapped_column(String(16), nullable=True, unique=True, index=True)
+    # True once this account has signed in by an OTP texted to `phone`; reset when the
+    # staff number changes.
+    phone_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sql_false(), nullable=False
+    )
+    # When the account last signed in (any method: password, Google, phone OTP).
+    last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     # Google OAuth subject identifier (sub claim). Nullable for password-only users.
     google_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)

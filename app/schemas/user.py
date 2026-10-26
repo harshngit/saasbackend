@@ -150,6 +150,8 @@ class UserOut(BaseModel):
     email: EmailStr
     username: str | None
     phone: str | None
+    phone_verified: bool = False       # signed in by an OTP texted to `phone`
+    last_login: datetime | None = None
     system_role: str | None            # super_admin / admin / staff
     role_id: str | None
     role_detail: RoleBrief | None      # the staff member's role + permissions

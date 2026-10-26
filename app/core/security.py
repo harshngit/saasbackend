@@ -11,6 +11,16 @@ ACCESS_TOKEN = "access"
 REFRESH_TOKEN = "refresh"
 
 
+def as_utc(moment: datetime) -> datetime:
+    """A stored timestamp as an aware UTC datetime, for expiry comparisons.
+
+    SQLite hands back naive UTC values; PostgreSQL hands back aware values in the
+    session's time zone. Those must be converted, not relabelled: `replace(tzinfo=utc)`
+    on an IST value would shift an expiry by 5h30m.
+    """
+    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment.astimezone(timezone.utc)
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 

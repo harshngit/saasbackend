@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.models.enums import UserRole
 from app.schemas.organization import OrganizationOut
@@ -143,6 +143,8 @@ class MeResponse(BaseModel):
     full_access: bool = False
     # `own` means list endpoints return only this user's own/assigned records.
     data_scope: str = "all"
+    # True once this account has signed in with an OTP texted to its staff number.
+    phone_verified: bool = False
 
     user: UserOut
     organization: OrganizationOut | None
@@ -172,8 +174,16 @@ class ForgotPasswordResponse(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    token: str
+    token: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=8, max_length=128)
+    # Optional: when sent it must equal new_password (the form also checks this).
+    confirm_password: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _passwords_match(self) -> "ResetPasswordRequest":
+        if self.confirm_password is not None and self.confirm_password != self.new_password:
+            raise ValueError("confirm_password does not match new_password")
+        return self
 
 
 class ChangePasswordRequest(BaseModel):
@@ -181,16 +191,22 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
-# --- DEMO-ONLY direct reset (no email verification). Insecure; replace with the
-#     token flow (forgot-password + reset-password) before production. ---
-class CheckEmailRequest(BaseModel):
-    email: EmailStr
+class OtpRequest(BaseModel):
+    """POST /auth/phone/send-otp. An Indian mobile number, e.g. `9876543210`,
+    `+91 98765-43210` or `09876543210`."""
+
+    phone: str = Field(min_length=1, max_length=20)
 
 
-class CheckEmailResponse(BaseModel):
-    exists: bool
+class OtpSendResponse(BaseModel):
+    detail: str
+    # Seconds before another code may be requested for this number.
+    resend_after: int
 
 
-class DirectResetRequest(BaseModel):
-    email: EmailStr
-    new_password: str = Field(min_length=8, max_length=128)
+class OtpVerifyRequest(BaseModel):
+    """POST /auth/phone/verify-otp. `code` must be exactly six digits; anything else is
+    answered 400 "Invalid or expired OTP" without contacting Twilio."""
+
+    phone: str = Field(min_length=1, max_length=20)
+    code: str = Field(max_length=32)

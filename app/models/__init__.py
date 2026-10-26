@@ -46,6 +46,7 @@ from app.models.supplier_invoice import (
 from app.models.grn import GoodsReceiptNote, GoodsReceiptNoteItem
 from app.models.sales_order import ORDER_STATUSES, SalesOrder, SalesOrderItem
 from app.models.password_reset_token import PasswordResetToken
+from app.models.auth_rate_limit import AuthRateLimitEvent
 from app.models.oauth_exchange_ticket import OAuthExchangeTicket
 from app.models.oauth_registration_ticket import OAuthRegistrationTicket
 from app.models.plan import Plan
@@ -187,6 +188,7 @@ __all__ = [
     "User",
     "RefreshToken",
     "PasswordResetToken",
+    "AuthRateLimitEvent",
     "OAuthExchangeTicket",
     "OAuthRegistrationTicket",
     "UserRole",

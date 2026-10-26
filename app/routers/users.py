@@ -50,6 +50,7 @@ from app.services import (
     password_service,
     role_service,
     staff_overview_service,
+    staff_phone_service,
 )
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -253,6 +254,8 @@ def create_staff(
     )
     db.add(staff)
     db.flush()
+    # One staff mobile number, one account, across every firm (409 otherwise).
+    staff_phone_service.sync_staff_phone(db, staff)
     employee_profile_service.apply_documents(db, staff, payload.documents)
     _sync_identity_alias(staff)
     activity_service.record(
@@ -505,6 +508,9 @@ def update_user(
     old_photo = target.profile_photo
     for field, value in data.items():
         setattr(target, field, value)
+    if "phone" in data:
+        # Only when the number is sent, so an unrelated edit never trips over a legacy duplicate.
+        staff_phone_service.sync_staff_phone(db, target)
     if "profile_photo" in data and old_photo and data["profile_photo"] != old_photo:
         from app.core.files import safe_delete_unreferenced_file
         safe_delete_unreferenced_file(db, old_photo, admin.organization_id)

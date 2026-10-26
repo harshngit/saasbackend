@@ -10,16 +10,16 @@ logger = logging.getLogger("crm.email")
 def send_email(to: str, subject: str, body: str) -> None:
     """Send a plain-text email.
 
-    If no SMTP host is configured we run in "console" mode and log the message
-    instead of sending it — so local dev works without a mailbox.
+    If no SMTP host is configured we run in "console" mode and log that a message
+    would have been sent instead of sending it — so local dev works without a mailbox.
+    The body is never logged: it can carry a secret (a password-reset link). Use
+    EXPOSE_RESET_TOKEN in dev to get the reset token without a mailbox.
     """
     if not settings.smtp_host:
         logger.warning(
-            "[email:console] SMTP not configured. Would send:\n"
-            "  To: %s\n  Subject: %s\n  Body:\n%s",
+            "[email:console] SMTP not configured. Would send to %s (subject=%s); body withheld",
             to,
             subject,
-            body,
         )
         return
 

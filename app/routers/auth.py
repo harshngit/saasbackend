@@ -1,6 +1,9 @@
+import logging
+import re
+
 import jwt
 from urllib.parse import quote
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -13,9 +16,6 @@ from app.models import User
 from app.schemas.auth import (
     AuthResponse,
     ChangePasswordRequest,
-    CheckEmailRequest,
-    CheckEmailResponse,
-    DirectResetRequest,
     ExchangeTicketRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
@@ -28,6 +28,9 @@ from app.schemas.auth import (
     LogoutRequest,
     MessageResponse,
     MeResponse,
+    OtpRequest,
+    OtpSendResponse,
+    OtpVerifyRequest,
     RefreshRequest,
     RegisterOrganization,
     ResetPasswordRequest,
@@ -35,11 +38,28 @@ from app.schemas.auth import (
 )
 from app.schemas.theme import OrganizationThemeOut
 from app.schemas.user import UserOut
-from app.services import auth_service, google_auth_service, org_service, password_service, role_service
+from app.core.phone import normalize_indian_mobile
+from app.services import (
+    activity_service,
+    auth_service,
+    google_auth_service,
+    org_service,
+    otp_service,
+    password_service,
+    rate_limit_service,
+    role_service,
+    staff_phone_service,
+)
 from app.services.email_service import send_password_reset
 from app.services.google_auth_service import GoogleAuthError
+from app.services.otp_service import OtpError
+
+logger = logging.getLogger("crm.auth")
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# The one rate-limit answer every unauthenticated endpoint gives -- it never says why.
+_THROTTLED = "Too many attempts. Please try again later."
 
 
 class GoogleIdentityConflict(Exception):
@@ -409,6 +429,7 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
         permissions=role_service.effective_permissions(db, user),
         full_access=role_service.is_full_access(user),
         data_scope=role_service.data_scope(db, user),
+        phone_verified=bool(user.phone_verified),
         user=user,
         organization=org,
         theme=theme_out,
@@ -416,18 +437,41 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)
-def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)) -> ForgotPasswordResponse:
+def forgot_password(
+    payload: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)
+) -> ForgotPasswordResponse:
     """Start a password reset. Always responds the same way to avoid leaking which
-    emails exist. If the email matches an active user, a reset link is emailed."""
+    emails exist. If the email matches an active user, a reset link is emailed.
+
+    Rate limited per email address and per client IP before any account lookup, so a
+    429 says nothing about whether the address is registered."""
     generic = "If that email is registered, a reset link has been sent."
-    user = db.query(User).filter(User.email == payload.email).first()
+    email = str(payload.email).strip().lower()
+    ip = rate_limit_service.client_ip(request)
+    rate_limit_service.hold(db, ("reset_request_ip", ip), ("reset_request_email", email))
+    if rate_limit_service.exceeded(db, "reset_request_ip", ip, rate_limit_service.RESET_REQUEST_IP) or \
+            rate_limit_service.exceeded(db, "reset_request_email", email, rate_limit_service.RESET_REQUEST_EMAIL):
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_THROTTLED)
+    rate_limit_service.record(db, "reset_request_ip", ip)
+    rate_limit_service.record(db, "reset_request_email", email)
+    db.commit()
+
+    # Case-insensitive, like Google sign-in: the reset form lowercases what it sends,
+    # while stored emails keep the casing they were created with. Several accounts
+    # differing only by case would make the target a guess, so none gets a link.
+    matches = db.query(User).filter(func.lower(User.email) == email).limit(2).all()
+    user = matches[0] if len(matches) == 1 else None
 
     if user is None or not user.is_active:
         return ForgotPasswordResponse(detail=generic)
 
     raw_token = password_service.create_reset_token(db, user)
     reset_link = password_service.build_reset_link(raw_token)
-    send_password_reset(to=user.email, name=user.name, reset_link=reset_link)
+    try:
+        send_password_reset(to=user.email, name=user.name, reset_link=reset_link)
+    except Exception as exc:  # noqa: BLE001 -- a mail outage must look exactly like any other request
+        logger.error("Password reset email could not be sent: %s", type(exc).__name__)
 
     return ForgotPasswordResponse(
         detail=generic,
@@ -437,8 +481,12 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
 
 @router.post("/reset-password", response_model=MessageResponse)
 def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)) -> MessageResponse:
+    """Set a new password with the emailed token. The token is single-use (consumed
+    atomically, even when the reset is then refused) and only ever resets the account
+    it was issued for. No session is issued: the user signs in with the new password."""
     user = password_service.consume_reset_token(db, payload.token)
-    if user is None:
+    # A deactivated account gets the same answer as a bad token: no reset, nothing revealed.
+    if user is None or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset token"
         )
@@ -450,26 +498,115 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     return MessageResponse(detail="Password has been reset. Please log in.")
 
 
-@router.post("/check-email", response_model=CheckEmailResponse)
-def check_email(payload: CheckEmailRequest, db: Session = Depends(get_db)) -> CheckEmailResponse:
-    """DEMO: report whether an account exists for this email, so the UI can then
-    show the 'set new password' field. (Reveals account existence — demo only.)"""
-    user = db.query(User).filter(User.email == payload.email).first()
-    return CheckEmailResponse(exists=user is not None and user.is_active)
+# ------------------------------ Staff mobile OTP login ------------------------------
+# Twilio Verify sends and checks the code; this backend decides who may receive one.
+# Only an active staff account whose number is unambiguous ever does -- admins and
+# super admins keep email/password and Google sign-in. Rate limits are counted before
+# any account lookup, so neither they nor the responses reveal which numbers exist.
+
+_OTP_SEND_GENERIC = "If this number is registered, an OTP has been sent."
+_OTP_INVALID = "Invalid or expired OTP"
+_OTP_CODE = re.compile(r"\d{6}")
 
 
-@router.post("/reset-password-direct", response_model=MessageResponse)
-def reset_password_direct(payload: DirectResetRequest, db: Session = Depends(get_db)) -> MessageResponse:
-    """DEMO-ONLY: reset a password using just the email — NO ownership verification.
-    Insecure (anyone can reset anyone's password); replace with the token-based
-    forgot-password / reset-password flow before production."""
-    user = db.query(User).filter(User.email == payload.email).first()
-    if user is None or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No account found for that email")
-    user.password_hash = hash_password(payload.new_password)
+def _otp_phone(raw: str) -> str:
+    e164 = normalize_indian_mobile(raw)
+    if e164 is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Enter a valid 10-digit Indian mobile number",
+        )
+    return e164
+
+
+def _otp_configured() -> None:
+    try:
+        otp_service.require_configured()
+    except OtpError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+def _otp_failed(db: Session, e164: str) -> HTTPException:
+    """Count one failed verification for this number and answer 400."""
+    rate_limit_service.record(db, "otp_verify_failure_phone", e164)
     db.commit()
-    password_service.revoke_all_refresh_tokens(db, user.id)
-    return MessageResponse(detail="Password has been reset. Please log in.")
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_OTP_INVALID)
+
+
+@router.post("/phone/send-otp", response_model=OtpSendResponse)
+def send_phone_otp(payload: OtpRequest, request: Request, db: Session = Depends(get_db)) -> OtpSendResponse:
+    """Text a one-time code to a staff mobile number.
+
+    The answer is the same whether or not the number belongs to anyone, and no SMS goes
+    out unless it belongs to exactly one active staff account. Never creates an account.
+    Limits: 1 per number per 30 s, 5 per 15 min, 10 per day; 30 per IP per hour.
+    """
+    e164 = _otp_phone(payload.phone)
+    _otp_configured()
+    ip = rate_limit_service.client_ip(request)
+    rate_limit_service.hold(db, ("otp_send_ip", ip), ("otp_send_phone", e164))
+    if rate_limit_service.exceeded(db, "otp_send_ip", ip, rate_limit_service.OTP_SEND_IP) or \
+            rate_limit_service.exceeded(db, "otp_send_phone", e164, rate_limit_service.OTP_SEND_PHONE):
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_THROTTLED)
+    rate_limit_service.record(db, "otp_send_ip", ip)
+    rate_limit_service.record(db, "otp_send_phone", e164)
+    db.commit()
+
+    if staff_phone_service.resolve_otp_account(db, e164) is not None:
+        try:
+            otp_service.start_verification(e164)
+        except OtpError as exc:  # already sanitized and logged (masked) by otp_service
+            raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return OtpSendResponse(detail=_OTP_SEND_GENERIC, resend_after=rate_limit_service.OTP_RESEND_AFTER_SECONDS)
+
+
+@router.post("/phone/verify-otp", response_model=AuthResponse)
+def verify_phone_otp(payload: OtpVerifyRequest, request: Request, db: Session = Depends(get_db)) -> AuthResponse:
+    """Exchange a valid code for the same session /auth/login issues.
+
+    A wrong, expired or used code is 400 (never 401, which the app reads as an expired
+    session). Five failed attempts per number per 15 minutes; the sixth is 429. The
+    account is re-resolved from the number on every call -- nothing the client sends
+    names a user, firm or role -- and checked again after Twilio approves the code.
+    """
+    e164 = _otp_phone(payload.phone)
+    _otp_configured()
+    if not _OTP_CODE.fullmatch(payload.code):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_OTP_INVALID)
+
+    # Held until this request's verdict is committed, so parallel guesses for one number
+    # are counted one after another instead of all passing the same check.
+    rate_limit_service.hold(db, ("otp_verify_failure_phone", e164))
+    if rate_limit_service.exceeded(db, "otp_verify_failure_phone", e164,
+                                   rate_limit_service.OTP_VERIFY_FAILURES_PHONE):
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=_THROTTLED)
+    if staff_phone_service.resolve_otp_account(db, e164) is None:
+        raise _otp_failed(db, e164)
+    try:
+        approved = otp_service.check_verification(e164, payload.code)
+    except OtpError as exc:  # provider trouble is not the user's failed attempt
+        db.commit()
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    if not approved:
+        raise _otp_failed(db, e164)
+    db.commit()
+
+    db.expire_all()
+    user = staff_phone_service.resolve_otp_account(db, e164)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_OTP_INVALID)
+
+    user.phone_verified = True
+    if user.staff_phone_e164 != e164:  # a legacy row the lookup just proved unique
+        user.staff_phone_e164 = e164
+    activity_service.record(db, user.organization_id, user, "auth", "Logged in via phone OTP")
+    # From here on, exactly what POST /auth/login does for a verified password
+    # (issue_tokens also stamps last_login and commits the changes above).
+    org_service.apply_trial_expiry(db, user.organization)
+    tokens = auth_service.issue_tokens(db, user)
+    return auth_service.build_auth_response(user, tokens)
 
 
 @router.post("/change-password", response_model=MessageResponse)

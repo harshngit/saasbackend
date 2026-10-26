@@ -6,7 +6,7 @@ from sqlalchemy import func, update as sa_update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.security import create_access_token, create_refresh_token, hash_password
+from app.core.security import as_utc, create_access_token, create_refresh_token, hash_password
 from app.models import OAuthExchangeTicket, OAuthRegistrationTicket, Organization, RefreshToken, User, UserRole
 from app.schemas.auth import AuthResponse, TokenPair
 from app.services import org_service, role_service
@@ -30,9 +30,14 @@ def _hash_token(token: str) -> str:
 
 
 def issue_tokens(db: Session, user: User) -> TokenPair:
-    """Create an access/refresh pair and persist the refresh token hash for revocation."""
+    """Create an access/refresh pair and persist the refresh token hash for revocation.
+
+    Every sign-in (password, Google, phone OTP, registration) ends here, so this is also
+    where `last_login` is stamped. A token refresh does not come through here.
+    """
     access = create_access_token(user.id, user.effective_system_role, user.organization_id)
     refresh = create_refresh_token(user.id)
+    user.last_login = datetime.now(timezone.utc)
 
     db.add(
         RefreshToken(
@@ -50,7 +55,7 @@ def get_active_refresh(db: Session, token: str) -> RefreshToken | None:
     record = db.query(RefreshToken).filter(RefreshToken.token_hash == _hash_token(token)).first()
     if record is None or record.revoked:
         return None
-    if record.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+    if as_utc(record.expires_at) < datetime.now(timezone.utc):
         return None
     return record
 
@@ -97,7 +102,7 @@ def consume_exchange_ticket(db: Session, code: str) -> User | None:
     if result.rowcount != 1:
         return None
     ticket = db.query(OAuthExchangeTicket).filter(OAuthExchangeTicket.ticket_hash == ticket_hash).first()
-    if ticket is None or ticket.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+    if ticket is None or as_utc(ticket.expires_at) < datetime.now(timezone.utc):
         return None
     return db.get(User, ticket.user_id)
 
@@ -133,7 +138,7 @@ def peek_registration_ticket(db: Session, code: str) -> OAuthRegistrationTicket 
     )
     if ticket is None or ticket.used:
         return None
-    if ticket.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+    if as_utc(ticket.expires_at) < datetime.now(timezone.utc):
         return None
     return ticket
 
@@ -155,7 +160,7 @@ def consume_registration_ticket(db: Session, code: str) -> OAuthRegistrationTick
         .filter(OAuthRegistrationTicket.ticket_hash == ticket_hash)
         .first()
     )
-    if ticket is None or ticket.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+    if ticket is None or as_utc(ticket.expires_at) < datetime.now(timezone.utc):
         return None
     return ticket
 

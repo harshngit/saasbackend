@@ -161,6 +161,18 @@ class Settings(BaseSettings):
     # --- Fernet Field-Level Encryption (Organization Payment Gateways) ---
     field_encryption_key: str = ""
 
+    # --- Staff mobile OTP login (Twilio Verify) ---
+    # All empty by default: OTP login refuses to run (503) until every one is set --
+    # same reasoning as the Razorpay secrets above. Rate limits are the agreed fixed
+    # rules in app.services.rate_limit_service.
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_verify_service_sid: str = ""
+    # Request header carrying the real client IP when the app sits behind a proxy that
+    # sets it (Cloudflare: CF-Connecting-IP). Empty = use the socket peer address. Only
+    # set it when clients cannot reach the app without passing through that proxy.
+    client_ip_header: str = ""
+
     @field_validator(
         "convert_inline_uploads_on_startup",
         "enable_docs",
@@ -190,6 +202,15 @@ class Settings(BaseSettings):
         return bool(
             self.r2_account_id and self.r2_access_key_id
             and self.r2_secret_access_key and self.r2_bucket_name
+        )
+
+    @property
+    def twilio_configured(self) -> bool:
+        """OTP login only ever runs once every Twilio Verify setting is present."""
+        return bool(
+            self.twilio_account_sid.strip()
+            and self.twilio_auth_token.strip()
+            and self.twilio_verify_service_sid.strip()
         )
 
     @property
