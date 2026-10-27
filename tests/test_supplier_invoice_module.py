@@ -168,7 +168,9 @@ try:
     )
     check("Supplier Invoice auto-created on confirmation", auto_inv is not None)
     check("Auto-created invoice status is recorded", auto_inv.status == "recorded" if auto_inv else False)
-    check("Auto-created invoice verification is matched", auto_inv.verification_status == "matched" if auto_inv else False)
+    # Nothing received yet: prices match the PO, quantities can't be matched until a GRN is confirmed
+    check("Auto-created invoice verification is pending until goods are received",
+          auto_inv.verification_status == "pending" if auto_inv else False)
     auto_inv_id = auto_inv.id if auto_inv else None
 finally:
     db.close()
@@ -580,7 +582,7 @@ try:
     check("SupplierInvoice purchase_id matches", sinv1.purchase_id == po1_id)
     check("SupplierInvoice supplier_id matches", sinv1.supplier_id == sup_ac)
     check("SupplierInvoice status is recorded", sinv1.status == "recorded")
-    check("SupplierInvoice verification_status is matched", sinv1.verification_status == "matched")
+    check("SupplierInvoice verification_status is pending (no goods received yet)", sinv1.verification_status == "pending")
     check("SupplierInvoice payment_status is unpaid", sinv1.payment_status == "unpaid")
     check("SupplierInvoice amount_paid is 0.0", sinv1.amount_paid == 0.0)
 

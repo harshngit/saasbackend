@@ -7,6 +7,7 @@ from app.models.grn import GoodsReceiptNote, GoodsReceiptNoteItem
 from app.models.product import Product, ProductVariant
 from app.models.purchase_invoice import PurchaseInvoice, PurchaseInvoiceItem
 from app.models.supplier import Supplier
+from app.models.supplier_invoice import SupplierInvoice
 from app.models.warehouse import Warehouse
 from app.schemas.grn import GRNItemIn
 from app.services import numbering_service, purchase_service, stock_service
@@ -264,6 +265,22 @@ def confirm_grn(db: Session, grn: GoodsReceiptNote, org_id: str, user_id: str) -
         purchase.receiving_status = "fully_received"
     else:
         purchase.receiving_status = "partially_received"
+
+    # Received quantities changed, so the 3-way match of the purchase's recorded supplier
+    # invoices may have too (e.g. pending -> matched). Metadata only; no stock involved.
+    db.flush()
+    from app.services import supplier_invoice_service
+
+    for sinv in (
+        db.query(SupplierInvoice)
+        .filter(
+            SupplierInvoice.organization_id == org_id,
+            SupplierInvoice.purchase_id == purchase.id,
+            SupplierInvoice.status == "recorded",
+        )
+        .all()
+    ):
+        supplier_invoice_service.refresh_verification(db, sinv)
 
     db.commit()
     db.refresh(grn)

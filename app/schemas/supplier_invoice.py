@@ -28,12 +28,22 @@ class SupplierInvoiceItemOut(BaseModel):
     product_id: str | None = None
     variant_id: str | None = None
     description: str | None = None
+    # From the linked purchase line and its confirmed GRNs
+    product_name: str | None = None
+    sku: str | None = None
+    ordered_qty: int | None = None
+    received_qty: int | None = None  # cumulative accepted on confirmed GRNs
+    purchase_price: float | None = None
     billed_qty: int
     unit_price: float
     tax_rate: float = 0.0
     tax_amount: float = 0.0
     discount_amount: float = 0.0
     line_total: float = 0.0
+    # 3-way match for this line: billed <= received not billed elsewhere; price == purchase price
+    available_qty: int | None = None
+    quantity_match: bool | None = None
+    price_match: bool | None = None
 
 
 class SupplierInvoiceCreate(BaseModel):
@@ -80,6 +90,9 @@ class SupplierInvoiceOut(BaseModel):
     due_date: datetime | None = None
     status: str
     verification_status: str
+    # The checks behind verification_status (all lines); null when the invoice has no lines
+    quantity_match: bool | None = None
+    price_match: bool | None = None
     payment_status: str
     subtotal: float
     tax_amount: float

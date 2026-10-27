@@ -205,6 +205,7 @@ def list_supplier_invoices(
         secondary_key=SupplierInvoice.id.desc(),
     )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    supplier_invoice_service.prefetch_verification(db, items)  # one query for the page's match checks
     return PaginatedResponse(
         items=[SupplierInvoiceOut.model_validate(inv) for inv in items],
         total=total,

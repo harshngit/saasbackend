@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 
 from app.core.database import Base
 
@@ -90,6 +90,17 @@ class SupplierInvoice(Base):
         """Same value as supplier_invoice_date (the supplier's invoice date)."""
         return self.supplier_invoice_date
 
+    # The component checks behind verification_status (3-way match: PO price, GRN quantity).
+    @property
+    def quantity_match(self) -> bool | None:
+        checks = [item.quantity_match for item in self.items]
+        return None if not checks or None in checks else all(checks)
+
+    @property
+    def price_match(self) -> bool | None:
+        checks = [item.price_match for item in self.items]
+        return None if not checks or None in checks else all(checks)
+
 
 class SupplierInvoiceItem(Base):
     __tablename__ = "supplier_invoice_items"
@@ -119,3 +130,57 @@ class SupplierInvoiceItem(Base):
     supplier_invoice: Mapped["SupplierInvoice"] = relationship(back_populates="items")
     purchase_item: Mapped["PurchaseInvoiceItem"] = relationship(lazy="joined")  # noqa: F821
     product: Mapped["Product | None"] = relationship(lazy="joined")  # noqa: F821
+
+    # Read from the linked purchase item (and its GRN roll-up) -- never copied or guessed.
+    @property
+    def product_name(self) -> str | None:
+        if self.purchase_item is not None and self.purchase_item.product_name:
+            return self.purchase_item.product_name
+        return self.product.name if self.product is not None else self.description
+
+    @property
+    def sku(self) -> str | None:
+        if self.purchase_item is not None and self.purchase_item.product_code:
+            return self.purchase_item.product_code
+        return self.product.sku if self.product is not None else None
+
+    @property
+    def ordered_qty(self) -> int | None:
+        return self.purchase_item.quantity if self.purchase_item is not None else None
+
+    @property
+    def received_qty(self) -> int | None:
+        """Cumulative accepted quantity from confirmed GRNs for the purchase line."""
+        return (self.purchase_item.received_qty or 0) if self.purchase_item is not None else None
+
+    @property
+    def purchase_price(self) -> float | None:
+        return self.purchase_item.purchase_price if self.purchase_item is not None else None
+
+    @property
+    def billed_on_other_invoices(self) -> int:
+        """Quantity of this purchase line billed on the purchase's OTHER recorded / disputed
+        invoices. Pre-filled for whole pages by supplier_invoice_service.prefetch_verification."""
+        cached = self.__dict__.get("_billed_elsewhere")
+        if cached is not None:
+            return cached
+        from app.services.supplier_invoice_service import billed_elsewhere_map
+
+        return billed_elsewhere_map(object_session(self), [self]).get(self.id, 0)
+
+    @property
+    def available_qty(self) -> int | None:
+        """Confirmed received quantity not yet billed on another invoice."""
+        if self.received_qty is None:
+            return None
+        return max(self.received_qty - self.billed_on_other_invoices, 0)
+
+    @property
+    def quantity_match(self) -> bool | None:
+        return None if self.available_qty is None else self.billed_qty <= self.available_qty
+
+    @property
+    def price_match(self) -> bool | None:
+        if self.purchase_price is None:
+            return None
+        return abs((self.unit_price or 0.0) - self.purchase_price) < 0.01

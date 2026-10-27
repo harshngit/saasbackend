@@ -142,7 +142,9 @@ def test_new_purchase_is_unpaid_everywhere_and_invoice_carries_its_links():
     assert si["supplier_invoice_number"] == purchase["invoice_number"]
     # The supplier's invoice date as entered -- not the purchase date
     assert si["supplier_invoice_date"].startswith("2026-10-20") and si["invoice_date"].startswith("2026-10-20")
-    assert si["grand_total"] == 10000.0 and si["verification_status"] == "matched"
+    # No goods received yet: prices match, quantities can't -- so pending, not matched
+    assert si["grand_total"] == 10000.0 and si["verification_status"] == "pending"
+    assert (si["price_match"], si["quantity_match"]) == (True, False)
     assert (si["amount_paid"], si["outstanding_amount"], si["payment_status"]) == (0.0, 10000.0, "unpaid")
     # Warehouse name in list and detail alike
     assert state["detail"]["warehouse_name"] == env["wh_name"] == state["row"]["warehouse_name"]
@@ -331,3 +333,95 @@ def test_tenant_isolation():
     ap_b = client.get("/accounts-payable", headers=env_b["auth"]).json()["items"]
     assert all(item["supplier_invoice_id"] != si for item in ap_b)
     _assert_in_sync(_state(env_a, purchase["id"], [si]), 0.0, 10000.0, "unpaid")
+
+
+def test_partial_supplier_payment_updates_purchase_paid_outstanding_and_status_together():
+    """The runtime scenario: 10 x 1,000, GRNs 4 + 6, a 4,000 supplier payment."""
+    env = _org()
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+    _receive(env, purchase, 4)
+    _receive(env, purchase, 6)
+    _pay(env, [(si, 4000.0)])
+
+    state = _state(env, purchase["id"], [si])
+    for view in (state["detail"], state["row"]):  # detail and list: the same three values
+        assert (view["amount_paid"], view["outstanding_balance"], view["payment_status"]) == (4000.0, 6000.0, "partially_paid")
+    _assert_in_sync(state, 4000.0, 6000.0, "partially_paid")
+
+    # One recalculation sets all three together, whatever was stored before
+    db = SessionLocal()
+    try:
+        stored = db.get(PurchaseInvoice, purchase["id"])
+        stored.amount_paid, stored.payment_status = 0.0, "unpaid"
+        db.commit()
+        supplier_payment_service.recalculate_supplier_invoice(db, db.get(SupplierInvoice, si))
+        db.commit()
+        stored = db.get(PurchaseInvoice, purchase["id"])
+        assert (stored.amount_paid, stored.outstanding_balance, stored.payment_status) == (4000.0, 6000.0, "partially_paid")
+    finally:
+        db.close()
+    for paid, expected in ((0.0, "unpaid"), (4000.0, "partially_paid"), (9999.99, "paid"), (10000.0, "paid")):
+        assert supplier_payment_service._payment_status(paid, 0.0, 10000.0) == expected
+
+
+def test_supplier_invoice_items_carry_the_purchase_line_and_its_match_checks():
+    env = _org()
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+
+    def invoice() -> dict:
+        return client.get(f"/supplier-invoices/{si}", headers=env["auth"]).json()
+
+    def listed() -> dict:
+        rows = client.get("/supplier-invoices", params={"purchase_id": purchase["id"]}, headers=env["auth"]).json()["items"]
+        return next(r for r in rows if r["id"] == si)
+
+    db = SessionLocal()
+    try:
+        sku = db.get(Product, env["prod"]).sku
+    finally:
+        db.close()
+
+    # Created on confirmation, before any goods: prices match, quantities not yet received
+    inv = invoice()
+    item = inv["items"][0]
+    assert (item["product_name"], item["sku"], item["ordered_qty"], item["received_qty"]) == ("Widget", sku, 10, 0)
+    assert (item["billed_qty"], item["unit_price"], item["purchase_price"]) == (10, 1000.0, 1000.0)
+    assert (item["discount_amount"], item["tax_amount"], item["line_total"]) == (0.0, 0.0, 10000.0)
+    assert (item["price_match"], item["quantity_match"]) == (True, False)
+    assert (inv["price_match"], inv["quantity_match"], inv["verification_status"]) == (True, False, "pending")
+
+    _receive(env, purchase, 4)
+    assert (invoice()["items"][0]["received_qty"], invoice()["verification_status"]) == (4, "pending")
+    _receive(env, purchase, 6)
+    inv = invoice()
+    item = inv["items"][0]
+    assert (item["ordered_qty"], item["received_qty"], item["available_qty"]) == (10, 10, 10)
+    assert (item["quantity_match"], item["price_match"]) == (True, True)
+    assert (inv["quantity_match"], inv["price_match"], inv["verification_status"]) == (True, True, "matched")
+    # The list returns the same, computed in one batch
+    row = listed()
+    assert {k: row["items"][0][k] for k in item} == item
+    assert (row["quantity_match"], row["price_match"], row["verification_status"]) == (True, True, "matched")
+    # Accounts Payable shows the same verification
+    ap = client.get("/accounts-payable", params={"supplier_id": env["sup"]}, headers=env["auth"]).json()["items"]
+    assert next(a for a in ap if a["supplier_invoice_id"] == si)["verification_status"] == "matched"
+
+
+def test_price_difference_is_reported_as_the_failing_check():
+    env = _org()
+    purchase = _purchase(env, qty=2)
+    auto = _auto_invoice_id(env, purchase["id"])
+    assert client.post(f"/supplier-invoices/{auto}/cancel", headers=env["auth"]).status_code == 200
+    _receive(env, purchase, 2)
+    r = client.post("/supplier-invoices", json={"supplier_id": env["sup"], "purchase_id": purchase["id"],
+                                                "supplier_invoice_number": f"PRICEY-{uuid.uuid4().hex[:4]}",
+                                                "items": [{"purchase_item_id": purchase["items"][0]["id"],
+                                                           "billed_qty": 2, "unit_price": 1100}]},
+                    headers=env["auth"])
+    assert r.status_code == 201, r.text
+    assert r.json()["verification_status"] == "pending"  # drafts are not verified until recorded
+    rec = client.post(f"/supplier-invoices/{r.json()['id']}/record", headers=env["auth"]).json()
+    assert (rec["verification_status"], rec["price_match"], rec["quantity_match"]) == ("mismatched", False, True)
+    assert (rec["items"][0]["unit_price"], rec["items"][0]["purchase_price"], rec["items"][0]["price_match"]) == (1100.0, 1000.0, False)

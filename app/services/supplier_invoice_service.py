@@ -150,9 +150,7 @@ def record_supplier_invoice(
             detail="Invoice supplier does not match the purchase order supplier",
         )
 
-    # 3-Way Matching & Over-invoicing Protection Loop
-    all_matched = True
-
+    # Over-invoicing protection (the match result itself is set by refresh_verification below)
     for item in invoice.items:
         p_item = db.get(PurchaseInvoiceItem, item.purchase_item_id)
         if p_item is None:
@@ -200,17 +198,9 @@ def record_supplier_invoice(
                 ),
             )
 
-        # 3. Evaluate 3-way match (Quantity & Price)
-        available_accepted = max(confirmed_accepted - previously_invoiced, 0)
-        qty_match = (item.billed_qty <= available_accepted)
-        price_match = (abs(item.unit_price - p_item.purchase_price) < 0.01)
-
-        if not (qty_match and price_match):
-            all_matched = False
-
     # Set statuses
     invoice.status = "recorded"
-    invoice.verification_status = "matched" if all_matched else "mismatched"
+    refresh_verification(db, invoice)  # same 3-way match rules everywhere
     invoice.recorded_at = datetime.now(timezone.utc)
     invoice.recorded_by = user_id
 
@@ -321,5 +311,65 @@ def auto_create_from_purchase(
     inv.items = built_items
     db.add(inv)
     db.flush()
+    # Created from the purchase itself, so prices match; quantities match once goods are
+    # received -- until then it is "pending", not "matched" with nothing checked.
+    refresh_verification(db, inv)
     return inv
 
+
+
+# --------------------------------------------------------------------------------------
+# Verification (3-way match) details
+# --------------------------------------------------------------------------------------
+
+
+def billed_elsewhere_map(db: Session, items: list[SupplierInvoiceItem]) -> dict[str, int]:
+    """{invoice item id: quantity of its purchase line billed on the purchase's OTHER recorded /
+    disputed invoices} -- one grouped query for any number of items. Same rule as recording."""
+    if db is None or not items:
+        return {}
+    line_ids = {item.purchase_item_id for item in items}
+    rows = (
+        db.query(SupplierInvoiceItem.purchase_item_id, SupplierInvoiceItem.supplier_invoice_id,
+                 func.coalesce(func.sum(SupplierInvoiceItem.billed_qty), 0))
+        .join(SupplierInvoice, SupplierInvoice.id == SupplierInvoiceItem.supplier_invoice_id)
+        .filter(
+            SupplierInvoiceItem.purchase_item_id.in_(line_ids),
+            SupplierInvoice.status.in_(["recorded", "disputed"]),
+        )
+        .group_by(SupplierInvoiceItem.purchase_item_id, SupplierInvoiceItem.supplier_invoice_id)
+        .all()
+    )
+    billed: dict[tuple[str, str], int] = {(line, inv): int(qty or 0) for line, inv, qty in rows}
+    result: dict[str, int] = {}
+    for item in items:
+        result[item.id] = sum(
+            qty for (line, inv), qty in billed.items()
+            if line == item.purchase_item_id and inv != item.supplier_invoice_id
+        )
+    return result
+
+
+def prefetch_verification(db: Session, invoices: list[SupplierInvoice]) -> None:
+    """Fill every item's billed-elsewhere figure for a page of invoices in one query, so
+    serializing quantity_match does not query per line."""
+    items = [item for inv in invoices for item in inv.items]
+    for item_id, qty in billed_elsewhere_map(db, items).items():
+        next(i for i in items if i.id == item_id).__dict__["_billed_elsewhere"] = qty
+
+
+def refresh_verification(db: Session, invoice: SupplierInvoice) -> None:
+    """Set verification_status from the line checks, for a recorded invoice:
+    mismatched -- a line's price differs from the purchase price;
+    matched    -- every line's price matches and its billed quantity has been received;
+    pending    -- prices match but goods are still to be received (e.g. an invoice created
+                  automatically when the purchase was confirmed)."""
+    if invoice.status != "recorded":
+        return
+    prefetch_verification(db, [invoice])
+    if invoice.price_match is False:
+        invoice.verification_status = "mismatched"
+    elif invoice.quantity_match:
+        invoice.verification_status = "matched"
+    else:
+        invoice.verification_status = "pending"
