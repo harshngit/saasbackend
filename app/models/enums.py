@@ -26,6 +26,15 @@ class SystemRole(str, enum.Enum):
     SUPER_ADMIN = "super_admin"
     ADMIN = "admin"
     STAFF = "staff"
+    # Platform staff (no organization), created by a Super Admin: reads organizations
+    # and raises upgrade / feature requests a Super Admin approves (app.routers.platform).
+    SALES_MANAGER = "sales_manager"
+
+
+# Platform-level roles: users with no organization who work on the SaaS platform itself.
+PLATFORM_ROLES = (SystemRole.SUPER_ADMIN.value, SystemRole.SALES_MANAGER.value)
+# Roles a Super Admin can give platform staff from /platform/staff.
+PLATFORM_STAFF_ROLES = (SystemRole.SALES_MANAGER.value,)
 
 
 # Map the legacy UserRole enum to a system role.

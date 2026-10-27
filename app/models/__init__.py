@@ -3,6 +3,8 @@ from app.models.enums import (
     LEGACY_ROLE_BY_NAME,
     LOCKED_STATUSES,
     OrganizationStatus,
+    PLATFORM_ROLES,
+    PLATFORM_STAFF_ROLES,
     PlanTier,
     ProductStatus,
     STAFF_ROLE_NAME,
@@ -50,6 +52,7 @@ from app.models.auth_rate_limit import AuthRateLimitEvent
 from app.models.oauth_exchange_ticket import OAuthExchangeTicket
 from app.models.oauth_registration_ticket import OAuthRegistrationTicket
 from app.models.plan import Plan
+from app.models.platform_request import PlatformFeatureRequest, PlatformUpgradeRequest
 from app.models.product import Product, ProductPricing, ProductVariant
 from app.models.subscription_payment import SubscriptionPayment
 from app.models.refresh_token import RefreshToken
@@ -193,6 +196,10 @@ __all__ = [
     "OAuthRegistrationTicket",
     "UserRole",
     "SystemRole",
+    "PLATFORM_ROLES",
+    "PLATFORM_STAFF_ROLES",
+    "PlatformUpgradeRequest",
+    "PlatformFeatureRequest",
     "STAFF_ROLES",
     "STAFF_ROLE_NAME",
     "LEGACY_ROLE_BY_NAME",

@@ -75,6 +75,7 @@ from app.routers import (
     notifications,
     organizations,
     plans,
+    platform,
     products,
     purchases,
     grns,
@@ -315,6 +316,7 @@ app.include_router(plans.router)
 app.include_router(organizations.router)
 app.include_router(settings_router.router)
 app.include_router(superadmin.router)
+app.include_router(platform.router)
 app.include_router(leads.router)
 app.include_router(quotations.router)
 app.include_router(payment_receipts.router)
