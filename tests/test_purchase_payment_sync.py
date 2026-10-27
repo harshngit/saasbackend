@@ -425,3 +425,80 @@ def test_price_difference_is_reported_as_the_failing_check():
     rec = client.post(f"/supplier-invoices/{r.json()['id']}/record", headers=env["auth"]).json()
     assert (rec["verification_status"], rec["price_match"], rec["quantity_match"]) == ("mismatched", False, True)
     assert (rec["items"][0]["unit_price"], rec["items"][0]["purchase_price"], rec["items"][0]["price_match"]) == (1100.0, 1000.0, False)
+
+
+def test_voided_payment_stays_in_invoice_history_and_reports_voided():
+    env = _org()
+    purchase = _purchase(env)
+    si = _auto_invoice_id(env, purchase["id"])
+    p1 = _pay(env, [(si, 4000.0)])
+    p2 = _pay(env, [(si, 6000.0)])
+    assert _void(env, p2["id"]).status_code == 200
+
+    history = client.get(f"/supplier-invoices/{si}/payments", headers=env["auth"]).json()
+    rows = {r["supplier_payment_id"]: r for r in history}
+    assert set(rows) == {p1["id"], p2["id"]}  # the voided payment is still listed, for audit
+    assert (rows[p2["id"]]["status"], rows[p2["id"]]["payment_status"]) == ("voided", "voided")
+    assert rows[p2["id"]]["voided_at"] is not None and rows[p2["id"]]["void_reason"] == "test"
+    assert rows[p2["id"]]["payment_number"] == p2["payment_number"]
+    assert (rows[p1["id"]]["status"], rows[p1["id"]]["payment_status"]) == ("recorded", "recorded")
+    assert rows[p1["id"]]["voided_at"] is None
+    # Same status as the Supplier Payments module reports
+    assert client.get(f"/supplier-payments/{p2['id']}", headers=env["auth"]).json()["status"] == "voided"
+    _assert_in_sync(_state(env, purchase["id"], [si]), 4000.0, 6000.0, "partially_paid")
+
+
+def test_accounts_payable_summary_counts_every_open_invoice():
+    env = _org()
+    db = SessionLocal()
+    try:
+        second = Supplier(organization_id=env["org_id"], name=f"Second Supplier {uuid.uuid4().hex[:4]}", is_active=True)
+        db.add(second)
+        db.commit()
+        second_id = second.id
+    finally:
+        db.close()
+
+    no_due = _purchase(env)                                   # 10,000 open, no due date
+    partial = _purchase(env)                                  # 10,000, 4,000 paid -> 6,000 open
+    paid = _purchase(env)                                     # fully paid -> not open
+    overdue = _purchase({**env, "sup": second_id}, qty=2,     # 2,000 open, second supplier, overdue
+                        due_date="2026-01-01T00:00:00+00:00")
+    si_no_due, si_partial, si_paid, si_overdue = (_auto_invoice_id(env, p["id"]) for p in (no_due, partial, paid, overdue))
+    p_partial = _pay(env, [(si_partial, 4000.0)])
+    _pay(env, [(si_paid, 10000.0)])
+
+    def summary() -> dict:
+        r = client.get("/accounts-payable/summary", headers=env["auth"])
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    s = summary()
+    assert s["summary"]["total_payable"] == 18000.0           # 10,000 + 6,000 + 2,000
+    assert s["summary"]["open_invoice_count"] == 3            # the fully paid invoice is excluded
+    assert s["summary"]["supplier_count"] == 2
+    assert s["summary"]["total_overdue"] == 2000.0            # only the invoice with a past due date
+    assert round(sum(s["ageing"].values()), 2) == 2000.0      # the no-due-date invoice is in no bucket
+
+    # The list endpoint carries the same summary, and its rows add up to it
+    listing = client.get("/accounts-payable", headers=env["auth"]).json()
+    assert listing["summary"] == s["summary"]
+    rows = {i["supplier_invoice_id"]: i for i in listing["items"]}
+    assert set(rows) == {si_no_due, si_partial, si_overdue}
+    assert round(sum(i["outstanding_amount"] for i in rows.values()), 2) == 18000.0
+    assert rows[si_partial]["outstanding_amount"] == 6000.0
+    assert rows[si_no_due]["due_date"] is None and rows[si_no_due]["is_overdue"] is False
+    assert rows[si_overdue]["is_overdue"] is True
+    # ...and agree with the supplier invoices themselves
+    invoices = [client.get(f"/supplier-invoices/{i}", headers=env["auth"]).json() for i in rows]
+    assert round(sum(i["outstanding_amount"] for i in invoices), 2) == 18000.0
+
+    # Voiding the 4,000 payment puts it back into the payable total
+    assert _void(env, p_partial["id"]).status_code == 200
+    s = summary()["summary"]
+    assert (s["total_payable"], s["open_invoice_count"], s["supplier_count"]) == (22000.0, 3, 2)
+
+    # Another firm sees none of it
+    other = _org("AP Other")
+    o = client.get("/accounts-payable/summary", headers=other["auth"]).json()["summary"]
+    assert (o["total_payable"], o["open_invoice_count"], o["supplier_count"]) == (0.0, 0, 0)

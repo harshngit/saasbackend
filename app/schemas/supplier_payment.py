@@ -67,7 +67,12 @@ class InvoicePaymentAllocationOut(BaseModel):
     payment_number: str | None = None
     payment_date: datetime
     payment_method: str
+    # The parent Supplier Payment's CURRENT status ("recorded" / "voided"); `status` carries the
+    # same value under the name SupplierPaymentOut uses. A voided payment stays in the history.
     payment_status: str
+    status: str
+    voided_at: datetime | None = None
+    void_reason: str | None = None
     reference: str | None = None
     allocated_amount: float
     created_at: datetime
