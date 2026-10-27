@@ -36,7 +36,7 @@ from app.schemas.organization_override import (
 )
 from app.schemas.plan import PlanCreate, PlanOut, PlanStatusUpdate, PlanUpdate
 from app.schemas.razorpay import SubscriptionPaymentOut
-from app.schemas.superadmin import SuperAdminCreate, SuperAdminUpdate
+from app.schemas.superadmin import EmailTestRequest, EmailTestResult, SuperAdminCreate, SuperAdminUpdate
 from app.schemas.user import UserOut
 from app.schemas.pagination import PaginatedResponse
 from app.core.pagination import paginate
@@ -45,9 +45,11 @@ from app.core.entitlements import normalize_entitlement_key
 from app.services import (
     activity_service,
     billing_service,
+    email_service,
     entitlement_service,
     org_service,
     password_service,
+    rate_limit_service,
     storage_service,
 )
 
@@ -59,6 +61,32 @@ router = APIRouter(
     tags=["superadmin"],
     dependencies=[Depends(_super_admin_guard)],
 )
+
+
+@router.post("/email/test", response_model=EmailTestResult)
+def send_test_email(
+    payload: EmailTestRequest,
+    db: Session = Depends(get_db),
+    current: User = Depends(_super_admin_guard),
+) -> EmailTestResult:
+    """Send one email synchronously with the live configuration and report the real
+    outcome -- the diagnostic for "reset emails don't arrive". 5 per hour per admin."""
+    rate_limit_service.hold(db, ("email_test", current.id))
+    if rate_limit_service.exceeded(db, "email_test", current.id, rate_limit_service.EMAIL_TEST_USER):
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many test emails. Please try again later.")
+    rate_limit_service.record(db, "email_test", current.id)
+    db.commit()
+
+    mode = email_service.delivery_mode()
+    try:
+        duration_ms = email_service.send_test_email(str(payload.to))
+    except email_service.EmailError as exc:
+        return EmailTestResult(sent=False, mode=mode, error=str(exc))
+    if mode == "console":
+        return EmailTestResult(sent=False, mode=mode, error="Email is not configured (console mode): nothing was sent")
+    return EmailTestResult(sent=True, mode=mode, duration_ms=duration_ms)
 
 
 def _get_org(db: Session, org_id: str) -> Organization:

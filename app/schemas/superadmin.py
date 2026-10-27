@@ -18,3 +18,16 @@ class SuperAdminUpdate(BaseModel):
     phone: str | None = None
     password: str | None = Field(default=None, min_length=8, max_length=128)
     is_active: bool | None = None
+
+
+class EmailTestRequest(BaseModel):
+    to: EmailStr
+
+
+class EmailTestResult(BaseModel):
+    """`sent` false carries the delivery error (safe: no secrets) instead of failing the call."""
+
+    sent: bool
+    mode: str
+    duration_ms: int | None = None
+    error: str | None = None

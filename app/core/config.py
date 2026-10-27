@@ -123,6 +123,15 @@ class Settings(BaseSettings):
     smtp_from: str = "CRM SaaS <no-reply@crm-saas.local>"
     smtp_use_tls: bool = True
 
+    # --- Email delivery provider ---
+    # "smtp" (default, the settings above) or an HTTPS API: "resend" / "brevo" -- which
+    # needs no outbound SMTP port, useful where the host blocks or throttles them.
+    email_provider: str = "smtp"
+    email_api_key: str = ""
+    # The From address for every provider, e.g. "Beas Suite <no-reply@beassuite.com>".
+    # Empty = SMTP_FROM; an unset or *.local address falls back to SMTP_USER.
+    email_from: str = ""
+
     # Push notifications (Firebase Cloud Messaging). Off unless explicitly enabled.
     # FIREBASE_SERVICE_ACCOUNT_JSON is the service-account key JSON (raw, or base64 of it),
     # supplied as a runtime secret -- never Application Default Credentials. FIREBASE_PROJECT_ID

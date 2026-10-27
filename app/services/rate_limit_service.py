@@ -25,6 +25,7 @@ OTP_SEND_IP: Rules = ((30, timedelta(hours=1)),)
 OTP_VERIFY_FAILURES_PHONE: Rules = ((5, timedelta(minutes=15)),)
 RESET_REQUEST_EMAIL: Rules = ((3, timedelta(minutes=15)), (10, timedelta(days=1)))
 RESET_REQUEST_IP: Rules = ((10, timedelta(hours=1)),)
+EMAIL_TEST_USER: Rules = ((5, timedelta(hours=1)),)
 
 OTP_RESEND_AFTER_SECONDS = int(OTP_SEND_PHONE[0][1].total_seconds())
 

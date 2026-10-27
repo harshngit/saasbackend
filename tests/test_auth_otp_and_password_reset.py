@@ -170,7 +170,8 @@ def _isolation():
     db.query(AuthRateLimitEvent).delete()
     db.commit()
     db.close()
-    with patch.multiple(settings, **TWILIO, client_ip_header="", smtp_host="", expose_reset_token=False), \
+    with patch.multiple(settings, **TWILIO, client_ip_header="", smtp_host="", email_provider="smtp",
+                        expose_reset_token=False), \
             patch("app.services.otp_service.http_requests.post", side_effect=AssertionError("unmocked Twilio call")), \
             patch("smtplib.SMTP", side_effect=AssertionError("unmocked SMTP connection")):
         yield
@@ -747,9 +748,10 @@ def test_email_failure_answers_generically_and_logs_no_secret(caplog):
 
     # Console mode (no SMTP host) says an email would be sent, never what is in it
     caplog.clear()
-    with patch.multiple(settings, smtp_host="", expose_reset_token=True):
+    with patch.multiple(settings, smtp_host="", email_provider="smtp", expose_reset_token=True):
         token = client.post("/auth/forgot-password", json={"email": user.email}).json()["reset_token"]
-    assert "Would send" in caplog.text and token not in caplog.text
+    assert "console mode, nothing sent" in caplog.text and token not in caplog.text
+    assert user.email not in caplog.text
 
 
 # ------------------------------------------------------------------ expiry across time zones

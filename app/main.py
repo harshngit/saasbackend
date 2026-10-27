@@ -52,6 +52,7 @@ from app.models import (  # noqa: F401  (register mappers)
     Warehouse,
     WarehouseStock,
 )
+from app.services import email_service
 from app.services.file_migration_service import convert_inline_uploads
 from app.services.numbering_service import backfill_missing_numbers
 from app.services.product_pricing_service import backfill_product_pricing
@@ -178,6 +179,10 @@ BUILD_TAG = "invoice-regular-renderer-simple-totals"
 @app.on_event("startup")
 def on_startup() -> None:
     _log.info("Starting CRM API — build: %s", BUILD_TAG)
+    try:
+        email_service.log_startup_config()
+    except Exception:  # noqa: BLE001
+        _log.exception("Email config summary failed")
 
     # Every startup step is isolated, including creating the tables: a database that
     # is unreachable at boot must not kill the process. An exception raised here fails

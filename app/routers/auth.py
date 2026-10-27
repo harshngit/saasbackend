@@ -50,6 +50,7 @@ from app.services import (
     role_service,
     staff_phone_service,
 )
+from app.services import email_service
 from app.services.email_service import send_password_reset
 from app.services.google_auth_service import GoogleAuthError
 from app.services.otp_service import OtpError
@@ -464,13 +465,18 @@ def forgot_password(
     user = matches[0] if len(matches) == 1 else None
 
     if user is None or not user.is_active:
+        email_service.logger.info("reset: no active user for %s", email_service.mask_email(email))
         return ForgotPasswordResponse(detail=generic)
 
     raw_token = password_service.create_reset_token(db, user)
     reset_link = password_service.build_reset_link(raw_token)
+    email_service.logger.info(
+        "reset: sending via %s to %s", email_service.delivery_mode(), email_service.mask_email(user.email)
+    )
     try:
         send_password_reset(to=user.email, name=user.name, reset_link=reset_link)
     except Exception as exc:  # noqa: BLE001 -- a mail outage must look exactly like any other request
+        # email_service already logged the masked "email: FAILED ..." line with the reason.
         logger.error("Password reset email could not be sent: %s", type(exc).__name__)
 
     return ForgotPasswordResponse(
