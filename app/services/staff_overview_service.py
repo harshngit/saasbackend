@@ -224,14 +224,19 @@ def _paid_by_order(db: Session, order_ids: list[str]) -> dict[str, float]:
     """
     if not order_ids:
         return {}
-    from_payments: dict[str, float] = defaultdict(float)
-    for payment in db.query(CustomerPayment).filter(CustomerPayment.order_id.in_(order_ids)):
-        from_payments[payment.order_id] += payment.amount or 0
-    from_invoices: dict[str, float] = defaultdict(float)
-    for invoice in db.query(Invoice).filter(
-        Invoice.order_id.in_(order_ids), Invoice.is_credit_note.is_(False)
-    ):
-        from_invoices[invoice.order_id] += invoice.amount_paid or 0
+    # Summed in the database: two grouped queries, whatever the number of payments.
+    from_payments: dict[str, float] = {
+        order_id: float(total or 0)
+        for order_id, total in db.query(CustomerPayment.order_id, func.sum(CustomerPayment.amount))
+        .filter(CustomerPayment.order_id.in_(order_ids))
+        .group_by(CustomerPayment.order_id)
+    }
+    from_invoices: dict[str, float] = {
+        order_id: float(total or 0)
+        for order_id, total in db.query(Invoice.order_id, func.sum(Invoice.amount_paid))
+        .filter(Invoice.order_id.in_(order_ids), Invoice.is_credit_note.is_(False))
+        .group_by(Invoice.order_id)
+    }
     return {
         order_id: max(from_payments.get(order_id, 0), from_invoices.get(order_id, 0))
         for order_id in set(from_payments) | set(from_invoices)
@@ -734,4 +739,232 @@ def build_staff_overview(
         attendance=_attendance(db, staff),
         current_location=_location(staff),
         **blocks,
+    )
+
+
+# ------------------------- mobile "my dashboard" --------------------------
+# GET /dashboard/me/sales and /dashboard/me/delivery: the same figures as the sales and
+# delivery blocks above, for the logged-in employee only, with nothing the field app does
+# not show. The definitions are shared (_their_orders, SALE_STATUSES, the delivery status
+# sets, _paid_by_order, _payment_type / _amount_due, _vehicle_badge); only the mechanics
+# differ -- totals, counts and per-day series are computed by the database, and lists read
+# just their columns, so no order, delivery or customer is loaded as a whole object.
+
+MOBILE_LIST_LIMIT = 5
+
+
+def _iso_day(value) -> str:  # noqa: ANN001
+    """SQL date() comes back as a str on SQLite and a date on PostgreSQL."""
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)[:10]
+
+
+def _customer_ref_from(customer_id, business_name, name) -> CustomerRef | None:  # noqa: ANN001
+    if customer_id is None:
+        return None
+    return CustomerRef(id=customer_id, name=business_name or name)
+
+
+class _OrderRow:
+    """The three order columns _order_ref / _payment_type / _amount_due read."""
+
+    def __init__(self, order_id: str, order_number: str | None, total: float | None) -> None:
+        self.id, self.order_number, self.total = order_id, order_number, total
+
+
+def build_my_sales_dashboard(
+    db: Session, staff: User, period: str | None = None, date_from: str | None = None, date_to: str | None = None,
+):
+    from app.schemas.dashboard import MySalesDashboardOut, MySalesSummary
+
+    name, start, end, df, dt = _resolve_range(period, date_from, date_to)
+    _, _, _, today_df, today_dt = _resolve_range("today", None, None)
+    sales = _their_orders(db, staff).filter(SalesOrder.status.in_(SALE_STATUSES))
+
+    def totals(frm: datetime, to: datetime) -> tuple[int, float]:
+        count, amount = (
+            sales.filter(SalesOrder.created_at >= frm, SalesOrder.created_at <= to)
+            .with_entities(func.count(SalesOrder.id), func.coalesce(func.sum(SalesOrder.total), 0.0))
+            .one()
+        )
+        return int(count or 0), round(float(amount or 0), 2)
+
+    orders, amount = totals(df, dt)
+    _, today_amount = totals(today_df, today_dt)
+
+    # Same day key as the Staff Detail series: the order date, else when it was created.
+    day = func.date(func.coalesce(SalesOrder.order_date, SalesOrder.created_at))
+    by_day = {
+        _iso_day(d): (round(float(total or 0), 2), int(count or 0))
+        for d, count, total in sales.filter(SalesOrder.created_at >= df, SalesOrder.created_at <= dt)
+        .with_entities(day, func.count(SalesOrder.id), func.sum(SalesOrder.total))
+        .group_by(day)
+    }
+
+    assigned = (
+        db.query(func.count(Customer.id))
+        .filter(Customer.organization_id == staff.organization_id, Customer.assigned_sales_officer_id == staff.id)
+        .scalar()
+        or 0
+    )
+
+    recent = (
+        _their_orders(db, staff)
+        .outerjoin(Customer, Customer.id == SalesOrder.customer_id)
+        .with_entities(
+            SalesOrder.id, SalesOrder.order_number, SalesOrder.customer_id, Customer.business_name, Customer.name,
+            SalesOrder.total, SalesOrder.status, SalesOrder.order_date, SalesOrder.created_at,
+        )
+        .order_by(SalesOrder.created_at.desc())
+        .limit(MOBILE_LIST_LIMIT)
+        .all()
+    )
+
+    return MySalesDashboardOut(
+        period=name,
+        period_from=start.isoformat(),
+        period_to=end.isoformat(),
+        summary=MySalesSummary(
+            sales_amount=amount, orders=orders, today_sales_amount=today_amount, assigned_customers=int(assigned),
+        ),
+        performance=[
+            SalesPerformancePoint(date=d, sales_amount=by_day.get(d, (0.0, 0))[0], orders=by_day.get(d, (0.0, 0))[1])
+            for d in _days(start, end)
+        ],
+        recent_orders=[
+            RecentOrderRow(
+                id=row.id,
+                order_number=row.order_number,
+                customer=_customer_ref_from(row.customer_id, row.business_name, row.name),
+                amount=round(row.total or 0, 2),
+                status=row.status,
+                date=(row.order_date or row.created_at).date().isoformat(),
+            )
+            for row in recent
+        ],
+    )
+
+
+def build_my_delivery_dashboard(
+    db: Session, staff: User, period: str | None = None, date_from: str | None = None, date_to: str | None = None,
+):
+    from app.schemas.dashboard import MyDeliveryDashboardOut
+
+    name, start, end, df, dt = _resolve_range(period, date_from, date_to)
+    mine = db.query(Delivery).filter(
+        Delivery.organization_id == staff.organization_id, Delivery.delivery_partner_id == staff.id
+    )
+    # Same day key as Staff Detail: when it is scheduled, else when it was created.
+    day = func.date(func.coalesce(Delivery.scheduled_date, Delivery.created_at))
+    in_period = mine.filter(day >= start, day <= end).outerjoin(SalesOrder, SalesOrder.id == Delivery.sales_order_id)
+
+    counts: dict[str, int] = {}
+    delivery_value = 0.0
+    for state, count, value in (
+        in_period.with_entities(Delivery.status, func.count(Delivery.id), func.sum(SalesOrder.total))
+        .group_by(Delivery.status)
+    ):
+        counts[state] = int(count or 0)
+        delivery_value += float(value or 0)
+
+    completed = in_period.filter(Delivery.status.in_(_DELIVERED))
+    pod_completed = sum(
+        1 for signature, photos in completed.with_entities(Delivery.pod_signature_file_id, Delivery.pod_photo_file_ids)
+        if signature or (photos or [])
+    )
+    by_day = {
+        _iso_day(d): (int(count or 0), round(float(total or 0), 2))
+        for d, count, total in completed.with_entities(day, func.count(Delivery.id), func.sum(SalesOrder.total))
+        .group_by(day)
+    }
+
+    # Receivable: goods handed over (whenever) and not yet paid for -- per delivery, as Staff Detail.
+    handed_over = (
+        mine.filter(Delivery.status.in_(_DELIVERED))
+        .join(SalesOrder, SalesOrder.id == Delivery.sales_order_id)
+        .with_entities(SalesOrder.id, SalesOrder.total)
+        .all()
+    )
+    paid = _paid_by_order(db, list({order_id for order_id, _ in handed_over}))
+    receivable = sum(max((total or 0) - paid.get(order_id, 0), 0) for order_id, total in handed_over)
+
+    # Collected: payments in the period against the orders of any of this employee's deliveries.
+    their_order_ids = mine.filter(Delivery.sales_order_id.isnot(None)).with_entities(Delivery.sales_order_id)
+    collected = (
+        db.query(func.coalesce(func.sum(CustomerPayment.amount), 0.0))
+        .filter(
+            CustomerPayment.organization_id == staff.organization_id,
+            CustomerPayment.order_id.in_(their_order_ids),
+            CustomerPayment.received_on >= df,
+            CustomerPayment.received_on <= dt,
+        )
+        .scalar()
+        or 0
+    )
+
+    open_q = mine.filter(Delivery.status.in_(_OPEN_DELIVERY))
+    open_count = open_q.with_entities(func.count(Delivery.id)).scalar() or 0
+    open_rows = (
+        open_q.outerjoin(SalesOrder, SalesOrder.id == Delivery.sales_order_id)
+        .outerjoin(Customer, Customer.id == Delivery.customer_id)
+        .with_entities(
+            Delivery.id, Delivery.delivery_note_number, Delivery.scheduled_date, Delivery.created_at, Delivery.status,
+            Delivery.customer_id, Customer.business_name, Customer.name,
+            SalesOrder.id.label("order_id"), SalesOrder.order_number, SalesOrder.total,
+        )
+        .order_by(Delivery.created_at.desc())
+        .limit(MOBILE_LIST_LIMIT)
+        .all()
+    )
+    open_paid = _paid_by_order(db, [r.order_id for r in open_rows if r.order_id])
+
+    loading = (
+        db.query(VehicleLoading)
+        .filter(
+            VehicleLoading.organization_id == staff.organization_id,
+            VehicleLoading.delivery_partner_id == staff.id,
+            VehicleLoading.status == "active",
+        )
+        .order_by(VehicleLoading.date.desc())
+        .first()
+    )
+    open_vehicles = open_q.with_entities(Delivery.vehicle_id).order_by(Delivery.created_at.desc()).all()
+
+    rows = []
+    for r in open_rows:
+        order = _OrderRow(r.order_id, r.order_number, r.total) if r.order_id else None
+        rows.append(AssignedDeliveryRow(
+            id=r.id,
+            delivery_number=r.delivery_note_number,
+            order=_order_ref(order),
+            customer=_customer_ref_from(r.customer_id, r.business_name, r.name),
+            scheduled_at=r.scheduled_date or r.created_at,
+            payment_type=_payment_type(order, open_paid),
+            amount_due=_amount_due(order, open_paid),
+            status=r.status,
+        ))
+
+    return MyDeliveryDashboardOut(
+        period=name,
+        period_from=start.isoformat(),
+        period_to=end.isoformat(),
+        summary=DeliverySummary(
+            deliveries=sum(counts.values()),
+            completed=counts.get("delivered", 0),
+            pending=sum(counts.get(s, 0) for s in _OPEN_DELIVERY),
+            partial=counts.get("partially_delivered", 0),
+            failed=counts.get("failed", 0),
+            delivery_value=round(delivery_value, 2),
+            amount_collected=round(float(collected), 2),
+            amount_receivable=round(receivable, 2),
+            pod_completed=pod_completed,
+        ),
+        performance=[
+            DeliveryPerformancePoint(
+                date=d, deliveries_completed=by_day.get(d, (0, 0.0))[0], delivery_amount=by_day.get(d, (0, 0.0))[1],
+            )
+            for d in _days(start, end)
+        ],
+        open_deliveries_count=int(open_count),
+        open_deliveries=rows,
+        vehicle=_vehicle_badge(db, staff, loading, open_vehicles),
     )

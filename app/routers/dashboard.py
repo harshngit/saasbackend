@@ -4,9 +4,15 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import require_permission
 from app.models import Customer, SalesOrder, Supplier, User, Warehouse
-from app.schemas.dashboard import AdminDashboardOut, DeliveryPartnerDashboardOut
+from app.schemas.dashboard import (
+    AdminDashboardOut,
+    DeliveryPartnerDashboardOut,
+    MyDeliveryDashboardOut,
+    MySalesDashboardOut,
+)
+from app.schemas.staff_overview import DELIVERY, SALES
 from app.schemas.sales_order import OrderOut
-from app.services import dashboard_service
+from app.services import dashboard_service, staff_overview_service
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -63,6 +69,58 @@ def admin_dashboard(
         date_from=date_from, date_to=date_to, company_id=company_id,
         warehouse_id=warehouse_id, customer_id=customer_id, supplier_id=supplier_id,
     )
+
+
+# ------------------------- mobile "my dashboard" --------------------------
+# The field app's dashboards: the logged-in employee's own figures, nothing firm-wide.
+# There is deliberately no user id parameter -- the token says whose figures these are.
+
+
+def _require_workspace(user: User, workspace: str) -> None:
+    role = user.role_detail
+    if (role.workspace if role is not None else None) != workspace:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This dashboard is for staff in the {workspace} workspace",
+        )
+
+
+_PERIOD = Query(default="today", description="today | week (last 7 days) | month (last 30 days)")
+_FROM = Query(default=None, description="YYYY-MM-DD; a custom range instead of `period`")
+_TO = Query(default=None, description="YYYY-MM-DD; defaults to today")
+
+
+@router.get("/me/sales", response_model=MySalesDashboardOut)
+def my_sales_dashboard(
+    period: str = _PERIOD,
+    date_from: str | None = _FROM,
+    date_to: str | None = _TO,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> MySalesDashboardOut:
+    """The salesperson's own dashboard for the field app: period sales and orders, today's
+    sales, assigned customers, a per-day series and the 5 latest orders. Same definitions
+    as the sales block of GET /users/{id}/overview. Staff in the sales workspace only."""
+    _org_id(user)
+    _require_workspace(user, SALES)
+    return staff_overview_service.build_my_sales_dashboard(db, user, period, date_from, date_to)
+
+
+@router.get("/me/delivery", response_model=MyDeliveryDashboardOut)
+def my_delivery_dashboard(
+    period: str = _PERIOD,
+    date_from: str | None = _FROM,
+    date_to: str | None = _TO,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> MyDeliveryDashboardOut:
+    """The delivery partner's own dashboard for the field app: deliveries by outcome, value,
+    collected and receivable, a per-day series, open deliveries (count + 5 latest) and the
+    van. Same definitions as the delivery block of GET /users/{id}/overview. Staff in the
+    delivery workspace only."""
+    _org_id(user)
+    _require_workspace(user, DELIVERY)
+    return staff_overview_service.build_my_delivery_dashboard(db, user, period, date_from, date_to)
 
 
 @router.get("/delivery-partner", response_model=DeliveryPartnerDashboardOut)

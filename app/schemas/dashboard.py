@@ -122,3 +122,47 @@ class AdminDashboardOut(BaseModel):
     sales_trend: list[SalesTrendPoint]
     stock_watch: list[StockWatchItem]
     recent_orders: list[RecentOrder]
+
+
+# ---------------------------------------------------------------------------------------
+# Mobile "my dashboard" responses -- GET /dashboard/me/sales and /dashboard/me/delivery.
+# Only what the field app shows, always for the logged-in employee. Every figure has the
+# same definition as the matching block of GET /users/{id}/overview (Staff Detail).
+# ---------------------------------------------------------------------------------------
+
+from app.schemas.staff_overview import (  # noqa: E402
+    AssignedDeliveryRow,
+    DeliveryPerformancePoint,
+    DeliverySummary,
+    PeriodName,
+    RecentOrderRow,
+    SalesPerformancePoint,
+    VehicleBadge,
+)
+
+
+class MySalesSummary(BaseModel):
+    sales_amount: float = Field(description="Sales in the period (orders past approval, by creation date)")
+    orders: int = Field(description="Number of those orders")
+    today_sales_amount: float = Field(description="Same definition, for today (UTC day, as Staff Detail)")
+    assigned_customers: int = Field(description="Customers whose assigned sales officer is this employee")
+
+
+class MySalesDashboardOut(BaseModel):
+    period: PeriodName
+    period_from: str
+    period_to: str
+    summary: MySalesSummary
+    performance: list[SalesPerformancePoint] = Field(description="One point per day of the period")
+    recent_orders: list[RecentOrderRow] = Field(description="Newest first, at most 5")
+
+
+class MyDeliveryDashboardOut(BaseModel):
+    period: PeriodName
+    period_from: str
+    period_to: str
+    summary: DeliverySummary
+    performance: list[DeliveryPerformancePoint] = Field(description="Completed deliveries per day")
+    open_deliveries_count: int = Field(description="All deliveries still open for this employee")
+    open_deliveries: list[AssignedDeliveryRow] = Field(description="Newest first, at most 5")
+    vehicle: VehicleBadge | None = None
