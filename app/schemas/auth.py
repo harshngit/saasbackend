@@ -1,6 +1,7 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models.enums import UserRole
+from app.schemas.employee_profile import OptionalDate, OptionalEmail
 from app.schemas.organization import OrganizationOut
 from app.schemas.role import RoleBriefOut
 from app.schemas.theme import OrganizationThemeOut
@@ -189,6 +190,45 @@ class ResetPasswordRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(min_length=8, max_length=128)
+
+
+class ProfileSelfUpdate(BaseModel):
+    """PATCH /auth/me — the signed-in user's own personal details; only the fields sent
+    change. Anything else (email, phone, role, organization, status, password, photo,
+    employment or payroll fields) is rejected with 422: those stay with the admin
+    workflows, POST /auth/change-password and POST /auth/me/photo."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=150)
+    first_name: str | None = Field(default=None, max_length=50)
+    last_name: str | None = Field(default=None, max_length=50)
+    display_name: str | None = Field(default=None, max_length=150)
+    gender: str | None = Field(default=None, max_length=30)
+    date_of_birth: OptionalDate = None
+    marital_status: str | None = Field(default=None, max_length=30)
+    blood_group: str | None = Field(default=None, max_length=10)
+    nationality: str | None = Field(default=None, max_length=100)
+    alternate_mobile_number: str | None = Field(default=None, max_length=20)
+    personal_email: OptionalEmail = None
+    emergency_contact_name: str | None = Field(default=None, max_length=150)
+    emergency_contact_number: str | None = Field(default=None, max_length=20)
+    emergency_contact_relationship: str | None = Field(default=None, max_length=50)
+    current_address: str | None = None
+    permanent_address: str | None = None
+    city: str | None = Field(default=None, max_length=100)
+    state: str | None = Field(default=None, max_length=100)
+    country: str | None = Field(default=None, max_length=100)
+    pin_zip_code: str | None = Field(default=None, max_length=20)
+    language: str | None = Field(default=None, max_length=30)
+    time_zone: str | None = Field(default=None, max_length=64)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _name_not_blank(cls, v: object) -> object:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            raise ValueError("name cannot be empty")
+        return v.strip() if isinstance(v, str) else v
 
 
 class OtpRequest(BaseModel):

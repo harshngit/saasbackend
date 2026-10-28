@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
+from app.core.database import commit_or_email_conflict, get_db
 from app.core.deps import require_system_role
 from app.core.security import hash_password
 from app.models import (
@@ -123,7 +123,7 @@ def _super_admin_count(db: Session) -> int:
 
 
 def _email_taken(db: Session, email: str, exclude_id: str | None = None) -> bool:
-    query = db.query(User).filter(User.email == email)
+    query = db.query(User).filter(func.lower(User.email) == email.strip().lower())
     if exclude_id is not None:
         query = query.filter(User.id != exclude_id)
     return db.query(query.exists()).scalar()
@@ -152,7 +152,7 @@ def create_super_admin(payload: SuperAdminCreate, db: Session = Depends(get_db))
         system_role=SystemRole.SUPER_ADMIN.value,
     )
     db.add(admin)
-    db.commit()
+    commit_or_email_conflict(db)
     db.refresh(admin)
     return admin
 
@@ -201,7 +201,7 @@ def update_super_admin(
             )
         target.is_active = is_active
 
-    db.commit()
+    commit_or_email_conflict(db)
     if password:
         # A new password ends the sessions opened with the old one.
         password_service.revoke_all_refresh_tokens(db, target.id)

@@ -150,7 +150,8 @@ def verify_google_id_token(credential: str, client_id: str | None = None) -> dic
     # Ensure email is verified by Google to prevent account takeover
     email_verified = id_info.get("email_verified")
     if email_verified is not True and str(email_verified).lower() != "true":
-        logger.warning("Google account email is not verified: %s", id_info.get("email"))
+        from app.services.email_service import mask_email
+        logger.warning("Google account email is not verified: %s", mask_email(id_info.get("email")))
         raise GoogleAuthError("Google email is not verified", status_code=401)
 
     sub = id_info.get("sub")

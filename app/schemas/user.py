@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Annotated
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -89,6 +90,16 @@ EmploymentTypeIn = Annotated[EmploymentType, BeforeValidator(_normalize_choice)]
 EmployeeStatusIn = Annotated[EmployeeStatus, BeforeValidator(_normalize_choice)]
 AccountStatusIn = Annotated[AccountStatus, BeforeValidator(_normalize_choice)]
 StringList = Annotated[list[str], BeforeValidator(_as_list)]
+
+
+def _normalize_login_email(value: object) -> object:
+    """The login email is matched case-insensitively, so it is stored lowercased:
+    the same rule self-registration, Google sign-in and forgot-password already use."""
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+# Every field that writes or looks up `users.email` (the login identifier).
+LoginEmail = Annotated[EmailStr, AfterValidator(_normalize_login_email)]
 
 
 class RoleBrief(BaseModel):

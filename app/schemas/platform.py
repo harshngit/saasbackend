@@ -2,10 +2,11 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from app.core.entitlements import ALL_ENTITLEMENT_KEYS, normalize_entitlement_key
 from app.models.enums import BillingCycle
+from app.schemas.user import LoginEmail
 
 PlatformStaffRole = Literal["sales_manager"]
 
@@ -15,7 +16,7 @@ PlatformStaffRole = Literal["sales_manager"]
 
 class PlatformStaffCreate(BaseModel):
     name: str = Field(min_length=1, max_length=150)
-    email: EmailStr
+    email: LoginEmail
     password: str = Field(min_length=8, max_length=128)
     phone: str | None = None
     role: PlatformStaffRole = "sales_manager"
@@ -25,7 +26,7 @@ class PlatformStaffUpdate(BaseModel):
     """Partial update: only the fields sent change."""
 
     name: str | None = Field(default=None, min_length=1, max_length=150)
-    email: EmailStr | None = None
+    email: LoginEmail | None = None
     phone: str | None = None
     password: str | None = Field(default=None, min_length=8, max_length=128)
     role: PlatformStaffRole | None = None

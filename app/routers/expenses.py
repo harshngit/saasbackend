@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.core.files import safe_delete_unreferenced_file, save_upload
+from app.core.files import delete_replaced_file, save_upload
 from app.core.sorting import apply_sorting
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
 from app.core.pagination import paginate
@@ -194,9 +194,11 @@ def upload_receipt(
     expense = _owned(db, expense_id, _org_id(user), user)
     old_receipt = expense.receipt_url
     expense.receipt_url, _ = save_upload(db, expense.organization_id, file, request)
-    if old_receipt and old_receipt != expense.receipt_url:
-        safe_delete_unreferenced_file(db, old_receipt, expense.organization_id)
+    new_receipt, org_id = expense.receipt_url, expense.organization_id
     db.commit()
+    # Only after the commit, and only if it is this firm's file and nothing else uses it.
+    if old_receipt and old_receipt != new_receipt:
+        delete_replaced_file(db, old_receipt, org_id)
     db.refresh(expense)
     return expense
 

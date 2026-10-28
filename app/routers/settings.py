@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core import workflow
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_system_role
-from app.core.files import save_upload
+from app.core.files import delete_replaced_file, save_upload
 from app.models import Organization, StoredFile, SystemRole, User
 from app.schemas.theme import OrganizationThemeOut, OrganizationThemeUpdate
 from app.schemas.payment_gateway import PaymentGatewayIn, PaymentGatewayOut
@@ -144,11 +144,11 @@ def _check_theme_image_type(file: UploadFile) -> None:
 
 
 def _delete_background_file(db: Session, org_id: str, background_url: str | None) -> None:
-    """Safely delete the StoredFile row, R2 object, and update storage snapshot."""
-    if not background_url:
-        return
-    from app.core.files import delete_stored_file
-    delete_stored_file(db, background_url, org_id)
+    """Call after the theme change is committed: deletes the old background's StoredFile
+    row, R2 object and storage usage, only if it is this firm's file and nothing else
+    (a logo set to the same URL, say) still uses it."""
+    if background_url:
+        delete_replaced_file(db, background_url, org_id)
 
 
 @router.get("/organization/theme", response_model=OrganizationThemeOut)
@@ -206,13 +206,12 @@ def upload_theme_background(
         db, org.id, file, request, allow_any=True, max_bytes=_THEME_MAX_UPLOAD_BYTES
     )
 
-    # Delete previous background file now that the new one is successfully saved
-    if old_bg_url and old_bg_url != url:
-        _delete_background_file(db, org.id, old_bg_url)
-
     theme.background_image_url = url
     activity_service.record(db, org.id, admin, "branding", "Background uploaded")
     db.commit()
+    # Delete the previous background only now that the new one is committed.
+    if old_bg_url and old_bg_url != url:
+        _delete_background_file(db, org.id, old_bg_url)
     db.refresh(theme)
     return OrganizationThemeOut.from_theme(theme)
 
@@ -227,10 +226,11 @@ def delete_theme_background(
     org = _org(admin)
     theme = theme_service.get_theme(db, org)
     if theme and theme.background_image_url:
-        _delete_background_file(db, org.id, theme.background_image_url)
+        old_bg_url = theme.background_image_url
         theme.background_image_url = None
         activity_service.record(db, org.id, admin, "branding", "Background removed")
         db.commit()
+        _delete_background_file(db, org.id, old_bg_url)
         db.refresh(theme)
     return OrganizationThemeOut.from_theme(theme)
 
@@ -245,8 +245,7 @@ def reset_organization_theme(
     org = _org(admin)
     theme = theme_service.get_theme(db, org)
     if theme is not None:
-        if theme.background_image_url:
-            _delete_background_file(db, org.id, theme.background_image_url)
+        old_bg_url = theme.background_image_url
         theme.custom_enabled = False
         theme.mode = "light"
         theme.primary_color = None
@@ -254,6 +253,7 @@ def reset_organization_theme(
         theme.overlay_opacity = 0.45
         activity_service.record(db, org.id, admin, "branding", "Theme reset to defaults")
         db.commit()
+        _delete_background_file(db, org.id, old_bg_url)
         db.refresh(theme)
     return OrganizationThemeOut.from_theme(theme)
 

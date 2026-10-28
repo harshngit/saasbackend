@@ -5,12 +5,14 @@ Idempotent — safe to run multiple times.
 """
 
 import secrets
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import Base, SessionLocal, engine
 from app.core.security import hash_password
 from app.models import Organization, OrganizationStatus, Plan, UpgradeStatus, User, UserRole
+from app.services.email_service import mask_email
 
 
 def _resolve_seed_password(configured_password: str | None) -> str:
@@ -87,9 +89,12 @@ def seed_plans(db: Session) -> Plan:
 
 
 def seed_super_admin(db: Session) -> None:
-    existing = db.query(User).filter(User.email == settings.super_admin_email).first()
+    # Stored like every other login email (trimmed, lowercased) and found ignoring case,
+    # so a capitalised SUPER_ADMIN_EMAIL can never create a second account.
+    email = settings.super_admin_email.strip().lower()
+    existing = db.query(User).filter(func.lower(User.email) == email).first()
     if existing is not None:
-        print(f"[seed] Super Admin already exists: {settings.super_admin_email}")
+        print(f"[seed] Super Admin already exists: {mask_email(email)}")
         return
 
     if not settings.super_admin_password:
@@ -102,19 +107,24 @@ def seed_super_admin(db: Session) -> None:
     admin = User(
         organization_id=None,  # platform-level, no tenant
         name=settings.super_admin_name,
-        email=settings.super_admin_email,
+        email=email,
         password_hash=hash_password(settings.super_admin_password),
         role=UserRole.SUPER_ADMIN,
         system_role="super_admin",
     )
     db.add(admin)
     db.commit()
-    print(f"[seed] Created Super Admin: {settings.super_admin_email}")
+    print(f"[seed] Created Super Admin: {mask_email(email)}")
 
 
 def seed_demo_firm(db: Session, default_plan: Plan | None) -> None:
     """A demo firm + admin so the login screen's admin@demo.com works out of the box."""
-    if db.query(User).filter(User.email == "admin@demo.com").first() is not None:
+    # The firm, not just its admin's address: once that admin changes their email, a
+    # re-run must not create a second demo firm that answers to admin@demo.com again.
+    if (
+        db.query(User).filter(func.lower(User.email) == "admin@demo.com").first() is not None
+        or db.query(Organization).filter(Organization.email == "admin@demo.com").first() is not None
+    ):
         print("[seed] Demo firm already exists: admin@demo.com")
         return
 

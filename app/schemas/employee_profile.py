@@ -24,6 +24,7 @@ from app.schemas.user import (
     AccountStatusIn,
     EmployeeStatusIn,
     EmploymentTypeIn,
+    LoginEmail,
     RoleBrief,
     StringList,
     TeamBrief,
@@ -94,6 +95,7 @@ def _blank_to_none(value: object) -> object:
 
 
 OptionalEmail = Annotated[EmailStr | None, BeforeValidator(_blank_to_none)]
+OptionalLoginEmail = Annotated[LoginEmail | None, BeforeValidator(_blank_to_none)]
 OptionalDate = Annotated[datetime | None, BeforeValidator(_blank_to_none)]
 OptionalRef = Annotated[str | None, BeforeValidator(_blank_to_none)]
 
@@ -136,7 +138,7 @@ class ContactInformation(BaseModel):
     mobile_number: str | None = Field(default=None, max_length=20)
     alternate_mobile_number: str | None = Field(default=None, max_length=20)
     personal_email: OptionalEmail = None
-    official_email: OptionalEmail = Field(default=None, description="The login identifier")
+    official_email: OptionalLoginEmail = Field(default=None, description="The login identifier (stored lowercased)")
     emergency_contact_name: str | None = Field(default=None, max_length=150)
     emergency_contact_number: str | None = Field(default=None, max_length=20)
     emergency_contact_relationship: str | None = Field(default=None, max_length=50)
@@ -310,6 +312,17 @@ class EmployeeProfileIn(BaseModel):
         folded = {k: v for k, v in data.items() if k in cls.model_fields}
         if "documents" not in folded and isinstance(data.get("document_information"), dict):
             folded["documents"] = data["document_information"]
+        # Inside a section, too, the column name works as well as the API name, so
+        # `contact_information.email` is never silently dropped.
+        for section, fields in SECTION_FIELDS.items():
+            block = folded.get(section)
+            if isinstance(block, dict):
+                for field in fields:
+                    column = COLUMN_FOR.get(field)
+                    if column and column in block and field not in block:
+                        block = {**block, field: block[column]}
+                        del block[column]
+                folded[section] = block
         for section, fields in SECTION_FIELDS.items():
             picked = {}
             for field in fields:

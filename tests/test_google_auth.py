@@ -493,7 +493,7 @@ def test_duplicate_case_insensitive_emails_are_not_linked():
     Runs the resolver on its own in-memory database, since the shared test database
     may enforce case-insensitive email uniqueness and refuse to hold such rows."""
     import pytest
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
     from sqlalchemy.orm import Session
     from sqlalchemy.pool import StaticPool
 
@@ -502,6 +502,8 @@ def test_duplicate_case_insensitive_emails_are_not_linked():
 
     mem = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(mem)
+    with mem.begin() as conn:  # a legacy database: the unique index could not be built over these rows
+        conn.execute(text("DROP INDEX ux_users_email_ci"))
     db = Session(bind=mem)
     try:
         db.add_all([

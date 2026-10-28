@@ -1,4 +1,5 @@
-"""Staff mobile OTP login (Twilio Verify) and the emailed password-reset link.
+"""Staff mobile OTP login (Twilio Verify), the emailed password-reset link, and changing
+the login email (PATCH /users/{id}) then signing in with it.
 
 Twilio is mocked at its HTTP boundary (`otp_service.http_requests.post`) and email at
 `send_password_reset`; any call escaping those mocks fails the test, so no SMS or email
@@ -847,3 +848,503 @@ def test_migration_backfills_unambiguous_staff_numbers_only(tmp_path):
     run(migration.upgrade)  # and back up again
     assert values() == expected
     mig_engine.dispose()
+
+
+# ------------------------------------------------------------------ changing the login email
+
+
+def _login(email: str, password: str = PASSWORD):  # noqa: ANN202
+    return client.post("/auth/login", json={"email": email, "password": password})
+
+
+def _set_email(admin: User, target_id: str, body: dict, **kw):  # noqa: ANN202
+    return client.patch(f"/users/{target_id}", json=body, headers=_auth(admin), **kw)
+
+
+def test_email_change_moves_login_to_the_new_address():
+    """The reported bug: admin@demo.com renamed in the profile, then the new address did not
+    sign in (it was stored with the casing typed, login matched case-sensitively)."""
+    admin = _user(_org(), "admin", email=f"admin_{uuid.uuid4().hex[:8]}@demo.com")
+    before = _row(admin.id)
+    new = f"Shivam.Wadkar_{uuid.uuid4().hex[:6]}@Gmail.COM"
+    r = _set_email(admin, admin.id, {"contact_information": {"official_email": f"  {new} "}})
+    assert r.status_code == 200, r.text
+    assert r.json()["contact_information"]["official_email"] == new.lower()
+
+    after = _row(admin.id)
+    assert after.email == new.lower()  # stored lowercased, like registration and Google sign-in
+    assert (after.password_hash, after.role, after.system_role, after.organization_id, after.name) == \
+        (before.password_hash, before.role, before.system_role, before.organization_id, before.name)
+
+    # No email-verification policy exists, so the new address is the login at once.
+    for spelling in (new.lower(), new, new.upper()):
+        assert _login(spelling).status_code == 200, spelling
+    # The old one is gone, answered exactly like an address that never existed.
+    old, unknown = _login(admin.email), _login(f"nobody_{uuid.uuid4().hex[:8]}@demo.com")
+    assert old.status_code == unknown.status_code == 401 and old.json() == unknown.json()
+    # Tokens carry the user id, not the email: the open session keeps working.
+    assert client.get("/auth/me", headers=_auth(admin)).status_code == 200
+
+
+def test_email_inside_a_section_by_its_column_name_is_applied_not_dropped():
+    admin = _user(_org(), "admin")
+    new = f"col_{uuid.uuid4().hex[:8]}@example.com"
+    assert _set_email(admin, admin.id, {"contact_information": {"email": new}}).status_code == 200
+    assert _row(admin.id).email == new and _login(new).status_code == 200
+
+
+def test_email_already_used_by_another_account_is_409_in_any_casing():
+    org = _org()
+    admin, other = _user(org, "admin"), _user(_org(), "staff")
+    for taken in (other.email, other.email.upper(), f" {other.email.title()} "):
+        r = _set_email(admin, admin.id, {"official_email": taken})
+        assert r.status_code == 409 and r.json()["detail"] == "Email already registered", taken
+    assert _row(admin.id).email == admin.email
+    assert _login(admin.email).status_code == 200
+
+
+def test_email_race_lost_at_commit_is_409_and_saves_nothing():
+    """Two updates checked the same free address at once: the second commit hits
+    uq_user_org_email and must answer 409 with nothing written, not 500."""
+    org = _org()
+    admin, colleague = _user(org, "admin"), _user(org, "staff")
+    with patch("app.routers.users._email_taken", return_value=False):
+        r = _set_email(admin, admin.id, {"official_email": colleague.email, "first_name": "Changed"})
+    assert r.status_code == 409 and r.json()["detail"] == "Email already registered"
+    row = _row(admin.id)
+    assert row.email == admin.email and row.first_name != "Changed"
+
+
+def test_only_the_firm_admin_can_change_an_account_email():
+    org = _org()
+    admin, staff = _user(org, "admin"), _user(org, "staff")
+    outsider = _user(_org(), "admin")
+    grab = {"official_email": f"grab_{uuid.uuid4().hex[:8]}@example.com"}
+    assert client.patch(f"/users/{admin.id}", json=grab).status_code in (401, 403)  # no token
+    assert _set_email(staff, admin.id, grab).status_code == 403
+    assert _set_email(outsider, admin.id, grab).status_code == 404
+    # Self-service is personal details only: the login email is not one of them.
+    assert client.patch("/auth/me", json={"email": grab["official_email"]}, headers=_auth(staff)).status_code == 422
+    assert _row(admin.id).email == admin.email and _row(staff.id).email == staff.email
+
+
+def test_rows_stored_with_mixed_case_still_sign_in():
+    """Emails saved before they were lowercased keep their casing; login matches them
+    case-insensitively."""
+    legacy = _user(_org(), "staff", email=f"Legacy.{uuid.uuid4().hex[:8]}@Example.com")
+    for spelling in (legacy.email, legacy.email.lower(), legacy.email.upper()):
+        assert _login(spelling).status_code == 200, spelling
+
+
+def test_email_change_keeps_existing_sessions():
+    """Documented decision: tokens carry the user id, not the email, so changing the
+    email signs nobody out — the access and refresh tokens issued before keep working."""
+    admin = _user(_org(), "admin")
+    tokens = _login(admin.email).json()["tokens"]
+    new = f"moved_{uuid.uuid4().hex[:8]}@example.com"
+    assert _set_email(admin, admin.id, {"official_email": new}).status_code == 200
+    me = client.get("/auth/me", headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    assert me.status_code == 200 and me.json()["user"]["email"] == new
+    assert client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]}).status_code == 200
+
+
+# ---- legacy duplicates: a database the unique index could not be built over
+
+
+@pytest.fixture
+def legacy_db(tmp_path):
+    """A scratch SQLite copy of the schema WITHOUT ux_users_email_ci, so rows sharing an
+    email can exist, served to the app in place of the real database."""
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.database import get_db
+
+    legacy = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    Base.metadata.create_all(bind=legacy)
+    with legacy.begin() as conn:
+        conn.execute(sa.text("DROP INDEX ux_users_email_ci"))
+    make = sessionmaker(bind=legacy, autoflush=False)
+
+    def _db():  # noqa: ANN202
+        db = make()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _db
+    try:
+        yield make
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        legacy.dispose()
+
+
+def _legacy_user(make, email: str, org: str | None = None) -> str:  # noqa: ANN001
+    db = make()
+    try:
+        user = User(organization_id=org, name="Legacy", email=email, password_hash=hash_password(PASSWORD),
+                    system_role="staff" if org else "super_admin", role=None if org else UserRole.SUPER_ADMIN)
+        db.add(user)
+        db.commit()
+        return user.id
+    finally:
+        db.close()
+
+
+def test_login_refuses_exact_and_case_only_duplicates_like_an_unknown_email(legacy_db):
+    from app.routers.auth import _user_by_login_email
+
+    _legacy_user(legacy_db, "same@example.com", "firm-a")
+    _legacy_user(legacy_db, "same@example.com", "firm-b")          # exact duplicate, two firms
+    _legacy_user(legacy_db, "Case@Example.com", "firm-a")
+    _legacy_user(legacy_db, "case@example.com", None)              # case-only, firm vs platform
+    unique = _legacy_user(legacy_db, "Only.One@Example.com", "firm-c")
+
+    unknown = _login("nobody-here@example.com")
+    assert unknown.status_code == 401
+    for spelling in ("same@example.com", "SAME@example.com", "case@example.com", "Case@Example.com"):
+        r = _login(spelling)
+        assert (r.status_code, r.json()) == (401, unknown.json()), spelling  # reveals nothing
+    db = legacy_db()
+    try:
+        assert _user_by_login_email(db, "same@example.com") is None
+        assert _user_by_login_email(db, " ONLY.ONE@example.com ").id == unique
+    finally:
+        db.close()
+
+
+def test_duplicate_email_index_log_names_counts_never_addresses(tmp_path, caplog, monkeypatch):
+    import sqlalchemy as sa
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.core import database
+
+    legacy = sa.create_engine(f"sqlite:///{tmp_path / 'log.db'}")
+    Base.metadata.create_all(bind=legacy)
+    with legacy.begin() as conn:
+        conn.execute(sa.text("DROP INDEX ux_users_email_ci"))
+    with OrmSession(legacy) as db:
+        for email in ("Secret.Person@Example.com", "secret.person@example.com", "Other.Person@corp.example",
+                      "other.person@corp.example", "other.PERSON@corp.example"):
+            db.add(User(name="x", email=email, password_hash="x", system_role="staff"))
+        db.commit()
+    monkeypatch.setattr(database, "engine", legacy)
+
+    with caplog.at_level(logging.INFO, logger="crm.db"):
+        database.enforce_unique_email()
+    text_logged = caplog.text.lower()
+    assert "2 email(s) are shared by 5 accounts" in text_logged
+    assert "secret" not in text_logged and "person" not in text_logged and "corp.example" not in text_logged
+    assert "app.scripts.email_conflicts" in text_logged
+
+    with legacy.begin() as conn:  # resolved by the owner -> the next boot builds the index
+        conn.execute(sa.text("DELETE FROM users WHERE email <> LOWER(email)"))
+    database.enforce_unique_email()
+    with legacy.connect() as conn:
+        assert conn.execute(sa.text("SELECT COUNT(*) FROM sqlite_master WHERE name = 'ux_users_email_ci'")).scalar() == 1
+    legacy.dispose()
+
+
+def test_duplicate_email_detection_ignores_other_constraints():
+    from sqlalchemy.exc import IntegrityError
+
+    from app.core.database import commit_or_email_conflict, is_duplicate_email_error
+
+    def err(message: str) -> IntegrityError:
+        return IntegrityError("INSERT", {}, Exception(message))
+
+    assert is_duplicate_email_error(err("UNIQUE constraint failed: index 'ux_users_email_ci'"))
+    assert is_duplicate_email_error(err('duplicate key value violates unique constraint "ux_users_email_ci"'))
+    assert is_duplicate_email_error(err("UNIQUE constraint failed: users.organization_id, users.email"))
+    assert is_duplicate_email_error(err('duplicate key value violates unique constraint "uq_user_org_email"'))
+    assert not is_duplicate_email_error(err("UNIQUE constraint failed: users.employee_id"))
+    assert not is_duplicate_email_error(err('null value in column "personal_email" violates not-null constraint'))
+
+    class _Db:
+        rolled_back = False
+
+        def commit(self):  # noqa: ANN202
+            raise err("UNIQUE constraint failed: users.username")
+
+        def rollback(self):  # noqa: ANN202
+            self.rolled_back = True
+
+    db = _Db()
+    with pytest.raises(IntegrityError):  # re-raised as is, not turned into a 409
+        commit_or_email_conflict(db)
+    assert db.rolled_back
+
+
+# ---- races, decided by the real unique index
+
+
+def _index_present() -> bool:
+    import sqlalchemy as sa
+
+    with engine.connect() as conn:
+        if IS_POSTGRES:
+            query = ("SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                     "AND indexname = 'ux_users_email_ci'")
+        else:
+            query = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'ux_users_email_ci'"
+        return bool(conn.execute(sa.text(query)).scalar())
+
+
+@pytest.fixture
+def email_index():
+    """These tests need ux_users_email_ci itself: a fresh test database has it; one carrying
+    legacy duplicate emails cannot, and the tests are skipped there."""
+    if not _index_present():
+        from app.core.database import enforce_unique_email
+        enforce_unique_email()
+    if not _index_present():
+        pytest.skip("this database holds duplicate emails, so ux_users_email_ci cannot exist; use a fresh one")
+
+
+def _rows_with(email: str) -> int:
+    from sqlalchemy import func as sa_func
+
+    db = SessionLocal()
+    try:
+        return db.query(User).filter(sa_func.lower(User.email) == email.lower()).count()
+    finally:
+        db.close()
+
+
+def test_the_index_rejects_case_variants_across_firms_and_the_platform(email_index):
+    from sqlalchemy.exc import IntegrityError
+
+    email = f"Indexed.{uuid.uuid4().hex[:8]}@example.com"
+    _user(_org(), "staff", email=email)
+    for org in (_org(), None):
+        with pytest.raises(IntegrityError):
+            _user(org, "staff" if org else "super_admin", email=email.upper())
+    assert _rows_with(email) == 1
+
+
+def test_create_and_update_races_answer_409_and_save_nothing(email_index, no_plan_limits):
+    """The pre-check passed (patched to miss the other account, as when two requests run
+    at once); the unique index decides, and nothing of the request is kept."""
+    taken = _user(_org(), "staff", email=f"taken_{uuid.uuid4().hex[:8]}@example.com").email
+    admin, root = _user(_org(), "admin"), _user(None, "super_admin")
+    db = SessionLocal()
+    try:
+        manager = User(name="SM", email=f"sm_{uuid.uuid4().hex[:8]}@example.com",
+                       password_hash=hash_password(PASSWORD), system_role="sales_manager")
+        db.add(manager)
+        db.commit()
+        manager_id = manager.id
+    finally:
+        db.close()
+    other_root = _user(None, "super_admin")
+    conflict = {"detail": "Email already registered"}
+
+    with patch("app.routers.users._email_taken", return_value=False), \
+            patch("app.routers.superadmin._email_taken", return_value=False):
+        attempts = {
+            "POST /users": client.post("/users", headers=_auth(admin), json={
+                "name": "Racer", "contact_information": {"official_email": taken.upper()},
+                "login_security": {"password": PASSWORD}}),
+            "PATCH /users": _set_email(admin, admin.id, {"official_email": taken, "first_name": "Kept?"}),
+            "POST /superadmin/admins": client.post("/superadmin/admins", headers=_auth(root), json={
+                "name": "Racer", "email": taken, "password": PASSWORD}),
+            "PATCH /superadmin/admins": client.patch(f"/superadmin/admins/{other_root.id}", headers=_auth(root),
+                                                     json={"email": taken, "name": "Kept?"}),
+            "POST /platform/staff": client.post("/platform/staff", headers=_auth(root), json={
+                "name": "Racer", "email": taken, "password": PASSWORD}),
+            "PATCH /platform/staff": client.patch(f"/platform/staff/{manager_id}", headers=_auth(root),
+                                                  json={"email": taken, "name": "Kept?"}),
+        }
+    for route, r in attempts.items():
+        assert (r.status_code, r.json()) == (409, conflict), (route, r.text)
+    assert _rows_with(taken) == 1
+    for user_id in (admin.id, other_root.id, manager_id):
+        row = _row(user_id)
+        assert row.first_name != "Kept?" and row.name != "Kept?" and row.email.lower() != taken
+
+
+def test_registration_race_answers_409_and_creates_no_firm(email_index):
+    email = f"Race.{uuid.uuid4().hex[:8]}@example.com"
+    firm = f"Race Firm {uuid.uuid4().hex[:8]}"
+    real_start = org_service.start_trial
+
+    def rival_registers_first(db, org):  # noqa: ANN001, ANN202
+        _user(None, "super_admin", email=email.lower())  # a platform account, committed after the pre-check
+        return real_start(db, org)
+
+    with patch("app.services.auth_service.org_service.start_trial", side_effect=rival_registers_first):
+        r = client.post("/auth/register", json={"organization_name": firm, "admin_name": "Racer",
+                                                "email": email, "password": PASSWORD})
+    assert (r.status_code, r.json()) == (409, {"detail": "Email already registered"})
+    assert _rows_with(email) == 1
+    db = SessionLocal()
+    try:
+        assert db.query(Organization).filter(Organization.name == firm).count() == 0
+    finally:
+        db.close()
+
+
+# ---- the migration that installs ux_users_email_ci
+
+
+def _email_migration():  # noqa: ANN202
+    path = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions" / "b7c8d9e0f1a2_users_email_unique_ci.py"
+    spec = importlib.util.spec_from_file_location("email_index_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
+@pytest.fixture
+def migration_db(tmp_path):
+    """A bare `users` table on the test engine's dialect: a scratch SQLite file, or a
+    throwaway schema on the Postgres test database (dropped afterwards)."""
+    import sqlalchemy as sa
+
+    schema = None
+    if IS_POSTGRES:
+        schema = f"mig_{uuid.uuid4().hex[:10]}"
+        with engine.begin() as conn:
+            conn.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+        mig = sa.create_engine(engine.url.render_as_string(hide_password=False),
+                               connect_args={"options": f"-csearch_path={schema}"})
+    else:
+        mig = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
+    with mig.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE users (id VARCHAR(36) PRIMARY KEY, organization_id VARCHAR(36), "
+                             "system_role VARCHAR(20), email VARCHAR(255) NOT NULL)"))
+    try:
+        yield mig
+    finally:
+        mig.dispose()
+        if schema:
+            with engine.begin() as conn:
+                conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+
+
+def _run(mig, step) -> None:  # noqa: ANN001
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    with mig.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            step()
+
+
+def _insert(mig, *emails: str, org: str | None = "firm-1") -> None:  # noqa: ANN001
+    import sqlalchemy as sa
+
+    with mig.begin() as conn:
+        for email in emails:
+            conn.execute(sa.text("INSERT INTO users (id, organization_id, email) VALUES (:i, :o, :e)"),
+                         {"i": str(uuid.uuid4()), "o": org, "e": email})
+
+
+def _has_index(mig) -> bool:  # noqa: ANN001
+    import sqlalchemy as sa
+
+    with mig.connect() as conn:
+        if mig.dialect.name == "postgresql":
+            return bool(conn.execute(sa.text(
+                "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema() "
+                "AND indexname = 'ux_users_email_ci'")).scalar())
+        return bool(conn.execute(sa.text(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'ux_users_email_ci'")).scalar())
+
+
+def test_email_index_migration_on_clean_data_creates_enforces_and_downgrades(migration_db):
+    import sqlalchemy as sa
+
+    migration = _email_migration()
+    _insert(migration_db, "a@example.com", "B@Example.com", org="firm-1")
+    _insert(migration_db, "c@example.com", org=None)
+    _run(migration_db, migration.upgrade)
+    assert _has_index(migration_db)
+    for org in ("firm-2", None):  # another firm, the platform: both refused
+        with pytest.raises(sa.exc.IntegrityError):
+            _insert(migration_db, "b@example.com", org=org)
+    _run(migration_db, migration.upgrade)  # already there: a no-op, not an error
+    _run(migration_db, migration.downgrade)
+    assert not _has_index(migration_db)
+    _insert(migration_db, "A@EXAMPLE.COM")  # nothing enforces it any more
+
+
+def test_email_index_migration_refuses_conflicts_and_changes_nothing(migration_db):
+    import sqlalchemy as sa
+
+    migration = _email_migration()
+    _insert(migration_db, "Private.Person@Example.com", org="firm-1")
+    _insert(migration_db, " private.person@example.com", org=None)   # case + spaces, platform
+    _insert(migration_db, "twin@example.com", "twin@example.com")    # exact, same firm
+    with pytest.raises(RuntimeError) as failure:
+        _run(migration_db, migration.upgrade)
+    message = str(failure.value)
+    assert "2 email(s) are shared by 4 accounts" in message and "app.scripts.email_conflicts" in message
+    assert "private" not in message.lower() and "twin" not in message
+    assert not _has_index(migration_db)
+    with migration_db.connect() as conn:
+        assert conn.execute(sa.text("SELECT COUNT(*) FROM users")).scalar() == 4
+
+
+def test_email_index_migration_accepts_the_startup_index_and_rejects_a_different_one(migration_db):
+    import sqlalchemy as sa
+
+    migration = _email_migration()
+    with migration_db.begin() as conn:  # what enforce_unique_email builds
+        conn.execute(sa.text('CREATE UNIQUE INDEX "ux_users_email_ci" ON "users" (LOWER("email"))'))
+    _run(migration_db, migration.upgrade)
+    assert _has_index(migration_db)
+
+    _run(migration_db, migration.downgrade)
+    with migration_db.begin() as conn:
+        conn.execute(sa.text('CREATE INDEX "ux_users_email_ci" ON users (email)'))  # not unique, not lower()
+    with pytest.raises(RuntimeError, match="different definition"):
+        _run(migration_db, migration.upgrade)
+
+
+def test_email_conflict_report_is_masked_and_categorized(migration_db):
+    from app.scripts.email_conflicts import find_conflicts
+
+    _insert(migration_db, "Same.Firm@example.com", "same.firm@example.com", org="firm-1")
+    _insert(migration_db, "cross@example.com", org="firm-1")
+    _insert(migration_db, "cross@example.com", org="firm-2")
+    _insert(migration_db, "Mixed@Example.com", org="firm-3")
+    _insert(migration_db, "mixed@example.com", "MIXED@example.com", org=None)
+    _insert(migration_db, "fine@example.com", org="firm-4")
+    with migration_db.connect() as conn:
+        report = find_conflicts(conn)
+    assert report["accounts"] == 7 and len(report["groups"]) == 3
+    assert report["counts"] == {"same_firm": 1, "cross_firm": 1, "firm_and_platform": 1, "platform": 1,
+                                "case_or_spaces": 2}
+    printed = repr(report).lower()
+    assert "same.firm@" not in printed and "cross@" not in printed and "mixed@" not in printed
+    assert "fine" not in printed
+
+
+def test_supplier_code_migration_keeps_the_transaction_usable_when_its_steps_fail(migration_db):
+    """s7t8u9v0w1x2 on a database that already has the constraint (a fresh install: the
+    baseline builds it from the models) and where the backfill fails. Its best-effort steps
+    must not poison the migration transaction on PostgreSQL — before the fix every later
+    statement, the alembic_version update included, failed with InFailedSqlTransaction."""
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "alembic" / "versions" / "s7t8u9v0w1x2_add_supplier_code_to_suppliers.py"
+    spec = importlib.util.spec_from_file_location("supplier_code_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    with migration_db.begin() as conn:  # no organizations table: the backfill will fail
+        conn.execute(sa.text("CREATE TABLE suppliers (id VARCHAR(36) PRIMARY KEY, organization_id VARCHAR(36), "
+                             "supplier_code VARCHAR(50), "
+                             "CONSTRAINT uq_suppliers_org_supplier_code UNIQUE (organization_id, supplier_code))"))
+    with migration_db.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            migration.upgrade()
+        assert conn.execute(sa.text("SELECT COUNT(*) FROM suppliers")).scalar() == 0  # still usable
+    with migration_db.connect() as conn:
+        names = {uc["name"] for uc in sa.inspect(conn).get_unique_constraints("suppliers")}
+        assert "uq_suppliers_org_supplier_code" in names

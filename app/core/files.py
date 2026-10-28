@@ -1,5 +1,8 @@
 import base64
+import logging
 import re
+import unicodedata
+from urllib.parse import quote
 
 from fastapi import HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
@@ -18,6 +21,41 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024    # 5 MB — the sheet's limit for images
 FILES_PATH = "/files"
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]+)?(;base64)?,(.*)$", re.S)
+
+_MAX_FILENAME = 150
+
+
+def safe_filename(name: str | None) -> str:
+    """A client-supplied filename reduced to something safe to store and to put in a
+    header: the last path segment only, no control characters (so no CR/LF), no quotes
+    or backslashes, at most 150 characters. Unicode letters are kept."""
+    base = re.split(r"[\\/]", name or "")[-1]
+    cleaned = "".join(
+        ch for ch in base if unicodedata.category(ch)[0] != "C" and ch not in '"\\'
+    ).strip(" .")
+    if len(cleaned) > _MAX_FILENAME:
+        stem, dot, ext = cleaned.rpartition(".")
+        cleaned = (stem[: _MAX_FILENAME - len(ext) - 1] + dot + ext) if dot and len(ext) <= 10 else cleaned[:_MAX_FILENAME]
+    return cleaned or "file"
+
+
+def document_filename(name: str) -> str:
+    """A download name built from document numbers: path separators (as in
+    `INV/2024/001`) become "-" rather than cutting the name down to its last part."""
+    return name.replace("/", "-").replace("\\", "-")
+
+
+def content_disposition(filename: str | None, disposition: str = "inline") -> str:
+    """A Content-Disposition value that is always plain ASCII: an ASCII `filename`
+    for every client plus RFC 6266 `filename*` carrying the UTF-8 name when it differs.
+    Sanitizes again, so rows stored before uploads were sanitized are safe too."""
+    name = safe_filename(filename)
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    ascii_name = re.sub(r"[^A-Za-z0-9 ._()\-]", "_", ascii_name).strip(" .") or "file"
+    value = f'{disposition}; filename="{ascii_name}"'
+    if ascii_name != name:
+        value += f"; filename*=UTF-8''{quote(name, safe='')}"
+    return value
 
 
 def _check_type(
@@ -125,7 +163,7 @@ def _persist(
     stored = StoredFile(
         id=str(uuid.uuid4()),  # generated up front so the R2 key can use it before the row exists
         organization_id=org_id,
-        filename=filename,
+        filename=safe_filename(filename),
         content_type=content_type or "application/octet-stream",
         size=len(content),
     )
@@ -246,6 +284,14 @@ def safe_delete_unreferenced_file(
     if org_id is not None and stored.organization_id != org_id:
         return False
 
+    if file_is_referenced(db, file_id):
+        return False
+
+    return delete_stored_file(db, stored, org_id)
+
+
+def file_is_referenced(db: Session, file_id: str) -> bool:
+    """True when any file-holding column anywhere still points at `file_id`."""
     pattern = f"%{file_id}%"
 
     from sqlalchemy import cast, Text, or_
@@ -288,7 +334,7 @@ def safe_delete_unreferenced_file(
         )
     ).count()
     if org_refs > 0:
-        return False
+        return True
 
     # 2. Product images, brochures, manuals, attachments, variants
     product_refs = db.query(Product).filter(
@@ -304,13 +350,13 @@ def safe_delete_unreferenced_file(
         )
     ).count()
     if product_refs > 0:
-        return False
+        return True
 
     variant_refs = db.query(ProductVariant).filter(
         ProductVariant.image_url.like(pattern)
     ).count()
     if variant_refs > 0:
-        return False
+        return True
 
     # 3. Expense receipts & vendor invoices
     expense_refs = db.query(Expense).filter(
@@ -321,7 +367,7 @@ def safe_delete_unreferenced_file(
         )
     ).count()
     if expense_refs > 0:
-        return False
+        return True
 
     # 4. User profile photos & employee documents
     user_refs = db.query(User).filter(
@@ -334,20 +380,20 @@ def safe_delete_unreferenced_file(
         )
     ).count()
     if user_refs > 0:
-        return False
+        return True
 
     # 5. Customer documents & payment proofs
     cust_refs = db.query(Customer).filter(
         Customer.profile_image_id.like(pattern),
     ).count()
     if cust_refs > 0:
-        return False
+        return True
 
     pay_refs = db.query(CustomerPayment).filter(
         CustomerPayment.payment_proof_url.like(pattern),
     ).count()
     if pay_refs > 0:
-        return False
+        return True
 
     doc_refs = db.query(CustomerDocument).filter(
         or_(
@@ -356,14 +402,14 @@ def safe_delete_unreferenced_file(
         )
     ).count()
     if doc_refs > 0:
-        return False
+        return True
 
     # 6. Organization Theme background
     theme_refs = db.query(OrganizationTheme).filter(
         OrganizationTheme.background_image_url.like(pattern)
     ).count()
     if theme_refs > 0:
-        return False
+        return True
 
     # 7. Purchase & Supplier Invoices
     pi_refs = db.query(PurchaseInvoice).filter(
@@ -377,35 +423,97 @@ def safe_delete_unreferenced_file(
         )
     ).count()
     if pi_refs > 0:
-        return False
+        return True
 
     si_refs = db.query(SupplierInvoice).filter(
         SupplierInvoice.attachment_url.like(pattern)
     ).count()
     if si_refs > 0:
-        return False
+        return True
 
     # 8. Delivery proof of delivery / payment
     del_refs = db.query(Delivery).filter(
         cast(Delivery.pod_photo_file_ids, Text).like(pattern)
     ).count()
     if del_refs > 0:
-        return False
+        return True
 
     dc_refs = db.query(DeliveryCollection).filter(
         DeliveryCollection.payment_proof_url.like(pattern)
     ).count()
     if dc_refs > 0:
-        return False
+        return True
 
     # 9. Category images
     cat_refs = db.query(Category).filter(
         Category.image.like(pattern)
     ).count()
     if cat_refs > 0:
-        return False
+        return True
 
-    return delete_stored_file(db, stored, org_id)
+    return False
+
+
+def delete_replaced_file(db: Session, old_url_or_id: str | None, org_id: str | None) -> None:
+    """Call AFTER committing the change that dropped the reference to `old_url_or_id`:
+    deletes that file when it belongs to `org_id`'s scope (None = platform) and nothing
+    references it any more. Best effort — a failure is logged and leaves an orphaned
+    file, never a broken reference, and never undoes the committed change.
+
+    Order, so a concurrent request that attaches the same file wins over the cleanup:
+    1. lock the StoredFile row (Postgres; serializes cleanups of one file), check every
+       reference, delete the row and its storage accounting, commit;
+    2. check the references again: one committed meanwhile restores the row from a
+       snapshot (the bytes are still there) and nothing else happens;
+    3. only then delete the R2 object. Failing there leaves an orphaned object, which is
+       logged — no row points at it any more.
+    Attach paths do not lock files, so a reference committed after step 2 can still
+    point at a removed file; that is the same as attaching any stale URL."""
+    file_id = extract_file_id_from_url(old_url_or_id)
+    if not file_id:
+        return
+    from app.models.stored_file import StoredFile
+    from app.services import storage_service
+
+    log = logging.getLogger("crm.files")
+    try:
+        stored = db.query(StoredFile).filter(StoredFile.id == file_id).with_for_update().first()
+        if stored is None or stored.organization_id != org_id or file_is_referenced(db, file_id):
+            db.rollback()  # releases the lock
+            return
+        snapshot = {column.key: getattr(stored, column.key) for column in StoredFile.__table__.columns}
+        db.delete(stored)
+        db.flush()
+        storage_service.record_file_deletion(org_id, snapshot["size"] or 0, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.warning("Could not delete replaced file_id=%s", file_id, exc_info=True)
+        return
+
+    try:
+        if file_is_referenced(db, file_id):
+            db.add(StoredFile(**snapshot))
+            db.flush()
+            storage_service.record_file_restored(org_id, snapshot["size"] or 0, db)
+            db.commit()
+            log.info("Kept file_id=%s: it was attached elsewhere while being cleaned up", file_id)
+            return
+    except Exception:
+        db.rollback()
+        # The row could not be put back, so keep the bytes: never delete them here.
+        log.error("Could not restore file_id=%s after a late reference; its storage object was kept",
+                  file_id, exc_info=True)
+        return
+
+    key = snapshot.get("storage_key")
+    if key:
+        try:
+            from app.core import r2
+            if not r2.delete_object(key):
+                log.warning("R2 object for removed file_id=%s was not deleted (orphaned)", file_id)
+        except Exception:
+            log.warning("R2 object for removed file_id=%s was not deleted (orphaned)", file_id, exc_info=True)
 
 
 def save_upload(

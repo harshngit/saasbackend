@@ -3,9 +3,11 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import is_duplicate_email_error
 from app.core.security import as_utc, create_access_token, create_refresh_token, hash_password
 from app.models import OAuthExchangeTicket, OAuthRegistrationTicket, Organization, RefreshToken, User, UserRole
 from app.schemas.auth import AuthResponse, TokenPair
@@ -228,7 +230,14 @@ def register_organization(
         google_id=google_id,
     )
     db.add(admin)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # Lost a race for the same email: nothing (firm or account) was saved.
+        db.rollback()
+        if is_duplicate_email_error(exc):
+            raise RegistrationError("Email already registered") from None
+        raise
     db.refresh(admin)
 
     # Auto-seed the 3 default roles (Sales Officer / Delivery Partner / Accountant).

@@ -10,9 +10,10 @@ frontend hiding a button is never the protection.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
+from app.core.database import commit_or_email_conflict, get_db
 from app.core.deps import require_system_role
 from app.core.entitlements import CANONICAL_ENTITLEMENTS, ENTITLEMENT_CATEGORIES
 from app.core.pagination import paginate
@@ -24,6 +25,7 @@ from app.models import (
     PLATFORM_STAFF_ROLES,
     PlatformFeatureRequest,
     PlatformUpgradeRequest,
+    RefreshToken,
     SystemRole,
     UpgradeStatus,
     User,
@@ -32,6 +34,7 @@ from app.routers import superadmin
 from app.schemas.organization import OrganizationOut
 from app.schemas.organization_override import OrganizationAdminEntitlementsOut
 from app.schemas.pagination import PaginatedResponse
+from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.plan import PlanOut
 from app.schemas.platform import (
     FeatureCatalogItem,
@@ -327,7 +330,7 @@ def create_staff(payload: PlatformStaffCreate, db: Session = Depends(get_db)) ->
         is_active=True,
     )
     db.add(staff)
-    db.commit()
+    commit_or_email_conflict(db)
     db.refresh(staff)
     return staff
 
@@ -357,8 +360,64 @@ def update_staff(staff_id: str, payload: PlatformStaffUpdate, db: Session = Depe
         staff.system_role = role
     if password:
         staff.password_hash = hash_password(password)
-    db.commit()
+    commit_or_email_conflict(db)
     if password or staff.is_active is False:
         password_service.revoke_all_refresh_tokens(db, staff.id)
     db.refresh(staff)
     return staff
+
+
+def _delete_staff(db: Session, staff_ids: list[str]) -> int:
+    """Hard-delete platform staff in one transaction: every id must be a platform staff
+    member or nothing is deleted (404 naming the ids that are not). Super Admins, tenant
+    users and unknown ids are never deletable here.
+
+    Same policy as DELETE /superadmin/admins/{id} and DELETE /users/{id}: the member's own
+    rows (sessions, reset tokens, notifications) go with them; requests they raised or
+    decided stay, with `requested_by` / `decided_by` nulled (FK SET NULL). Their access
+    tokens stop working at once -- get_current_user refuses a user that no longer exists.
+    """
+    ids = list(dict.fromkeys(i.strip() for i in staff_ids if i and i.strip()))
+    found = (
+        db.query(User)
+        .filter(User.id.in_(ids), User.organization_id.is_(None), User.system_role.in_(PLATFORM_STAFF_ROLES))
+        .with_for_update(of=User)
+        .all()
+    )
+    found_ids = {u.id for u in found}
+    missing = [i for i in ids if i not in found_ids]
+    if missing or not ids:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "STAFF_NOT_FOUND", "message": "Not platform staff; nothing was deleted", "ids": missing},
+        )
+    # Revoked in the same transaction (not via revoke_all_refresh_tokens, which commits).
+    db.query(RefreshToken).filter(RefreshToken.user_id.in_(found_ids)).update(
+        {RefreshToken.revoked: True}, synchronize_session=False
+    )
+    for staff in found:
+        db.delete(staff)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A staff member is still referenced by records that cannot be removed; nothing was deleted",
+        ) from None
+    return len(found)
+
+
+@router.post("/staff/bulk-delete", response_model=BulkDeleteResult, dependencies=[Depends(_super_admin_guard)])
+@router.delete("/staff/bulk-delete", response_model=BulkDeleteResult, dependencies=[Depends(_super_admin_guard)])
+def bulk_delete_staff(payload: BulkDelete, db: Session = Depends(get_db)) -> BulkDeleteResult:
+    """All-or-nothing: duplicate ids count once; any id that is not platform staff
+    (unknown, a Super Admin, a tenant user) fails the whole request with 404."""
+    return BulkDeleteResult(deleted=_delete_staff(db, payload.ids))
+
+
+@router.delete("/staff/{staff_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(_super_admin_guard)])
+def delete_staff(staff_id: str, db: Session = Depends(get_db)) -> None:
+    _get_staff(db, staff_id)
+    _delete_staff(db, [staff_id])

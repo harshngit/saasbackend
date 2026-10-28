@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
+from app.core.files import content_disposition, document_filename
 from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
 from app.core import scoping, workflow
 from app.core.sorting import apply_sorting
@@ -991,7 +992,7 @@ def delivery_challan(
         content=body,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'inline; filename="{delivery.delivery_note_number}.pdf"'
+            "Content-Disposition": content_disposition(document_filename(f"{delivery.delivery_note_number}.pdf"))
         },
     )
 
@@ -1852,7 +1853,8 @@ def get_delivery_receipt(
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="delivery-receipt-{delivery.delivery_note_number}.pdf"'},
+        headers={"Content-Disposition": content_disposition(
+            document_filename(f"delivery-receipt-{delivery.delivery_note_number}.pdf"), "attachment")},
     )
 
 

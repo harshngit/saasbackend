@@ -1,5 +1,6 @@
-"""Platform staff: Super Admin manages Sales Managers; Sales Managers read organizations and
-raise plan-upgrade / feature-change requests that only a Super Admin can approve.
+"""Platform staff: Super Admin manages Sales Managers (create, edit, deactivate, delete); Sales
+Managers read organizations and raise plan-upgrade / feature-change requests that only a Super
+Admin can approve. Also: every signed-in user edits their own profile, password and photo.
 """
 import os
 import sys
@@ -362,3 +363,195 @@ def test_feature_request_validation(sm):
                        headers=h).status_code == 422
     assert client.get("/platform/feature-requests", params={"status": "weird"}, headers=h).status_code == 422
     assert client.get("/platform/feature-requests/nope", headers=h).status_code == 404
+
+
+# ------------------------------------------------------------------ staff deletion
+
+
+def _new_sm(sa) -> dict:
+    email = f"sm_{uuid.uuid4().hex[:10]}@example.com"
+    r = client.post("/platform/staff", json={"name": "Sales X", "email": email, "password": PASSWORD},
+                    headers=_auth(sa))
+    assert r.status_code == 201, r.text
+    return {"id": r.json()["id"], "email": email}
+
+
+def _exists(user_id: str) -> bool:
+    db = SessionLocal()
+    try:
+        return db.get(User, user_id) is not None
+    finally:
+        db.close()
+
+
+def test_super_admin_deletes_a_sales_manager_and_their_sessions_end(sa, sm):
+    org = _org(_plan())
+    raised = client.post(f"/platform/organizations/{org.id}/upgrade-requests",
+                         json={"requested_plan_id": _plan().id, "reason": "growth"}, headers=sm["headers"])
+    assert raised.status_code == 201
+
+    assert client.delete(f"/platform/staff/{sm['id']}", headers=_auth(sa)).status_code == 204
+    assert not _exists(sm["id"])
+    assert client.get("/platform/summary", headers=sm["headers"]).status_code == 401
+    assert client.post("/auth/refresh", json={"refresh_token": sm["refresh"]}).status_code == 401
+    assert client.post("/auth/login", json={"email": sm["email"], "password": PASSWORD}).status_code == 401
+    # The request they raised stays, unattributed.
+    kept = client.get(f"/platform/upgrade-requests/{raised.json()['id']}", headers=_auth(sa))
+    assert kept.status_code == 200 and kept.json()["requested_by"] is None
+    assert client.delete(f"/platform/staff/{sm['id']}", headers=_auth(sa)).status_code == 404
+
+
+def test_bulk_delete_is_all_or_nothing_and_counts_duplicates_once(sa):
+    a, b, c = _new_sm(sa), _new_sm(sa), _new_sm(sa)
+    tenant_admin = _user("admin", _org())
+    other_sa = _user("super_admin")
+
+    r = client.post("/platform/staff/bulk-delete", json={"ids": [a["id"], b["id"], a["id"]]}, headers=_auth(sa))
+    assert r.status_code == 200 and r.json() == {"deleted": 2}
+    assert not _exists(a["id"]) and not _exists(b["id"])
+
+    for bad in (other_sa.id, sa.id, tenant_admin.id, "not-a-uuid", a["id"]):
+        r = client.post("/platform/staff/bulk-delete", json={"ids": [c["id"], bad]}, headers=_auth(sa))
+        assert r.status_code == 404, bad
+        assert r.json()["detail"]["code"] == "STAFF_NOT_FOUND" and r.json()["detail"]["ids"] == [bad]
+        assert _exists(c["id"])
+    assert _exists(other_sa.id) and _exists(sa.id) and _exists(tenant_admin.id)
+
+    assert client.post("/platform/staff/bulk-delete", json={"ids": []}, headers=_auth(sa)).status_code == 422
+    r = client.request("DELETE", "/platform/staff/bulk-delete", json={"ids": [c["id"]]}, headers=_auth(sa))
+    assert r.status_code == 200 and r.json() == {"deleted": 1}
+
+
+def test_only_a_super_admin_deletes_and_never_protected_accounts(sa, sm):
+    victim = _new_sm(sa)
+    tenant_admin = _user("admin", _org())
+    for headers in (sm["headers"], _auth(tenant_admin)):
+        assert client.delete(f"/platform/staff/{victim['id']}", headers=headers).status_code == 403
+        assert client.post("/platform/staff/bulk-delete", json={"ids": [victim["id"]]},
+                           headers=headers).status_code == 403
+    assert client.delete(f"/platform/staff/{victim['id']}").status_code in (401, 403)
+    assert _exists(victim["id"])
+
+    other_sa = _user("super_admin")
+    for target in (sa.id, other_sa.id, tenant_admin.id, _user("staff", _org()).id):
+        assert client.delete(f"/platform/staff/{target}", headers=_auth(sa)).status_code == 404
+        assert _exists(target)
+
+
+# ------------------------------------------------------------------ self-service profile
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+
+
+def _photo(headers: dict, content: bytes, content_type: str, name: str = "me.png"):  # noqa: ANN202
+    return client.post("/auth/me/photo", files={"file": (name, content, content_type)}, headers=headers)
+
+
+def _file_id(url: str) -> str:
+    return url.rsplit("/", 1)[-1]
+
+
+@pytest.mark.parametrize("kind", ["staff", "sales_manager", "admin"])
+def test_users_edit_their_own_profile(kind, sm):
+    headers = sm["headers"] if kind == "sales_manager" else _auth(_user(kind, _org()))
+    r = client.patch("/auth/me", json={"name": "  New Name ", "city": "Pune", "personal_email": "",
+                                       "date_of_birth": "1990-05-01"}, headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "New Name" and body["city"] == "Pune" and body["personal_email"] is None
+    assert "password_hash" not in body and "password" not in body
+    assert client.get("/auth/me", headers=headers).json()["user"]["city"] == "Pune"
+
+    r = client.patch("/auth/me", json={"first_name": "Asha", "last_name": "Rao"}, headers=headers)
+    assert r.json()["name"] == "Asha Rao"
+    assert client.patch("/auth/me", json={"name": ""}, headers=headers).status_code == 422
+    assert client.patch("/auth/me", json={"name": None}, headers=headers).status_code == 422
+
+
+def test_self_service_cannot_touch_privileged_fields(sm):
+    staff = _user("staff", _org())
+    other_org = _org()
+    before = client.get("/auth/me", headers=_auth(staff)).json()["user"]
+    for field, value in [
+        ("system_role", "super_admin"), ("role", "admin"), ("role_id", "x"), ("organization_id", other_org.id),
+        ("is_active", False), ("status", "inactive"), ("email", "new@example.com"), ("phone", "9876543210"),
+        ("password", "Another@123"), ("password_hash", "x"), ("profile_photo", "/files/abc"), ("id", "x"),
+        ("designation", "CEO"), ("basic_salary", 1), ("phone_verified", True), ("google_id", "g"),
+        ("employee_id", "EMP-1"), ("username", "boss"),
+    ]:
+        r = client.patch("/auth/me", json={"name": "Hacker", field: value}, headers=_auth(staff))
+        assert r.status_code == 422, field
+    after = client.get("/auth/me", headers=_auth(staff)).json()["user"]
+    assert after == before
+    assert client.patch("/auth/me", json={"name": "x"}).status_code in (401, 403)
+    # A Sales Manager editing themselves stays a Sales Manager with no organization.
+    me = client.patch("/auth/me", json={"name": "Still Sales"}, headers=sm["headers"]).json()
+    assert me["system_role"] == "sales_manager" and me["organization_id"] is None
+
+
+def test_change_password_requires_the_current_one_and_ends_sessions(sm):
+    h = sm["headers"]
+    wrong = client.post("/auth/change-password", json={"current_password": "nope", "new_password": "Brand@New1"},
+                        headers=h)
+    assert wrong.status_code == 400
+    assert client.post("/auth/change-password", json={"current_password": PASSWORD, "new_password": "short"},
+                       headers=h).status_code == 422
+    ok = client.post("/auth/change-password", json={"current_password": PASSWORD, "new_password": "Brand@New1"},
+                     headers=h)
+    assert ok.status_code == 200
+    assert client.post("/auth/refresh", json={"refresh_token": sm["refresh"]}).status_code == 401
+    assert client.post("/auth/login", json={"email": sm["email"], "password": PASSWORD}).status_code == 401
+    assert client.post("/auth/login", json={"email": sm["email"], "password": "Brand@New1"}).status_code == 200
+
+
+@pytest.mark.parametrize("kind", ["staff", "sales_manager"])
+def test_profile_photo_upload_replace_and_remove(kind, sm):
+    headers = sm["headers"] if kind == "sales_manager" else _auth(_user(kind, _org()))
+    first = _photo(headers, PNG, "image/png", name='evil"name.png')
+    assert first.status_code == 200, first.text
+    url1 = first.json()["profile_photo"]
+    served = client.get(f"/files/{_file_id(url1)}", follow_redirects=False)
+    assert served.status_code == 200 and served.content == PNG
+    assert 'filename="profile-photo.png"' in served.headers["content-disposition"]
+
+    second = _photo(headers, JPEG, "image/jpeg", name="me.jpg")
+    assert second.status_code == 200
+    url2 = second.json()["profile_photo"]
+    assert url2 != url1
+    assert client.get(f"/files/{_file_id(url1)}").status_code == 404  # replaced and unreferenced: removed
+
+    removed = client.delete("/auth/me/photo", headers=headers)
+    assert removed.status_code == 200 and removed.json()["profile_photo"] is None
+    assert client.get(f"/files/{_file_id(url2)}").status_code == 404
+
+
+def test_a_shared_photo_is_never_deleted_on_replace():
+    org = _org()
+    me, colleague = _user("staff", org), _user("staff", org)
+    url = _photo(_auth(me), PNG, "image/png").json()["profile_photo"]
+    db = SessionLocal()
+    try:
+        db.get(User, colleague.id).profile_photo = url
+        db.commit()
+    finally:
+        db.close()
+    assert _photo(_auth(me), JPEG, "image/jpeg").status_code == 200
+    assert client.get(f"/files/{_file_id(url)}").status_code == 200
+
+
+def test_invalid_and_oversized_photos_are_rejected():
+    headers = _auth(_user("staff", _org()))
+    cases = [
+        (b"just text, not an image", "image/png", 400),
+        (PNG, "image/jpeg", 400),  # declared type does not match the bytes
+        (b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>", "image/svg+xml", 400),
+        (b"GIF89a" + b"\x00" * 16, "image/gif", 400),
+        (b"%PDF-1.4", "application/pdf", 400),
+        (PNG + b"\x00" * (5 * 1024 * 1024), "image/png", 413),
+    ]
+    for content, content_type, expected in cases:
+        assert _photo(headers, content, content_type).status_code == expected, content_type
+    assert client.get("/auth/me", headers=headers).json()["user"]["profile_photo"] is None
+    assert client.post("/auth/me/photo", files={"file": ("a.png", PNG, "image/png")}).status_code in (401, 403)

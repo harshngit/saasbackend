@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.files import normalize_file_url, safe_delete_unreferenced_file, save_upload
+from app.core.files import delete_replaced_file, normalize_file_url, save_upload
 from app.core.deps import get_current_user, require_system_role
 from app.core import reference_data as R
 from app.core.reference_data import (
@@ -277,12 +277,13 @@ def upload_logo(
 ) -> UploadResponse:
     org = _admin_org(admin, db)
     old_logo = org.logo_url
-    org.logo_url = _store_image(db, org.id, file, request)
-    if old_logo and old_logo != org.logo_url:
-        safe_delete_unreferenced_file(db, old_logo, org.id)
+    new_logo = org.logo_url = _store_image(db, org.id, file, request)
     activity_service.record(db, org.id, admin, "branding", "Company logo updated")
     db.commit()
-    return UploadResponse(url=normalize_file_url(org.logo_url))
+    # Only after the commit, and only if it is this firm's file and nothing else uses it.
+    if old_logo and old_logo != new_logo:
+        delete_replaced_file(db, old_logo, org.id)
+    return UploadResponse(url=normalize_file_url(new_logo))
 
 
 @router.post("/settings/signature", response_model=UploadResponse)
@@ -294,12 +295,13 @@ def upload_signature(
 ) -> UploadResponse:
     org = _admin_org(admin, db)
     old_sig = org.signature_url
-    org.signature_url = _store_image(db, org.id, file, request)
-    if old_sig and old_sig != org.signature_url:
-        safe_delete_unreferenced_file(db, old_sig, org.id)
+    new_sig = org.signature_url = _store_image(db, org.id, file, request)
     activity_service.record(db, org.id, admin, "branding", "Authorized signature updated")
     db.commit()
-    return UploadResponse(url=normalize_file_url(org.signature_url))
+    # Only after the commit, and only if it is this firm's file and nothing else uses it.
+    if old_sig and old_sig != new_sig:
+        delete_replaced_file(db, old_sig, org.id)
+    return UploadResponse(url=normalize_file_url(new_sig))
 
 
 def _is_document(content_type: str) -> bool:
@@ -427,9 +429,9 @@ def delete_other_document(
     if not doc_to_delete:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     remaining = [d for d in documents if d.get("id") != document_id]
-    result = _save_documents(db, org, remaining)
-    safe_delete_unreferenced_file(db, doc_to_delete.get("url"), org.id)
     activity_service.record(db, org.id, admin, "document", "Document removed")
+    result = _save_documents(db, org, remaining)  # commits, the activity entry included
+    delete_replaced_file(db, doc_to_delete.get("url"), org.id)
     return result
 
 
@@ -438,9 +440,9 @@ def clear_other_documents(admin: User = Depends(_ADMIN), db: Session = Depends(g
     """Remove every "Other Business Document" for this company."""
     org = _admin_org(admin, db)
     docs_to_delete = list(_other_documents(org))
-    _save_documents(db, org, [])
+    _save_documents(db, org, [])  # commits first
     for doc in docs_to_delete:
-        safe_delete_unreferenced_file(db, doc.get("url"), org.id)
+        delete_replaced_file(db, doc.get("url"), org.id)
 
 
 # ------------------------- Single business documents -------------------------
@@ -467,13 +469,13 @@ def upload_business_document(
     old_url = getattr(org, slot.column, None)
     url, _ = _store_document(db, org.id, file, request)
     setattr(org, slot.column, url)
-    if old_url and old_url != url:
-        safe_delete_unreferenced_file(db, old_url, org.id)
     activity_service.record(
         db, org.id, admin, "document", "Document uploaded",
         f"{slot.value.replace('_', ' ').title()} uploaded",
     )
     db.commit()
+    if old_url and old_url != url:
+        delete_replaced_file(db, old_url, org.id)
     db.refresh(org)
     return org
 
@@ -488,13 +490,13 @@ def clear_business_document(
     org = _admin_org(admin, db)
     old_url = getattr(org, slot.column, None)
     setattr(org, slot.column, None)
-    if old_url:
-        safe_delete_unreferenced_file(db, old_url, org.id)
     activity_service.record(
         db, org.id, admin, "document", "Document removed",
         f"{slot.value.replace('_', ' ').title()} removed",
     )
     db.commit()
+    if old_url:
+        delete_replaced_file(db, old_url, org.id)
     db.refresh(org)
     return org
 

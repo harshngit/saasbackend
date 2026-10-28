@@ -1,11 +1,12 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
+from app.core.database import commit_or_email_conflict, get_db
 from app.core.deps import get_current_user, require_permission, require_system_role, require_unlocked_org
+from app.core.files import delete_replaced_file
 from app.core.pagination import paginate
 from app.core.security import hash_password
 from app.core.sorting import apply_sorting
@@ -85,7 +86,7 @@ def _owned_user(db: Session, user_id: str, admin: User) -> User:
 
 def _email_taken(db: Session, email: str, exclude_id: str | None = None) -> bool:
     # Email is the login identifier — keep it unique platform-wide.
-    query = db.query(User).filter(User.email == email)
+    query = db.query(User).filter(func.lower(User.email) == email.strip().lower())
     if exclude_id is not None:
         query = query.filter(User.id != exclude_id)
     return db.query(query.exists()).scalar()
@@ -253,7 +254,7 @@ def create_staff(
         **data,
     )
     db.add(staff)
-    db.flush()
+    commit_or_email_conflict(db, flush_only=True)  # the INSERT meets the email index here
     # One staff mobile number, one account, across every firm (409 otherwise).
     staff_phone_service.sync_staff_phone(db, staff)
     employee_profile_service.apply_documents(db, staff, payload.documents)
@@ -510,10 +511,8 @@ def update_user(
         setattr(target, field, value)
     if "phone" in data:
         # Only when the number is sent, so an unrelated edit never trips over a legacy duplicate.
+        commit_or_email_conflict(db, flush_only=True)  # a new email meets its index here, not mid-lookup
         staff_phone_service.sync_staff_phone(db, target)
-    if "profile_photo" in data and old_photo and data["profile_photo"] != old_photo:
-        from app.core.files import safe_delete_unreferenced_file
-        safe_delete_unreferenced_file(db, old_photo, admin.organization_id)
     # Renaming either half of the name refreshes the combined `name`, unless the
     # caller set it themselves in the same request.
     if "name" not in data and ("first_name" in data or "last_name" in data):
@@ -531,10 +530,14 @@ def update_user(
         db, admin.organization_id, admin, "employee", "Employee updated",
         f"{target.name}'s profile was updated",
     )
-    db.commit()
+    commit_or_email_conflict(db)
     if payload.password is not None:
         # A new password ends the sessions opened with the old one.
         password_service.revoke_all_refresh_tokens(db, target.id)
+    if "profile_photo" in data and old_photo and data["profile_photo"] != old_photo:
+        # Only now that the new photo is committed: the reference scan sees it, and a
+        # failed update never leaves the record pointing at a deleted file.
+        delete_replaced_file(db, old_photo, admin.organization_id)
     db.refresh(target)
     return employee_profile_service.build_profile(db, target)
 
@@ -592,10 +595,10 @@ def delete_employee_document(
     remaining = [d for d in documents if d.get("id") != document_id]
     # Reassigned wholesale — SQLAlchemy does not track in-place JSON mutation.
     setattr(target, column, remaining)
-    db.flush()
-    from app.core.files import safe_delete_unreferenced_file
-    safe_delete_unreferenced_file(db, doc_to_delete.get("url") or document_id, admin.organization_id)
     db.commit()
+    # Only now that the shortened list is saved, and only if it is this firm's file and
+    # nothing else uses it: a failed commit never leaves a document pointing at nothing.
+    delete_replaced_file(db, doc_to_delete.get("url") or document_id, admin.organization_id)
     db.refresh(target)
     return employee_profile_service.build_profile(db, target)
 

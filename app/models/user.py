@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Index, String, Text, UniqueConstraint, func
 from sqlalchemy import false as sql_false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,7 +18,8 @@ def _now() -> datetime:
 
 
 class User(Base):
-    """A platform or firm user. Email is unique per organization.
+    """A platform or firm user. The login email is unique platform-wide, ignoring case
+    (ux_users_email_ci, below); uq_user_org_email is the older per-firm rule.
 
     SUPER_ADMIN rows have organization_id = NULL (platform-level, no tenant).
     """
@@ -172,3 +173,9 @@ class User(Base):
         from app.models.enums import system_role_for
 
         return system_role_for(self.role)
+
+
+# One login email, one account, across every firm and the platform, ignoring case.
+# Alembic revision b7c8d9e0f1a2 installs it on existing databases (refusing while
+# conflicting rows exist); create_all builds it on fresh ones.
+Index("ux_users_email_ci", func.lower(User.email), unique=True)

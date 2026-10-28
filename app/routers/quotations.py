@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.core.files import content_disposition, document_filename
 from app.models import Customer, Lead, Quotation, User
 from app.core.pdf_docs import quotation_pdf
 from app.services import quotation_service
@@ -164,7 +165,7 @@ def quotation_pdf_download(
         content=body,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'inline; filename="{quotation.quotation_number}.pdf"'
+            "Content-Disposition": content_disposition(document_filename(f"{quotation.quotation_number}.pdf"))
         },
     )
 

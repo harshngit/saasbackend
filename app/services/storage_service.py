@@ -347,6 +347,26 @@ def record_file_upload(
     record_file_upload_serialized(organization_id, file_size, db)
 
 
+def record_file_restored(
+    organization_id: Optional[str],
+    file_size: int,
+    db: Session,
+) -> None:
+    """Re-count a file whose deletion was undone (see files.delete_replaced_file). No
+    quota check: these bytes were already counted until a moment ago."""
+    if not organization_id or file_size <= 0:
+        return
+
+    usage = get_or_create_storage_usage(organization_id, db, for_update=True)
+    if not usage:
+        return
+
+    usage.files_documents_bytes += file_size
+    usage.total_used_bytes += file_size
+    usage.updated_at = _now()
+    db.flush()
+
+
 def record_file_deletion(
     organization_id: Optional[str],
     file_size: int,

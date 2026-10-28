@@ -40,25 +40,37 @@ def upgrade() -> None:
             )
             logger.info("Added supplier_code column to suppliers")
 
+        # Each best-effort step runs in a SAVEPOINT: on PostgreSQL a failed statement
+        # aborts the whole transaction, so a plain try/except "warn and continue" left
+        # every later statement (and the alembic_version update) failing. The savepoint
+        # rolls back just the failed step, which is what the warnings always intended.
+
         # Backfill existing suppliers with supplier_code before applying unique constraint
         try:
-            from sqlalchemy.orm import Session
-            session = Session(bind=bind)
-            from app.scripts.backfill_supplier_codes import backfill_supplier_codes
-            backfill_supplier_codes(db=session)
+            with bind.begin_nested():
+                from sqlalchemy.orm import Session
+                session = Session(bind=bind)
+                from app.scripts.backfill_supplier_codes import backfill_supplier_codes
+                backfill_supplier_codes(db=session)
         except Exception as exc:
             logger.warning("Could not backfill suppliers during migration: %s", exc)
 
-        # Unique constraint per tenant
-        try:
-            op.create_unique_constraint(
-                "uq_suppliers_org_supplier_code",
-                "suppliers",
-                ["organization_id", "supplier_code"],
-            )
-            logger.info("Added uq_suppliers_org_supplier_code constraint")
-        except Exception as exc:
-            logger.warning("Could not create uq_suppliers_org_supplier_code: %s", exc)
+        # Unique constraint per tenant. A fresh database already has it: the baseline
+        # revision builds the schema from the current models, which declare it.
+        existing = {uc["name"] for uc in sa.inspect(bind).get_unique_constraints("suppliers")}
+        if "uq_suppliers_org_supplier_code" in existing:
+            logger.info("uq_suppliers_org_supplier_code already exists")
+        else:
+            try:
+                with bind.begin_nested():
+                    op.create_unique_constraint(
+                        "uq_suppliers_org_supplier_code",
+                        "suppliers",
+                        ["organization_id", "supplier_code"],
+                    )
+                logger.info("Added uq_suppliers_org_supplier_code constraint")
+            except Exception as exc:
+                logger.warning("Could not create uq_suppliers_org_supplier_code: %s", exc)
 
 
 def downgrade() -> None:

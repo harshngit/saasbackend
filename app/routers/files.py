@@ -7,7 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.files import MAX_UPLOAD_BYTES, delete_stored_file, normalize_file_url, save_upload
+from app.core.files import (
+    MAX_UPLOAD_BYTES,
+    content_disposition,
+    delete_stored_file,
+    normalize_file_url,
+    safe_filename,
+    save_upload,
+)
 from app.models import StoredFile, User
 
 logger = logging.getLogger("crm.files")
@@ -62,7 +69,7 @@ def upload_file(
     )
     stored_id = url.rsplit("/", 1)[-1]
     db.commit()
-    name = file.filename or "upload"
+    name = safe_filename(file.filename)  # what was stored and what downloads will be named
     return FileUploadOut(
         url=normalize_file_url(url),
         file_id=stored_id,
@@ -97,7 +104,7 @@ def get_file(file_id: str, db: Session = Depends(get_db)) -> Response:
         url = r2.presigned_get_url(
             stored.storage_key,
             content_type=stored.content_type,
-            content_disposition=f'inline; filename="{stored.filename}"',
+            content_disposition=content_disposition(stored.filename),
             expires_in=3600,
         )
         return RedirectResponse(
@@ -110,7 +117,7 @@ def get_file(file_id: str, db: Session = Depends(get_db)) -> Response:
         content=stored.data,
         media_type=stored.content_type,
         headers={
-            "Content-Disposition": f'inline; filename="{stored.filename}"',
+            "Content-Disposition": content_disposition(stored.filename),
             # Content is immutable — a new upload gets a new id.
             "Cache-Control": "public, max-age=31536000, immutable",
         },

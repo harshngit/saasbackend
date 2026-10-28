@@ -3,7 +3,7 @@ import re
 
 import jwt
 from urllib.parse import quote
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.config import settings
+from app.core.files import MAX_IMAGE_BYTES, delete_replaced_file, save_upload
 from app.core.security import REFRESH_TOKEN, create_access_token, decode_token, hash_password, verify_password
 from app.models import User
 from app.schemas.auth import (
@@ -31,6 +32,7 @@ from app.schemas.auth import (
     OtpRequest,
     OtpSendResponse,
     OtpVerifyRequest,
+    ProfileSelfUpdate,
     RefreshRequest,
     RegisterOrganization,
     ResetPasswordRequest,
@@ -145,9 +147,19 @@ def register_organization(payload: RegisterOrganization, db: Session = Depends(g
     return auth_service.build_auth_response(admin, tokens)
 
 
+def _user_by_login_email(db: Session, email: str) -> User | None:
+    """The one account whose email matches, ignoring case (rows written before emails
+    were lowercased kept their casing; LOWER(email) is what ux_users_email_ci indexes).
+    When several rows match — legacy duplicates the unique index could not be built
+    over — picking one would be a guess, so nobody is returned and login answers the
+    generic 401: the same rule as Google sign-in and forgot-password."""
+    matches = db.query(User).filter(func.lower(User.email) == email.strip().lower()).limit(2).all()
+    return matches[0] if len(matches) == 1 else None
+
+
 @router.post("/login", response_model=AuthResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
-    user = db.query(User).filter(User.email == payload.email).first()
+    user = _user_by_login_email(db, str(payload.email))
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     if not user.is_active:
@@ -435,6 +447,88 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)) ->
         organization=org,
         theme=theme_out,
     )
+
+
+@router.patch("/me", response_model=UserOut)
+def update_my_profile(
+    payload: ProfileSelfUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """The signed-in user edits their own personal details. Identity comes only from
+    the access token — there is no user id in the path or body to tamper with."""
+    data = payload.model_dump(exclude_unset=True)
+    for field, value in data.items():
+        setattr(user, field, value)
+    # Same rule as PATCH /users/{id}: renaming either half refreshes `name` unless sent.
+    if "name" not in data and ("first_name" in data or "last_name" in data):
+        composed = " ".join(p for p in (user.first_name, user.last_name) if p).strip()
+        if composed:
+            user.name = composed
+    if data and user.organization_id:
+        activity_service.record(
+            db, user.organization_id, user, "employee", "Profile updated", f"{user.name} updated their own profile",
+        )
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+# Declared type -> what the bytes must start with. SVG is deliberately absent (it can carry script).
+_PHOTO_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+
+def _sniffed_image_type(content: bytes) -> str | None:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+@router.post("/me/photo", response_model=UserOut)
+def upload_my_photo(
+    request: Request,
+    file: UploadFile = File(..., description="JPEG, PNG or WebP, up to 5 MB"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """Upload and set the signed-in user's profile photo; the previous one is removed when
+    nothing else uses it. Stored like every other upload (R2 when configured)."""
+    declared = (file.content_type or "").lower()
+    if declared not in _PHOTO_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Profile photo must be a JPEG, PNG or WebP image")
+    content = file.file.read(MAX_IMAGE_BYTES + 1)
+    if len(content) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large (max {MAX_IMAGE_BYTES // (1024 * 1024)} MB)",
+        )
+    if _sniffed_image_type(content) != declared:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File content is not a valid JPEG, PNG or WebP image")
+    file.file.seek(0)
+    file.filename = f"profile-photo.{_PHOTO_TYPES[declared]}"  # never the client's name
+    url, _size = save_upload(db, user.organization_id, file, request, allow_pdf=False, max_bytes=MAX_IMAGE_BYTES)
+    old = user.profile_photo
+    user.profile_photo = url
+    db.commit()
+    # After the commit: the old photo goes only if it is this user's scope's file and
+    # nothing else references it; a failure there leaves an orphan, not a broken photo.
+    delete_replaced_file(db, old, user.organization_id)
+    db.refresh(user)
+    return user
+
+
+@router.delete("/me/photo", response_model=UserOut)
+def remove_my_photo(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    old = user.profile_photo
+    user.profile_photo = None
+    db.commit()
+    delete_replaced_file(db, old, user.organization_id)
+    db.refresh(user)
+    return user
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

@@ -380,6 +380,40 @@ def drop_legacy_columns() -> None:
             logger.info("Auto-migrated: dropped legacy column %s.%s", table, column)
 
 
+# The platform-wide, case-insensitive login-email index (alembic revision b7c8d9e0f1a2;
+# also declared on the User model). uq_user_org_email is the older per-firm rule.
+EMAIL_UNIQUE_INDEX = "ux_users_email_ci"
+_EMAIL_CONSTRAINT_MARKERS = (
+    EMAIL_UNIQUE_INDEX,
+    "uq_user_org_email",
+    "users.organization_id, users.email",  # SQLite names uq_user_org_email by its columns
+)
+
+
+def is_duplicate_email_error(exc: BaseException) -> bool:
+    """True only when an IntegrityError came from a users.email uniqueness rule — never
+    for any other constraint, so nothing else is misreported as a duplicate email."""
+    message = str(getattr(exc, "orig", exc)).lower()
+    return any(marker in message for marker in _EMAIL_CONSTRAINT_MARKERS)
+
+
+def commit_or_email_conflict(db: Session, *, flush_only: bool = False) -> None:
+    """Commit (or, with flush_only, just flush) an account write. If it lost a race for
+    the same email (the check before it passed, the unique index refused it), roll back
+    and answer 409 "Email already registered" — nothing was saved. Any other integrity
+    error is rolled back and re-raised unchanged."""
+    from fastapi import HTTPException, status
+    from sqlalchemy.exc import IntegrityError
+
+    try:
+        db.flush() if flush_only else db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if is_duplicate_email_error(exc):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered") from None
+        raise
+
+
 def enforce_unique_email() -> None:
     """Business rule: one email belongs to only one CRM user, platform-wide
     (the existing `uq_user_org_email` constraint only scoped this per
@@ -402,23 +436,26 @@ def enforce_unique_email() -> None:
         return
     try:
         with engine.connect() as conn:
-            duplicates = conn.execute(
+            groups, accounts = conn.execute(
                 text(
-                    "SELECT LOWER(email) AS e, COUNT(*) AS c FROM users "
-                    "GROUP BY LOWER(email) HAVING COUNT(*) > 1"
+                    "SELECT COUNT(*), COALESCE(SUM(c), 0) FROM ("
+                    "SELECT COUNT(*) AS c FROM users GROUP BY LOWER(email) HAVING COUNT(*) > 1) d"
                 )
-            ).fetchall()
+            ).one()
     except Exception:  # noqa: BLE001
         logger.exception("Could not run the duplicate-email audit — skipping unique-email migration")
         return
 
-    if duplicates:
-        logger.warning(
-            "Skipping platform-wide email uniqueness: %d duplicate email group(s) found "
-            "(case-insensitive). Resolve them manually (merge/rename/deactivate) before this "
-            "constraint can be added. First few: %s",
-            len(duplicates),
-            [row[0] for row in duplicates[:10]],
+    if groups:
+        # Counts only: the addresses themselves never go to the log.
+        logger.error(
+            "Login-email uniqueness is NOT enforced: %d email(s) are shared by %d accounts "
+            "(case-insensitive), so %s cannot be created. Those addresses cannot log in until "
+            "resolved. List them (masked, read-only) with `python -m app.scripts.email_conflicts`, "
+            "have an authorized owner resolve each, then run `alembic upgrade head`.",
+            groups,
+            accounts,
+            EMAIL_UNIQUE_INDEX,
         )
         return
 

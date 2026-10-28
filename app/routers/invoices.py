@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core import workflow
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.core.files import decode_data_url, get_bytes
+from app.core.files import content_disposition, decode_data_url, document_filename, get_bytes
 from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf
 from app.core.sorting import apply_sorting
 from app.models import (
@@ -916,8 +916,8 @@ def download_invoice_pdf(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition":
-                f'attachment; filename="invoice-{invoice.invoice_number}-{format}.pdf"'
+            "Content-Disposition": content_disposition(
+                document_filename(f"invoice-{invoice.invoice_number}-{format}.pdf"), "attachment")
         },
     )
 

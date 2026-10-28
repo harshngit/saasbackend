@@ -13,6 +13,9 @@
   secure random password fallback.
 - seed_on_startup remains False by default.
 - No seed passwords logged or printed.
+- The seeded Super Admin's email is stored trimmed + lowercased, found ignoring case,
+  and printed masked; startup never seeds while SEED_ON_STARTUP is off; the demo firm is
+  not created a second time after its admin changed their email.
 
 Runs only against the local test database — never production, and never
 seeds a real password into source or test code.
@@ -275,5 +278,64 @@ def test_seed_does_not_log_passwords(monkeypatch):
     finally:
         db.query(User).filter(User.email.in_(["admin@demo.com", "testing@gmail.com"])).delete()
         db.query(Organization).filter(Organization.email.in_(["admin@demo.com", "testing@gmail.com"])).delete()
+        db.commit()
+        db.close()
+
+
+def test_seeded_super_admin_email_is_normalized_masked_and_found_ignoring_case(monkeypatch):
+    tag = uuid.uuid4().hex[:8]
+    monkeypatch.setattr(settings, "super_admin_password", f"SeedPass-{uuid.uuid4().hex[:10]}")
+    monkeypatch.setattr(settings, "super_admin_email", f"  Seed.Mixed{tag}@Example.COM ")
+    buf = io.StringIO()
+    db = SessionLocal()
+    try:
+        with redirect_stdout(buf):
+            seed_super_admin(db)
+            monkeypatch.setattr(settings, "super_admin_email", f"SEED.MIXED{tag}@example.com")
+            seed_super_admin(db)  # another spelling of the same address: no second account
+        rows = db.query(User).filter(User.email.ilike(f"%seed.mixed{tag}%")).all()
+        assert [r.email for r in rows] == [f"seed.mixed{tag}@example.com"]
+        assert f"seed.mixed{tag}" not in buf.getvalue().lower()  # masked: s***@example.com
+    finally:
+        db.query(User).filter(User.email.ilike(f"%seed.mixed{tag}%")).delete(synchronize_session=False)
+        db.commit()
+        db.close()
+
+
+def test_startup_seeds_only_when_seed_on_startup_is_on(monkeypatch):
+    from unittest.mock import MagicMock
+
+    import app.main as main
+    import app.seed
+
+    seed_main = MagicMock()
+    monkeypatch.setattr(app.seed, "main", seed_main)
+    monkeypatch.setattr(settings, "seed_on_startup", False)
+    main.on_startup()
+    seed_main.assert_not_called()
+    monkeypatch.setattr(settings, "seed_on_startup", True)
+    main.on_startup()
+    seed_main.assert_called_once()
+
+
+def test_demo_firm_is_not_recreated_after_its_admin_changes_email(monkeypatch):
+    monkeypatch.setattr(settings, "demo_admin_password", "")
+    db = SessionLocal()
+    try:
+        db.query(User).filter(User.email == "admin@demo.com").delete()
+        db.query(Organization).filter(Organization.email == "admin@demo.com").delete()
+        db.commit()
+        seed_demo_firm(db, db.query(Plan).first())
+        admin = db.query(User).filter(User.email == "admin@demo.com").one()
+        moved = f"moved_{uuid.uuid4().hex[:8]}@example.com"
+        admin.email = moved
+        db.commit()
+
+        seed_demo_firm(db, db.query(Plan).first())  # e.g. a restart with seeding left on
+        assert db.query(User).filter(User.email == "admin@demo.com").count() == 0
+        assert db.query(Organization).filter(Organization.email == "admin@demo.com").count() == 1
+    finally:
+        db.query(User).filter(User.email.in_(["admin@demo.com", moved])).delete(synchronize_session=False)
+        db.query(Organization).filter(Organization.email == "admin@demo.com").delete()
         db.commit()
         db.close()
