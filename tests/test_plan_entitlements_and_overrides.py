@@ -16,7 +16,8 @@ Covers all 24+ core scenarios:
 13. Organization limit override (max_warehouses=3) allows creating additional warehouses.
 14. Report enforcement uniform across screen (GET /reports/{type}) and export (GET /reports/{type}/export).
 15. Super Admin plan management with entitlements and validation against unknown keys.
-16. Super Admin organization override endpoints (upsert, list, delete, reset-all).
+16. Super Admin organization override endpoints (upsert, list, delete, reset-all,
+    grant-full-access).
 17. Current organization entitlements endpoint (GET /organizations/me/entitlements).
 18. Error contracts (HTTP 403 with PLAN_FEATURE_NOT_AVAILABLE and PLAN_LIMIT_REACHED).
 """
@@ -1025,6 +1026,90 @@ def test_rbac_and_entitlement_dual_guards():
     ok("Admin has RBAC but plan denies crm.leads -> 403 PLAN_FEATURE_NOT_AVAILABLE")
 
 
+def test_grant_full_access_allows_everything_in_one_call():
+    print("\n--- Test Super Admin grant-full-access ---")
+    from app.core.entitlements import ALL_ENTITLEMENT_KEYS, ALL_LIMIT_KEYS
+    from app.models import ActivityLog
+
+    sa_headers = _super_admin_auth()
+    org = _create_test_org("Basic")
+    org_id = org["org_id"]
+    base = f"/superadmin/organizations/{org_id}"
+
+    before = client.get(f"{base}/entitlements", headers=sa_headers).json()
+    assert not all(before["features"].values()), "a Basic firm starts with some features off"
+    # Existing overrides are replaced, not duplicated: a BLOCK with an expiry, and a limit.
+    blocked = sorted(ALL_ENTITLEMENT_KEYS)[0]
+    expiry = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+    assert client.post(f"{base}/overrides/features", headers=sa_headers, json={
+        "entitlement_key": blocked, "effect": "BLOCK", "expires_at": expiry, "reason": "test"}).status_code == 200
+    assert client.post(f"{base}/overrides/limits", headers=sa_headers, json={
+        "limit_key": "max_users", "value": 1, "reason": "test"}).status_code == 200
+
+    db = SessionLocal()
+    try:
+        activity_before = db.query(ActivityLog).filter(ActivityLog.organization_id == org_id).count()
+    finally:
+        db.close()
+
+    r = client.post(f"{base}/overrides/grant-full-access", headers=sa_headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert all(body["features"].values()) and set(ALL_ENTITLEMENT_KEYS) <= set(body["features"])
+    assert all(body["limits"][key] is None for key in ALL_LIMIT_KEYS)
+    assert len(body["feature_overrides"]) == len(ALL_ENTITLEMENT_KEYS)
+    assert len(body["limit_overrides"]) == len(ALL_LIMIT_KEYS)
+    for override in body["feature_overrides"]:
+        assert (override["effect"], override["expires_at"], override["reason"]) == \
+            ("ALLOW", None, "Granted full access (Super Admin)")
+    for override in body["limit_overrides"]:
+        assert (override["value"], override["expires_at"], override["reason"]) == \
+            (None, None, "Granted full access (Super Admin)")
+    assert body == client.get(f"{base}/entitlements", headers=sa_headers).json()  # same shape as GET
+    ok("grant-full-access allows every feature, lifts every limit, replaces existing overrides")
+
+    # The firm itself now sees everything.
+    mine = client.get("/organizations/me/entitlements", headers=org["auth"])
+    assert mine.status_code == 200 and all(mine.json()["features"].values())
+
+    db = SessionLocal()
+    try:
+        entries = db.query(ActivityLog).filter(ActivityLog.organization_id == org_id).all()
+        assert len(entries) == activity_before + 1  # one entry, not one per override
+        assert [e.title for e in entries].count("Granted full access") == 1
+        assert db.query(OrganizationFeatureOverride).filter(
+            OrganizationFeatureOverride.organization_id == org_id).count() == len(ALL_ENTITLEMENT_KEYS)
+    finally:
+        db.close()
+    ok("grant-full-access writes a single activity entry")
+
+    # Idempotent, and reset-all still undoes it completely.
+    again = client.post(f"{base}/overrides/grant-full-access", headers=sa_headers)
+    assert again.status_code == 200 and len(again.json()["feature_overrides"]) == len(ALL_ENTITLEMENT_KEYS)
+    assert client.post(f"{base}/overrides/reset-all", headers=sa_headers).status_code == 200
+    after_reset = client.get(f"{base}/entitlements", headers=sa_headers).json()
+    assert after_reset["feature_overrides"] == [] and after_reset["limit_overrides"] == []
+    assert after_reset["features"] == before["features"]
+    ok("grant-full-access is idempotent and reset-all restores plan defaults")
+
+
+def test_grant_full_access_is_super_admin_only():
+    print("\n--- Test grant-full-access authorization ---")
+    org = _create_test_org("Basic")
+    route = f"/superadmin/organizations/{org['org_id']}/overrides/grant-full-access"
+    assert client.post(route).status_code in (401, 403)
+    assert client.post(route, headers=org["auth"]).status_code == 403  # the firm's own admin
+    assert client.post("/superadmin/organizations/no-such-org/overrides/grant-full-access",
+                       headers=_super_admin_auth()).status_code == 404
+    db = SessionLocal()
+    try:
+        assert db.query(OrganizationFeatureOverride).filter(
+            OrganizationFeatureOverride.organization_id == org["org_id"]).count() == 0
+    finally:
+        db.close()
+    ok("grant-full-access refuses non-Super-Admins and unknown firms")
+
+
 def main():
     test_basic_plan_feature_denials()
     test_pro_plan_access()
@@ -1041,6 +1126,8 @@ def main():
     test_delivery_and_whatsapp_separation()
     test_monthly_order_limits_and_conversion_bypass()
     test_rbac_and_entitlement_dual_guards()
+    test_grant_full_access_allows_everything_in_one_call()
+    test_grant_full_access_is_super_admin_only()
 
     print("\n" + "=" * 50)
     print(f"Results: {_passed} passed, {_failed} failed")

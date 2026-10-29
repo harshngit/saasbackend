@@ -41,7 +41,7 @@ from app.schemas.user import UserOut
 from app.schemas.pagination import PaginatedResponse
 from app.core.pagination import paginate
 from app.core.sorting import apply_sorting, validate_sort_params
-from app.core.entitlements import normalize_entitlement_key
+from app.core.entitlements import ALL_ENTITLEMENT_KEYS, ALL_LIMIT_KEYS, normalize_entitlement_key
 from app.services import (
     activity_service,
     billing_service,
@@ -839,6 +839,68 @@ def reset_all_overrides(
         "deleted_feature_overrides": num_features,
         "deleted_limit_overrides": num_limits,
     }
+
+
+GRANT_FULL_ACCESS_REASON = "Granted full access (Super Admin)"
+
+
+@router.post(
+    "/organizations/{org_id}/overrides/grant-full-access",
+    response_model=OrganizationAdminEntitlementsOut,
+)
+def grant_full_access(
+    org_id: str,
+    caller: User = Depends(_super_admin_guard),
+    db: Session = Depends(get_db),
+) -> dict:
+    """The opposite of reset-all: in one transaction, an ALLOW override for every
+    entitlement key and an unlimited (null) override for every limit key, no expiry —
+    replacing any existing override for those keys (a BLOCK included). One activity
+    entry, not one per override. Returns the same body as GET .../entitlements."""
+    _get_org(db, org_id)
+    # Serializes two grants for one firm, so they cannot both insert the same key.
+    db.query(Organization).filter(Organization.id == org_id).with_for_update(of=Organization).first()
+
+    features = {
+        o.entitlement_key: o
+        for o in db.query(OrganizationFeatureOverride).filter(OrganizationFeatureOverride.organization_id == org_id)
+    }
+    for key in sorted(ALL_ENTITLEMENT_KEYS):
+        override = features.get(key)
+        if override is None:
+            override = OrganizationFeatureOverride(organization_id=org_id, entitlement_key=key)
+            db.add(override)
+        override.effect = "ALLOW"
+        override.is_allowed = True
+        override.expires_at = None
+        override.reason = GRANT_FULL_ACCESS_REASON
+        override.created_by_user_id = caller.id
+
+    limits = {
+        o.limit_key: o
+        for o in db.query(OrganizationLimitOverride).filter(OrganizationLimitOverride.organization_id == org_id)
+    }
+    for key in sorted(ALL_LIMIT_KEYS):
+        override = limits.get(key)
+        if override is None:
+            override = OrganizationLimitOverride(organization_id=org_id, limit_key=key)
+            db.add(override)
+        override.value = None  # unlimited
+        override.expires_at = None
+        override.reason = GRANT_FULL_ACCESS_REASON
+        override.created_by_user_id = caller.id
+
+    activity_service.record(
+        db,
+        org_id,
+        caller,
+        "entitlements",
+        "Granted full access",
+        f"All {len(ALL_ENTITLEMENT_KEYS)} features allowed and all {len(ALL_LIMIT_KEYS)} limits "
+        "set to unlimited, with no expiry",
+    )
+    db.commit()
+    return get_organization_entitlements_admin(org_id, db)
 
 
 
