@@ -106,6 +106,10 @@ def create_follow_up(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="visit_id belongs to a different lead than lead_id",
             )
+        # Same rule as visit_service.create_visit: a follow-up on a Lead that
+        # has a Customer also belongs to that Customer (one row, both links).
+        if not customer_id:
+            customer_id = lead_service.linked_customer_id(db, org_id, lead_id)
 
     # Validate assigned_to_id. When this follow-up resolves to a Lead and no
     # assignee was explicitly given, default to that Lead's own salesperson
@@ -221,6 +225,7 @@ def update_follow_up(
     valid_statuses = {"pending", "completed", "cancelled"}
 
     data = payload.model_dump(exclude_unset=True)
+    old_lead_customer_id = lead_service.linked_customer_id(db, org_id, follow_up.lead_id)
 
     if "customer_id" in data and data["customer_id"]:
         cust = db.get(Customer, data["customer_id"])
@@ -264,6 +269,7 @@ def update_follow_up(
     for k, v in data.items():
         if k != "status":
             setattr(follow_up, k, v)
+    lead_service.resync_activity_customer(db, org_id, follow_up, data, old_lead_customer_id)
 
     follow_up.updated_at = _now()
     db.commit()

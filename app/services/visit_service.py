@@ -60,6 +60,11 @@ def create_visit(db: Session, org_id: str, user: User, payload: VisitCreate) -> 
     if payload.lead_id:
         lead = lead_service.validate_lead_reference(db, org_id, user, payload.lead_id)
 
+    # A visit logged on a Lead that has a Customer (converted, or pre-linked)
+    # also belongs to that Customer: same single row, lead_id kept for the
+    # Lead's history, customer_id so the Customer's Activities show it.
+    customer_id = payload.customer_id or lead_service.linked_customer_id(db, org_id, payload.lead_id)
+
     # 3. Validate user / salesperson. When this visit is for a Lead and no
     # user_id was explicitly given, default to that Lead's own salesperson
     # rather than the creator — otherwise an Admin logging a visit for a
@@ -100,7 +105,7 @@ def create_visit(db: Session, org_id: str, user: User, payload: VisitCreate) -> 
 
     visit = Visit(
         organization_id=org_id,
-        customer_id=payload.customer_id,
+        customer_id=customer_id,
         lead_id=payload.lead_id,
         user_id=user_id,
         visit_date=payload.visit_date or _now(),
@@ -192,6 +197,7 @@ def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: V
     visit = get_visit(db, org_id, visit_id, user)
 
     data = payload.model_dump(exclude_unset=True)
+    old_lead_customer_id = lead_service.linked_customer_id(db, org_id, visit.lead_id)
 
     # Ensure at least one of customer_id or lead_id remains
     new_customer_id = data.get("customer_id", visit.customer_id) if "customer_id" in data else visit.customer_id
@@ -257,6 +263,7 @@ def update_visit(db: Session, org_id: str, visit_id: str, user: User, payload: V
     for k, v in data.items():
         if k != "status":
             setattr(visit, k, v)
+    lead_service.resync_activity_customer(db, org_id, visit, data, old_lead_customer_id)
 
     visit.updated_at = _now()
     db.commit()

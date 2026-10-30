@@ -163,6 +163,11 @@ class LeadOut(LeadBase):
     created_at: datetime
     updated_at: datetime
 
+    # Canonical conversion flag: True only once POST /leads/{id}/convert-to-customer
+    # has succeeded (lead_status 'won' + converted_at). A customer_id on its own
+    # (Lead pre-linked to an existing Customer) does NOT mean converted.
+    is_converted: bool = False
+
     customer: LeadCustomerBrief | None = None
     assigned_salesperson: LeadSalespersonBrief | None = None
     interested_products: list[LeadProductBrief] = []

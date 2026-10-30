@@ -35,7 +35,70 @@ def is_converted(lead: Lead) -> bool:
     still-supported way to pre-link a Lead) without ever having gone through
     conversion — that Lead must stay editable.
     """
-    return lead.converted_at is not None or lead.lead_status == "won"
+    return lead.is_converted
+
+
+def linked_customer_id(db: Session, org_id: str, lead_id: str | None) -> str | None:
+    """The Customer a Lead's activity (Visits, Follow-ups) must also be
+    attached to: the Lead's own customer_id — set by conversion, or by
+    pre-linking at creation — provided that Customer is in the same
+    organization. None when the Lead has no Customer.
+
+    This is the single rule behind the Lead -> Customer activity link:
+    an activity row keeps its lead_id (where it was logged) and gains the
+    linked customer_id, so one row serves both the Lead's Visits tab and the
+    Customer's Activities tab — never a duplicate row.
+    """
+    if not lead_id:
+        return None
+    lead = db.get(Lead, lead_id)
+    if lead is None or lead.organization_id != org_id or not lead.customer_id:
+        return None
+    customer = db.get(Customer, lead.customer_id)
+    if customer is None or customer.organization_id != org_id:
+        return None
+    return customer.id
+
+
+def resync_activity_customer(
+    db: Session, org_id: str, record: Visit | FollowUp, data: dict, old_lead_customer_id: str | None
+) -> None:
+    """After a PATCH has been applied to a Visit/Follow-up, keep its
+    customer_id consistent with its Lead's linked Customer (see
+    linked_customer_id):
+
+    - no customer_id at all -> take the Lead's linked Customer;
+    - the PATCH moved it to another Lead without naming a customer, and its
+      customer_id was the one inherited from the old Lead -> follow the new
+      Lead (possibly to None, leaving it lead-only).
+
+    An explicitly sent, non-null customer_id is never overridden.
+    """
+    if data.get("customer_id"):
+        return
+    derived = linked_customer_id(db, org_id, record.lead_id)
+    if record.customer_id is None:
+        record.customer_id = derived
+    elif (
+        "lead_id" in data
+        and "customer_id" not in data
+        and record.lead_id is not None
+        and record.customer_id == old_lead_customer_id
+    ):
+        record.customer_id = derived
+
+
+def _propagate_lead_activity(db: Session, org_id: str, lead_id: str, customer_id: str) -> None:
+    """Give every Quotation, Visit and Follow-up recorded against this Lead
+    the Lead's Customer, alongside its preserved lead_id. Only rows with no
+    customer yet are touched, so a row a user deliberately pointed at some
+    other Customer is left alone. Idempotent."""
+    for model in (Quotation, Visit, FollowUp):
+        db.query(model).filter(
+            model.organization_id == org_id,
+            model.lead_id == lead_id,
+            model.customer_id.is_(None),
+        ).update({"customer_id": customer_id}, synchronize_session=False)
 
 
 def is_lead_assignable(db: Session, candidate: User) -> bool:
@@ -376,9 +439,10 @@ def convert_lead_to_customer(
 ) -> dict:
     """Convert a Lead to a full Customer record. Does the commit itself.
 
-    If already converted, returns the existing Customer without creating a
-    duplicate. Updates the Lead's status to 'won' and links `customer_id` and
-    `converted_at`.
+    If the Lead already has a Customer (converted, or pre-linked at creation),
+    that Customer is returned and no duplicate is created; a pre-linked Lead
+    is marked converted against it. Sets the Lead's status to 'won' and links
+    `customer_id` and `converted_at`.
 
     Concurrency: the Lead row is locked with a real `UPDATE` before the
     conversion-state check below, so two simultaneous calls for the same
@@ -411,15 +475,27 @@ def convert_lead_to_customer(
             detail="Delivery partners cannot create customers",
         )
 
-    # 1. If already converted (by us or by the request we were racing),
-    # return the existing customer — idempotent duplicate protection.
+    # 1. The Lead already points at a Customer — never create a second one.
+    #    - Already converted (by us, or by the request we were racing): an
+    #      idempotent no-op apart from re-linking any activity that is still
+    #      lead-only (heals rows logged before the write-time link existed).
+    #    - Pre-linked to an existing Customer at creation but never converted:
+    #      finish the conversion against THAT Customer. Previously this path
+    #      returned `converted: true` while leaving the Lead at its old status
+    #      with no converted_at — a Lead that looked converted but wasn't.
     if lead.customer_id:
         existing_customer = db.get(Customer, lead.customer_id)
         if existing_customer and existing_customer.organization_id == org_id:
+            if not is_converted(lead):
+                lead.lead_status = "won"
+                lead.converted_at = datetime.now(timezone.utc)
+            _propagate_lead_activity(db, org_id, lead.id, existing_customer.id)
+            db.commit()
+            db.refresh(lead)
             return {
                 "lead_id": lead.id,
                 "customer_id": existing_customer.id,
-                "lead_status": lead.lead_status or "won",
+                "lead_status": lead.lead_status,
                 "converted": True,
                 "customer": existing_customer,
             }
@@ -496,28 +572,14 @@ def convert_lead_to_customer(
     # Customer" transition. Only quotations not already linked to some other
     # Customer are touched, so a quotation a user already manually re-pointed
     # elsewhere is left alone.
-    db.query(Quotation).filter(
-        Quotation.organization_id == org_id,
-        Quotation.lead_id == lead.id,
-        Quotation.customer_id.is_(None),
-    ).update({"customer_id": customer.id})
-
+    #
     # Same propagation, same reasoning, for the Lead's pre-conversion
     # activity history: Follow-ups and Visits logged directly against the
-    # Lead (no Customer required — see follow_up_service.create_follow_up /
-    # visit_service.create_visit) must remain fully readable after
-    # conversion, and gain the new customer_id alongside their preserved
-    # lead_id rather than only being reachable via the now-closed Lead.
-    db.query(Visit).filter(
-        Visit.organization_id == org_id,
-        Visit.lead_id == lead.id,
-        Visit.customer_id.is_(None),
-    ).update({"customer_id": customer.id})
-    db.query(FollowUp).filter(
-        FollowUp.organization_id == org_id,
-        FollowUp.lead_id == lead.id,
-        FollowUp.customer_id.is_(None),
-    ).update({"customer_id": customer.id})
+    # Lead must remain fully readable after conversion, and gain the new
+    # customer_id alongside their preserved lead_id. Activity logged on the
+    # Lead *after* conversion is linked at write time instead (see
+    # linked_customer_id, used by visit_service / follow_up_service).
+    _propagate_lead_activity(db, org_id, lead.id, customer.id)
 
     db.commit()
     db.refresh(customer)

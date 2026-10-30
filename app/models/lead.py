@@ -75,6 +75,13 @@ class Lead(Base):
         return [link.product for link in self.interested_product_links]
 
     @property
+    def is_converted(self) -> bool:
+        """Canonical "has been through convert-to-customer" signal — see
+        lead_service.is_converted. A bare customer_id (pre-linked Lead) is
+        not enough."""
+        return self.converted_at is not None or self.lead_status == "won"
+
+    @property
     def converted_customer_id(self) -> str | None:
         return self.customer_id
 

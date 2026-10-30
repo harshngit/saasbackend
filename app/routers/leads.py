@@ -117,9 +117,10 @@ def convert_lead_to_customer(
 ) -> dict:
     """Convert a lead to a full customer record.
 
-    If already converted, returns the existing customer without creating a
-    duplicate. Updates the lead's status to 'won' and links `customer_id` and
-    `converted_at`. Safe under concurrent double-submission — see
+    If the lead already has a customer (converted, or pre-linked at
+    creation), returns that customer without creating a duplicate; a
+    pre-linked lead is marked converted against it. Updates the lead's status
+    to 'won' and links `customer_id` and `converted_at`. Safe under concurrent double-submission — see
     lead_service.convert_lead_to_customer for the locking strategy.
     """
     org_id = _org_id(user)
