@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core import workflow
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.models import Customer, Invoice, SalesReturn, User
+from app.models import Customer, Invoice, SalesOrder, SalesReturn, User
 from app.core.pagination import paginate
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.pagination import PaginatedResponse
@@ -133,7 +133,14 @@ def create_sales_return(
         db, org_id, payload.invoice_reference_id, payload.customer_id
     )
 
-    warehouse = stock_service.owned_warehouse(db, payload.warehouse_id, org_id)
+    # Goods come back into the warehouse the sale went out of: when the caller
+    # names none, use the invoiced order's own warehouse before the firm default.
+    return_warehouse_id = payload.warehouse_id
+    if not return_warehouse_id and invoice is not None and getattr(invoice, "order_id", None):
+        source_order = db.get(SalesOrder, invoice.order_id)
+        if source_order is not None and source_order.organization_id == org_id:
+            return_warehouse_id = source_order.warehouse_id
+    warehouse = stock_service.owned_warehouse(db, return_warehouse_id, org_id)
     if payload.warehouse_id and warehouse is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

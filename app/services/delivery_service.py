@@ -91,18 +91,14 @@ def is_delivery_partner(db: Session, partner: User) -> bool:
 
 def resolve_delivery_warehouse(db: Session, delivery: Delivery) -> Warehouse | None:
     """Resolve warehouse for an existing delivery using the canonical hierarchy:
-    1. delivery.warehouse_id
-    2. delivery.sales_order.warehouse_id
+    1. delivery.sales_order.warehouse_id — an order is fulfilled from exactly the
+       warehouse it was placed (and reserved) against, so for an order delivery
+       this always wins; a stale delivery.warehouse_id can never redirect the
+       deduction to another warehouse.
+    2. delivery.warehouse_id (deliveries with no order)
     3. None (no org-default fallback during loading/serialization)
     """
     org_id = delivery.organization_id
-    # 1. delivery.warehouse_id
-    if delivery.warehouse_id:
-        wh = stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
-        if wh is not None:
-            return wh
-
-    # 2. delivery.sales_order.warehouse_id
     order_wh_id = None
     if delivery.sales_order_id:
         if delivery.sales_order and delivery.sales_order.warehouse_id:
@@ -113,6 +109,11 @@ def resolve_delivery_warehouse(db: Session, delivery: Delivery) -> Warehouse | N
                 order_wh_id = order.warehouse_id
     if order_wh_id:
         wh = stock_service.owned_warehouse(db, order_wh_id, org_id)
+        if wh is not None:
+            return wh
+
+    if delivery.warehouse_id:
+        wh = stock_service.owned_warehouse(db, delivery.warehouse_id, org_id)
         if wh is not None:
             return wh
 
@@ -418,6 +419,20 @@ def plan(
     org_id = order.organization_id
     by_id = {item.id: item for item in order.items}
 
+    # An order ships from the one warehouse it was placed and reserved against.
+    # A different warehouse here would deduct stock the order never reserved.
+    if warehouse_id and order.warehouse_id and warehouse_id != order.warehouse_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="warehouse_id must be the order's own warehouse — a sales order is "
+                   "fulfilled only from the warehouse selected on it",
+        )
+    if warehouse_id and stock_service.owned_warehouse(db, warehouse_id, org_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="warehouse_id is not a warehouse in your firm",
+        )
+
     if delivery_partner is not None:
         require_partner_available(db, org_id, delivery_partner, scheduled_date or datetime.now(timezone.utc))
 
@@ -446,7 +461,7 @@ def plan(
         delivery_date=scheduled_date or datetime.now(timezone.utc),
         sales_order_id=order.id,
         customer_id=order.customer_id,
-        warehouse_id=warehouse_id or order.warehouse_id,
+        warehouse_id=order.warehouse_id or warehouse_id,
         delivery_address=(
             delivery_address
             or (
@@ -750,7 +765,7 @@ def load(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Unable to determine a warehouse for this delivery. Please assign a warehouse to the delivery or order.",
         )
-    if not delivery.warehouse_id:
+    if delivery.warehouse_id != warehouse.id:
         delivery.warehouse_id = warehouse.id
 
     by_id = {item.id: item for item in locked_items}
@@ -775,12 +790,24 @@ def load(
             organization_id=org_id,
             delivery_partner_id=delivery.delivery_partner_id,
             vehicle_id=delivery.vehicle_id,
+            # Remembered so the end-of-day return puts unsold goods back into the
+            # warehouse they came out of, not the firm's default.
+            warehouse_id=warehouse.id,
             date=datetime.now(timezone.utc),
             status="active",
         )
         db.add(loading)
         db.flush()
     else:
+        if loading.warehouse_id is None:
+            loading.warehouse_id = warehouse.id
+        elif loading.warehouse_id != warehouse.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This delivery partner's active vehicle run is loaded from another "
+                       "warehouse. Close that run (end of day) before loading from "
+                       f"{warehouse.name}, so returns go back to the right warehouse.",
+            )
         if loading.vehicle_id is None and delivery.vehicle_id:
             loading.vehicle_id = delivery.vehicle_id
         elif loading.vehicle_id and delivery.vehicle_id and loading.vehicle_id != delivery.vehicle_id:

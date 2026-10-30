@@ -12,7 +12,18 @@ from app.core.sorting import apply_sorting
 from app.models import EXPENSE_CATEGORIES, Expense, ExpenseItem, User
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
-from app.schemas.expense import BulkDelete, BulkDeleteResult, ExpenseCreate, ExpenseOut, ExpenseUpdate, RejectBody
+from app.schemas.expense import (
+    ApproveBody,
+    BulkDelete,
+    BulkDeleteResult,
+    ExpenseCreate,
+    ExpenseDetailOut,
+    ExpenseHistoryEntry,
+    ExpenseOut,
+    ExpenseUpdate,
+    RejectBody,
+    ReimburseBody,
+)
 from app.core import notification_types as nt
 from app.services import expense_service, lookup_service, notification_service, numbering_service
 
@@ -91,6 +102,18 @@ def create_expense(
     db: Session = Depends(get_db),
 ) -> Expense:
     org_id = _org_id(user)
+    expense_service.validate_attachment_refs(
+        db, org_id, payload.receipt_url, payload.vendor_invoice_url,
+        *expense_service.supporting_refs(payload.supporting_documents),
+    )
+    # Admin-created expenses are approved on creation (approved = accepted as valid).
+    # They are reimbursed on creation only when the Admin explicitly says it was
+    # already paid (payment_status "Paid") with a canonical payment method.
+    # Everyone else's expense starts pending approval, whatever lifecycle values
+    # the client sent.
+    creator_is_admin = expense_service.is_admin(user)
+    already_paid = creator_is_admin and (payload.payment_status or "").strip().lower() == "paid"
+    paid_method = expense_service.normalize_reimbursement_method(payload.payment_mode) if already_paid else None
 
     # Validate vendor if provided and auto-populate payee info if not manually set
     vendor = expense_service.validate_vendor(db, org_id, payload.vendor_id)
@@ -141,7 +164,7 @@ def create_expense(
         expense_id=numbering_service.next_number(db, org_id, Expense.expense_id, "EXPID"),
         expense_number=numbering_service.next_number(db, org_id, Expense.expense_number, "EXP"),
         expense_type=payload.expense_type,
-        expense_status=payload.expense_status or "Submitted",
+        expense_status="Submitted",
         financial_year=payload.financial_year,
         branch_id=payload.branch_id,
         department_id=payload.department_id,
@@ -152,8 +175,8 @@ def create_expense(
         email_address=email_address,
         payee_gstin=payee_gstin,
         payment_reference=payload.payment_reference,
-        payment_status=payload.payment_status or "Pending",
-        approval_status=payload.approval_status or "Pending",
+        payment_status="Pending",
+        approval_status="Pending",
         paid_from_account_id=payload.paid_from_account_id,
         expense_account_id=payload.expense_account_id,
         cost_center_id=payload.cost_center_id,
@@ -172,10 +195,20 @@ def create_expense(
 
     db.add(expense)
     db.flush()
-    notification_service.notify_org_admins(
-        db, expense.organization_id, "New expense submitted",
-        f"{expense.category}: Rs {expense.amount:,.2f}", type="expense", link=expense.id,
-        data=nt.build_data(nt.EXPENSE_CREATED, expense_id=expense.id))
+    expense_service.record_history(db, expense, user, "created")
+    if creator_is_admin:
+        expense_service.mark_approved(db, expense, user, "Created by Admin (auto-approved)")
+        if already_paid:
+            expense_service.mark_reimbursed(
+                db, expense, user, paid_method, payload.payment_reference,
+                "Recorded as already paid at creation", None,
+            )
+        expense_service._post_gl(db, expense, "expense")
+    else:
+        notification_service.notify_org_admins(
+            db, expense.organization_id, "New expense submitted",
+            f"{expense.category}: Rs {expense.amount:,.2f}", type="expense", link=expense.id,
+            data=nt.build_data(nt.EXPENSE_CREATED, expense_id=expense.id))
     db.commit()
     db.refresh(expense)
     return expense
@@ -208,6 +241,8 @@ def list_expenses(
     user: User = Depends(_view),
     category: str | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
+    lifecycle_status: str | None = Query(
+        default=None, description="pending_approval | approved | rejected | reimbursed (approved = not yet reimbursed)"),
     submitted_by: str | None = Query(default=None),
     vendor_id: str | None = Query(default=None),
     branch_id: str | None = Query(default=None),
@@ -228,8 +263,26 @@ def list_expenses(
     q = db.query(Expense).filter(Expense.organization_id == org_id)
     if category:
         q = q.filter(Expense.category == category)
-    if status_filter:
+    if status_filter == "pending_approval":
+        q = q.filter(Expense.status.in_(expense_service.PENDING_STATUSES))
+    elif status_filter == "reimbursed":
+        q = q.filter(Expense.status == "approved", Expense.reimbursed_at.isnot(None))
+    elif status_filter:
         q = q.filter(Expense.status == status_filter)
+    if lifecycle_status:
+        if lifecycle_status == "pending_approval":
+            q = q.filter(Expense.status.in_(expense_service.PENDING_STATUSES))
+        elif lifecycle_status == "approved":
+            q = q.filter(Expense.status == "approved", Expense.reimbursed_at.is_(None))
+        elif lifecycle_status == "reimbursed":
+            q = q.filter(Expense.status == "approved", Expense.reimbursed_at.isnot(None))
+        elif lifecycle_status == "rejected":
+            q = q.filter(Expense.status == "rejected")
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="lifecycle_status must be one of pending_approval, approved, rejected, reimbursed",
+            )
     if submitted_by:
         q = q.filter(Expense.submitted_by == submitted_by)
     if vendor_id:
@@ -279,9 +332,23 @@ def list_expenses(
     )
 
 
-@router.get("/{expense_id}", response_model=ExpenseOut)
-def get_expense(expense_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> Expense:
-    return _owned(db, expense_id, _org_id(user), user)
+def _detail(db: Session, expense: Expense) -> ExpenseDetailOut:
+    out = ExpenseDetailOut.model_validate(expense)
+    out.attachments = expense_service.attachments(db, expense)
+    out.history = [ExpenseHistoryEntry(**e) for e in expense_service.history(db, expense)]
+    return out
+
+
+@router.get("/{expense_id}", response_model=ExpenseDetailOut)
+def get_expense(expense_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> ExpenseDetailOut:
+    """Expense detail, with its proof attachments (file metadata) and lifecycle history."""
+    return _detail(db, _owned(db, expense_id, _org_id(user), user))
+
+
+@router.get("/{expense_id}/history", response_model=list[ExpenseHistoryEntry])
+def get_expense_history(expense_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> list[dict]:
+    """Created / Approved / Rejected / Reimbursed trail: actor, time, note."""
+    return expense_service.history(db, _owned(db, expense_id, _org_id(user), user))
 
 
 @router.patch("/{expense_id}", response_model=ExpenseOut)
@@ -299,45 +366,30 @@ def update_expense(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    # The submitted amount (and the lifecycle columns) are fixed once the expense
+    # is in the approval workflow, i.e. from creation. A wrong amount is rejected
+    # and raised again; it is never edited under the approver.
+    locked = expense_service.lock_violations(expense, update_data)
+    if locked:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "EXPENSE_AMOUNT_LOCKED",
+                "message": "The amount and approval state of a submitted expense cannot be edited. "
+                           "Reject it and raise a new expense with the correct amount.",
+                "fields": locked,
+            },
+        )
+    for field in expense_service.AMOUNT_FIELDS + expense_service.LIFECYCLE_FIELDS:
+        update_data.pop(field, None)
+    expense_service.validate_attachment_refs(
+        db, org_id, update_data.get("receipt_url"), update_data.get("vendor_invoice_url"),
+        *expense_service.supporting_refs(update_data.get("supporting_documents")),
+    )
+
     # Validate vendor if vendor_id is updated
     if "vendor_id" in update_data:
         expense_service.validate_vendor(db, org_id, update_data["vendor_id"])
-
-    # If items are provided in update, recalculate line items and totals
-    if "items" in update_data:
-        items_in = payload.items
-        subtotal, tax_amount, total_amount, calculated_items = expense_service.calculate_totals(
-            items_in=items_in,
-            header_tax_rate=update_data.get("tax_rate", expense.tax_rate),
-            header_tax_amount=update_data.get("tax_amount", expense.tax_amount),
-            header_amount=update_data.get("amount", expense.amount),
-        )
-        expense.subtotal = subtotal
-        expense.tax_amount = tax_amount
-        expense.amount = total_amount
-        expense.items.clear()
-        for item_data in calculated_items:
-            expense.items.append(ExpenseItem(**item_data))
-        del update_data["items"]
-    elif "amount" in update_data or "tax_rate" in update_data or "tax_amount" in update_data:
-        subtotal, tax_amount, total_amount, _ = expense_service.calculate_totals(
-            items_in=None,
-            header_tax_rate=update_data.get("tax_rate", expense.tax_rate),
-            header_tax_amount=update_data.get("tax_amount", expense.tax_amount),
-            header_amount=update_data.get("amount", expense.amount),
-        )
-        expense.subtotal = subtotal
-        expense.tax_amount = tax_amount
-        expense.amount = total_amount
-
-    # Validate TDS
-    tds_app = update_data.get("tds_applicable", expense.tds_applicable)
-    tds_amt = update_data.get("tds_amount", expense.tds_amount)
-    if tds_app and tds_amt > expense.amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="TDS amount cannot exceed the total expense amount",
-        )
 
     for field, value in update_data.items():
         if field not in ("amount", "subtotal", "tax_amount"):
@@ -345,42 +397,35 @@ def update_expense(
 
     if expense.status == "clarification_requested":
         expense.status = "pending"  # resubmitted for approval
+        expense_service.record_history(db, expense, user, "resubmitted")
 
     db.commit()
     db.refresh(expense)
     return expense
 
 
+@router.post("/{expense_id}/approve", response_model=ExpenseOut)
 @router.patch("/{expense_id}/approve", response_model=ExpenseOut)
 def approve_expense(
     expense_id: str,
+    payload: ApproveBody | None = None,
     user: User = Depends(_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Expense:
+    """pending_approval -> approved. Records approved_by / approved_at / note and posts
+    the expense to the ledger (accrued to Payable until reimbursed). A reviewer cannot
+    approve their own expense."""
     # Reviewer action, gated by the separate expenses:approve permission —
     # deliberately org-wide regardless of the reviewer's own data scope.
     expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
-    if expense.status not in ("pending", "clarification_requested"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses can be approved")
-    expense.status = "approved"
-    expense.approval_status = "Approved"
-    expense.approved_by = user.id
-    db.flush()
-    try:
-        from app.services import accounting_service
-        accounting_service.post_operational_document(db, expense.organization_id, "expense", expense.id)
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to post approved expense to general ledger: {exc}",
-        ) from exc
+    expense_service.approve(db, expense, user, payload.note if payload else None)
     db.commit()
     db.refresh(expense)
     return expense
 
 
+@router.post("/{expense_id}/reject", response_model=ExpenseOut)
 @router.patch("/{expense_id}/reject", response_model=ExpenseOut)
 def reject_expense(
     expense_id: str,
@@ -389,15 +434,35 @@ def reject_expense(
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Expense:
+    """pending_approval -> rejected. `reason` is required. A rejected expense can never
+    be reimbursed."""
     # Reviewer action, gated by the separate expenses:approve permission —
     # deliberately org-wide regardless of the reviewer's own data scope.
     expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
-    if expense.status != "pending":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses can be rejected")
-    expense.status = "rejected"
-    expense.approval_status = "Rejected"
-    expense.approved_by = user.id
-    expense.reject_reason = payload.reason
+    expense_service.reject(db, expense, user, payload.reason or payload.note)
+    db.commit()
+    db.refresh(expense)
+    return expense
+
+
+@router.post("/{expense_id}/reimburse", response_model=ExpenseOut)
+@router.patch("/{expense_id}/reimburse", response_model=ExpenseOut)
+def reimburse_expense(
+    expense_id: str,
+    payload: ReimburseBody,
+    user: User = Depends(_approve),
+    _unlocked: User = Depends(require_unlocked_org),
+    db: Session = Depends(get_db),
+) -> Expense:
+    """approved -> reimbursed (full amount only). Records reimbursed_by / reimbursed_at /
+    payment_method / payment_reference / notes and posts the payment to the ledger.
+    A second call is refused with 409; rejected or pending expenses with 400."""
+    expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
+    expense_service.reimburse(
+        db, expense, user,
+        payment_method=payload.payment_method, amount=payload.amount,
+        payment_reference=payload.payment_reference, notes=payload.notes, paid_at=payload.paid_at,
+    )
     db.commit()
     db.refresh(expense)
     return expense
@@ -419,6 +484,7 @@ def request_clarification(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only pending expenses need clarification")
     expense.status = "clarification_requested"
     expense.reject_reason = payload.reason  # reused as the clarification note
+    expense_service.record_history(db, expense, user, "clarification_requested", payload.reason)
     if expense.submitted_by:
         notification_service.notify(
             db, expense.submitted_by, "Clarification requested on your expense",
@@ -461,6 +527,8 @@ def bulk_delete_expenses(
 
     expenses = [_owned(db, eid, org_id, user) for eid in unique_ids]
     for expense in expenses:
+        _require_deletable(expense)
+    for expense in expenses:
         db.delete(expense)
     db.commit()
     return BulkDeleteResult(deleted=len(expenses))
@@ -474,5 +542,15 @@ def delete_expense(
     db: Session = Depends(get_db),
 ) -> None:
     expense = _owned(db, expense_id, _org_id(user), user)
+    _require_deletable(expense)
     db.delete(expense)
     db.commit()
+
+
+def _require_deletable(expense: Expense) -> None:
+    """A reimbursed expense is a record of money paid out: terminal and read-only."""
+    if expense.reimbursed_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A reimbursed expense cannot be deleted",
+        )

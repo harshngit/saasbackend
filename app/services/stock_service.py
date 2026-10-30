@@ -135,8 +135,16 @@ def _row(
             product_id=product_id,
             variant_id=variant_id,
             # An item nobody has tracked per warehouse yet opens with whatever the
-            # catalog counter says — see on_hand() for why.
-            on_hand_quantity=_untracked_catalog_stock(db, org_id, product_id, variant_id),
+            # catalog counter says — see on_hand() for why. Only the firm's
+            # default warehouse inherits it: that counter is the firm-wide,
+            # pre-warehouse figure, and handing it to whichever warehouse is
+            # touched first would let an order on W2 draw on stock that was
+            # never in W2.
+            on_hand_quantity=(
+                _untracked_catalog_stock(db, org_id, product_id, variant_id)
+                if _is_default_warehouse(db, warehouse_id)
+                else 0.0
+            ),
         )
         db.add(row)
         db.flush()
@@ -204,6 +212,19 @@ def lock_stock_items(
     return locked_rows
 
 
+def _is_default_warehouse(db: Session, warehouse_id: str | None) -> bool:
+    """Whether this is its firm's default warehouse (promoting one if the firm
+    has none flagged yet, exactly as default_warehouse() does)."""
+    if not warehouse_id:
+        return False
+    wh = db.get(Warehouse, warehouse_id)
+    if wh is None:
+        return False
+    if wh.is_default:
+        return True
+    return default_warehouse(db, wh.organization_id).id == wh.id
+
+
 def _untracked_catalog_stock(
     db: Session, org_id: str, product_id: str, variant_id: str | None
 ) -> float:
@@ -249,6 +270,10 @@ def on_hand(db: Session, warehouse_id: str, product_id: str, variant_id: str | N
     )
     tracked = rows.all()
     if not tracked:
+        # The untracked catalog figure lives in the default warehouse only (see
+        # _row): any other warehouse genuinely holds none of it.
+        if not _is_default_warehouse(db, warehouse_id):
+            return 0.0
         return round(_catalog_stock(db, product_id, variant_id), 3)
     return round(sum(r.on_hand_quantity or 0 for r in tracked if r.warehouse_id == warehouse_id), 3)
 

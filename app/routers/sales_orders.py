@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session
 
 from app.core import scoping, workflow
@@ -23,11 +24,13 @@ from app.models import (
     User,
     UserRole,
     Vehicle,
+    Warehouse,
 )
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.customer import CustomerPaymentOut
 from app.schemas.sales_order import (
+    OrderWarehouseBrief,
     AssignDeliveryBody,
     BulkDelete,
     BulkDeleteResult,
@@ -97,6 +100,10 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
     the effect of placing it without a second call."""
     out = OrderOut.model_validate(order)
     if order.warehouse_id:
+        wh = db.get(Warehouse, order.warehouse_id)
+        if wh is not None and wh.organization_id == order.organization_id:
+            out.warehouse = OrderWarehouseBrief.model_validate(wh)
+            out.warehouse_name = wh.name
         seen: set[tuple[str, str | None]] = set()
         summary = []
         for item in order.items:
@@ -1151,6 +1158,11 @@ def confirm_order_pickup(
     """
     org_id = _org_id(user)
     order = _owned(db, order_id, org_id, user)
+    # Serialize concurrent confirmations (double-click / retry): a real UPDATE locks
+    # the row on Postgres and takes SQLite's write lock, so the second call re-reads
+    # `pickup_status == "collected"` below and is refused instead of deducting again.
+    db.execute(sa_update(SalesOrder).where(SalesOrder.id == order.id).values(status=SalesOrder.status))
+    db.refresh(order)
     if order.status in ("draft", "cancelled", "rejected"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1164,48 +1176,81 @@ def confirm_order_pickup(
 
     order.fulfilment_method = "pickup"
 
-    # Process items
+    # Pickup deducts from exactly the order's own warehouse — never the default or
+    # the firm-wide total — so an order with no warehouse cannot be collected.
+    if not order.warehouse_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This order has no warehouse. Set the order's warehouse before confirming pickup.",
+        )
+
+    items_map = {item.id: item for item in order.items}
     if payload and payload.items:
-        items_map = {item.id: item for item in order.items}
+        wanted: dict[str, float] = {}
         for item_in in payload.items:
-            item = items_map.get(item_in.order_item_id)
-            if item is None:
+            if items_map.get(item_in.order_item_id) is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Item {item_in.order_item_id} does not belong to this order",
                 )
-            qty = float(item_in.collected_quantity)
-            if qty > 0 and item.product_id and order.warehouse_id:
-                stock_service.adjust_on_hand(
-                    db, org_id, order.warehouse_id, item.product_id, item.variant_id,
-                    -qty, "sale", note=f"Pickup for order {order.order_number}", created_by=user.id,
-                )
-                res = (
-                    db.query(StockReservation)
-                    .filter(StockReservation.order_item_id == item.id, StockReservation.status == "active")
-                    .first()
-                )
-                if res:
-                    stock_service.consume_reservation(db, res, qty)
-                item.delivered_quantity = round((item.delivered_quantity or 0) + qty, 3)
-                item.reserved_quantity = max(0.0, round((item.reserved_quantity or 0) - qty, 3))
+            wanted[item_in.order_item_id] = wanted.get(item_in.order_item_id, 0.0) + float(item_in.collected_quantity)
+        partial = True
     else:
-        for item in order.items:
-            qty = float(item.quantity or 0)
-            if qty > 0 and item.product_id and order.warehouse_id:
-                stock_service.adjust_on_hand(
-                    db, org_id, order.warehouse_id, item.product_id, item.variant_id,
-                    -qty, "sale", note=f"Pickup for order {order.order_number}", created_by=user.id,
-                )
-                res = (
-                    db.query(StockReservation)
-                    .filter(StockReservation.order_item_id == item.id, StockReservation.status == "active")
-                    .first()
-                )
-                if res:
-                    stock_service.consume_reservation(db, res, qty)
-                item.delivered_quantity = qty
-                item.reserved_quantity = 0.0
+        wanted = {
+            item.id: round(float(item.quantity or 0) - float(item.delivered_quantity or 0), 3)
+            for item in order.items
+        }
+        partial = False
+
+    # Lock the stock rows first, then validate everything before moving anything,
+    # so a refused pickup leaves no half-applied deduction.
+    lock_lines = [
+        {"product_id": items_map[iid].product_id, "variant_id": items_map[iid].variant_id}
+        for iid, qty in wanted.items() if qty > 0 and items_map[iid].product_id
+    ]
+    stock_service.lock_stock_items(db, org_id, order.warehouse_id, lock_lines)
+    needed: dict[tuple[str, str | None], float] = {}
+    for iid, qty in wanted.items():
+        item = items_map[iid]
+        remaining = round(float(item.quantity or 0) - float(item.delivered_quantity or 0), 3)
+        if qty > remaining + 0.001:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{item.product_name}: only {remaining:g} remains to be collected on this order",
+            )
+        if qty > 0 and item.product_id:
+            key = (item.product_id, item.variant_id)
+            needed[key] = needed.get(key, 0.0) + qty
+    for (product_id, variant_id), qty in needed.items():
+        held = stock_service.on_hand(db, order.warehouse_id, product_id, variant_id)
+        if qty > held + 0.001:
+            name = next(i.product_name for i in order.items if i.product_id == product_id and i.variant_id == variant_id)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "INSUFFICIENT_STOCK", "message": f"{name}: only {held:g} on hand in the order's warehouse",
+                        "warehouse_id": order.warehouse_id, "product_id": product_id, "variant_id": variant_id,
+                        "required_quantity": round(qty, 3), "on_hand": held},
+            )
+
+    for iid, qty in wanted.items():
+        item = items_map[iid]
+        if qty > 0 and item.product_id:
+            stock_service.adjust_on_hand(
+                db, org_id, order.warehouse_id, item.product_id, item.variant_id,
+                -qty, "sale", note=f"Pickup for order {order.order_number}", created_by=user.id,
+            )
+            res = (
+                db.query(StockReservation)
+                .filter(StockReservation.order_item_id == item.id, StockReservation.status == "active")
+                .first()
+            )
+            if res:
+                stock_service.consume_reservation(db, res, qty)
+        if qty > 0:
+            item.delivered_quantity = round((item.delivered_quantity or 0) + qty, 3)
+            item.reserved_quantity = (
+                max(0.0, round((item.reserved_quantity or 0) - qty, 3)) if partial else 0.0
+            )
 
     previous_status = order.status
     order.pickup_status = "collected"

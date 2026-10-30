@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -24,6 +24,9 @@ class ActivityLog(Base):
     """
 
     __tablename__ = "activity_logs"
+    __table_args__ = (
+        Index("ix_activity_logs_org_entity", "organization_id", "entity_type", "entity_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     organization_id: Mapped[str | None] = mapped_column(
@@ -39,6 +42,13 @@ class ActivityLog(Base):
     # authorized_person, address, branding, online_presence, document, employee.
     type: Mapped[str] = mapped_column(String(50), default="company_profile", nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Optional link to the one record this entry is about, so a record's own
+    # history (e.g. an Expense's created/approved/reimbursed trail, a delivery
+    # Day-End's submitted/approved trail) is read from this same feed rather
+    # than a second audit table. `action` is the machine key (created, approved…).
+    entity_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    action: Mapped[str | None] = mapped_column(String(50), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(

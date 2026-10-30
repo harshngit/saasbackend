@@ -104,6 +104,7 @@ from app.routers import (
     websocket,
     payment_webhooks,
     cash_reconciliation,
+    delivery_day_end,
 )
 
 app = FastAPI(
@@ -330,6 +331,7 @@ app.include_router(companies.router)
 app.include_router(websocket.router)
 app.include_router(payment_webhooks.router)
 app.include_router(cash_reconciliation.router)
+app.include_router(delivery_day_end.router)
 
 
 

@@ -14,6 +14,7 @@ from app.schemas.lead import (
     LeadConvertResponse,
     LeadCreate,
     LeadOut,
+    LeadQuotationPrefill,
     LeadUpdate,
 )
 
@@ -94,6 +95,20 @@ def get_lead_detail(
     db: Session = Depends(get_db),
 ) -> Lead:
     return lead_service.get_lead(db, _org_id(user), id, user)
+
+
+@router.get("/{id}/quotation-prefill", response_model=LeadQuotationPrefill)
+def lead_quotation_prefill(
+    id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Suggested starting point for a quotation from this Lead: the party to quote
+    and one line per interested product. Creates nothing — show the lines for the
+    user to confirm, then POST /quotations with the ones they keep."""
+    org_id = _org_id(user)
+    lead = lead_service.get_lead(db, org_id, id, user)
+    return lead_service.quotation_prefill(db, org_id, lead)
 
 
 @router.patch("/{id}", response_model=LeadOut)

@@ -592,3 +592,40 @@ def convert_lead_to_customer(
         "converted": True,
         "customer": customer,
     }
+
+
+def quotation_prefill(db: Session, org_id: str, lead: Lead) -> dict:
+    """What a new quotation for this Lead would start from — its party and one
+    suggested line per interested product (current selling price and tax rate,
+    quantity 1). Read-only: no Quotation or QuotationItem is created here;
+    quotation_service only ever builds lines from the payload the user confirms.
+    Products that no longer belong to this organization are skipped.
+    """
+    customer_id = linked_customer_id(db, org_id, lead.id)
+    items = []
+    for link in lead.interested_product_links:
+        product = link.product
+        if product is None or product.organization_id != org_id:
+            continue
+        items.append({
+            "product_id": product.id,
+            "variant_id": None,
+            "product_name": product.name,
+            "sku": product.sku,
+            "uom": product.uom,
+            "quantity": 1,
+            "unit_price": float(product.price or 0),
+            "tax_rate": product.tax_rate,
+            "is_active": bool(product.is_active),
+        })
+    return {
+        "lead_id": lead.id,
+        "customer_id": customer_id,
+        "quotation_lead_id": None if customer_id else lead.id,
+        "party_name": lead.name,
+        "contact_person": lead.contact_person,
+        "mobile_number": lead.mobile_number,
+        "email": lead.email,
+        "salesperson_id": lead.assigned_salesperson_id,
+        "items": items,
+    }

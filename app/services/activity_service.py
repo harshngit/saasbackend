@@ -54,8 +54,15 @@ def record(
     type: str,
     title: str,
     description: str | None = None,
+    *,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    action: str | None = None,
 ) -> ActivityLog:
-    """Add one entry to the firm's feed. Does not commit."""
+    """Add one entry to the firm's feed. Does not commit.
+
+    Pass entity_type/entity_id/action to make the entry part of that record's
+    own history (see `history()`)."""
     entry = ActivityLog(
         organization_id=organization_id,
         user_id=actor.id if actor is not None else None,
@@ -63,9 +70,26 @@ def record(
         type=type,
         title=title,
         description=description,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        action=action,
     )
     db.add(entry)
     return entry
+
+
+def history(db: Session, organization_id: str, entity_type: str, entity_id: str) -> list[ActivityLog]:
+    """One record's own trail, oldest first. Organization-scoped."""
+    return (
+        db.query(ActivityLog)
+        .filter(
+            ActivityLog.organization_id == organization_id,
+            ActivityLog.entity_type == entity_type,
+            ActivityLog.entity_id == entity_id,
+        )
+        .order_by(ActivityLog.created_at.asc(), ActivityLog.id.asc())
+        .all()
+    )
 
 
 def record_field_changes(

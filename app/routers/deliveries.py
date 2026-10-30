@@ -30,6 +30,7 @@ from app.models import (
     DeliveryItem,
 )
 from app.core import notification_types as nt
+from app.services import day_end_service
 from app.services import (
     delivery_redistribution_service,
     delivery_service,
@@ -1337,6 +1338,9 @@ def record_general_customer_collection(
             except ValueError:
                 pass
 
+    # A day whose Day-End is submitted / approved takes no new collections.
+    day_end_service.require_day_open(db, org_id, user.id, collected_at)
+
     coll = DeliveryCollection(
         organization_id=org_id,
         delivery_id=delivery.id if delivery else None,
@@ -1478,6 +1482,8 @@ def void_delivery_collection(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot void collection in state '{coll.reconciliation_status}'. Only 'recorded' or 'reconciled' collections can be voided.",
         )
+    # Part of a submitted / approved Day-End: the reviewed figures must stay true.
+    day_end_service.require_day_open(db, org_id, coll.delivery_partner_id, coll.collected_at)
 
     if coll.customer_payment_id:
         payment = db.get(CustomerPayment, coll.customer_payment_id)
@@ -1557,6 +1563,11 @@ def record_delivery_collection(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Collection amount exceeds remaining balance",
                 )
+
+    # A day whose Day-End is submitted / approved takes no new collections.
+    day_end_service.require_day_open(
+        db, org_id, delivery.delivery_partner_id or user.id, datetime.now(timezone.utc)
+    )
 
     # Derive audit links directly from Delivery & User (never trust client)
     coll = DeliveryCollection(

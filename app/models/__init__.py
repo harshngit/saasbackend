@@ -92,6 +92,7 @@ from app.models.transfer import WarehouseTransfer, WarehouseTransferItem
 from app.models.visit import Visit
 from app.models.follow_up import FollowUp
 from app.models.cash_reconciliation import CashReconciliation, CashReconciliationDetail
+from app.models.delivery_day_end import DeliveryDayEnd
 from app.models.leave import LEAVE_STATUSES, LEAVE_TYPES, Leave
 from app.models.accounting import (
     ACCOUNT_CLASSIFICATIONS,
@@ -109,6 +110,7 @@ __all__ = [
     "ACCOUNT_CLASSIFICATIONS",
     "CashReconciliation",
     "CashReconciliationDetail",
+    "DeliveryDayEnd",
     "PurchaseReturn",
     "PurchaseReturnItem",
     "PURCHASE_RETURN_STATUSES",

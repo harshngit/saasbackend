@@ -119,7 +119,9 @@ check("Branch ID persisted correctly", exp1["branch_id"] == "BR-MUMBAI-01")
 check("Department ID persisted correctly", exp1["department_id"] == "DEPT-ADMIN")
 check("Financial Year persisted correctly", exp1["financial_year"] == "2026-2027")
 check("Expense Type is Operational", exp1["expense_type"] == "Operational")
-check("Initial status is pending", exp1["status"] == "pending")
+# Admin-created expenses are approved on creation (not reimbursed).
+check("Admin-created expense is auto-approved", exp1["status"] == "approved" and exp1["lifecycle_status"] == "approved")
+check("Admin-created expense is not reimbursed", exp1["reimbursed_at"] is None)
 
 # --- TEST 2: PAYEE DETAILS (Vendor Auto-fill & Manual Payee Fallback) ---
 print("\n--- TEST 2: Payee Details (Vendor Auto-fill & Manual Fallback) ---")
@@ -260,22 +262,31 @@ check("Reject TDS amount exceeding total expense (HTTP 400)", res_bad_tds.status
 
 # --- TEST 6: DOCUMENTS & ATTACHMENTS (Receipt, Vendor Invoice & Supporting Docs) ---
 print("\n--- TEST 6: Supporting Documents & Attachments ---")
+# Attachments must be this organization's own uploads (POST /files/upload).
+def _upload(name: str, content_type: str) -> str:
+    up = client.post("/files/upload", headers=headers, files={"file": (name, io.BytesIO(b"%PDF-1.4 doc"), content_type)})
+    assert up.status_code == 201, up.text
+    return up.json()["url"]
+
+invoice_url = _upload("invoice_scan_001.pdf", "application/pdf")
+supp1_url = _upload("quotation_comparison.pdf", "application/pdf")
+supp2_url = _upload("delivery_challan.pdf", "application/pdf")
 res_docs = client.post(
     "/expenses",
     headers=headers,
     json={
         "category": "Office Expenses",
         "amount": 3200.0,
-        "vendor_invoice_url": "/files/invoice_scan_001.pdf",
+        "vendor_invoice_url": invoice_url,
         "supporting_documents": [
-            {"name": "quotation_comparison.pdf", "url": "/files/supp_doc_1.pdf"},
-            {"name": "delivery_challan.png", "url": "/files/supp_doc_2.png"},
+            {"name": "quotation_comparison.pdf", "url": supp1_url},
+            {"name": "delivery_challan.pdf", "url": supp2_url},
         ],
     },
 )
 check("Create expense with multi-document attachments (HTTP 201)", res_docs.status_code == 201)
 exp_d = res_docs.json()
-check("Vendor invoice URL persisted", exp_d["vendor_invoice_url"] == "/files/invoice_scan_001.pdf")
+check("Vendor invoice URL persisted", exp_d["vendor_invoice_url"].endswith(invoice_url))
 check("Supporting documents array persisted (2 items)", len(exp_d["supporting_documents"]) == 2)
 
 # Test receipt upload endpoint
@@ -323,24 +334,39 @@ check("Template next_due_date advanced into future", updated_template["next_due_
 
 # --- TEST 8: APPROVAL WORKFLOW & STATUS RESTRICTIONS ---
 print("\n--- TEST 8: Approval Workflow & Restrictions ---")
+# Pending-approval flows need a non-Admin submitter (Admin expenses are approved on creation).
+_roles = {r["name"]: r["id"] for r in client.get("/roles", headers=headers).json()}
+_sub_email = f"submitter_{uuid.uuid4().hex[:6]}@example.com"
+_r = client.post("/users", headers=headers, json={
+    "name": "Expense Submitter", "email": _sub_email, "username": f"sub_{uuid.uuid4().hex[:6]}",
+    "password": "Password123!", "role_id": _roles["Sales Officer"],
+})
+assert _r.status_code == 201, _r.text
+sub_headers = {"Authorization": "Bearer " + client.post(
+    "/auth/login", json={"email": _sub_email, "password": "Password123!"}).json()["tokens"]["access_token"]}
+
 # 8A: Approve
-res_app = client.patch(f"/expenses/{exp1['id']}/approve", headers=headers)
+exp_pending = client.post("/expenses", headers=sub_headers, json={"category": "Office Expenses", "amount": 1500.0}).json()
+check("Staff expense starts pending", exp_pending["status"] == "pending")
+res_app = client.patch(f"/expenses/{exp_pending['id']}/approve", headers=headers)
 check("Approve expense (HTTP 200)", res_app.status_code == 200)
 check("Status updated to approved", res_app.json()["status"] == "approved")
 check("Approval status updated to Approved", res_app.json()["approval_status"] == "Approved")
+check("Already-approved expense cannot be approved again (HTTP 400)",
+      client.patch(f"/expenses/{exp1['id']}/approve", headers=headers).status_code == 400)
 
 # 8B: Approved expense cannot be edited
 res_edit_app = client.patch(f"/expenses/{exp1['id']}", headers=headers, json={"amount": 2000.0})
 check("Approved expense cannot be edited (HTTP 400)", res_edit_app.status_code == 400)
 
 # 8C: Clarification workflow
-res_new = client.post("/expenses", headers=headers, json={"category": "Staff Expenses", "amount": 800.0}).json()
+res_new = client.post("/expenses", headers=sub_headers, json={"category": "Staff Expenses", "amount": 800.0}).json()
 res_clar = client.patch(f"/expenses/{res_new['id']}/request-clarification", headers=headers, json={"reason": "Please attach GST invoice"})
 check("Request clarification (HTTP 200)", res_clar.status_code == 200)
 check("Status is clarification_requested", res_clar.json()["status"] == "clarification_requested")
 
 # Editing clarification-requested expense resubmits it as pending
-res_resub = client.patch(f"/expenses/{res_new['id']}", headers=headers, json={"description": "Added detailed bill reference"})
+res_resub = client.patch(f"/expenses/{res_new['id']}", headers=sub_headers, json={"description": "Added detailed bill reference"})
 check("Editing clarification-requested expense succeeds (HTTP 200)", res_resub.status_code == 200)
 check("Status resets back to pending upon edit", res_resub.json()["status"] == "pending")
 

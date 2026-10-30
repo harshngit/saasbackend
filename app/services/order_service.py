@@ -499,6 +499,23 @@ def update_order(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="warehouse_id is not a warehouse in your firm",
             )
+        # Open deliveries were planned against the current warehouse; moving the
+        # order underneath them would split reservation and deduction across two
+        # warehouses.
+        open_delivery = (
+            db.query(Delivery.id)
+            .filter(
+                Delivery.sales_order_id == order.id,
+                Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES),
+            )
+            .first()
+        )
+        if open_delivery is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot change the warehouse while open deliveries exist for this order. "
+                       "Cancel them first.",
+            )
         order.warehouse_id = wh.id
         warehouse_changed = True
 

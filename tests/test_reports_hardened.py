@@ -3175,7 +3175,7 @@ def test_operational_workflow_posting_expense_and_sales_return(db):
     assert exp_entry is not None
     exp_lines = {l.account.account_code: (l.debit, l.credit) for l in exp_entry.lines}
     assert exp_lines["6010"] == (Decimal("590.00"), Decimal("0.00"))  # Expense Dr
-    assert exp_lines["1010"] == (Decimal("0.00"), Decimal("590.00"))  # Cash Cr
+    assert exp_lines["2010"] == (Decimal("0.00"), Decimal("590.00"))  # Payable Cr until reimbursed
 
     # 2. Sales return posting
     sr = SalesReturn(

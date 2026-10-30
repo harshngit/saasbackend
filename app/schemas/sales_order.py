@@ -129,6 +129,15 @@ class UserBrief(BaseModel):
         return normalize_file_url(v)
 
 
+class OrderWarehouseBrief(BaseModel):
+    """The one warehouse this order is reserved against and fulfilled from."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    name: str
+    code: str | None = None
+    is_default: bool = False
+
+
 class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -146,6 +155,9 @@ class OrderOut(BaseModel):
                     "partially_delivered | delivered | failed",
     )
     warehouse_id: str | None = None
+    warehouse: OrderWarehouseBrief | None = Field(
+        default=None, description="The order's fulfilment warehouse (stock is reserved and deducted here only)")
+    warehouse_name: str | None = None
     quotation_id: str | None = None
     delivery_date: datetime | None = None
     fulfilment_method: str | None = None

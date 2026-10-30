@@ -206,3 +206,32 @@ class LeadConvertResponse(BaseModel):
 
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 
+
+
+class LeadQuotationPrefillItem(BaseModel):
+    """One suggested quotation line from a Lead's interested products. Nothing is
+    created from it — the user confirms (and may edit or drop) each line, then
+    sends it in POST /quotations `items` exactly as shown."""
+    product_id: str
+    variant_id: str | None = None
+    product_name: str
+    sku: str | None = None
+    uom: str | None = None
+    quantity: float = 1
+    unit_price: float = 0
+    tax_rate: float | None = None
+    is_active: bool = True
+
+
+class LeadQuotationPrefill(BaseModel):
+    lead_id: str
+    # Exactly one is set: the party a new quotation for this Lead must name.
+    # A Lead with a linked Customer quotes that Customer.
+    customer_id: str | None = None
+    quotation_lead_id: str | None = None
+    party_name: str | None = None
+    contact_person: str | None = None
+    mobile_number: str | None = None
+    email: str | None = None
+    salesperson_id: str | None = None
+    items: list[LeadQuotationPrefillItem] = []

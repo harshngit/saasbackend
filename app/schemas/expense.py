@@ -54,9 +54,25 @@ class ExpenseOut(BaseModel):
     vendor_invoice_url: str | None = None
     supporting_documents: list[dict | str] | None = None
     status: str
+    lifecycle_status: str = Field(
+        default="pending_approval",
+        description="pending_approval | approved | rejected | reimbursed — the approved workflow. "
+                    "`status` keeps its stored values (pending | clarification_requested | approved | rejected).",
+    )
     submitted_by: str | None = None
     approved_by: str | None = None
+    approved_at: datetime | None = None
+    approval_note: str | None = None
     reject_reason: str | None = None
+    rejection_reason: str | None = None
+    rejected_by: str | None = None
+    rejected_at: datetime | None = None
+    reimbursed_by: str | None = None
+    reimbursed_at: datetime | None = None
+    reimbursement_method: str | None = None
+    reimbursement_reference: str | None = None
+    reimbursement_notes: str | None = None
+    reimbursed_amount: float | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -258,6 +274,47 @@ class ExpenseUpdate(BaseModel):
 
 class RejectBody(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
+    note: str | None = Field(default=None, max_length=500, description="Alias of reason")
+
+
+class ApproveBody(BaseModel):
+    note: str | None = Field(default=None, max_length=500, description="Optional approval note")
+
+
+class ReimburseBody(BaseModel):
+    payment_method: str = Field(description="cash | bank_transfer | upi | cheque")
+    payment_reference: str | None = Field(default=None, max_length=150, description="UTR / cheque no / txn id")
+    paid_at: datetime | None = Field(default=None, description="Payment date; defaults to now")
+    notes: str | None = Field(default=None, max_length=500)
+    amount: float | None = Field(
+        default=None, gt=0,
+        description="Optional check value. Full reimbursement only: must equal the expense's net_payable.",
+    )
+
+
+class ExpenseAttachmentOut(BaseModel):
+    id: str | None = Field(default=None, description="Stored file id (GET /files/{id})")
+    kind: str = Field(description="receipt | vendor_invoice | supporting_document")
+    url: str | None = None
+    filename: str | None = None
+    mime_type: str | None = None
+    size: int | None = None
+    uploaded_at: datetime | None = None
+    is_image: bool = False
+
+
+class ExpenseHistoryEntry(BaseModel):
+    action: str | None = Field(default=None, description="created | approved | rejected | reimbursed | clarification_requested")
+    title: str | None = None
+    actor_id: str | None = None
+    actor_name: str | None = None
+    at: datetime | None = None
+    note: str | None = None
+
+
+class ExpenseDetailOut(ExpenseOut):
+    attachments: list[ExpenseAttachmentOut] = Field(default_factory=list)
+    history: list[ExpenseHistoryEntry] = Field(default_factory=list)
 
 
 from app.schemas.bulk import BulkDelete, BulkDeleteResult

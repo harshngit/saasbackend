@@ -7,6 +7,15 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 EXPENSE_STATUSES = {"pending", "approved", "rejected", "clarification_requested"}
+# The approved workflow, as clients see it (`Expense.lifecycle_status`):
+#   pending_approval -> approved | rejected ; approved -> reimbursed
+# Stored `status` keeps its original vocabulary (reports, dashboards, the GL and cash
+# reconciliation all read status == "approved"): a reimbursed expense stays
+# status "approved" with reimbursed_at set, and clarification_requested is a
+# sub-state of pending_approval.
+EXPENSE_LIFECYCLE_STATUSES = ("pending_approval", "approved", "rejected", "reimbursed")
+# Canonical reimbursement payment methods (same keys as the rest of the payments code).
+EXPENSE_REIMBURSEMENT_METHODS = ("cash", "bank_transfer", "upi", "cheque")
 # Suggested categories (free-form; frontend can offer these).
 EXPENSE_CATEGORIES = [
     "Petrol/Diesel", "Food and Travel", "Office Expenses", "Rent", "Utilities",
@@ -40,6 +49,17 @@ class Expense(Base):
     submitted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Approval / rejection / reimbursement audit (set only by the lifecycle actions)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approval_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    rejected_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reimbursed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reimbursed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reimbursement_method: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    reimbursement_reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    reimbursement_notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # Basic Information (Ext)
     expense_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
@@ -101,6 +121,22 @@ class Expense(Base):
         back_populates="expense", cascade="all, delete-orphan", lazy="joined"
     )
     vendor: Mapped["Supplier | None"] = relationship(lazy="joined", primaryjoin="Expense.vendor_id == Supplier.id")  # noqa: F821
+
+    @property
+    def lifecycle_status(self) -> str:
+        if self.status == "approved":
+            return "reimbursed" if self.reimbursed_at is not None else "approved"
+        if self.status == "rejected":
+            return "rejected"
+        return "pending_approval"
+
+    @property
+    def rejection_reason(self) -> str | None:
+        return self.reject_reason if self.status == "rejected" else None
+
+    @property
+    def reimbursed_amount(self) -> float | None:
+        return self.net_payable if self.reimbursed_at is not None else None
 
     @property
     def net_payable(self) -> float:

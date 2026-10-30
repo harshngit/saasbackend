@@ -543,8 +543,14 @@ def post_operational_document(
             return None
 
         amt = round(exp.amount, 2)
-        # If paid: Cr Cash/Bank. If unpaid: Cr Accounts Payable (2010).
-        offset_code = "2010" if exp.payment_status == "unpaid" else ("1010" if (exp.payment_mode or "").lower() == "cash" else "1020")
+        # Approved but not yet reimbursed: the money is owed, not paid -> Cr Accounts
+        # Payable (2010); POST /expenses/{id}/reimburse later settles it
+        # ("expense_reimbursement" below). Already reimbursed when approved (an Admin
+        # recording an expense that was paid up front): Cr Cash/Bank directly.
+        if exp.reimbursed_at is not None:
+            offset_code = _cash_or_bank_code(exp.reimbursement_method or exp.payment_mode)
+        else:
+            offset_code = "2010"
 
         # Dr Operating Expenses (6010)
         # Cr Cash / Bank / AP
@@ -565,4 +571,47 @@ def post_operational_document(
             description=f"Expense {exp.category}",
         )
 
+    elif document_type == "expense_reimbursement":
+        exp = db.get(Expense, document_id)
+        if not exp or exp.organization_id != org_id or exp.status != "approved" or exp.reimbursed_at is None:
+            return None
+        # Settle only what approval accrued to Payable. An expense approved before
+        # accrual existed was posted straight to Cash/Bank, so paying it again here
+        # would take the cash out twice.
+        approval = (
+            db.query(JournalEntry)
+            .filter(
+                JournalEntry.organization_id == org_id,
+                JournalEntry.source_type == "expense",
+                JournalEntry.source_id == exp.id,
+            )
+            .first()
+        )
+        payable = accounts.get("2010")
+        if approval is None or payable is None or not any(
+            line.account_id == payable.id and (line.credit or 0) > 0 for line in approval.lines
+        ):
+            return None
+        amt = round(exp.amount, 2)
+        return create_journal_entry(
+            db=db,
+            org_id=org_id,
+            effective_date=exp.reimbursed_at,
+            lines=[
+                {"account_code": "2010", "debit": amt, "credit": 0.0, "description": f"Expense reimbursed: {exp.category}"},
+                {"account_code": _cash_or_bank_code(exp.reimbursement_method), "debit": 0.0, "credit": amt,
+                 "description": f"Expense reimbursement paid ({exp.reimbursement_method})"},
+            ],
+            entry_type="expense",
+            reference=exp.expense_number or exp.category,
+            source_type="expense_reimbursement",
+            source_id=exp.id,
+            description=f"Expense {exp.expense_number or exp.category} reimbursed",
+        )
+
     return None
+
+
+def _cash_or_bank_code(method: str | None) -> str:
+    """Cash on Hand (1010) for cash, the Operating Bank Account (1020) otherwise."""
+    return "1010" if (method or "").strip().lower() == "cash" else "1020"
