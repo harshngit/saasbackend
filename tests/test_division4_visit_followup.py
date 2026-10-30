@@ -32,10 +32,12 @@ os.environ["DATABASE_URL"] = "sqlite:///./crm_saas.db"
 os.environ["TESTING"] = "1"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.core.database import Base, engine, get_db
+from app.core.database import Base, engine, get_db, SessionLocal
 from app.main import app
-from app.models import Customer, FollowUp, Lead, Product, Role, SalesOrder, User, Visit
+from app.models import Customer, FollowUp, Lead, Organization, Plan, Product, Role, SalesOrder, User, Visit
+from app.seed import main as seed_main
 
+seed_main()
 client = TestClient(app)
 
 PASSED = 0
@@ -52,6 +54,12 @@ def log_test(name: str, condition: bool, extra: str = ""):
         print(f"  FAIL  {name} {extra}".rstrip())
 
 
+def _items(data):
+    if isinstance(data, dict) and "items" in data:
+        return data["items"]
+    return data
+
+
 def _register_org(label: str):
     clean_label = label.replace("_", "").lower()
     email = f"admin_{uuid.uuid4().hex[:8]}@{clean_label}.com"
@@ -66,6 +74,13 @@ def _register_org(label: str):
         },
     )
     assert r.status_code == 201, r.text
+    org_id = r.json()["user"]["organization_id"]
+    s = SessionLocal()
+    ent_plan = s.query(Plan).filter(Plan.name == "Enterprise").first()
+    if ent_plan:
+        s.query(Organization).filter(Organization.id == org_id).update({"plan_id": ent_plan.id})
+        s.commit()
+    s.close()
     token = r.json()["tokens"]["access_token"]
     return {"Authorization": f"Bearer {token}"}
 
@@ -218,7 +233,7 @@ def run_all_tests():
     print("\n--- TEST 3: Visit List & Filtering ---")
     r_list = client.get(f"/visits?customer_id={cust_a_id}", headers=sales_auth)
     log_test("GET /visits?customer_id={id} succeeds", r_list.status_code == 200)
-    visits_list = r_list.json()
+    visits_list = _items(r_list.json())
     log_test("Returns list with 1 visit", len(visits_list) == 1)
     log_test("Returned visit ID matches", visits_list[0]["id"] == visit_id)
 
@@ -341,11 +356,36 @@ def run_all_tests():
     log_test("GET /customers/{id}/visits succeeds (HTTP 200)", r_cust_visits.status_code == 200)
     cust_visits = r_cust_visits.json()
     log_test("Customer has 2 visits recorded", len(cust_visits) == 2)
+    log_test("Visits return list of VisitOut", isinstance(cust_visits, list))
+    if cust_visits:
+        log_test("Visit fields include nullable and optional attributes", "purpose" in cust_visits[0] and "notes" in cust_visits[0])
+
+    # Customer with no visits returns empty list
+    r_no_visits = client.post("/customers", json={"name": "Customer With No Visits"}, headers=admin_auth)
+    no_visit_cust_id = r_no_visits.json()["id"]
+    r_empty_visits = client.get(f"/customers/{no_visit_cust_id}/visits", headers=admin_auth)
+    log_test("Customer with no visits returns HTTP 200", r_empty_visits.status_code == 200)
+    log_test("Customer with no visits returns empty list", r_empty_visits.json() == [])
+
+    # Invalid customer ID and nonexistent customer return 404
+    r_invalid_cid = client.get("/customers/invalid-uuid-format/visits", headers=admin_auth)
+    log_test("Invalid customer ID returns 404", r_invalid_cid.status_code == 404)
+    r_nonexistent_cid = client.get("/customers/00000000-0000-0000-0000-000000000000/visits", headers=admin_auth)
+    log_test("Nonexistent customer returns 404", r_nonexistent_cid.status_code == 404)
+
+    # Unauthorized requests return 401/403
+    r_unauth = client.get(f"/customers/{cust_a_id}/visits")
+    log_test("Unauthorized request returns 401 or 403", r_unauth.status_code in (401, 403))
 
     r_cust_fus = client.get(f"/customers/{cust_a_id}/follow-ups", headers=sales_auth)
     log_test("GET /customers/{id}/follow-ups succeeds (HTTP 200)", r_cust_fus.status_code == 200)
     cust_fus = r_cust_fus.json()
     log_test("Customer has 3 follow-ups recorded", len(cust_fus) == 3)
+    log_test("Follow-ups return list of FollowUpOut", isinstance(cust_fus, list))
+
+    r_empty_fus = client.get(f"/customers/{no_visit_cust_id}/follow-ups", headers=admin_auth)
+    log_test("Customer with no follow-ups returns HTTP 200", r_empty_fus.status_code == 200)
+    log_test("Customer with no follow-ups returns empty list", r_empty_fus.json() == [])
 
     # ----------------------------------------------------
     # TEST 10: Visit & Follow-Up Integrity After Later Sales Order
@@ -663,16 +703,18 @@ def run_visit_lifecycle_ownership_tests():
     log_test("visit.user_id defaults to assigned Sales Officer A", v8_data["user_id"] == so_a["id"])
 
     r_own = client.get(f"/visits?lead_id={lead_id}", headers=so_a_auth)
+    own_items = _items(r_own.json())
     log_test(
         "Sales Officer A (data_scope=own) sees the visit",
-        r_own.status_code == 200 and any(x["id"] == v8_data["id"] for x in r_own.json()),
+        r_own.status_code == 200 and any(x["id"] == v8_data["id"] for x in own_items),
         r_own.text,
     )
 
     r_other = client.get(f"/visits?lead_id={lead_id}", headers=so_x_auth)
+    other_items = _items(r_other.json())
     log_test(
         "Unrelated Sales Officer X does NOT see the visit",
-        r_other.status_code == 200 and not any(x["id"] == v8_data["id"] for x in r_other.json()),
+        r_other.status_code == 200 and not any(x["id"] == v8_data["id"] for x in other_items),
         r_other.text,
     )
 
@@ -722,7 +764,7 @@ def run_visit_lifecycle_ownership_tests():
     log_test("POST /follow-ups with lead_id still works", r.status_code == 201, r.text)
 
     r = client.get(f"/follow-ups?lead_id={lead_id}", headers=admin_auth)
-    log_test("GET /follow-ups?lead_id= still works", r.status_code == 200 and len(r.json()) >= 1, r.text)
+    log_test("GET /follow-ups?lead_id= still works", r.status_code == 200 and len(_items(r.json())) >= 1, r.text)
 
     r = client.post(
         f"/visits/{v_id}/follow-ups",

@@ -739,7 +739,8 @@ def list_customer_visits(
 ):
     customer = _owned_customer(db, customer_id, user)
     from app.services import visit_service
-    return visit_service.list_visits(db, _org_id(user), user, customer_id=customer.id)
+    res = visit_service.list_visits(db, _org_id(user), user, customer_id=customer.id, page_size=100)
+    return res.items
 
 
 @router.get("/{customer_id}/follow-ups", response_model=list[FollowUpOut])
@@ -750,5 +751,6 @@ def list_customer_follow_ups(
 ):
     customer = _owned_customer(db, customer_id, user)
     from app.services import follow_up_service
-    return follow_up_service.list_follow_ups(db, _org_id(user), user, customer_id=customer.id)
+    res = follow_up_service.list_follow_ups(db, _org_id(user), user, customer_id=customer.id, page_size=100)
+    return res.items
 
