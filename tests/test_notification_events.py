@@ -198,6 +198,97 @@ def test_follow_up_reminder_skips_inactive_or_foreign_assignees(db):
     assert _inbox(db, f.sales2) == [] and _inbox(db, other.sales) == []
 
 
+def test_follow_up_reminder_settings_are_read_from_the_environment(monkeypatch):
+    from app.core.config import Settings
+
+    defaults = Settings(_env_file=None)
+    assert (defaults.follow_up_reminders_enabled, defaults.follow_up_reminder_interval_seconds,
+            defaults.follow_up_due_lead_minutes, defaults.follow_up_overdue_after_minutes,
+            defaults.follow_up_overdue_lookback_days) == (True, 300, 30, 60, 7)
+    for name, value in {"FOLLOW_UP_REMINDERS_ENABLED": "false", "FOLLOW_UP_REMINDER_INTERVAL_SECONDS": "900",
+                        "FOLLOW_UP_DUE_LEAD_MINUTES": "15", "FOLLOW_UP_OVERDUE_AFTER_MINUTES": "120",
+                        "FOLLOW_UP_OVERDUE_LOOKBACK_DAYS": "3"}.items():
+        monkeypatch.setenv(name, value)
+    loaded = Settings(_env_file=None)
+    assert (loaded.follow_up_reminders_enabled, loaded.follow_up_reminder_interval_seconds,
+            loaded.follow_up_due_lead_minutes, loaded.follow_up_overdue_after_minutes,
+            loaded.follow_up_overdue_lookback_days) == (False, 900, 15, 120, 3)
+
+
+def test_background_sweep_respects_enabled_flag_and_interval(monkeypatch):
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, args, name, daemon):
+            started.append(args[0])
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(reminder_service.threading, "Thread", FakeThread)
+    monkeypatch.setattr(reminder_service, "_thread", None)
+    monkeypatch.setattr(reminder_service.settings, "follow_up_reminders_enabled", False)
+    assert reminder_service.start_background_sweeps() is False and started == []
+
+    monkeypatch.setattr(reminder_service.settings, "follow_up_reminders_enabled", True)
+    monkeypatch.setattr(reminder_service.settings, "follow_up_reminder_interval_seconds", 900)
+    assert reminder_service.start_background_sweeps() is True and started == [900]
+    monkeypatch.setattr(reminder_service.settings, "follow_up_reminder_interval_seconds", 5)
+    reminder_service.start_background_sweeps()
+    assert started[-1] == 30  # clamped: a typo cannot hammer the database
+
+
+def test_reminder_timing_settings_are_respected(db, monkeypatch):
+    f = _firm(db)
+    now = datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(reminder_service.settings, "follow_up_due_lead_minutes", 10)
+    monkeypatch.setattr(reminder_service.settings, "follow_up_overdue_after_minutes", 5)
+    monkeypatch.setattr(reminder_service.settings, "follow_up_overdue_lookback_days", 1)
+    outside_lead = _follow_up(db, f, now + timedelta(minutes=20))   # due-lead is only 10 min
+    inside_lead = _follow_up(db, f, now + timedelta(minutes=8))
+    just_late = _follow_up(db, f, now - timedelta(minutes=6))       # past the 5-min grace
+    too_old = _follow_up(db, f, now - timedelta(days=2))            # beyond the 1-day lookback
+
+    reminder_service.run_follow_up_reminders(db, now)
+    due = {n.data["follow_up_id"] for n in _inbox(db, f.sales, nt.FOLLOW_UP_DUE)}
+    overdue = {n.data["follow_up_id"] for n in _inbox(db, f.sales, nt.FOLLOW_UP_OVERDUE)}
+    assert due == {inside_lead.id} and overdue == {just_late.id}
+    assert outside_lead.id not in due | overdue and too_old.id not in due | overdue
+
+
+def test_reminder_sweep_isolates_failures(db, monkeypatch):
+    f = _firm(db)
+    now = datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
+    bad = _follow_up(db, f, now + timedelta(minutes=5))
+    good = _follow_up(db, f, now + timedelta(minutes=6))
+    real_notify = notification_service.notify
+
+    def flaky(session, user_id, title, body=None, *a, data=None, **k):
+        if data and data.get("follow_up_id") == bad.id:
+            raise RuntimeError("boom")
+        return real_notify(session, user_id, title, body, *a, data=data, **k)
+
+    monkeypatch.setattr(notification_service, "notify", flaky)
+    reminder_service.run_follow_up_reminders(db, now)  # must not raise
+    assert [n.data["follow_up_id"] for n in _inbox(db, f.sales, nt.FOLLOW_UP_DUE)] == [good.id]
+
+    monkeypatch.setattr(notification_service, "notify", real_notify)
+    reminder_service.run_follow_up_reminders(db, now)  # the failed one is retried by the next sweep
+    reminder_service.run_follow_up_reminders(db, now)  # ...and then never sent again
+    assert sorted(n.data["follow_up_id"] for n in _inbox(db, f.sales, nt.FOLLOW_UP_DUE)) == sorted([good.id, bad.id])
+
+
+def test_external_cron_command_runs_one_sweep(monkeypatch, capsys):
+    from app.scripts import send_follow_up_reminders
+
+    monkeypatch.setattr(reminder_service, "run_once", lambda: {"due": 2, "overdue": 1})
+    send_follow_up_reminders.main()
+    assert capsys.readouterr().out.strip() == "Follow-up reminders: 2 due, 1 overdue"
+
+
 # ------------------------------------------------------------------ sales officer: quotations
 
 
