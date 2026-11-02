@@ -140,6 +140,17 @@ class Settings(BaseSettings):
     firebase_service_account_json: str = ""
     firebase_project_id: str = ""
 
+    # Follow-up reminders (in-app + push to the assigned salesperson). An in-process sweep
+    # runs every FOLLOW_UP_REMINDER_INTERVAL_SECONDS; `python -m app.scripts.send_follow_up_reminders`
+    # runs one sweep for an external cron. "Due" is sent from FOLLOW_UP_DUE_LEAD_MINUTES before
+    # the due time; "overdue" once it is FOLLOW_UP_OVERDUE_AFTER_MINUTES past it. Overdue
+    # follow-ups older than FOLLOW_UP_OVERDUE_LOOKBACK_DAYS are not reminded (no backlog flood).
+    follow_up_reminders_enabled: bool = True
+    follow_up_reminder_interval_seconds: int = 300
+    follow_up_due_lead_minutes: int = 30
+    follow_up_overdue_after_minutes: int = 60
+    follow_up_overdue_lookback_days: int = 7
+
     super_admin_email: str = "superadmin@demo.com"
     # No default on purpose: a known password baked into source code would be
     # a working production credential for anyone who reads the repo. Set

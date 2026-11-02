@@ -13,7 +13,7 @@ from app.core import scoping, workflow
 from app.core.workflow import QuotationTransitionError, validate_quotation_transition
 from app.models import Customer, Lead, Product, ProductVariant, Quotation, QuotationItem, User
 from app.schemas.quotation import ConversionOut, ConvertedOrderBrief, ConvertToOrder, QuotationCreate, QuotationUpdate
-from app.services import lookup_service, numbering_service, order_service
+from app.services import lookup_service, notification_service, numbering_service, order_service
 
 
 def _require_quotation_transition(current: str, new: str) -> None:
@@ -335,6 +335,7 @@ def update_quotation(db: Session, org_id: str, quotation_id: str, user: User, pa
         if meaningful and quotation.status in _RESET_TO_DRAFT_FROM:
             data["status"] = "draft"
 
+    previous_status = quotation.status
     items = data.pop("items", None)
     for field, value in data.items():
         setattr(quotation, field, value)
@@ -347,6 +348,7 @@ def update_quotation(db: Session, org_id: str, quotation_id: str, user: User, pa
         db.flush()
         quotation.items.extend(_build_items(db, org_id, payload.items))
 
+    notification_service.notify_quotation_status_changed(db, quotation, previous_status, actor_id=user.id)
     db.commit()
     db.refresh(quotation)
     return quotation

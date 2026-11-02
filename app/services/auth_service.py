@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +12,9 @@ from app.core.database import is_duplicate_email_error
 from app.core.security import as_utc, create_access_token, create_refresh_token, hash_password
 from app.models import OAuthExchangeTicket, OAuthRegistrationTicket, Organization, RefreshToken, User, UserRole
 from app.schemas.auth import AuthResponse, TokenPair
-from app.services import org_service, role_service
+from app.services import notification_service, org_service, role_service
+
+logger = logging.getLogger("crm.auth")
 
 # Registration tickets give a real user time to fill in a form; exchange
 # tickets only ever hand off a redirect, so they stay short-lived (60s).
@@ -242,6 +245,14 @@ def register_organization(
 
     # Auto-seed the 3 default roles (Sales Officer / Delivery Partner / Accountant).
     role_service.seed_default_roles(db, org.id)
+
+    # Tell the platform team. The firm already exists: a failure here is logged, never raised.
+    try:
+        notification_service.notify_organization_created(db, org)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.exception("New-organization notification failed for %s", org.id)
 
     return admin
 

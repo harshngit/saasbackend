@@ -235,6 +235,13 @@ def on_startup() -> None:
         except Exception:  # noqa: BLE001
             _log.exception("Startup seed failed")
 
+    try:
+        from app.services import reminder_service
+
+        reminder_service.start_background_sweeps()
+    except Exception:  # noqa: BLE001
+        _log.exception("Follow-up reminder sweep could not start")
+
     _log.info("CRM API startup complete — build: %s", BUILD_TAG)
 
 

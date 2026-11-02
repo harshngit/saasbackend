@@ -127,7 +127,7 @@ def request_upgrade(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Selected plan does not exist or is no longer available",
         )
-    return org_service.request_upgrade(db, org, plan, payload.billing_cycle)
+    return org_service.request_upgrade(db, org, plan, payload.billing_cycle, actor_id=admin.id)
 
 
 # ------------------------------- Company Settings -------------------------------

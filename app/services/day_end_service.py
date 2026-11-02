@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Delivery, DeliveryCollection, User
 from app.models.delivery_day_end import DAY_END_METHODS, DeliveryDayEnd
-from app.services import activity_service, role_service
+from app.services import activity_service, notification_service, role_service
 from app.services.cash_reconciliation_service import get_business_day_utc_range, normalize_payment_method
 from app.services.report_service import get_org_timezone
 
@@ -267,6 +267,7 @@ def submit(
     day_end.rejection_reason = None
     db.flush()
     _history(db, day_end, user, "submitted", notes)
+    notification_service.notify_day_end_submitted(db, day_end, user)
     return day_end
 
 
@@ -300,6 +301,7 @@ def approve(db: Session, user: User, day_end: DeliveryDayEnd, note: str | None) 
     day_end.review_note = note
     db.flush()
     _history(db, day_end, user, "approved", note)
+    notification_service.notify_day_end_decided(db, day_end, actor_id=user.id)
     return day_end
 
 
@@ -316,6 +318,7 @@ def reject(db: Session, user: User, day_end: DeliveryDayEnd, reason: str | None)
     day_end.rejection_reason = reason.strip()
     db.flush()
     _history(db, day_end, user, "rejected", day_end.rejection_reason)
+    notification_service.notify_day_end_decided(db, day_end, actor_id=user.id)
     return day_end
 
 

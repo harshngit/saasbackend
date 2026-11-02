@@ -379,6 +379,7 @@ def move_tracked(
     )
     if row is None:
         row = _row(db, org_id, warehouse_id, product_id, variant_id)
+    before = row.on_hand_quantity or 0
     row.on_hand_quantity = round((row.on_hand_quantity or 0) + delta, 3)
     # This session runs with autoflush off, so the new figure has to be written
     # before the sum below can see it — otherwise the catalog counter is set from
@@ -405,6 +406,7 @@ def move_tracked(
         db, org_id, warehouse_id, product_id, variant_id, delta,
         batch=batch, serial_numbers=serial_numbers,
     )
+    available_now = available(db, warehouse_id, product_id, variant_id)
     queue_event(
         db,
         org_id=org_id,
@@ -414,10 +416,16 @@ def move_tracked(
             "variant_id": variant_id,
             "warehouse_id": warehouse_id,
             "on_hand_quantity": row.on_hand_quantity,
-            "available_quantity": available(db, warehouse_id, product_id, variant_id),
+            "available_quantity": available_now,
         },
         required_permission="inventory:view",
     )
+    if delta < 0:  # only an outbound move can cross into low / out of stock
+        from app.services import notification_service
+
+        notification_service.notify_stock_transition(
+            db, org_id, warehouse_id, product_id, variant_id, before, row.on_hand_quantity, available_now,
+        )
     return row.on_hand_quantity, snapshot
 
 

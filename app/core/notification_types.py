@@ -21,6 +21,22 @@ PAYMENT_RECEIVED = "payment_received"
 EXPENSE_CREATED = "expense_created"
 EXPENSE_CLARIFICATION_REQUESTED = "expense_clarification_requested"
 LEAVE_STATUS_CHANGED = "leave_status_changed"
+# Sales officer
+LEAD_ASSIGNED = "lead_assigned"
+FOLLOW_UP_DUE = "follow_up_due"
+FOLLOW_UP_OVERDUE = "follow_up_overdue"
+QUOTATION_STATUS_CHANGED = "quotation_status_changed"
+# Expense lifecycle (status: approved / rejected / reimbursed)
+EXPENSE_STATUS_CHANGED = "expense_status_changed"
+EXPENSE_READY_FOR_REIMBURSEMENT = "expense_ready_for_reimbursement"
+# Delivery Day-End
+DAY_END_SUBMITTED = "day_end_submitted"
+DAY_END_STATUS_CHANGED = "day_end_status_changed"
+# Inventory (status: low_stock / out_of_stock)
+STOCK_ALERT = "stock_alert"
+# Platform scope: addressed to platform users (no organization), never to a tenant feed.
+ORGANIZATION_CREATED = "organization_created"
+UPGRADE_REQUESTED = "upgrade_requested"
 
 # event -> in-app `type` (category). Existing categories are kept exactly as before.
 EVENT_CATEGORY: dict[str, str] = {
@@ -35,7 +51,26 @@ EVENT_CATEGORY: dict[str, str] = {
     EXPENSE_CREATED: "expense",
     EXPENSE_CLARIFICATION_REQUESTED: "expense",
     LEAVE_STATUS_CHANGED: "leave",
+    LEAD_ASSIGNED: "lead",
+    FOLLOW_UP_DUE: "follow_up",
+    FOLLOW_UP_OVERDUE: "follow_up",
+    QUOTATION_STATUS_CHANGED: "quotation",
+    EXPENSE_STATUS_CHANGED: "expense",
+    EXPENSE_READY_FOR_REIMBURSEMENT: "expense",
+    DAY_END_SUBMITTED: "day_end",
+    DAY_END_STATUS_CHANGED: "day_end",
+    STOCK_ALERT: "inventory",
+    ORGANIZATION_CREATED: "platform",
+    UPGRADE_REQUESTED: "platform",
 }
+
+# Events addressed to platform users. Their notifications carry organization_id = NULL,
+# so they can never appear in -- or be counted against -- a tenant's notifications.
+PLATFORM_EVENTS = frozenset({ORGANIZATION_CREATED, UPGRADE_REQUESTED})
+
+# Keys any event may carry: who acted (a user id), and -- for an event whose subject can
+# vary -- nothing else. Everything else is per event, below.
+COMMON_DATA_KEYS: tuple[str, ...] = ("actor_id",)
 
 # The identifier keys an event may carry in `data` (besides "event" and "status").
 EVENT_DATA_KEYS: dict[str, tuple[str, ...]] = {
@@ -49,9 +84,86 @@ EVENT_DATA_KEYS: dict[str, tuple[str, ...]] = {
     EXPENSE_CREATED: ("expense_id",),
     EXPENSE_CLARIFICATION_REQUESTED: ("expense_id",),
     LEAVE_STATUS_CHANGED: ("leave_id", "status"),
+    LEAD_ASSIGNED: ("lead_id",),
+    FOLLOW_UP_DUE: ("follow_up_id", "lead_id", "customer_id"),
+    FOLLOW_UP_OVERDUE: ("follow_up_id", "lead_id", "customer_id"),
+    QUOTATION_STATUS_CHANGED: ("quotation_id", "status"),
+    EXPENSE_STATUS_CHANGED: ("expense_id", "status"),
+    EXPENSE_READY_FOR_REIMBURSEMENT: ("expense_id",),
+    # has_variance: "true" when the handed-over total differs from the expected total.
+    DAY_END_SUBMITTED: ("day_end_id", "delivery_partner_id", "has_variance"),
+    DAY_END_STATUS_CHANGED: ("day_end_id", "status"),
+    STOCK_ALERT: ("product_id", "variant_id", "warehouse_id", "status"),
+    ORGANIZATION_CREATED: ("target_organization_id",),
+    UPGRADE_REQUESTED: ("target_organization_id", "upgrade_request_id"),
 }
 
 ALL_EVENTS = frozenset(EVENT_CATEGORY)
+
+
+# What a notification is about, and where it opens. Derived from the event and its stored
+# identifiers when a notification is read (never stored), so rows written before these
+# fields existed get them too. action_url is the REST resource path of the subject; each
+# client maps it to its own screen.
+#   event -> (entity_type, id key in data, action_url template)
+_ENTITY: dict[str, tuple[str, str, str]] = {
+    ORDER_CREATED: ("sales_order", "order_id", "/sales-orders/{id}"),
+    ORDER_CONFIRMED: ("sales_order", "order_id", "/sales-orders/{id}"),
+    ORDER_STATUS_CHANGED: ("sales_order", "order_id", "/sales-orders/{id}"),
+    DELIVERY_ASSIGNED: ("delivery", "delivery_id", "/deliveries/{id}"),
+    DELIVERY_REJECTED: ("delivery", "delivery_id", "/deliveries/{id}"),
+    DELIVERY_STATUS_CHANGED: ("delivery", "delivery_id", "/deliveries/{id}"),
+    EXPENSE_CREATED: ("expense", "expense_id", "/expenses/{id}"),
+    EXPENSE_CLARIFICATION_REQUESTED: ("expense", "expense_id", "/expenses/{id}"),
+    EXPENSE_STATUS_CHANGED: ("expense", "expense_id", "/expenses/{id}"),
+    EXPENSE_READY_FOR_REIMBURSEMENT: ("expense", "expense_id", "/expenses/{id}"),
+    LEAVE_STATUS_CHANGED: ("leave", "leave_id", "/leaves/{id}"),
+    LEAD_ASSIGNED: ("lead", "lead_id", "/leads/{id}"),
+    FOLLOW_UP_DUE: ("follow_up", "follow_up_id", "/follow-ups/{id}"),
+    FOLLOW_UP_OVERDUE: ("follow_up", "follow_up_id", "/follow-ups/{id}"),
+    QUOTATION_STATUS_CHANGED: ("quotation", "quotation_id", "/quotations/{id}"),
+    DAY_END_SUBMITTED: ("day_end", "day_end_id", "/delivery-day-ends/{id}"),
+    DAY_END_STATUS_CHANGED: ("day_end", "day_end_id", "/delivery-day-ends/{id}"),
+    STOCK_ALERT: ("product", "product_id", "/warehouses/stock?warehouse_id={warehouse_id}&product_id={id}"),
+    ORGANIZATION_CREATED: ("organization", "target_organization_id", "/superadmin/organizations/{id}"),
+}
+
+
+def describe(data: dict | None) -> dict[str, str | None]:
+    """{entity_type, entity_id, action_url} for a notification's stored data (all None
+    when the event has no subject, e.g. push_test)."""
+    data = data or {}
+    event = data.get("event")
+    out: dict[str, str | None] = {"entity_type": None, "entity_id": None, "action_url": None}
+    if event == PAYMENT_RECEIVED:
+        # The invoice when the payment settled one, otherwise the receipt itself.
+        if data.get("invoice_id"):
+            return {"entity_type": "invoice", "entity_id": data["invoice_id"],
+                    "action_url": f"/invoices/{data['invoice_id']}"}
+        if data.get("payment_id"):
+            return {"entity_type": "payment_receipt", "entity_id": data["payment_id"],
+                    "action_url": f"/payment-receipts/{data['payment_id']}"}
+        return out
+    if event == UPGRADE_REQUESTED:
+        # A platform-staff request has its own record; an org admin's request lives on
+        # the organization (approved from /superadmin/organizations/{id}/approve-upgrade).
+        if data.get("upgrade_request_id"):
+            return {"entity_type": "upgrade_request", "entity_id": data["upgrade_request_id"],
+                    "action_url": f"/platform/upgrade-requests/{data['upgrade_request_id']}"}
+        if data.get("target_organization_id"):
+            return {"entity_type": "organization", "entity_id": data["target_organization_id"],
+                    "action_url": f"/superadmin/organizations/{data['target_organization_id']}"}
+        return out
+    if event == DAY_END_STATUS_CHANGED and data.get("status") == "rejected":
+        # The partner goes back to Close My Day to correct and resubmit.
+        return {"entity_type": "day_end", "entity_id": data.get("day_end_id"),
+                "action_url": "/delivery-day-ends/current"}
+    spec = _ENTITY.get(event or "")
+    if spec is None or not data.get(spec[1]):
+        return out
+    entity_type, key, template = spec
+    url = template.replace("{id}", data[key]).replace("{warehouse_id}", data.get("warehouse_id", ""))
+    return {"entity_type": entity_type, "entity_id": data[key], "action_url": url}
 
 
 def build_data(event: str, **ids) -> dict[str, str]:
@@ -59,7 +171,7 @@ def build_data(event: str, **ids) -> dict[str, str]:
     keys are rejected so nothing beyond the documented identifiers can slip in."""
     if event not in ALL_EVENTS:
         raise ValueError(f"unknown notification event '{event}'")
-    allowed = set(EVENT_DATA_KEYS.get(event, ()))
+    allowed = set(EVENT_DATA_KEYS.get(event, ())) | set(COMMON_DATA_KEYS)
     unknown = set(ids) - allowed
     if unknown:
         raise ValueError(f"data keys {sorted(unknown)} are not part of the '{event}' contract")

@@ -39,7 +39,6 @@ from app.schemas.payment_gateway import (
     PaymentGatewayOut,
     REQUIRED_WEBHOOK_EVENTS,
 )
-from app.core import notification_types as nt
 from app.services import activity_service, notification_service, payment_service
 
 logger = logging.getLogger("crm.invoice_payment_link")
@@ -530,14 +529,11 @@ def record_online_payment(
         )
 
         # 4. In-App Notification to Org Admins
-        notification_service.notify_org_admins(
-            db,
-            organization_id=link.organization_id,
-            title=f"₹{amount_inr:,.2f} received for Invoice #{invoice.invoice_number} via Razorpay",
-            body=f"Payment ID: {razorpay_payment_id}",
-            type="success",
+        notification_service.notify_payment_received(
+            db, payment, invoice,
+            admin_title=f"₹{amount_inr:,.2f} received for Invoice #{invoice.invoice_number} via Razorpay",
+            admin_body=f"Payment ID: {razorpay_payment_id}",
             link=f"/invoices/{invoice.id}",
-            data=nt.build_data(nt.PAYMENT_RECEIVED, payment_id=payment.id, invoice_id=invoice.id),
         )
 
         db.commit()

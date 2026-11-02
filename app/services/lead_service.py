@@ -13,7 +13,7 @@ from app.core import scoping
 from app.core.workflow import LEAD_STATUSES, LeadTransitionError, validate_lead_transition
 from app.models import Customer, FollowUp, Lead, LeadInterestedProduct, Product, Quotation, Role, User, Visit
 from app.schemas.lead import LeadConvertToCustomerIn, LeadCreate, LeadUpdate
-from app.services import entitlement_service, lookup_service, numbering_service, role_service
+from app.services import entitlement_service, lookup_service, notification_service, numbering_service, role_service
 
 
 def _require_manual_transition(current: str | None, new: str) -> None:
@@ -235,6 +235,8 @@ def create_lead(db: Session, org_id: str, user: User, payload: LeadCreate) -> Le
         _sync_interested_products(db, org_id, lead, payload.interested_product_ids)
 
     db.add(lead)
+    db.flush()
+    notification_service.notify_lead_assigned(db, lead, None, actor_id=user.id)
     db.commit()
     db.refresh(lead)
     return lead
@@ -356,6 +358,7 @@ def update_lead(db: Session, org_id: str, lead_id: str, user: User, payload: Lea
         _require_manual_transition(lead.lead_status, new_status)
 
     assignee_touched = "assigned_salesperson_id" in data or "assigned_sales_officer_id" in data
+    previous_assignee_id = lead.assigned_salesperson_id
     new_assignee = data.get("assigned_salesperson_id") or data.get("assigned_sales_officer_id")
     if assignee_touched:
         # An "own"-scope role may not hand their Lead to someone else.
@@ -385,6 +388,8 @@ def update_lead(db: Session, org_id: str, lead_id: str, user: User, payload: Lea
     if product_ids_touched:
         _sync_interested_products(db, org_id, lead, new_product_ids or [])
 
+    if assignee_touched:
+        notification_service.notify_lead_assigned(db, lead, previous_assignee_id, actor_id=user.id)
     db.commit()
     db.refresh(lead)
     return lead

@@ -204,6 +204,7 @@ def create_expense(
                 "Recorded as already paid at creation", None,
             )
         expense_service._post_gl(db, expense, "expense")
+        notification_service.notify_expense_status_changed(db, expense, actor_id=user.id)
     else:
         notification_service.notify_org_admins(
             db, expense.organization_id, "New expense submitted",
@@ -420,6 +421,7 @@ def approve_expense(
     # deliberately org-wide regardless of the reviewer's own data scope.
     expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
     expense_service.approve(db, expense, user, payload.note if payload else None)
+    notification_service.notify_expense_status_changed(db, expense, actor_id=user.id)
     db.commit()
     db.refresh(expense)
     return expense
@@ -440,6 +442,7 @@ def reject_expense(
     # deliberately org-wide regardless of the reviewer's own data scope.
     expense = _owned(db, expense_id, _org_id(user), user, enforce_scope=False)
     expense_service.reject(db, expense, user, payload.reason or payload.note)
+    notification_service.notify_expense_status_changed(db, expense, actor_id=user.id)
     db.commit()
     db.refresh(expense)
     return expense
@@ -463,6 +466,7 @@ def reimburse_expense(
         payment_method=payload.payment_method, amount=payload.amount,
         payment_reference=payload.payment_reference, notes=payload.notes, paid_at=payload.paid_at,
     )
+    notification_service.notify_expense_status_changed(db, expense, actor_id=user.id)
     db.commit()
     db.refresh(expense)
     return expense

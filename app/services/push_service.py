@@ -281,6 +281,11 @@ def push_data(notification: Notification) -> dict[str, str]:
     }
     if notification.link:
         data["link"] = notification.link
+    from app.core import notification_types as nt
+
+    for key, value in nt.describe(notification.data).items():  # entity_type, entity_id, action_url
+        if value:
+            data[key] = value
     return {k: v for k, v in data.items() if v != ""}
 
 

@@ -83,12 +83,27 @@ def apply_trial_expiry(db: Session, org: Organization | None) -> Organization | 
     return org
 
 
-def request_upgrade(db: Session, org: Organization, plan: Plan, billing_cycle: BillingCycle) -> Organization:
+def request_upgrade(db: Session, org: Organization, plan: Plan, billing_cycle: BillingCycle,
+                    actor_id: str | None = None) -> Organization:
+    # Re-sending the same pending request (a retry, a double click) changes nothing the
+    # platform team needs to hear about again.
+    unchanged = (
+        org.upgrade_status == UpgradeStatus.PENDING.value
+        and org.requested_plan_id == plan.id
+        and org.billing_cycle == billing_cycle.value
+    )
     org.requested_plan_id = plan.id
     org.billing_cycle = billing_cycle.value
     org.upgrade_status = UpgradeStatus.PENDING.value
-    org.upgrade_requested_at = datetime.now(timezone.utc)
+    if not unchanged or org.upgrade_requested_at is None:
+        org.upgrade_requested_at = datetime.now(timezone.utc)
     org.upgrade_reject_reason = None
+    if not unchanged:
+        from app.services import notification_service
+
+        notification_service.notify_upgrade_requested(
+            db, org, plan.name, requested_at=org.upgrade_requested_at, actor_id=actor_id,
+        )
     db.commit()
     db.refresh(org)
     return org

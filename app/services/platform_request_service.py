@@ -20,7 +20,7 @@ from app.models import (
     UpgradeStatus,
     User,
 )
-from app.services import activity_service
+from app.services import activity_service, notification_service
 
 PENDING, APPROVED, REJECTED = "pending", "approved", "rejected"
 _EFFECT = {"unlock": "ALLOW", "restrict": "BLOCK"}
@@ -91,6 +91,8 @@ def create_upgrade_request(
         requested_by_user_id=caller.id,
     )
     db.add(request)
+    db.flush()
+    notification_service.notify_upgrade_requested(db, org, plan.name, request_id=request.id, actor_id=caller.id)
     db.commit()
     db.refresh(request)
     return request

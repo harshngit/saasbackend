@@ -814,7 +814,8 @@ def test_manual_payment_receipt_notifies_other_admins(db_session):
     rows = db_session.query(Notification).filter(
         Notification.organization_id == recorder.organization_id, Notification.title == "Payment received").all()
     assert [r.user_id for r in rows] == [other_admin.id]
-    assert rows[0].data == {"event": "payment_received", "payment_id": res.json()["id"]}
+    assert rows[0].data == {"event": "payment_received", "payment_id": res.json()["id"],
+                            "actor_id": recorder.id}
 
 
 def test_notifications_migration_up_and_down(tmp_path):
