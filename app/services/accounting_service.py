@@ -123,6 +123,7 @@ DEFAULT_CHART_OF_ACCOUNTS = [
     # 4. Income Statement Accounts (Revenue & Expenses for transactional ledger)
     {"account_code": "4010", "name": "Sales Revenue", "account_type": "revenue", "classification": "operating_revenue", "is_system": True},
     {"account_code": "4020", "name": "Sales Returns & Allowances", "account_type": "revenue", "classification": "contra_revenue", "is_system": True},
+    {"account_code": "4030", "name": "Discount Allowed", "account_type": "revenue", "classification": "contra_revenue", "is_system": True},
     {"account_code": "5010", "name": "Cost of Goods Sold", "account_type": "expense", "classification": "cogs", "is_system": True},
     {"account_code": "6010", "name": "Operating Expenses", "account_type": "expense", "classification": "operating_expense", "is_system": True},
 ]
@@ -455,18 +456,31 @@ def post_operational_document(
         total = round(inv.total, 2)
         subtotal = round(inv.subtotal, 2)
         tax = round(inv.tax or 0.0, 2)
+        discount = round(inv.discount or 0.0, 2)
+        charges = round(inv.additional_charges or 0.0, 2)
+        round_off = round(inv.round_off or 0.0, 2)
         if total <= 0:
             return None
 
+        # The invoice total is subtotal - discount + tax + additional charges + round off
+        # (line discounts are already netted into the subtotal), so each part is posted:
         # Dr Accounts Receivable (1200) for total
-        # Cr Sales Revenue (4010) for subtotal
+        # Dr Discount Allowed (4030) for the invoice-level discount
+        # Cr Sales Revenue (4010) for subtotal, and for additional charges / round off
         # Cr GST Output Payable (2100) for tax
         lines = [
             {"account_code": "1200", "debit": total, "credit": 0.0, "description": f"Invoice {inv.invoice_number}"},
             {"account_code": "4010", "debit": 0.0, "credit": subtotal, "description": f"Invoice {inv.invoice_number} Revenue"},
         ]
+        if discount > 0:
+            lines.append({"account_code": "4030", "debit": discount, "credit": 0.0, "description": f"Invoice {inv.invoice_number} Discount"})
         if tax > 0:
             lines.append({"account_code": "2100", "debit": 0.0, "credit": tax, "description": f"Invoice {inv.invoice_number} Output GST"})
+        # Signed amounts: a negative charge or round off reduces revenue instead.
+        for amount, label in ((charges, "Additional Charges"), (round_off, "Round Off")):
+            if amount:
+                lines.append({"account_code": "4010", "debit": max(-amount, 0.0), "credit": max(amount, 0.0),
+                              "description": f"Invoice {inv.invoice_number} {label}"})
 
         return create_journal_entry(
             db=db,

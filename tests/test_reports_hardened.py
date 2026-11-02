@@ -2562,7 +2562,8 @@ def test_profit_loss_summary_and_phase1_exports_unbroken(client, pl_statement_da
 def test_chart_of_accounts_and_journal_double_entry_validation(db, test_data):
     org = test_data["org"]
     accounts = accounting_service.ensure_default_accounts(db, org.id)
-    assert len(accounts) == 14
+    assert len(accounts) == 15
+    assert "4030" in accounts  # Discount Allowed (contra revenue)
     assert "1010" in accounts
     assert "1200" in accounts
     assert "2010" in accounts
@@ -3134,6 +3135,46 @@ def test_operational_workflow_posting_invoice_payment_void(db):
     )
     assert reversal_entry is not None
     assert reversal_entry.status == "posted"
+
+
+@pytest.mark.parametrize(
+    "subtotal, discount, tax, charges, round_off, expected",
+    [
+        # Three products, ₹10 invoice discount, no tax: Dr AR 10168 + Dr Discount 10 = Cr Revenue 10178
+        (10178.0, 10.0, 0.0, None, None, {"1200": [("10168.00", "0.00")], "4030": [("10.00", "0.00")],
+                                          "4010": [("0.00", "10178.00")]}),
+        # Discount with GST: the discount is posted once and GST stays as billed
+        (1000.0, 50.0, 180.0, None, None, {"1200": [("1130.00", "0.00")], "4030": [("50.00", "0.00")],
+                                           "4010": [("0.00", "1000.00")], "2100": [("0.00", "180.00")]}),
+        # Zero discount: no discount line at all
+        (1000.0, 0.0, 180.0, None, None, {"1200": [("1180.00", "0.00")], "4010": [("0.00", "1000.00")],
+                                          "2100": [("0.00", "180.00")]}),
+        # Additional charges and a negative round off are part of the total too
+        (999.0, 9.5, 0.0, 50.0, -0.5, {"1200": [("1039.00", "0.00")], "4030": [("9.50", "0.00")],
+                                       "4010": [("0.00", "999.00"), ("0.00", "50.00"), ("0.50", "0.00")]}),
+    ],
+)
+def test_invoice_posting_balances_discount_tax_charges_and_round_off(
+    db, subtotal, discount, tax, charges, round_off, expected
+):
+    org = Organization(id=str(uuid.uuid4()), name="Discount Org",
+                       company_code=f"CMP-{uuid.uuid4().int % 90000 + 10000}", timezone="Asia/Kolkata")
+    db.add(org)
+    db.commit()
+    total = round(subtotal - discount + tax + (charges or 0) + (round_off or 0), 2)
+    inv = Invoice(id=str(uuid.uuid4()), organization_id=org.id, invoice_number=f"INV-D-{uuid.uuid4().hex[:6]}",
+                  subtotal=subtotal, discount=discount, tax=tax, additional_charges=charges, round_off=round_off,
+                  total=total, amount_paid=0.0, status="unpaid", is_credit_note=False,
+                  invoice_date=datetime(2026, 3, 1, tzinfo=timezone.utc))
+    db.add(inv)
+    db.commit()
+
+    entry = accounting_service.post_operational_document(db, org.id, "invoice", inv.id)
+    assert sum(l.debit for l in entry.lines) == sum(l.credit for l in entry.lines)
+    by_code: dict[str, list] = {}
+    for line in sorted(entry.lines, key=lambda l: l.line_number):
+        by_code.setdefault(line.account.account_code, []).append((f"{line.debit:.2f}", f"{line.credit:.2f}"))
+    assert by_code == expected
 
 
 def test_operational_workflow_posting_expense_and_sales_return(db):
