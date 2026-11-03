@@ -80,6 +80,24 @@ def push_status() -> dict:
     return {"enabled": True, "configured": True, "project_id": info["project_id"], "error": None}
 
 
+def log_startup_status() -> None:
+    """One line at startup saying whether push will go out (no secrets). A disabled or broken
+    setup is a warning: with push off, business events queue no push and log nothing else."""
+    status = push_status()
+    if not status["enabled"]:
+        logger.warning("push: disabled (PUSH_NOTIFICATIONS_ENABLED is not true); no push notifications will be sent")
+        return
+    if not status["configured"]:
+        logger.warning("push: enabled but not configured (%s); no push notifications will be sent", status["error"])
+        return
+    try:
+        import firebase_admin  # noqa: F401
+    except ImportError:
+        logger.warning("push: enabled but the firebase-admin package is not installed; no push notifications will be sent")
+        return
+    logger.info("push: enabled for Firebase project %s", status["project_id"])
+
+
 def get_app():
     """The process-wide Firebase app, created on first use from the explicit certificate."""
     global _app

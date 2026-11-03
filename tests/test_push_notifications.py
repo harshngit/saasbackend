@@ -6,6 +6,7 @@ messaging call is mocked."""
 
 import base64
 import json
+import logging
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -140,6 +141,26 @@ def test_disabled_and_misconfigured_states(push_disabled, monkeypatch):
     assert status_["enabled"] and not status_["configured"] and "not set" in status_["error"]
     with pytest.raises(firebase.FirebaseConfigError, match="not set"):
         firebase.get_app()
+
+
+def test_startup_status_line_warns_when_push_will_not_send(push_disabled, monkeypatch, service_account, caplog):
+    def lines():
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="crm.push"):
+            firebase.log_startup_status()
+        return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == "crm.push"]
+
+    [(level, msg)] = lines()
+    assert level == logging.WARNING and "disabled" in msg
+
+    monkeypatch.setattr(firebase.settings, "push_notifications_enabled", True)
+    [(level, msg)] = lines()
+    assert level == logging.WARNING and "FIREBASE_SERVICE_ACCOUNT_JSON is not set" in msg
+
+    monkeypatch.setattr(firebase.settings, "firebase_service_account_json", json.dumps(service_account))
+    [(level, msg)] = lines()
+    assert level == logging.INFO and service_account["project_id"] in msg
+    assert service_account["private_key_id"] not in msg and "PRIVATE KEY" not in msg
 
 
 def test_explicit_certificate_initialisation_without_adc(push_enabled, monkeypatch):

@@ -175,7 +175,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 
 # Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "invoice-regular-renderer-simple-totals"
+BUILD_TAG = "push-startup-diagnostics"
 
 
 @app.on_event("startup")
@@ -185,6 +185,12 @@ def on_startup() -> None:
         email_service.log_startup_config()
     except Exception:  # noqa: BLE001
         _log.exception("Email config summary failed")
+    try:
+        from app.core import firebase
+
+        firebase.log_startup_status()
+    except Exception:  # noqa: BLE001
+        _log.exception("Push config summary failed")
 
     # Every startup step is isolated, including creating the tables: a database that
     # is unreachable at boot must not kill the process. An exception raised here fails
