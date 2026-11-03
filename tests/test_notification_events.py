@@ -360,6 +360,208 @@ def test_order_customer_owner_is_notified_only_if_they_can_open_the_order(db):
     db.rollback()
 
 
+# ------------------------------------------------------------------ new orders
+
+
+def _order_setup(db, f):
+    """A stocked product, a customer owned by sales2, and a team (sales in it) whose manager
+    has a team-scope role that can view sales orders."""
+    from app.models import Customer, Team
+    from app.services import stock_service
+
+    wh = Warehouse(id=str(uuid.uuid4()), organization_id=f.id, name="Main", code=f"W{uuid.uuid4().hex[:5]}")
+    product = Product(id=str(uuid.uuid4()), organization_id=f.id, name="Cement Bag", price=100.0,
+                      inventory_tracking=True)
+    customer = Customer(id=str(uuid.uuid4()), organization_id=f.id, name="Acme", phone="9876500001",
+                        assigned_sales_officer_id=f.sales2.id)
+    db.add_all([wh, product, customer])
+    db.commit()
+    stock_service.adjust_on_hand(db, f.id, wh.id, product.id, None, 100, "adjustment")
+    mgr_role = Role(id=str(uuid.uuid4()), organization_id=f.id, name="Area Manager",
+                    permissions={"sales_orders": {"view": True}}, data_scope="team")
+    db.add(mgr_role)
+    db.commit()
+    f.manager = _person(db, f.id, system_role="staff", role="sales_officer", role_id=mgr_role.id, name="Manager")
+    team = Team(id=str(uuid.uuid4()), organization_id=f.id, name=f"North {uuid.uuid4().hex[:4]}",
+                manager_id=f.manager.id)
+    db.add(team)
+    db.flush()
+    f.manager.team_id = team.id
+    f.sales.team_id = team.id
+    db.commit()
+    return {"customer_id": customer.id, "warehouse_id": wh.id,
+            "items": [{"product_id": product.id, "quantity": 2}]}
+
+
+def test_order_placed_notifies_admins_salesperson_and_team_manager_once(db):
+    f = _firm(db)
+    other = _firm(db)
+    body = _order_setup(db, f)
+
+    # A draft (pickup, no automated flow) notifies nobody...
+    res = _client(f.sales).post("/orders", json={**body, "fulfilment_method": "pickup"})
+    assert res.status_code == 201, res.text
+    order_id = res.json()["id"]
+    assert [n for n in _all_for_org(db, f.id) if (n.data or {}).get("order_id") == order_id] == []
+
+    # ...until it is confirmed: admins + the team manager, never the acting salesperson.
+    assert _client(f.sales).post(f"/orders/{order_id}/confirm").status_code == 200
+    rows = [n for n in _all_for_org(db, f.id) if (n.data or {}).get("order_id") == order_id]
+    assert sorted(n.user_id for n in rows) == sorted([f.admin.id, f.admin2.id, f.manager.id])
+    assert {n.title for n in rows} == {"Sales order confirmed"}
+    assert {n.data["event"] for n in rows} == {nt.ORDER_CONFIRMED}
+    # The customer's own-scope owner (sales2) cannot open this order, so is not told.
+    assert _inbox(db, f.sales2) == [] and _inbox(db, f.partner) == []
+    assert _all_for_org(db, other.id) == []
+
+    # Placed by an admin for the salesperson: the salesperson and manager hear, not the actor.
+    from app.models import Customer, SalesOrder
+    from app.services import order_service
+
+    db.expire_all()
+    order, _ = order_service.place_order(
+        db, f.admin, db.get(Customer, body["customer_id"]),
+        [order_service.OrderLine(product_id=body["items"][0]["product_id"], quantity=1)],
+        warehouse_id=body["warehouse_id"], salesperson_id=f.sales.id)
+    db.commit()
+    rows = [n for n in _all_for_org(db, f.id) if (n.data or {}).get("order_id") == order.id]
+    assert sorted(n.user_id for n in rows) == sorted([f.admin2.id, f.sales.id, f.manager.id])
+    assert {n.title for n in rows} == {"New sales order"} and {n.data["event"] for n in rows} == {nt.ORDER_CREATED}
+
+    # A retry of the same event, or the salesperson also being an admin, never doubles up.
+    order = db.get(SalesOrder, order.id)
+    order.salesperson_id = f.admin2.id
+    assert notification_service.notify_order_placed(db, order, f.admin.id, nt.ORDER_CREATED, "New sales order") == []
+    db.rollback()
+
+
+# ------------------------------------------------------------------ push allowlist
+
+
+@pytest.mark.parametrize("event, data, expected", [
+    (nt.DELIVERY_ASSIGNED, {}, True),
+    (nt.DELIVERY_REJECTED, {}, True),
+    (nt.DELIVERY_STATUS_CHANGED, {"status": "failed"}, True),
+    (nt.DELIVERY_STATUS_CHANGED, {"status": "cancelled"}, True),
+    (nt.DELIVERY_STATUS_CHANGED, {"status": "delivered"}, False),
+    (nt.DELIVERY_STATUS_CHANGED, {"status": "partially_delivered"}, False),
+    (nt.DAY_END_STATUS_CHANGED, {"status": "rejected"}, True),
+    (nt.DAY_END_STATUS_CHANGED, {"status": "approved"}, False),
+    (nt.DAY_END_SUBMITTED, {"has_variance": "true"}, True),
+    (nt.DAY_END_SUBMITTED, {"has_variance": "false"}, False),
+    (nt.ORDER_CREATED, {}, True),
+    (nt.ORDER_CONFIRMED, {}, True),
+    (nt.ORDER_STATUS_CHANGED, {"status": "completed"}, False),
+    (nt.ORDER_STATUS_CHANGED, {"status": "cancelled"}, False),
+    (nt.LEAD_ASSIGNED, {}, True),
+    (nt.FOLLOW_UP_DUE, {}, True),
+    (nt.FOLLOW_UP_OVERDUE, {}, False),
+    (nt.QUOTATION_STATUS_CHANGED, {"status": "accepted"}, True),
+    (nt.QUOTATION_STATUS_CHANGED, {"status": "rejected"}, True),
+    (nt.EXPENSE_STATUS_CHANGED, {"status": "approved"}, True),
+    (nt.EXPENSE_STATUS_CHANGED, {"status": "rejected"}, True),
+    (nt.EXPENSE_STATUS_CHANGED, {"status": "reimbursed"}, False),
+    (nt.EXPENSE_CLARIFICATION_REQUESTED, {}, True),
+    (nt.EXPENSE_READY_FOR_REIMBURSEMENT, {}, True),
+    (nt.EXPENSE_CREATED, {}, False),
+    (nt.LEAVE_STATUS_CHANGED, {"status": "approved"}, True),
+    (nt.PAYMENT_RECEIVED, {}, False),
+    (nt.STOCK_ALERT, {"status": "out_of_stock"}, True),
+    (nt.STOCK_ALERT, {"status": "low_stock"}, False),
+    (nt.ORGANIZATION_CREATED, {}, True),
+    (nt.UPGRADE_REQUESTED, {}, True),
+    (nt.PUSH_TEST, {}, True),
+    (None, {}, False),
+])
+def test_should_push_allowlist(event, data, expected):
+    assert nt.should_push(event, data) is expected
+
+
+def test_every_event_has_a_push_decision():
+    # A new event must be added to the allowlist on purpose (or stay in-app only on purpose).
+    in_app_only = {nt.ORDER_STATUS_CHANGED, nt.FOLLOW_UP_OVERDUE, nt.PAYMENT_RECEIVED, nt.EXPENSE_CREATED,
+                   nt.DAY_END_SUBMITTED}
+    assert set(nt._PUSHED) | in_app_only == nt.ALL_EVENTS
+
+
+@pytest.fixture
+def dispatched(monkeypatch):
+    """Push on, and the worker pool replaced by a recorder of the notification ids handed to it."""
+    monkeypatch.setattr(push_service.settings, "push_notifications_enabled", True)
+    sent: list[str] = []
+    monkeypatch.setattr(push_service, "_dispatch", lambda ids: sent.extend(ids))
+    return sent
+
+
+def test_low_stock_is_in_app_only_and_out_of_stock_is_pushed(db, dispatched):
+    from app.services import stock_service
+
+    f = _firm(db)
+    wh = Warehouse(id=str(uuid.uuid4()), organization_id=f.id, name="Main", code=f"W{uuid.uuid4().hex[:5]}")
+    product = Product(id=str(uuid.uuid4()), organization_id=f.id, name="Sand", minimum_stock_level=5,
+                      inventory_tracking=True)
+    db.add_all([wh, product])
+    db.commit()
+    stock_service.adjust_on_hand(db, f.id, wh.id, product.id, None, 10, "adjustment")
+    db.commit()
+    stock_service.adjust_on_hand(db, f.id, wh.id, product.id, None, -6, "adjustment")  # -> low
+    db.commit()
+    low = _inbox(db, f.admin, nt.STOCK_ALERT)
+    assert [n.data["status"] for n in low] == ["low_stock"] and dispatched == []
+
+    stock_service.adjust_on_hand(db, f.id, wh.id, product.id, None, -4, "adjustment")  # -> out
+    db.commit()
+    out = [n for n in _inbox(db, f.admin, nt.STOCK_ALERT) if n.data["status"] == "out_of_stock"]
+    assert len(out) == 1 and out[0].id in dispatched
+
+
+def test_delivery_assignment_is_pushed_and_reassignment_back_notifies_again(db, dispatched):
+    from app.services import delivery_service
+
+    f = _firm(db)
+    other_partner = _person(db, f.id, system_role="staff", role="delivery_partner", name="Second Partner")
+    delivery = SimpleNamespace(id=str(uuid.uuid4()), delivery_number="DL-1", delivery_note_number=None,
+                               organization_id=f.id)
+    n = delivery_service.notify_delivery_assignment(db, delivery, f.partner.id)
+    db.commit()
+    assert n.user_id == f.partner.id and n.id in dispatched
+    # Saving the same partner again (a retry) is not a new assignment.
+    assert delivery_service.notify_delivery_assignment(db, delivery, f.partner.id, f.partner.id) is None
+    # Moved away and later back: each real assignment notifies.
+    delivery_service.notify_delivery_assignment(db, delivery, other_partner.id, f.partner.id)
+    delivery_service.notify_delivery_assignment(db, delivery, f.partner.id, other_partner.id)
+    db.commit()
+    assert len(_inbox(db, f.partner, nt.DELIVERY_ASSIGNED)) == 2
+    assert len(_inbox(db, other_partner, nt.DELIVERY_ASSIGNED)) == 1
+
+
+def test_in_app_only_event_still_creates_the_row_and_realtime_event(db, dispatched):
+    f = _firm(db)
+    n = notification_service.notify(db, f.admin.id, "Delivery completed", "DL-1", organization_id=f.id,
+                                    data=nt.build_data(nt.DELIVERY_STATUS_CHANGED, delivery_id="d1",
+                                                       status="delivered"))
+    realtime = [e for e in db.info.get("_pending_realtime_events", []) if e["event"] == "notification.created"]
+    db.commit()
+    assert _inbox(db, f.admin, nt.DELIVERY_STATUS_CHANGED)[0].id == n.id and dispatched == []
+    assert [e["data"]["id"] for e in realtime] == [n.id]  # the websocket event is unchanged
+
+
+# ------------------------------------------------------------------ expenses (web Add Expense screen)
+
+
+def test_accountant_has_full_expense_rights_and_admin_expenses_are_auto_approved(db):
+    from app.core.permissions import ACTIONS, default_role_matrices
+
+    assert all(default_role_matrices()["Accountant"]["expenses"].get(a) for a in ACTIONS)
+    f = _firm(db)
+    res = _client(f.admin).post("/expenses", json={"category": "Travel", "amount": 500})
+    assert res.status_code in (200, 201), res.text
+    assert res.json()["lifecycle_status"] == "approved"
+    res = _client(f.accountant).post("/expenses", json={"category": "Travel", "amount": 300})
+    assert res.status_code in (200, 201), res.text
+    assert res.json()["lifecycle_status"] == "pending_approval"  # only admins are auto-approved
+
+
 # ------------------------------------------------------------------ expenses
 
 

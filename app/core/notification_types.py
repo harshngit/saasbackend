@@ -178,3 +178,42 @@ def build_data(event: str, **ids) -> dict[str, str]:
     data = {"event": event}
     data.update({key: str(value) for key, value in ids.items() if value is not None and value != ""})
     return data
+
+
+# Which notifications are also pushed to phones/browsers. Every notification is stored
+# in-app (and sent over the websocket); only the ones someone should act on now are
+# pushed, so routine updates don't train people to ignore the phone.
+#   event -> None (always pushed) or the set of `data["status"]` values that are pushed.
+_PUSHED: dict[str, frozenset[str] | None] = {
+    PUSH_TEST: None,
+    ORDER_CREATED: None,
+    ORDER_CONFIRMED: None,
+    DELIVERY_ASSIGNED: None,
+    DELIVERY_REJECTED: None,
+    DELIVERY_STATUS_CHANGED: frozenset({"failed", "cancelled"}),
+    LEAD_ASSIGNED: None,
+    FOLLOW_UP_DUE: None,
+    QUOTATION_STATUS_CHANGED: None,
+    EXPENSE_STATUS_CHANGED: frozenset({"approved", "rejected"}),
+    EXPENSE_CLARIFICATION_REQUESTED: None,
+    EXPENSE_READY_FOR_REIMBURSEMENT: None,
+    LEAVE_STATUS_CHANGED: None,
+    DAY_END_STATUS_CHANGED: frozenset({"rejected"}),
+    STOCK_ALERT: frozenset({"out_of_stock"}),
+    ORGANIZATION_CREATED: None,
+    UPGRADE_REQUESTED: None,
+}
+
+
+def should_push(event: str | None, data: dict | None = None) -> bool:
+    """Whether a notification for `event` (with its stored `data`) is also pushed. In-app
+    only: order_status_changed, delivery delivered / partially delivered, Day-End approved
+    or submitted without variance, follow_up_overdue, low stock, payment_received,
+    expense_created and expense reimbursed -- and anything without a known event."""
+    data = data or {}
+    if event == DAY_END_SUBMITTED:
+        return data.get("has_variance") == "true"
+    if event not in _PUSHED:
+        return False
+    statuses = _PUSHED[event]
+    return statuses is None or data.get("status") in statuses

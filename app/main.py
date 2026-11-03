@@ -1,3 +1,10 @@
+import logging
+import os
+
+# Python prints only WARNING and above until logging is configured, so without this the
+# INFO lines (push / email / reminder status, "N accepted") never reach the container logs.
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(levelname)s [%(name)s] %(message)s")
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text as sa_text

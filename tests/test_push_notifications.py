@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.core import firebase
+from app.core import notification_types as nt
 from app.core.database import Base, engine
 from app.core.security import create_access_token
 from app.main import app
@@ -697,15 +698,15 @@ def test_push_is_sent_only_after_commit_with_the_same_id_and_type(db_session, in
     from app.services import notification_service
 
     user, _ = _user(db_session)
-    n = notification_service.notify(db_session, user.id, "Order completed", "SO-1",
-                                    data=nt.build_data(nt.ORDER_STATUS_CHANGED, order_id="o1", status="completed"))
+    n = notification_service.notify(db_session, user.id, "Delivery failed", "DL-1",
+                                    data=nt.build_data(nt.DELIVERY_STATUS_CHANGED, delivery_id="d1", status="failed"))
     db_session.flush()
     assert inline_push == []  # nothing before commit
     db_session.commit()
     assert len(inline_push) == 1
     data = inline_push[0]["data"]
-    assert data["notification_id"] == n.id and data["type"] == "order_status_changed"
-    assert data["category"] == "order" and data["order_id"] == "o1" and data["status"] == "completed"
+    assert data["notification_id"] == n.id and data["type"] == "delivery_status_changed"
+    assert data["category"] == "delivery" and data["delivery_id"] == "d1" and data["status"] == "failed"
     assert all(isinstance(v, str) for v in data.values())
 
     db_session.commit()  # a later commit does not resend
@@ -717,7 +718,7 @@ def test_rollback_discards_the_push(db_session, inline_push):
     from app.services import notification_service
 
     user, _ = _user(db_session)
-    n = notification_service.notify(db_session, user.id, "Rolled back")
+    n = notification_service.notify(db_session, user.id, "Rolled back", data=nt.build_data(nt.LEAD_ASSIGNED, lead_id="l1"))
     db_session.rollback()
     db_session.commit()
     assert inline_push == [] and db_session.get(Notification, n.id) is None
@@ -732,7 +733,7 @@ def test_push_failure_keeps_the_in_app_notification(db_session, inline_push, mon
 
     monkeypatch.setattr(push_service, "send_to_user", boom)
     user, _ = _user(db_session)
-    n = notification_service.notify(db_session, user.id, "Still here")
+    n = notification_service.notify(db_session, user.id, "Still here", data=nt.build_data(nt.LEAD_ASSIGNED, lead_id="l1"))
     db_session.commit()  # must not raise
     db_session.expire_all()
     assert db_session.get(Notification, n.id) is not None
@@ -767,7 +768,7 @@ def test_order_status_changed_recipients_and_guards(db_session, inline_push):
     order.status = "processing"
     assert notification_service.notify_order_status_changed(db_session, order, "placed") == []  # not notified
     db_session.commit()
-    assert [p["user_id"] for p in inline_push] == [other_admin.id]
+    assert inline_push == []  # order outcomes are in-app only (notification_types.should_push)
 
 
 def test_delivery_status_changed_recipients_and_guards(db_session):

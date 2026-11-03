@@ -300,12 +300,9 @@ def place_order(
                 item.reserved_quantity = reservation.reserved_quantity
         order.fulfilment_status = "reserved"
 
-    # Notify admins only for actual placed/awaiting orders, not drafts.
+    # Notify only for actual placed/awaiting orders, not drafts.
     if not create_as_draft:
-        notification_service.notify_org_admins(
-            db, org_id, "New sales order", f"{order.order_number} — Rs {order.total:,.2f}",
-            type="order", link=order.id, data=nt.build_data(nt.ORDER_CREATED, order_id=order.id),
-        )
+        notification_service.notify_order_placed(db, order, user.id, nt.ORDER_CREATED, "New sales order")
 
     queue_event(
         db,
@@ -397,11 +394,7 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
     if credit:
         warnings.append(credit)
 
-    # Notify admins
-    notification_service.notify_org_admins(
-        db, org_id, "Sales order confirmed", f"{order.order_number} — Rs {order.total:,.2f}",
-        type="order", link=order.id, data=nt.build_data(nt.ORDER_CONFIRMED, order_id=order.id),
-    )
+    notification_service.notify_order_placed(db, order, user.id, nt.ORDER_CONFIRMED, "Sales order confirmed")
 
     queue_event(
         db,

@@ -259,8 +259,14 @@ _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="push")
 
 
 def queue_notification_push(db: Session, notification: Notification) -> None:
-    """Schedule a push for this (not yet committed) notification. No-op when push is off."""
+    """Schedule a push for this (not yet committed) notification. No-op when push is off,
+    and for events that are in-app only (see notification_types.should_push)."""
     if not settings.push_notifications_enabled or not hasattr(db, "info"):
+        return
+    from app.core import notification_types as nt
+
+    data = notification.data or {}
+    if not nt.should_push(data.get("event"), data):
         return
     pending = db.info.setdefault(_PENDING_KEY, [])
     if notification.id not in pending:

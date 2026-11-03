@@ -243,6 +243,45 @@ def _order_salesperson(db: Session, order) -> User | None:  # noqa: ANN001
     return None
 
 
+_ORDER_SCOPE = ("created_by", "salesperson_id", "assigned_delivery_partner_id")
+
+
+def notify_order_placed(db: Session, order, actor_id: str | None, event: str,  # noqa: ANN001
+                        title: str) -> list[Notification]:
+    """A new (non-draft) or confirmed order: the org admins, the order's salesperson, the
+    customer's assigned sales officer and the salesperson's team manager -- each once, never
+    the person who placed it, and only people who can open the order (the same scope check
+    as the order's detail route). A retry of the same event creates nothing new."""
+    from app.models import Customer, Team
+
+    org_id = order.organization_id
+    body = f"{order.order_number} — Rs {order.total:,.2f}"
+    data = nt.build_data(event, order_id=order.id)
+    key = f"order:{order.id}:{event}"
+    created = notify_org_admins(db, org_id, title, body, type="order", link=order.id, data=data,
+                                exclude_user_id=actor_id, actor_id=actor_id, dedupe_key=key)
+
+    salesperson = _member(db, getattr(order, "salesperson_id", None), org_id)
+    customer = getattr(order, "customer", None) or (
+        db.get(Customer, order.customer_id) if getattr(order, "customer_id", None) else None)
+    team = db.get(Team, salesperson.team_id) if salesperson is not None and salesperson.team_id else None
+    candidate_ids = (
+        getattr(salesperson, "id", None),
+        getattr(customer, "assigned_sales_officer_id", None),
+        team.manager_id if team is not None and team.organization_id == org_id else None,
+    )
+    recipients = []
+    for user_id in candidate_ids:
+        user = _member(db, user_id, org_id)
+        if (user is not None and user.effective_system_role != "admin"  # admins heard above
+                and _can_view(db, user, "sales_orders", order, *_ORDER_SCOPE,
+                              team_attributes=("salesperson_id",))):
+            recipients.append(user)
+    created += notify_users(db, recipients, title, body, link=order.id, organization_id=org_id, data=data,
+                            exclude_user_ids=[actor_id], actor_id=actor_id, dedupe_key=key)
+    return created
+
+
 def notify_order_status_changed(db: Session, order, previous_status: str | None,
                                 actor_id: str | None = None) -> list[Notification]:
     """Tell the org admins and the order's salesperson (never the person who acted) that an
