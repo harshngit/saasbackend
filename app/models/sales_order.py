@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from app.core.database import Base
@@ -30,6 +30,12 @@ def _now() -> datetime:
 
 class SalesOrder(Base):
     __tablename__ = "sales_orders"
+    # Every order list and dashboard window is "this firm's orders, newest first / in a
+    # date range / with a status".
+    __table_args__ = (
+        Index("ix_sales_orders_org_created_at", "organization_id", "created_at"),
+        Index("ix_sales_orders_org_status", "organization_id", "status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     organization_id: Mapped[str] = mapped_column(

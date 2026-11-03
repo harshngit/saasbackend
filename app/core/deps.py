@@ -3,7 +3,7 @@ from collections.abc import Callable
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.database import get_db
 from app.core.security import ACCESS_TOKEN, decode_token
@@ -36,7 +36,9 @@ def get_current_user(
     if not user_id:
         raise _CREDENTIALS_ERROR
 
-    user = db.get(User, user_id)
+    # The organization comes in the same query: plan gates, the trial lock and most
+    # handlers read it, and a separate lookup is one more database round trip.
+    user = db.get(User, user_id, options=[joinedload(User.organization)])
     if user is None or not user.is_active:
         raise _CREDENTIALS_ERROR
     return user

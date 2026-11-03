@@ -60,6 +60,23 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 5
     db_pool_recycle: int = 300
+    # Every database round trip costs ~60-90 ms when the container and database sit in
+    # different regions, so a ping on every checkout doubles small requests. Instead a
+    # connection is only pinged when it has been idle longer than db_idle_ping_seconds
+    # (when it is most likely to have been dropped). DB_POOL_PRE_PING=true restores the
+    # old ping-on-every-checkout behaviour.
+    db_pool_pre_ping: bool = False
+    db_idle_ping_seconds: int = 60
+
+    # --- Performance diagnostics ---
+    # PERF_LOG=true logs one line per request: method, path, status, total ms, SQL query
+    # count and SQL ms (no parameters, no bodies).
+    perf_log: bool = False
+
+    # --- Startup schema steps (create_all, enum/column fixes, backfills) ---
+    # Each step costs several database round trips on every container start. Leave on
+    # until `alembic upgrade head` runs as part of every deploy; then set false.
+    run_startup_migrations: bool = True
 
     # --- One-off inline-upload -> stored-file conversion (app/services/file_migration_service.py) ---
     # Runs a full table scan across 8 models; off by default so it never runs implicitly

@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import update as sa_update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core import scoping, workflow
 from app.core.database import get_db
@@ -95,9 +95,84 @@ def _owned(db: Session, order_id: str, org_id: str, user: User | None = None) ->
     return record
 
 
-def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None) -> OrderOut:
+def _order_context(db: Session, orders: list[SalesOrder]) -> dict:
+    """Everything _order_out looks up per order, loaded for a whole page at once -- a
+    fixed number of queries however many orders the page holds. Loaded rows stay in the
+    session, so the db.get() calls in _order_out are answered without a query."""
+    ids = [o.id for o in orders]
+    ctx: dict = {"stock": {}, "direct_colls": {}, "alloc_colls": {}, "direct_payments": {}, "alloc_payments": {}}
+    if not ids:
+        return ctx
+    org_ids = {o.organization_id for o in orders}
+    keep = ctx["_keep"] = []  # strong references: the session's identity map is weak
+
+    warehouse_ids = {o.warehouse_id for o in orders if o.warehouse_id}
+    if warehouse_ids:
+        keep += db.query(Warehouse).filter(Warehouse.id.in_(warehouse_ids)).all()
+    partner_ids = {o.assigned_delivery_partner_id for o in orders if o.assigned_delivery_partner_id}
+    if partner_ids:
+        keep += db.query(User).filter(User.id.in_(partner_ids)).all()
+    customer_ids = {o.customer_id for o in orders if o.customer_id and o.customer is None}
+    if customer_ids:
+        keep += db.query(Customer).filter(Customer.id.in_(customer_ids)).all()
+
+    stock_keys = []
+    for order in orders:
+        if order.warehouse_id:
+            stock_keys += [(order.warehouse_id, i.product_id, i.variant_id) for i in order.items if i.product_id]
+    ctx["stock"] = stock_service.stock_summaries(db, stock_keys)
+
+    for c in (
+        db.query(DeliveryCollection)
+        .options(selectinload(DeliveryCollection.allocations))
+        .filter(
+            DeliveryCollection.organization_id.in_(org_ids),
+            DeliveryCollection.sales_order_id.in_(ids),
+            DeliveryCollection.reconciliation_status == "recorded",
+        )
+    ):
+        ctx["direct_colls"].setdefault(c.sales_order_id, []).append(c)
+    for a, c, order_id in (
+        db.query(DeliveryCollectionAllocation, DeliveryCollection, Invoice.order_id)
+        .join(DeliveryCollection, DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id)
+        .join(Invoice, DeliveryCollectionAllocation.invoice_id == Invoice.id)
+        .filter(
+            DeliveryCollection.organization_id.in_(org_ids),
+            Invoice.order_id.in_(ids),
+            DeliveryCollection.reconciliation_status == "recorded",
+        )
+    ):
+        ctx["alloc_colls"].setdefault(order_id, []).append((a, c))
+    for pmt in db.query(CustomerPayment).filter(
+        CustomerPayment.organization_id.in_(org_ids), CustomerPayment.order_id.in_(ids)
+    ):
+        ctx["direct_payments"].setdefault(pmt.order_id, []).append(pmt)
+    for pmt, order_id in (
+        db.query(CustomerPayment, Invoice.order_id)
+        .join(CustomerPaymentAllocation, CustomerPaymentAllocation.customer_payment_id == CustomerPayment.id)
+        .join(Invoice, CustomerPaymentAllocation.invoice_id == Invoice.id)
+        .filter(CustomerPayment.organization_id.in_(org_ids), Invoice.order_id.in_(ids))
+    ):
+        ctx["alloc_payments"].setdefault(order_id, []).append(pmt)
+    return ctx
+
+
+def _latest(rows, keep) -> object | None:  # noqa: ANN001
+    """The newest row (by created_at) passing `keep` -- what ORDER BY created_at DESC LIMIT 1 returned."""
+    best = None
+    for row in rows:
+        if keep(row) and (best is None or row.created_at > best.created_at):
+            best = row
+    return best
+
+
+def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None,
+               ctx: dict | None = None) -> OrderOut:
     """The order plus what the warehouse now holds for it, so the sales screen sees
-    the effect of placing it without a second call."""
+    the effect of placing it without a second call.
+
+    `ctx` (from _order_context) carries the per-order lookups preloaded for a list page;
+    without it every lookup is queried here, as for a single order."""
     out = OrderOut.model_validate(order)
     if order.warehouse_id:
         wh = db.get(Warehouse, order.warehouse_id)
@@ -111,14 +186,23 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             if not item.product_id or key in seen:
                 continue
             seen.add(key)
-            summary.append(
-                stock_service.stock_summary(db, order.warehouse_id, item.product_id, item.variant_id)
-            )
+            if ctx is not None:
+                summary.append(ctx["stock"][(order.warehouse_id, item.product_id, item.variant_id)])
+            else:
+                summary.append(
+                    stock_service.stock_summary(db, order.warehouse_id, item.product_id, item.variant_id)
+                )
         out.stock_summary = summary
     out.warnings = warnings or []
 
     # Ensure delivery and invoice references are populated
-    if not out.delivery_id:
+    if not out.delivery_id and ctx is not None:
+        latest_del = _latest(order.deliveries, lambda d: d.organization_id == order.organization_id
+                             and d.status != "cancelled")
+        if latest_del:
+            out.delivery_id = latest_del.id
+            out.delivery_number = latest_del.delivery_note_number
+    elif not out.delivery_id:
         latest_del = (
             db.query(Delivery)
             .filter(
@@ -147,7 +231,13 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
     else:
         out.delivery_proof_url = None
 
-    if not out.invoice_id:
+    if not out.invoice_id and ctx is not None:
+        latest_inv = _latest(order.invoices, lambda i: i.organization_id == order.organization_id
+                             and not i.is_credit_note)
+        if latest_inv:
+            out.invoice_id = latest_inv.id
+            out.invoice_number = latest_inv.invoice_number
+    elif not out.invoice_id:
         latest_inv = (
             db.query(Invoice)
             .filter(
@@ -196,7 +286,7 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
         out.delivery_method = order.fulfilment_method
 
     # Calculate unreconciled collections recorded against this order or its invoices
-    direct_colls = (
+    direct_colls = ctx["direct_colls"].get(order.id, []) if ctx is not None else (
         db.query(DeliveryCollection)
         .filter(
             DeliveryCollection.organization_id == order.organization_id,
@@ -206,7 +296,7 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
         .all()
     )
 
-    alloc_colls = (
+    alloc_colls = ctx["alloc_colls"].get(order.id, []) if ctx is not None else (
         db.query(DeliveryCollectionAllocation, DeliveryCollection)
         .join(DeliveryCollection, DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id)
         .join(Invoice, DeliveryCollectionAllocation.invoice_id == Invoice.id)
@@ -254,7 +344,7 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
     else:
         out.delivery_partner = None
 
-    direct_payments = (
+    direct_payments = ctx["direct_payments"].get(order.id, []) if ctx is not None else (
         db.query(CustomerPayment)
         .filter(
             CustomerPayment.organization_id == order.organization_id,
@@ -263,7 +353,7 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
         .all()
     )
 
-    alloc_payments = (
+    alloc_payments = ctx["alloc_payments"].get(order.id, []) if ctx is not None else (
         db.query(CustomerPayment)
         .join(CustomerPaymentAllocation, CustomerPaymentAllocation.customer_payment_id == CustomerPayment.id)
         .join(Invoice, CustomerPaymentAllocation.invoice_id == Invoice.id)
@@ -475,9 +565,11 @@ def list_orders(
         default_order=[SalesOrder.created_at.desc(), SalesOrder.id.desc()],
         secondary_key=SalesOrder.id.desc(),
     )
+    query = query.options(selectinload(SalesOrder.deliveries), selectinload(SalesOrder.invoices))
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    ctx = _order_context(db, items)
     return PaginatedResponse(
-        items=[_order_out(db, o) for o in items],
+        items=[_order_out(db, o, ctx=ctx) for o in items],
         total=total,
         page=page,
         page_size=page_size,

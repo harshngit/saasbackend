@@ -37,6 +37,7 @@ MIGRATION POLICY (as of the Alembic adoption in alembic/):
 
 import json
 import logging
+import time
 from collections.abc import Generator
 from datetime import date, datetime
 
@@ -56,6 +57,7 @@ from sqlalchemy import (
     inspect,
     text,
 )
+from sqlalchemy.exc import DisconnectionError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -65,7 +67,8 @@ logger = logging.getLogger("crm.db")
 DATABASE_URL = settings.sqlalchemy_database_url
 
 
-def build_engine_kwargs(database_url: str, *, pool_size: int, max_overflow: int, pool_recycle: int) -> dict:
+def build_engine_kwargs(database_url: str, *, pool_size: int, max_overflow: int, pool_recycle: int,
+                        pre_ping: bool = False) -> dict:
     """The create_engine() kwargs for `database_url` — a pure function (no I/O,
     no connection attempt) so the PostgreSQL-vs-SQLite branching is directly
     unit-testable without needing a real database of either kind.
@@ -74,12 +77,16 @@ def build_engine_kwargs(database_url: str, *, pool_size: int, max_overflow: int,
     and has no connection-pool concept of its own — pool_size/max_overflow/
     pool_recycle are PostgreSQL-only, included only on that branch so SQLite
     (local dev and the test suite) is completely unaffected.
+
+    PostgreSQL pings on checkout only when `pre_ping` (DB_POOL_PRE_PING) is set; otherwise
+    install_idle_ping() below checks just the connections that sat idle, so a busy
+    request path pays no extra round trip.
     """
     if database_url.startswith("sqlite"):
         return {"connect_args": {"check_same_thread": False}, "pool_pre_ping": True}
     return {
         "connect_args": {},
-        "pool_pre_ping": True,
+        "pool_pre_ping": pre_ping,
         "pool_size": pool_size,
         "max_overflow": max_overflow,
         "pool_recycle": pool_recycle,
@@ -93,9 +100,41 @@ engine = create_engine(
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_recycle=settings.db_pool_recycle,
+        pre_ping=settings.db_pool_pre_ping,
     ),
 )
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def install_idle_ping(target_engine, idle_seconds: int) -> None:  # noqa: ANN001
+    """Ping a pooled connection on checkout only if it sat idle for more than
+    `idle_seconds` (PgBouncer or the server may have dropped it meanwhile). A failed ping
+    raises DisconnectionError, which makes the pool discard it and hand out a fresh
+    connection -- the request never sees the stale one."""
+
+    @event.listens_for(target_engine, "checkin")
+    def _stamp(_dbapi_connection, record):  # noqa: ANN001
+        record.info["crm_checked_in_at"] = time.monotonic()
+
+    @event.listens_for(target_engine, "checkout")
+    def _ping_if_idle(dbapi_connection, record, _proxy):  # noqa: ANN001
+        last = record.info.get("crm_checked_in_at")
+        if last is None or time.monotonic() - last <= idle_seconds:
+            return
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SELECT 1")
+        except Exception as exc:  # noqa: BLE001
+            raise DisconnectionError() from exc
+        finally:
+            try:
+                cursor.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+if not DATABASE_URL.startswith("sqlite") and not settings.db_pool_pre_ping:
+    install_idle_ping(engine, settings.db_idle_ping_seconds)
 
 
 if DATABASE_URL.startswith("sqlite"):

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -104,6 +104,10 @@ class StockReservation(Base):
     """
 
     __tablename__ = "stock_reservations"
+    # What is promised of one item in one warehouse (stock_service.reserved / stock_summaries).
+    __table_args__ = (
+        Index("ix_stock_reservations_wh_product_status", "warehouse_id", "product_id", "status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     organization_id: Mapped[str] = mapped_column(

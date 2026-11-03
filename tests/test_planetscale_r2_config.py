@@ -86,7 +86,11 @@ def test_postgres_engine_receives_configured_pool_options():
         "postgresql+psycopg://user:pass@host/db",
         pool_size=7, max_overflow=3, pool_recycle=120,
     )
-    assert kwargs["pool_pre_ping"] is True
+    # No ping on every checkout by default (one extra round trip per request); idle
+    # connections are checked instead (install_idle_ping). DB_POOL_PRE_PING restores it.
+    assert kwargs["pool_pre_ping"] is False
+    assert build_engine_kwargs("postgresql+psycopg://user:pass@host/db", pool_size=7, max_overflow=3,
+                               pool_recycle=120, pre_ping=True)["pool_pre_ping"] is True
     assert kwargs["pool_size"] == 7
     assert kwargs["max_overflow"] == 3
     assert kwargs["pool_recycle"] == 120

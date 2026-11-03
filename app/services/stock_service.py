@@ -313,6 +313,45 @@ def stock_summary(
     }
 
 
+def stock_summaries(db: Session, keys) -> dict:  # noqa: ANN001
+    """stock_summary for many (warehouse_id, product_id, variant_id) at once -- two
+    queries instead of two per item, the same figures. An item no warehouse tracks yet
+    (the catalog-counter fallback in on_hand) is resolved one by one, exactly as before."""
+    keys = list(dict.fromkeys(keys))
+    if not keys:
+        return {}
+    product_ids = {k[1] for k in keys}
+    warehouse_ids = {k[0] for k in keys}
+    stock_rows: dict[tuple, list] = {}
+    for row in db.query(WarehouseStock).filter(WarehouseStock.product_id.in_(product_ids)):
+        stock_rows.setdefault((row.product_id, row.variant_id), []).append(row)
+    reservations: dict[tuple, list] = {}
+    for row in db.query(StockReservation).filter(
+        StockReservation.warehouse_id.in_(warehouse_ids),
+        StockReservation.product_id.in_(product_ids),
+        StockReservation.status == "active",
+    ):
+        reservations.setdefault((row.warehouse_id, row.product_id, row.variant_id), []).append(row)
+
+    out = {}
+    for warehouse_id, product_id, variant_id in keys:
+        tracked = stock_rows.get((product_id, variant_id))
+        if tracked:
+            held = round(sum(r.on_hand_quantity or 0 for r in tracked if r.warehouse_id == warehouse_id), 3)
+        else:
+            held = on_hand(db, warehouse_id, product_id, variant_id)
+        promised = round(sum(r.outstanding_quantity for r in reservations.get((warehouse_id, product_id, variant_id), [])), 3)
+        out[(warehouse_id, product_id, variant_id)] = {
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "warehouse_id": warehouse_id,
+            "on_hand": held,
+            "reserved": promised,
+            "available": round(held - promised, 3),
+        }
+    return out
+
+
 # --------------------------- physical stock moves ---------------------------
 
 

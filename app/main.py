@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 # Python prints only WARNING and above until logging is configured, so without this the
 # INFO lines (push / email / reminder status, "N accepted") never reach the container logs.
@@ -137,8 +138,12 @@ else:
         **_cors_kwargs,
     )
 
+if settings.perf_log:
+    from app.core import perf
 
-import logging
+    perf.install_query_counter(engine)
+    perf.install_middleware(app)
+
 
 _log = logging.getLogger("crm.startup")
 _error_log = logging.getLogger("crm.errors")
@@ -217,7 +222,14 @@ def on_startup() -> None:
         if settings.convert_inline_uploads_on_startup:
             convert_inline_uploads()
 
-    for label, step in (
+    try:
+        from app.core import perf
+
+        perf.log_round_trip(engine)
+    except Exception:  # noqa: BLE001
+        _log.exception("Database round-trip check failed")
+
+    steps = (
         ("create_all", _create_tables),
         ("extend_pg_enum_types", extend_pg_enum_types),
         ("drop_legacy_columns", drop_legacy_columns),
@@ -234,11 +246,19 @@ def on_startup() -> None:
         ("migrate_order_statuses", migrate_order_statuses),
         ("convert_inline_uploads", _convert_inline_uploads_if_enabled),
         ("backfill_product_pricing", backfill_product_pricing),
-    ):
+    )
+    if not settings.run_startup_migrations:
+        # Schema is kept current by `alembic upgrade head` in the deploy instead.
+        _log.info("Startup schema steps skipped (RUN_STARTUP_MIGRATIONS=false)")
+        steps = ()
+    started = time.perf_counter()
+    for label, step in steps:
         try:
             step()
         except Exception:  # noqa: BLE001
             _log.exception("Startup migration step failed: %s", label)
+    if steps:
+        _log.info("Startup schema steps took %.0f ms", (time.perf_counter() - started) * 1000)
 
     if settings.seed_on_startup:
         try:
