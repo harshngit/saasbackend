@@ -15,12 +15,13 @@ from collections import defaultdict
 from datetime import date, datetime, time, timezone
 import math
 import re
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, aliased, selectinload
 
 from app.models import (
     Customer,
@@ -2693,34 +2694,28 @@ def _sales_overview(db: Session, org_id: str, df: datetime | None, dt: datetime 
     if salesperson_id:
         _verify_tenant_entity(db, org_id, User, salesperson_id, "Salesperson")
 
-    q = (
-        db.query(SalesOrder)
-        .options(
-            selectinload(SalesOrder.deliveries).selectinload(Delivery.items),
-            joinedload(SalesOrder.customer),
-            joinedload(SalesOrder.salesperson),
-            joinedload(SalesOrder.items),
-        )
-        .filter(SalesOrder.organization_id == org_id)
-    )
+    # Only the columns the report shows. Loading full SalesOrder rows pulled in every
+    # line with its product and variant, the customer, both users and each delivery's
+    # lines -- for every order in the range, while the page shows 25 of them.
+    ids = db.query(SalesOrder.id).filter(SalesOrder.organization_id == org_id)
 
     if df is not None:
-        q = q.filter(func.coalesce(SalesOrder.order_date, SalesOrder.created_at) >= df)
+        ids = ids.filter(func.coalesce(SalesOrder.order_date, SalesOrder.created_at) >= df)
     if dt is not None:
-        q = q.filter(func.coalesce(SalesOrder.order_date, SalesOrder.created_at) <= dt)
+        ids = ids.filter(func.coalesce(SalesOrder.order_date, SalesOrder.created_at) <= dt)
 
     if customer_id:
-        q = q.filter(SalesOrder.customer_id == customer_id)
+        ids = ids.filter(SalesOrder.customer_id == customer_id)
     if salesperson_id:
-        q = q.filter(SalesOrder.salesperson_id == salesperson_id)
+        ids = ids.filter(SalesOrder.salesperson_id == salesperson_id)
     if order_status:
-        q = q.filter(SalesOrder.status == order_status)
+        ids = ids.filter(SalesOrder.status == order_status)
     if fulfilment_status:
-        q = q.filter(SalesOrder.fulfilment_status == fulfilment_status)
+        ids = ids.filter(SalesOrder.fulfilment_status == fulfilment_status)
 
     if search:
         s = f"%{search}%"
-        q = q.outerjoin(Customer, Customer.id == SalesOrder.customer_id).outerjoin(
+        ids = ids.outerjoin(Customer, Customer.id == SalesOrder.customer_id).outerjoin(
             Delivery, Delivery.sales_order_id == SalesOrder.id
         ).filter(
             or_(
@@ -2732,9 +2727,51 @@ def _sales_overview(db: Session, org_id: str, df: datetime | None, dt: datetime 
                 Delivery.delivery_note_number.ilike(s),
             )
         ).distinct()
+    ids = ids.subquery()
 
-    orders = q.order_by(func.coalesce(SalesOrder.order_date, SalesOrder.created_at).desc(), SalesOrder.id.desc()).all()
+    salesperson_user = aliased(User)
+    order_rows = (
+        db.query(
+            SalesOrder.id, SalesOrder.order_number, SalesOrder.sales_order_number, SalesOrder.order_date,
+            SalesOrder.created_at, SalesOrder.customer_id, SalesOrder.salesperson_id, SalesOrder.total,
+            SalesOrder.status, SalesOrder.fulfilment_status,
+            Customer.id.label("cust_pk"), Customer.customer_id.label("cust_code"),
+            Customer.business_name.label("cust_business_name"), Customer.name.label("cust_name"),
+            salesperson_user.id.label("salesperson_pk"), salesperson_user.name.label("salesperson_name"),
+        )
+        .outerjoin(Customer, Customer.id == SalesOrder.customer_id)
+        .outerjoin(salesperson_user, salesperson_user.id == SalesOrder.salesperson_id)
+        .filter(SalesOrder.id.in_(select(ids.c.id)))
+        .order_by(func.coalesce(SalesOrder.order_date, SalesOrder.created_at).desc(), SalesOrder.id.desc())
+        .all()
+    )
+    lines_by_order: dict[str, list] = defaultdict(list)
+    deliveries_by_order: dict[str, list] = defaultdict(list)
+    if order_rows:
+        for line in db.query(
+            SalesOrderItem.order_id, SalesOrderItem.quantity, SalesOrderItem.delivered_quantity
+        ).filter(SalesOrderItem.order_id.in_(select(ids.c.id))):
+            lines_by_order[line.order_id].append(line)
+        for d in db.query(
+            Delivery.id, Delivery.sales_order_id, Delivery.delivery_note_number, Delivery.status,
+            Delivery.scheduled_date, Delivery.delivery_date, Delivery.created_at,
+            Delivery.delivery_partner_id, Delivery.vehicle_id,
+        ).filter(Delivery.sales_order_id.in_(select(ids.c.id))):
+            deliveries_by_order[d.sales_order_id].append(d)
 
+    def _brief(row):  # noqa: ANN001, ANN202
+        return SimpleNamespace(
+            id=row.id, order_number=row.order_number, sales_order_number=row.sales_order_number,
+            order_date=row.order_date, created_at=row.created_at, customer_id=row.customer_id,
+            salesperson_id=row.salesperson_id, total=row.total, status=row.status,
+            fulfilment_status=row.fulfilment_status,
+            items=lines_by_order.get(row.id, []), deliveries=deliveries_by_order.get(row.id, []),
+            customer=SimpleNamespace(customer_id=row.cust_code, business_name=row.cust_business_name,
+                                     name=row.cust_name) if row.cust_pk is not None else None,
+            salesperson=SimpleNamespace(name=row.salesperson_name) if row.salesperson_pk is not None else None,
+        )
+
+    orders = [_brief(row) for row in order_rows]
     if delivery_status:
         filtered_orders = []
         for o in orders:

@@ -313,10 +313,13 @@ def stock_summary(
     }
 
 
-def stock_summaries(db: Session, keys) -> dict:  # noqa: ANN001
+def stock_summaries(db: Session, keys, reservations_out: list | None = None) -> dict:  # noqa: ANN001
     """stock_summary for many (warehouse_id, product_id, variant_id) at once -- two
     queries instead of two per item, the same figures. An item no warehouse tracks yet
-    (the catalog-counter fallback in on_hand) is resolved one by one, exactly as before."""
+    (the catalog-counter fallback in on_hand) is resolved one by one, exactly as before.
+
+    `reservations_out`, when given, receives the active reservation rows loaded (every
+    reservation for these warehouses and products), for a caller that needs them too."""
     keys = list(dict.fromkeys(keys))
     if not keys:
         return {}
@@ -332,6 +335,8 @@ def stock_summaries(db: Session, keys) -> dict:  # noqa: ANN001
         StockReservation.status == "active",
     ):
         reservations.setdefault((row.warehouse_id, row.product_id, row.variant_id), []).append(row)
+        if reservations_out is not None:
+            reservations_out.append(row)
 
     out = {}
     for warehouse_id, product_id, variant_id in keys:

@@ -1,5 +1,5 @@
 import calendar
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -219,6 +219,7 @@ def process_due_recurring_expenses(db: Session, org_id: str | None = None) -> li
 from app.core.files import extract_file_id_from_url, normalize_file_url  # noqa: E402
 from app.models import ActivityLog, StoredFile, User  # noqa: E402
 from app.models.expense import EXPENSE_REIMBURSEMENT_METHODS  # noqa: E402
+from app.core import business_time  # noqa: E402
 from app.services import activity_service, role_service  # noqa: E402
 
 PENDING_STATUSES = ("pending", "clarification_requested")
@@ -266,13 +267,21 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def record_history(db: Session, expense: Expense, actor: User | None, action: str, note: str | None = None) -> None:
-    activity_service.record(
+def record_history(db: Session, expense: Expense, actor: User | None, action: str, note: str | None = None):
+    return activity_service.record(
         db, expense.organization_id, actor, "expense",
         f"{_TITLES.get(action, action)}: {expense.expense_number or expense.category}",
         note,
         entity_type="expense", entity_id=expense.id, action=action,
     )
+
+
+def preload_user_names(db: Session, expenses: list[Expense]) -> None:
+    """Names for every submitted_by / approved_by / reimbursed_by on a page, in one query."""
+    ids = {uid for e in expenses for uid in (e.submitted_by, e.approved_by, e.reimbursed_by) if uid}
+    names = dict(db.query(User.id, User.name).filter(User.id.in_(ids)).all()) if ids else {}
+    for e in expenses:
+        e._crm_user_names = names
 
 
 def _name(db: Session, user_id: str | None) -> str | None:
@@ -327,28 +336,84 @@ def _post_gl(db: Session, expense: Expense, document_type: str) -> None:
         ) from exc
 
 
-def mark_approved(db: Session, expense: Expense, user: User, note: str | None = None) -> None:
+def apply_approval(expense: Expense, user: User, note: str | None = None) -> None:
+    """The approved state, without flushing or recording history (see mark_approved)."""
     expense.status = "approved"
     expense.approval_status = "Approved"
     expense.expense_status = "Approved"
     expense.approved_by = user.id
     expense.approved_at = _utcnow()
     expense.approval_note = note
+
+
+def mark_approved(db: Session, expense: Expense, user: User, note: str | None = None) -> None:
+    apply_approval(expense, user, note)
     db.flush()
     record_history(db, expense, user, "approved", note)
 
 
-def mark_reimbursed(
+def _paid_moment(db: Session, expense: Expense, paid_at: datetime | date | None) -> datetime:
+    """When the reimbursement happened, in UTC.
+
+    - not sent: now;
+    - a date only (the payment-date picker; ReimburseBody also turns a bare midnight into
+      a date): that day at the current time of the action in the organization's timezone
+      (Asia/Kolkata by default) -- not midnight UTC, which sorted the payment before its
+      own approval in the history;
+    - a date and time: that moment (no timezone = UTC, as before).
+
+    A payment before the approval is refused with 400. The one exception is a date only on
+    the approval day itself ("paid the same day"): it is placed just after the approval.
+    """
+    if paid_at is None:
+        return _utcnow()
+    date_only = not isinstance(paid_at, datetime)
+    if date_only:
+        tz = business_time.org_timezone(db, expense.organization_id)
+        moment = datetime.combine(paid_at, datetime.now(tz).time(), tzinfo=tz).astimezone(timezone.utc)
+    else:
+        moment = paid_at.astimezone(timezone.utc) if paid_at.tzinfo else paid_at.replace(tzinfo=timezone.utc)
+
+    approved = expense.approved_at
+    if approved is not None:
+        if approved.tzinfo is None:
+            approved = approved.replace(tzinfo=timezone.utc)
+        if moment < approved:
+            tz = business_time.org_timezone(db, expense.organization_id)
+            if date_only and business_time.local_date(approved, tz) == paid_at:
+                moment = approved + timedelta(seconds=1)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": "PAID_BEFORE_APPROVAL",
+                        "message": "paid_at cannot be earlier than the approval of this expense "
+                                   f"({approved.astimezone(tz).strftime('%d %b %Y %H:%M')} {tz}).",
+                        "approved_at": approved.isoformat(),
+                    },
+                )
+    return moment
+
+
+def apply_reimbursement(
     db: Session, expense: Expense, user: User, method: str,
-    reference: str | None, notes: str | None, paid_at: datetime | None,
+    reference: str | None, notes: str | None, paid_at: datetime | date | None,
 ) -> None:
+    """The reimbursed state, without flushing or recording history (see mark_reimbursed)."""
     expense.reimbursed_by = user.id
-    expense.reimbursed_at = paid_at or _utcnow()
+    expense.reimbursed_at = _paid_moment(db, expense, paid_at)
     expense.reimbursement_method = method
     expense.reimbursement_reference = reference
     expense.reimbursement_notes = notes
     expense.payment_status = "Paid"
     expense.expense_status = "Paid"
+
+
+def mark_reimbursed(
+    db: Session, expense: Expense, user: User, method: str,
+    reference: str | None, notes: str | None, paid_at: datetime | date | None,
+) -> None:
+    apply_reimbursement(db, expense, user, method, reference, notes, paid_at)
     db.flush()
     record_history(db, expense, user, "reimbursed", notes)
 
@@ -383,7 +448,7 @@ def reject(db: Session, expense: Expense, user: User, reason: str | None) -> Exp
 
 def reimburse(
     db: Session, expense: Expense, user: User, *, payment_method: str, amount: float | None = None,
-    payment_reference: str | None = None, notes: str | None = None, paid_at: datetime | None = None,
+    payment_reference: str | None = None, notes: str | None = None, paid_at: datetime | date | None = None,
 ) -> Expense:
     """Full reimbursement only: the amount, if sent, must be the expense's net payable."""
     if expense.reimbursed_at is not None:

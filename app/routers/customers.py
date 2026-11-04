@@ -5,7 +5,7 @@ from fastapi import (
 )
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload, selectinload
 
 from app.core.database import get_db
 from app.core import scoping
@@ -287,6 +287,14 @@ def list_customers(
         allowed_fields=CUSTOMER_SORTABLE_FIELDS,
         default_order=[Customer.created_at.desc(), Customer.id.desc()],
         secondary_key=Customer.id.desc(),
+    )
+    # The list row reads neither the uploaded documents (joined into every customer row
+    # by default) nor anything of a collection beyond its amount and status (used for
+    # the unreconciled figures) -- so neither those nor the collections' own users,
+    # allocations and orders are loaded.
+    query = query.options(
+        lazyload(Customer.documents),
+        selectinload(Customer.delivery_collections).lazyload("*"),
     )
     customers, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
 

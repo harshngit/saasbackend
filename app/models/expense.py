@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, JSON, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, JSON, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 
 from app.core.database import Base
 
@@ -33,6 +33,9 @@ def _now() -> datetime:
 
 class Expense(Base):
     __tablename__ = "expenses"
+    __table_args__ = (
+        Index("ux_expenses_idempotency", "organization_id", "submitted_by", "idempotency_key", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     organization_id: Mapped[str] = mapped_column(
@@ -45,8 +48,13 @@ class Expense(Base):
     payment_mode: Mapped[str | None] = mapped_column(String(30), nullable=True)
     receipt_url: Mapped[str | None] = mapped_column(Text, nullable=True)  # bill/receipt image
 
-    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    # 30: the longest stored value, "clarification_requested", is 23 characters (a
+    # String(20) column made Postgres refuse it; SQLite never checks the length).
+    status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
     submitted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # The client's Idempotency-Key for POST /expenses: a retried create returns the
+    # expense the first attempt made instead of a duplicate. Unique per submitter.
+    idempotency_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
@@ -121,6 +129,34 @@ class Expense(Base):
         back_populates="expense", cascade="all, delete-orphan", lazy="joined"
     )
     vendor: Mapped["Supplier | None"] = relationship(lazy="joined", primaryjoin="Expense.vendor_id == Supplier.id")  # noqa: F821
+    # Names of the people behind the *_by ids. A list page fills `_crm_user_names` with
+    # one query (expense_service.preload_user_names); otherwise each name is read from the
+    # session (usually already loaded: the acting user).
+    def _user_name(self, user_id: str | None) -> str | None:
+        if not user_id:
+            return None
+        names = getattr(self, "_crm_user_names", None)
+        if names is not None and user_id in names:
+            return names[user_id]
+        db = object_session(self)
+        if db is None:
+            return None
+        from app.models.user import User
+
+        user = db.get(User, user_id)
+        return user.name if user is not None else None
+
+    @property
+    def submitted_by_name(self) -> str | None:
+        return self._user_name(self.submitted_by)
+
+    @property
+    def approved_by_name(self) -> str | None:
+        return self._user_name(self.approved_by)
+
+    @property
+    def reimbursed_by_name(self) -> str | None:
+        return self._user_name(self.reimbursed_by)
 
     @property
     def lifecycle_status(self) -> str:

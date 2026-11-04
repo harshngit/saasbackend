@@ -73,6 +73,17 @@ class Settings(BaseSettings):
     # count and SQL ms (no parameters, no bodies).
     perf_log: bool = False
 
+    # --- Abandoned read requests (app/core/request_guard.py) ---
+    # A GET/HEAD whose client disconnected stops at its next database query. One that is
+    # still running after this many seconds is stopped the same way and answers 503.
+    # 0 turns the time limit off (a disconnect still stops the request).
+    read_request_timeout_seconds: float = 60
+
+    # --- Build label shown by /health and the startup log ---
+    # Set per release (e.g. the git commit or a date) so a deploy can be confirmed from
+    # /health. Empty = the label written in app/main.py.
+    build_tag: str = ""
+
     # --- Startup schema steps (create_all, enum/column fixes, backfills) ---
     # Each step costs several database round trips on every container start. Leave on
     # until `alembic upgrade head` runs as part of every deploy; then set false.

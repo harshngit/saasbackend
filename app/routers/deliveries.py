@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
@@ -70,6 +70,7 @@ from app.schemas.delivery import (
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.sales_order import OrderItemOut, OrderOut
+from app.routers.sales_orders import _ORDER_LIST_LOADING, _order_context, _order_out
 
 router = APIRouter(
     prefix="/deliveries",
@@ -207,9 +208,12 @@ def list_assigned_deliveries(
         default_order=[SalesOrder.created_at.desc(), SalesOrder.id.desc()],
         secondary_key=SalesOrder.id.desc(),
     )
+    q = q.options(*_ORDER_LIST_LOADING)
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    # The same order response (and page preload) as GET /orders.
+    ctx = _order_context(db, items)
     return PaginatedResponse(
-        items=[order_service._order_out(db, o) for o in items],
+        items=[_order_out(db, o, ctx=ctx) for o in items],
         total=total,
         page=page,
         page_size=page_size,
@@ -261,13 +265,17 @@ def _owned_delivery(db: Session, delivery_id: str, user: User) -> Delivery:
     return delivery
 
 
-def _delivery_out(db: Session, delivery: Delivery, include_timeline: bool = False) -> DeliveryOut:
+def _delivery_out(
+    db: Session, delivery: Delivery, include_timeline: bool = False, ctx: dict | None = None
+) -> DeliveryOut:
+    """`ctx` (delivery_service.delivery_list_context) carries the per-delivery lookups
+    preloaded for a list page; without it every lookup is queried here, as for one delivery."""
     out = DeliveryOut.model_validate(delivery)
     # Raw internal status, before status's own public-mapping field_validator
     # ran — see DeliveryOut.internal_status: distinguishes "loaded" from
     # "in_transit", which the public `status` deliberately reports the same.
     out.internal_status = delivery.status
-    for key, value in delivery_service.sync_delivery_view(db, delivery).items():
+    for key, value in delivery_service.sync_delivery_view(db, delivery, ctx).items():
         setattr(out, key, value)
 
     cust = delivery.customer
@@ -313,6 +321,7 @@ def _delivery_out(db: Session, delivery: Delivery, include_timeline: bool = Fals
                 orm_item,
                 line_out.product_id,
                 line_out.variant_id,
+                ctx=ctx,
             )
         else:
             line_out.warehouse_available = None
@@ -468,9 +477,18 @@ def list_deliveries(
         default_order=[Delivery.created_at.desc(), Delivery.id.desc()],
         secondary_key=Delivery.id.desc(),
     )
+    # Customer, order and vehicle come in the page query itself, without their own
+    # relationships (a customer's payments and collections, an order's lines...): the
+    # response only reads their columns.
+    query = query.options(
+        joinedload(Delivery.customer).lazyload("*"),
+        joinedload(Delivery.sales_order).lazyload("*"),
+        joinedload(Delivery.vehicle).lazyload("*"),
+    )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    ctx = delivery_service.delivery_list_context(db, items)
     return PaginatedResponse(
-        items=[_delivery_out(db, d) for d in items],
+        items=[_delivery_out(db, d, ctx=ctx) for d in items],
         total=total,
         page=page,
         page_size=page_size,

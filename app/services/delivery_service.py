@@ -127,6 +127,7 @@ def available_for_delivery_line(
     item: DeliveryItem | None,
     product_id: str | None,
     variant_id: str | None = None,
+    ctx: dict | None = None,
 ) -> float | None:
     """Compute how much stock is legitimately available for a specific delivery line.
 
@@ -134,10 +135,29 @@ def available_for_delivery_line(
     - Accounts for warehouse physical on-hand stock.
     - Subtracts active reservations belonging to OTHER orders/lines.
     - Does NOT penalize this delivery's own active reservation on the associated sales order.
+
+    `ctx` (from delivery_list_context) carries the stock rows preloaded for a whole page.
     """
     if not warehouse_id or not product_id:
         return None
     try:
+        if ctx is not None:
+            figures = ctx["stock"].get((warehouse_id, product_id, variant_id)) or stock_service.stock_summary(
+                db, warehouse_id, product_id, variant_id)
+            on_hand_qty, generic_avail = figures["on_hand"], figures["available"]
+            this_res_qty = 0.0
+            if delivery.sales_order_id:
+                this_res_qty = sum(
+                    h.outstanding_quantity or 0.0
+                    for h in ctx["order_reservations"].get(delivery.sales_order_id, [])
+                    if h.organization_id == delivery.organization_id
+                    and h.warehouse_id == warehouse_id
+                    and h.product_id == product_id
+                    and h.variant_id == variant_id
+                    and not (item and item.order_item_id and h.order_item_id != item.order_item_id)
+                )
+            return round(min(on_hand_qty, max(0.0, generic_avail + this_res_qty)), 3)
+
         on_hand_qty = stock_service.on_hand(db, warehouse_id, product_id, variant_id)
         generic_avail = stock_service.available(db, warehouse_id, product_id, variant_id)
 
@@ -313,7 +333,7 @@ def require_partner_available(db: Session, org_id: str, partner: User, on_date) 
         )
 
 
-def amount_due(db: Session, delivery: Delivery) -> float:
+def amount_due(db: Session, delivery: Delivery, ctx: dict | None = None) -> float:
     """What the customer still owes on the order behind this delivery — what the
     partner needs to know before handing anything over."""
     if not delivery.sales_order_id:
@@ -321,16 +341,15 @@ def amount_due(db: Session, delivery: Delivery) -> float:
     order = db.get(SalesOrder, delivery.sales_order_id)
     if order is None:
         return 0.0
-    paid = sum(
-        i.amount_paid or 0
-        for i in db.query(Invoice).filter(
-            Invoice.order_id == order.id, Invoice.is_credit_note.is_(False)
-        )
+    invoices = (
+        ctx["order_invoices"].get(order.id, []) if ctx is not None
+        else db.query(Invoice).filter(Invoice.order_id == order.id, Invoice.is_credit_note.is_(False))
     )
+    paid = sum(i.amount_paid or 0 for i in invoices)
     return round(max((order.total or 0) - paid, 0), 2)
 
 
-def previous_pending_balance(db: Session, delivery: Delivery) -> float:
+def previous_pending_balance(db: Session, delivery: Delivery, ctx: dict | None = None) -> float:
     """The customer's receivable/pending balance immediately before the current order/delivery financial impact.
 
     outstanding = opening_balance + total_billed - total_received.
@@ -352,7 +371,14 @@ def previous_pending_balance(db: Session, delivery: Delivery) -> float:
 
     # Invoices associated with this delivery or its parent sales order in the same tenant org
     invoices_current = []
-    if delivery.id:
+    if ctx is not None:
+        org = delivery.organization_id
+        invoices_current.extend(
+            inv for inv in ctx["delivery_invoices"].get(delivery.id, []) if inv.organization_id == org)
+        for inv in ctx["order_invoices"].get(delivery.sales_order_id, []) if delivery.sales_order_id else []:
+            if inv.organization_id == org and inv not in invoices_current:
+                invoices_current.append(inv)
+    elif delivery.id:
         invoices_current.extend(
             db.query(Invoice).filter(
                 Invoice.delivery_id == delivery.id,
@@ -360,7 +386,7 @@ def previous_pending_balance(db: Session, delivery: Delivery) -> float:
                 Invoice.is_credit_note.is_(False),
             ).all()
         )
-    if delivery.sales_order_id:
+    if ctx is None and delivery.sales_order_id:
         order_invoices = (
             db.query(Invoice).filter(
                 Invoice.order_id == delivery.sales_order_id,
@@ -1126,7 +1152,60 @@ def _settle_order_fulfilment(db: Session, order: SalesOrder, actor_id: str | Non
         order.status = "processing"
 
 
-def sync_delivery_view(db: Session, delivery: Delivery) -> dict:
+def delivery_list_context(db: Session, deliveries: list[Delivery]) -> dict:
+    """Everything the delivery response looks up per delivery and per line, loaded for a
+    whole page at once -- a fixed number of queries however many deliveries (and lines)
+    the page holds. Rows loaded here stay in the session, so the db.get() calls made
+    while building each response are answered without a query."""
+    ctx: dict = {"order_invoices": {}, "delivery_invoices": {}, "stock": {}, "order_reservations": {}}
+    if not deliveries:
+        return ctx
+    keep = ctx["_keep"] = []  # strong references: the session's identity map is weak
+    delivery_ids = [d.id for d in deliveries]
+    order_ids = {d.sales_order_id for d in deliveries if d.sales_order_id}
+
+    partner_ids = {d.delivery_partner_id for d in deliveries if d.delivery_partner_id}
+    if partner_ids:
+        keep += db.query(User).filter(User.id.in_(partner_ids)).all()
+    orders = {o.id: o for o in (d.sales_order for d in deliveries) if o is not None}
+    missing = order_ids - set(orders)
+    if missing:
+        orders.update({o.id: o for o in db.query(SalesOrder).filter(SalesOrder.id.in_(missing))})
+    keep += list(orders.values())
+    warehouse_ids = {o.warehouse_id for o in orders.values() if o.warehouse_id}
+    warehouse_ids |= {d.warehouse_id for d in deliveries if d.warehouse_id}
+    if warehouse_ids:
+        keep += db.query(Warehouse).filter(Warehouse.id.in_(warehouse_ids)).all()
+
+    invoice_filter = Invoice.delivery_id.in_(delivery_ids)
+    if order_ids:
+        invoice_filter = invoice_filter | Invoice.order_id.in_(order_ids)
+    # Only the invoices' own amounts are read: none of their relationships is loaded.
+    for inv in db.query(Invoice).options(lazyload("*")).filter(invoice_filter, Invoice.is_credit_note.is_(False)):
+        keep.append(inv)
+        if inv.order_id in order_ids:
+            ctx["order_invoices"].setdefault(inv.order_id, []).append(inv)
+        if inv.delivery_id is not None:
+            ctx["delivery_invoices"].setdefault(inv.delivery_id, []).append(inv)
+
+    stock_keys = []
+    for d in deliveries:
+        wh = resolve_delivery_warehouse(db, d)
+        if wh is None:
+            continue
+        stock_keys += [(wh.id, i.product_id, i.variant_id) for i in (d.items or []) if i.product_id]
+    if stock_keys:
+        # A line only counts its own order's reservations for the same warehouse and
+        # product -- all among the rows the stock figures load anyway.
+        reservations: list = []
+        ctx["stock"] = stock_service.stock_summaries(db, stock_keys, reservations_out=reservations)
+        for h in reservations:
+            if h.order_id in order_ids:
+                ctx["order_reservations"].setdefault(h.order_id, []).append(h)
+    return ctx
+
+
+def sync_delivery_view(db: Session, delivery: Delivery, ctx: dict | None = None) -> dict:
     """The extra fields the response carries beyond the columns.
 
     Built as plain dicts merged onto DeliveryOut via setattr() (see
@@ -1150,8 +1229,8 @@ def sync_delivery_view(db: Session, delivery: Delivery) -> dict:
             "fulfilment_status": order.fulfilment_status,
             "total": order.total,
         } if order is not None else None,
-        "amount_due": amount_due(db, delivery),
-        "previous_pending_balance": previous_pending_balance(db, delivery),
+        "amount_due": amount_due(db, delivery, ctx),
+        "previous_pending_balance": previous_pending_balance(db, delivery, ctx),
         "pod": {
             "photo_file_ids": list(delivery.pod_photo_file_ids or []),
             "signature_file_id": delivery.pod_signature_file_id,

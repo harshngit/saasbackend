@@ -14,7 +14,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -139,21 +139,36 @@ def extract_company_number(db: Session, org_id: str) -> str:
     return num_part
 
 
-def _highest_issued(db: Session, org_id: str, column, stem: str) -> int:
+def _highest_issued(db: Session, org_id: str, column, stem: str, above: int = 0) -> int:
     """Highest sequence number already present matching the exact stem.
 
-    Used only to seed the counter the first time so existing canonical records
-    are not collided with and old legacy formats do not interfere.
+    Seeds the counter the first time, so existing canonical records are not collided
+    with and old legacy formats do not interfere; afterwards it checks that nothing was
+    issued past the counter. `above` (the counter) limits the rows read to those that
+    could be higher, instead of every number of the year. Numbers are written zero-padded
+    to at least 4 digits (_allocate_next), so with W = that padded width:
+      - longer than W digits                      -> read (could be higher);
+      - exactly W digits                          -> read only if it sorts after `above`
+                                                     padded to W (same length: sorts = compares);
+      - fewer than W but at least as many digits
+        as `above` unpadded (a legacy unpadded no.) -> read;
+      - fewer digits than `above` itself          -> always smaller, skipped.
     """
     if column is None:
         return 0
     try:
         model = column.parent.class_
-        rows = (
-            db.query(column)
-            .filter(model.organization_id == org_id, column.like(f"{stem}%"))
-            .all()
-        )
+        query = db.query(column).filter(model.organization_id == org_id, column.like(f"{stem}%"))
+        if above > 0:
+            digits = len(str(above))
+            padded = max(4, digits)
+            length = func.length(column)
+            query = query.filter(or_(
+                length > len(stem) + padded,
+                and_(length == len(stem) + padded, column > f"{stem}{str(above).zfill(padded)}"),
+                and_(length >= len(stem) + digits, length < len(stem) + padded),
+            ))
+        rows = query.all()
     except Exception:
         return 0
 
@@ -214,7 +229,7 @@ def _allocate_next(
             pass
     else:
         # Ensure sequence counter is synchronized if records with higher numbers exist
-        initial_highest = _highest_issued(db, org_id, column, stem)
+        initial_highest = _highest_issued(db, org_id, column, stem, above=exists.last_number)
         if exists.last_number < initial_highest:
             exists.last_number = initial_highest
             db.flush()

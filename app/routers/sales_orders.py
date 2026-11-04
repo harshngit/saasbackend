@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import update as sa_update
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, lazyload, selectinload
 
-from app.core import scoping, workflow
+from app.core import business_time, scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
@@ -36,6 +36,7 @@ from app.schemas.sales_order import (
     BulkDeleteResult,
     CancelBody,
     OrderCreate,
+    OrderListSummary,
     OrderOut,
     OrderPaymentCreate,
     OrderPaymentSummary,
@@ -95,6 +96,26 @@ def _owned(db: Session, order_id: str, org_id: str, user: User | None = None) ->
     return record
 
 
+# How a page of orders is loaded for _order_out: deliveries, invoices and the customer
+# are only read for their own columns, so none of their relationships (a customer's
+# collections and payments, a delivery's lines, customer and vehicle...) is loaded.
+_ORDER_LIST_LOADING = (
+    selectinload(SalesOrder.deliveries).lazyload("*"),
+    selectinload(SalesOrder.invoices).lazyload("*"),
+    joinedload(SalesOrder.customer).lazyload("*"),
+)
+
+
+# A payment in the order response (CustomerPaymentOut) reads its invoice's and its
+# delivery collection's own columns, the collector and the splits -- not the invoice's
+# or collection's relationships, which would otherwise load in a chain.
+_PAYMENT_LOADING = (
+    selectinload(CustomerPayment.invoice).lazyload("*"),
+    selectinload(CustomerPayment.delivery_collection).lazyload("*"),
+    joinedload(CustomerPayment.allocations).lazyload("*"),
+)
+
+
 def _order_context(db: Session, orders: list[SalesOrder]) -> dict:
     """Everything _order_out looks up per order, loaded for a whole page at once -- a
     fixed number of queries however many orders the page holds. Loaded rows stay in the
@@ -124,7 +145,7 @@ def _order_context(db: Session, orders: list[SalesOrder]) -> dict:
 
     for c in (
         db.query(DeliveryCollection)
-        .options(selectinload(DeliveryCollection.allocations))
+        .options(lazyload("*"), selectinload(DeliveryCollection.allocations).lazyload("*"))
         .filter(
             DeliveryCollection.organization_id.in_(org_ids),
             DeliveryCollection.sales_order_id.in_(ids),
@@ -134,6 +155,7 @@ def _order_context(db: Session, orders: list[SalesOrder]) -> dict:
         ctx["direct_colls"].setdefault(c.sales_order_id, []).append(c)
     for a, c, order_id in (
         db.query(DeliveryCollectionAllocation, DeliveryCollection, Invoice.order_id)
+        .options(lazyload("*"))
         .join(DeliveryCollection, DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id)
         .join(Invoice, DeliveryCollectionAllocation.invoice_id == Invoice.id)
         .filter(
@@ -143,12 +165,13 @@ def _order_context(db: Session, orders: list[SalesOrder]) -> dict:
         )
     ):
         ctx["alloc_colls"].setdefault(order_id, []).append((a, c))
-    for pmt in db.query(CustomerPayment).filter(
+    for pmt in db.query(CustomerPayment).options(*_PAYMENT_LOADING).filter(
         CustomerPayment.organization_id.in_(org_ids), CustomerPayment.order_id.in_(ids)
     ):
         ctx["direct_payments"].setdefault(pmt.order_id, []).append(pmt)
     for pmt, order_id in (
         db.query(CustomerPayment, Invoice.order_id)
+        .options(*_PAYMENT_LOADING)
         .join(CustomerPaymentAllocation, CustomerPaymentAllocation.customer_payment_id == CustomerPayment.id)
         .join(Invoice, CustomerPaymentAllocation.invoice_id == Invoice.id)
         .filter(CustomerPayment.organization_id.in_(org_ids), Invoice.order_id.in_(ids))
@@ -512,32 +535,35 @@ ORDER_SORTABLE_FIELDS = {
 }
 
 
-@router.get("", response_model=PaginatedResponse[OrderOut])
-def list_orders(
-    user: User = Depends(_view),
-    status_filter: str | None = Query(
-        default=None, alias="status",
-        description="draft | confirmed | completed | cancelled. Filter orders by public status.",
-    ),
-    fulfilment_status: str | None = Query(
-        default=None,
-        description="not_started | reserved | planned | loaded | in_transit | "
-                    "partially_delivered | delivered | failed",
-    ),
-    customer_id: str | None = Query(default=None),
-    assigned_delivery_partner_id: str | None = Query(default=None),
-    search: str | None = Query(default=None, description="matches order_number"),
-    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
-    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
-    sort_by: str | None = Query(default=None, description="Field to sort by"),
-    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
-    db: Session = Depends(get_db),
-) -> PaginatedResponse[OrderOut]:
+# The internal statuses behind each public Order status (workflow.PUBLIC_ORDER_STATUS).
+_PUBLIC_STATUS_GROUPS: dict[str, tuple[str, ...]] = {}
+for _internal, _public in workflow.PUBLIC_ORDER_STATUS.items():
+    _PUBLIC_STATUS_GROUPS[_public] = _PUBLIC_STATUS_GROUPS.get(_public, ()) + (_internal,)
+
+
+def _filtered_orders(
+    db: Session,
+    user: User,
+    status_filter: str | None,
+    fulfilment_status: str | None,
+    customer_id: str | None,
+    assigned_delivery_partner_id: str | None,
+    search: str | None,
+    date_from: date | None,
+    date_to: date | None,
+    source: str | None,
+):
+    """The orders GET /orders lists and GET /orders/summary counts -- one set of filters,
+    so the summary cards always add up to what the list shows."""
     org_id = _org_id(user)
     query = db.query(SalesOrder).filter(SalesOrder.organization_id == org_id)
     if status_filter:
         mapped = workflow.LEGACY_ORDER_STATUS.get(status_filter)
-        if mapped and status_filter not in workflow.ORDER_STATUSES:
+        if status_filter == "confirmed":
+            # The public status: placed, processing and awaiting approval all read as
+            # "confirmed" (the legacy mapping matched only processing + reserved).
+            query = query.filter(SalesOrder.status.in_(_PUBLIC_STATUS_GROUPS["confirmed"]))
+        elif mapped and status_filter not in workflow.ORDER_STATUSES:
             new_status, fulfilment = mapped
             query = query.filter(
                 SalesOrder.status == new_status, SalesOrder.fulfilment_status == fulfilment
@@ -552,11 +578,55 @@ def list_orders(
         query = query.filter(SalesOrder.assigned_delivery_partner_id == assigned_delivery_partner_id)
     if search:
         query = query.filter(SalesOrder.order_number.ilike(f"%{search}%"))
-    query = scoping.owned_by(
+    if source:
+        query = query.filter(SalesOrder.source == source)
+    if date_from or date_to:
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                detail="date_from must not be after date_to")
+        # Organization-local calendar days, both inclusive, on the order date (the
+        # creation time when no order date was entered) -- as the reports read it.
+        tz = business_time.org_timezone(db, org_id)
+        order_day = func.coalesce(SalesOrder.order_date, SalesOrder.created_at)
+        if date_from:
+            query = query.filter(order_day >= business_time.day_start(date_from, tz))
+        if date_to:
+            query = query.filter(order_day <= business_time.day_end(date_to, tz))
+    return scoping.owned_by(
         query, db, user,
         SalesOrder.created_by, SalesOrder.salesperson_id, SalesOrder.assigned_delivery_partner_id,
         team_columns=(SalesOrder.salesperson_id,),
     )
+
+
+_STATUS_QUERY_DESCRIPTION = "draft | confirmed | completed | cancelled. Filter orders by public status."
+_DATE_DESCRIPTION = "YYYY-MM-DD: an organization calendar day, inclusive, on the order date"
+_SOURCE_DESCRIPTION = "direct | quotation | office | delivery_vehicle"
+
+
+@router.get("", response_model=PaginatedResponse[OrderOut])
+def list_orders(
+    user: User = Depends(_view),
+    status_filter: str | None = Query(default=None, alias="status", description=_STATUS_QUERY_DESCRIPTION),
+    fulfilment_status: str | None = Query(
+        default=None,
+        description="not_started | reserved | planned | loaded | in_transit | "
+                    "partially_delivered | delivered | failed",
+    ),
+    customer_id: str | None = Query(default=None),
+    assigned_delivery_partner_id: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="matches order_number"),
+    date_from: date | None = Query(default=None, description=_DATE_DESCRIPTION),
+    date_to: date | None = Query(default=None, description=_DATE_DESCRIPTION),
+    source: str | None = Query(default=None, description=_SOURCE_DESCRIPTION),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
+    db: Session = Depends(get_db),
+) -> PaginatedResponse[OrderOut]:
+    query = _filtered_orders(db, user, status_filter, fulfilment_status, customer_id,
+                             assigned_delivery_partner_id, search, date_from, date_to, source)
     query = apply_sorting(
         query,
         sort_by=sort_by,
@@ -565,7 +635,7 @@ def list_orders(
         default_order=[SalesOrder.created_at.desc(), SalesOrder.id.desc()],
         secondary_key=SalesOrder.id.desc(),
     )
-    query = query.options(selectinload(SalesOrder.deliveries), selectinload(SalesOrder.invoices))
+    query = query.options(*_ORDER_LIST_LOADING)
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
     ctx = _order_context(db, items)
     return PaginatedResponse(
@@ -574,6 +644,49 @@ def list_orders(
         page=page,
         page_size=page_size,
         total_pages=total_pages,
+    )
+
+
+@router.get("/summary", response_model=OrderListSummary)
+def orders_summary(
+    user: User = Depends(_view),
+    status_filter: str | None = Query(default=None, alias="status", description=_STATUS_QUERY_DESCRIPTION),
+    fulfilment_status: str | None = Query(default=None),
+    customer_id: str | None = Query(default=None),
+    assigned_delivery_partner_id: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="matches order_number"),
+    date_from: date | None = Query(default=None, description=_DATE_DESCRIPTION),
+    date_to: date | None = Query(default=None, description=_DATE_DESCRIPTION),
+    source: str | None = Query(default=None, description=_SOURCE_DESCRIPTION),
+    db: Session = Depends(get_db),
+) -> OrderListSummary:
+    """The cards above the Orders list: how many orders per public status and their
+    value, over exactly the orders GET /orders returns for the same filters (and the
+    same data scope). One query."""
+    query = _filtered_orders(db, user, status_filter, fulfilment_status, customer_id,
+                             assigned_delivery_partner_id, search, date_from, date_to, source)
+    counts = {key: 0 for key in ("draft", "confirmed", "completed", "cancelled")}
+    values = {key: 0.0 for key in counts}
+    rows = (
+        query.order_by(None)
+        .with_entities(SalesOrder.status, func.count(SalesOrder.id), func.coalesce(func.sum(SalesOrder.total), 0))
+        .group_by(SalesOrder.status)
+        .all()
+    )
+    for internal, n, value in rows:
+        public = workflow.public_order_status(internal)
+        if public in counts:
+            counts[public] += n
+            values[public] += float(value or 0)
+    values = {key: round(v, 2) for key, v in values.items()}
+    return OrderListSummary(
+        total=sum(counts.values()),
+        **counts,
+        total_value=round(values["confirmed"] + values["completed"], 2),
+        draft_value=values["draft"],
+        confirmed_value=values["confirmed"],
+        completed_value=values["completed"],
+        cancelled_value=values["cancelled"],
     )
 
 

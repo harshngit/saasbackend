@@ -1,7 +1,8 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import scoping
@@ -97,11 +98,22 @@ def expense_categories(_user: User = Depends(_view)) -> dict:
 @router.post("", response_model=ExpenseOut, status_code=status.HTTP_201_CREATED)
 def create_expense(
     payload: ExpenseCreate,
+    response: Response,
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", max_length=100,
+        description="Optional. Send the same key when retrying a create (e.g. after a timeout): the "
+                    "expense the first attempt made is returned instead of a duplicate.",
+    ),
     user: User = Depends(_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> Expense:
     org_id = _org_id(user)
+    key = (idempotency_key or "").strip() or None
+    if key:
+        earlier = _by_idempotency_key(db, org_id, user.id, key)
+        if earlier is not None:
+            return _replay(earlier, payload, response)
     expense_service.validate_attachment_refs(
         db, org_id, payload.receipt_url, payload.vendor_invoice_url,
         *expense_service.supporting_refs(payload.supporting_documents),
@@ -188,21 +200,48 @@ def create_expense(
         is_recurring=payload.is_recurring,
         recurrence_frequency=payload.recurrence_frequency,
         next_due_date=next_due_date,
+        idempotency_key=key,
+        # Set here, not at the INSERT, so an auto-approval below is never "before" it.
+        created_at=datetime.now(timezone.utc),
     )
 
     for item_data in calculated_items:
         expense.items.append(ExpenseItem(**item_data))
 
-    db.add(expense)
-    db.flush()
-    expense_service.record_history(db, expense, user, "created")
+    # An Admin's expense is written already approved (and paid) in the one INSERT,
+    # instead of an INSERT followed by an UPDATE per step.
+    approval_note = "Created by Admin (auto-approved)"
+    paid_note = "Recorded as already paid at creation"
     if creator_is_admin:
-        expense_service.mark_approved(db, expense, user, "Created by Admin (auto-approved)")
+        expense_service.apply_approval(expense, user, approval_note)
         if already_paid:
-            expense_service.mark_reimbursed(
-                db, expense, user, paid_method, payload.payment_reference,
-                "Recorded as already paid at creation", None,
-            )
+            expense_service.apply_reimbursement(
+                db, expense, user, paid_method, payload.payment_reference, paid_note, None)
+
+    db.add(expense)
+    if key:
+        try:
+            with db.begin_nested():
+                db.flush()
+        except IntegrityError:
+            # The same key won a concurrent attempt a moment ago: answer with that one.
+            db.rollback()
+            earlier = _by_idempotency_key(db, org_id, user.id, key)
+            if earlier is None:
+                raise
+            return _replay(earlier, payload, response)
+    else:
+        db.flush()
+    # Recorded in the same instant, so each step is stamped a microsecond after the one
+    # before it: the history then always reads created < approved < reimbursed.
+    steps = [expense_service.record_history(db, expense, user, "created")]
+    if creator_is_admin:
+        steps.append(expense_service.record_history(db, expense, user, "approved", approval_note))
+        if already_paid:
+            steps.append(expense_service.record_history(db, expense, user, "reimbursed", paid_note))
+    for n, entry in enumerate(steps):
+        entry.created_at = expense.created_at + timedelta(microseconds=n)
+    if creator_is_admin:
         expense_service._post_gl(db, expense, "expense")
         notification_service.notify_expense_status_changed(db, expense, actor_id=user.id)
     else:
@@ -213,6 +252,35 @@ def create_expense(
     db.commit()
     db.refresh(expense)
     return expense
+
+
+def _by_idempotency_key(db: Session, org_id: str, user_id: str, key: str) -> Expense | None:
+    return (
+        db.query(Expense)
+        .filter(Expense.organization_id == org_id, Expense.submitted_by == user_id, Expense.idempotency_key == key)
+        .first()
+    )
+
+
+def _replay(earlier: Expense, payload: ExpenseCreate, response: Response) -> Expense:
+    """A retried create: the expense the first attempt made, unchanged. A key reused for
+    a different expense (another category or amount) is refused rather than guessed at."""
+    _, _, total_amount, _ = expense_service.calculate_totals(
+        items_in=payload.items, header_tax_rate=payload.tax_rate,
+        header_tax_amount=payload.tax_amount, header_amount=payload.amount,
+    )
+    if earlier.category != payload.category or abs((earlier.amount or 0) - total_amount) > 0.005:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "IDEMPOTENCY_KEY_REUSED",
+                "message": "This Idempotency-Key was already used for a different expense. "
+                           "Use a new key for a new expense.",
+                "expense_id": earlier.id,
+            },
+        )
+    response.headers["Idempotent-Replayed"] = "true"
+    return earlier
 
 
 @router.post("/{expense_id}/receipt", response_model=ExpenseOut)
@@ -324,6 +392,7 @@ def list_expenses(
         secondary_key=Expense.id.desc(),
     )
     items, total, page, page_size, total_pages = paginate(q, page=page, page_size=page_size)
+    expense_service.preload_user_names(db, items)  # submitted / approved / reimbursed by: one query
     return PaginatedResponse(
         items=[ExpenseOut.model_validate(e) for e in items],
         total=total,

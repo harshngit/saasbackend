@@ -138,6 +138,21 @@ class OrderWarehouseBrief(BaseModel):
     is_default: bool = False
 
 
+class OrderListSummary(BaseModel):
+    """GET /orders/summary: the cards above the Orders list, over the same filters."""
+
+    total: int = Field(description="All orders matching the filters (every status)")
+    draft: int
+    confirmed: int
+    completed: int
+    cancelled: int
+    total_value: float = Field(description="Value of confirmed + completed orders (drafts and cancelled excluded)")
+    draft_value: float
+    confirmed_value: float
+    completed_value: float
+    cancelled_value: float
+
+
 class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

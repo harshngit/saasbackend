@@ -148,6 +148,11 @@ from app.core.database import install_disconnect_retry  # noqa: E402
 
 install_disconnect_retry(app)
 
+from app.core import request_guard  # noqa: E402
+
+# Added last = outermost, so it sees the client's own disconnect.
+request_guard.install(app, engine, settings.read_request_timeout_seconds)
+
 
 _log = logging.getLogger("crm.startup")
 _error_log = logging.getLogger("crm.errors")
@@ -190,8 +195,10 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 
-# Bump when the deployed feature set changes, so /health and logs confirm the build.
-BUILD_TAG = "push-startup-diagnostics"
+# Shown by /health and the startup log, so a deploy can be confirmed. The BUILD_TAG
+# environment variable (set per release, e.g. to the git commit) wins; otherwise this
+# label -- bump it in every release.
+BUILD_TAG = settings.build_tag.strip() or "2026-11-04-deliveries-n-plus-one"
 
 
 @app.on_event("startup")

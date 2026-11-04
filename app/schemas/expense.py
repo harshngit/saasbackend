@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime, time
 from typing import Literal
 
 from app.schemas.choices import ApprovalStatus, ExpensePaymentStatus, ExpenseStatus
@@ -60,7 +60,10 @@ class ExpenseOut(BaseModel):
                     "`status` keeps its stored values (pending | clarification_requested | approved | rejected).",
     )
     submitted_by: str | None = None
+    submitted_by_name: str | None = Field(default=None, description="Name of the user who submitted it")
     approved_by: str | None = None
+    approved_by_name: str | None = Field(
+        default=None, description="Name of the reviewer in approved_by (for a rejection: who rejected it)")
     approved_at: datetime | None = None
     approval_note: str | None = None
     reject_reason: str | None = None
@@ -68,6 +71,7 @@ class ExpenseOut(BaseModel):
     rejected_by: str | None = None
     rejected_at: datetime | None = None
     reimbursed_by: str | None = None
+    reimbursed_by_name: str | None = Field(default=None, description="Name of the user who recorded the reimbursement")
     reimbursed_at: datetime | None = None
     reimbursement_method: str | None = None
     reimbursement_reference: str | None = None
@@ -284,12 +288,37 @@ class ApproveBody(BaseModel):
 class ReimburseBody(BaseModel):
     payment_method: str = Field(description="cash | bank_transfer | upi | cheque")
     payment_reference: str | None = Field(default=None, max_length=150, description="UTR / cheque no / txn id")
-    paid_at: datetime | None = Field(default=None, description="Payment date; defaults to now")
+    paid_at: datetime | date | None = Field(
+        default=None,
+        description="When it was paid; defaults to now. A date only (YYYY-MM-DD) is that day at the "
+                    "current time of the action in the organization's timezone.",
+    )
     notes: str | None = Field(default=None, max_length=500)
     amount: float | None = Field(
         default=None, gt=0,
         description="Optional check value. Full reimbursement only: must equal the expense's net_payable.",
     )
+
+    @field_validator("paid_at", mode="before")
+    @classmethod
+    def _date_only(cls, v: object) -> object:
+        """Keep a picked date a date: "2026-11-04" -- or a date picker's midnight, e.g.
+        "2026-11-04T00:00:00Z" / "...T00:00:00+05:30" -- carries no time of day, and must not
+        be stored as midnight UTC (it would sort before the approval in the history)."""
+        if isinstance(v, str):
+            text = v.strip()
+            if len(text) == 10:
+                try:
+                    return date.fromisoformat(text)
+                except ValueError:
+                    return v
+            try:
+                v = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return v
+        if isinstance(v, datetime) and v.time() == time(0):
+            return v.date()  # midnight in its own offset: the day that was picked
+        return v
 
 
 class ExpenseAttachmentOut(BaseModel):
