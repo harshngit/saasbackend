@@ -119,6 +119,10 @@ class DashboardToday(BaseModel):
     orders: int = Field(description="Orders placed today (placed / processing / completed)")
     sales: float = Field(description="Their total amount (same as summary.today_sales)")
     delivered: int = Field(description="Deliveries confirmed as delivered today")
+    delivered_orders: int = Field(description="Of today's orders, those fully delivered (completed)")
+    pending_orders: int = Field(description="Of today's orders, the rest (orders - delivered_orders)")
+    delivered_amount: float = Field(description="Total amount of delivered_orders")
+    pending_amount: float = Field(description="Total amount of pending_orders (sales - delivered_amount)")
 
 
 class AdminDashboardOut(BaseModel):
@@ -156,7 +160,7 @@ from app.schemas.staff_overview import (  # noqa: E402
 class MySalesSummary(BaseModel):
     sales_amount: float = Field(description="Sales in the period (orders past approval, by creation date)")
     orders: int = Field(description="Number of those orders")
-    today_sales_amount: float = Field(description="Same definition, for today (UTC day, as Staff Detail)")
+    today_sales_amount: float = Field(description="Same definition, for today (organization's timezone)")
     assigned_customers: int = Field(description="Customers whose assigned sales officer is this employee")
 
 

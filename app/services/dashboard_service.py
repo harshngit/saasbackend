@@ -19,7 +19,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
@@ -617,11 +617,20 @@ def build_admin_dashboard(
     totals = tuple(_sales_totals(db, eff_org, customer_id, company_id,
                                  [windows["previous"], windows["today"], windows["month"]]))
     today_from, today_to = windows["today"]
-    today_orders = (
+    # Today's placed orders split into fully delivered (completed) and the rest, in one query.
+    fully_delivered = or_(SalesOrder.status == "completed", SalesOrder.fulfilment_status == "delivered")
+    today_orders, delivered_orders, today_amount, delivered_amount = (
         _sale_orders(db, eff_org, customer_id, company_id)
         .filter(SalesOrder.created_at >= today_from, SalesOrder.created_at <= today_to)
-        .count()
+        .with_entities(
+            func.count(SalesOrder.id),
+            func.coalesce(func.sum(case((fully_delivered, 1), else_=0)), 0),
+            func.coalesce(func.sum(SalesOrder.total), 0),
+            func.coalesce(func.sum(case((fully_delivered, SalesOrder.total), else_=0)), 0),
+        )
+        .one()
     )
+    delivered_amount = round(float(delivered_amount or 0), 2)
     delivered_q = db.query(Delivery).filter(
         Delivery.organization_id == eff_org, Delivery.status == "delivered",
         Delivery.confirmed_at >= today_from, Delivery.confirmed_at <= today_to,
@@ -640,8 +649,13 @@ def build_admin_dashboard(
         ),
         summary=_summary(db, eff_org, start, end, df, dt, period_sales, purchases, expenses, customer_id, company_id,
                          tz=tz, totals=totals),
-        today=DashboardToday(date=today.isoformat(), timezone=str(tz), orders=today_orders, sales=totals[1],
-                             delivered=delivered_q.count()),
+        today=DashboardToday(
+            date=today.isoformat(), timezone=str(tz), orders=today_orders, sales=totals[1],
+            delivered=delivered_q.count(),
+            delivered_orders=int(delivered_orders or 0), pending_orders=today_orders - int(delivered_orders or 0),
+            delivered_amount=delivered_amount,
+            pending_amount=round(float(today_amount or 0) - delivered_amount, 2),
+        ),
         orders=_orders(db, eff_org, customer_id, company_id, df, dt,
                        rows=[(o.status, o.fulfilment_status) for o in window_rows]),
         cashflow=_cashflow(db, eff_org, start, end, df, dt, customer_id, supplier_id, company_id,
