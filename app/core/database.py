@@ -137,6 +137,29 @@ if not DATABASE_URL.startswith("sqlite") and not settings.db_pool_pre_ping:
     install_idle_ping(engine, settings.db_idle_ping_seconds)
 
 
+_RETRY_METHODS = {"GET", "HEAD"}
+
+
+def install_disconnect_retry(app) -> None:  # noqa: ANN001
+    """Run a read-only request (GET/HEAD) once more when it failed because the database
+    connection had dropped (a connection used within the idle-ping window can still have
+    been closed by the server). SQLAlchemy has already discarded that connection, so the
+    second attempt gets a fresh one. Writes are never retried: a POST/PATCH/DELETE that
+    reached the database must not run twice."""
+    from sqlalchemy.exc import DBAPIError
+
+    @app.middleware("http")
+    async def _retry_dropped_connection(request, call_next):  # noqa: ANN001, ANN202
+        try:
+            return await call_next(request)
+        except DBAPIError as exc:
+            if request.method not in _RETRY_METHODS or not exc.connection_invalidated:
+                raise
+            logger.warning("Database connection dropped during %s %s; retrying once",
+                           request.method, request.url.path)
+            return await call_next(request)
+
+
 if DATABASE_URL.startswith("sqlite"):
     # SQLite ignores foreign keys unless told to enforce them. Turn it on so
     # dev matches Postgres (ON DELETE SET NULL / CASCADE actually fire).

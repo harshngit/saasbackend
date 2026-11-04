@@ -579,7 +579,9 @@ def list_orders(
 
 @router.get("/{order_id}", response_model=OrderOut)
 def get_order(order_id: str, user: User = Depends(_view), db: Session = Depends(get_db)) -> OrderOut:
-    return _order_out(db, _owned(db, order_id, _org_id(user), user))
+    order = _owned(db, order_id, _org_id(user), user)
+    # The list's bulk loader: stock for all lines in two queries instead of two per line.
+    return _order_out(db, order, ctx=_order_context(db, [order]))
 
 
 @router.get("/import/template")

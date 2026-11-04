@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core import business_time
 from app.core.database import get_db
 from app.core.deps import require_permission, require_unlocked_org
 from app.core.pagination import paginate
@@ -78,7 +79,7 @@ def preview_expected(
 ) -> ExpectedCollectionsPreview:
     """Preview expected collections and cash movements for a business date."""
     org_id = _org_id(user)
-    target_date = reconciliation_date or date.today()
+    target_date = reconciliation_date or business_time.today(business_time.org_timezone(db, org_id))
     figures = cash_reconciliation_service.calculate_expected_figures(db, org_id, target_date)
 
     details = [

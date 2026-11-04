@@ -20,3 +20,7 @@ razorpay==2.0.1
 cryptography>=42.0.0
 
 firebase-admin==7.7.0
+
+# Timezone data for zoneinfo (organization business days, e.g. Asia/Kolkata); slim container
+# images may ship without the system tz database.
+tzdata>=2024.1

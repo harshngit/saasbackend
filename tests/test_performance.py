@@ -171,6 +171,50 @@ def test_admin_dashboard_cache_is_cleared_by_a_write(db):
     assert client.get("/dashboard/admin").json() == second
 
 
+def test_dashboard_cache_is_cleared_by_any_business_write_but_not_by_a_notification(db):
+    from app.models import Notification, SalesReturn
+
+    org, admin, client = _tenant(db, 1)
+    client.get("/dashboard/admin")
+    assert dashboard_service._dashboard_cache  # filled
+    db.add(Notification(id=str(uuid.uuid4()), user_id=admin.id, organization_id=org.id, title="hi"))
+    db.commit()
+    assert dashboard_service._dashboard_cache  # a notification never changes a figure
+    db.add(SalesReturn(id=str(uuid.uuid4()), organization_id=org.id, return_number=f"SR-{uuid.uuid4().hex[:6]}"))
+    db.commit()
+    assert not dashboard_service._dashboard_cache  # any business table clears it, listed or not
+
+
+def test_read_requests_are_retried_once_after_a_dropped_connection():
+    from sqlalchemy.exc import OperationalError
+
+    from app.core.database import install_disconnect_retry
+
+    mini = FastAPI()
+    install_disconnect_retry(mini)
+    calls = {"get": 0, "post": 0}
+
+    def dropped():
+        return OperationalError("SELECT 1", {}, Exception("server closed the connection"),
+                                connection_invalidated=True)
+
+    @mini.get("/read")
+    def read():
+        calls["get"] += 1
+        if calls["get"] == 1:
+            raise dropped()
+        return {"ok": True}
+
+    @mini.post("/write")
+    def write():
+        calls["post"] += 1
+        raise dropped()
+
+    client = TestClient(mini, raise_server_exceptions=False)
+    assert client.get("/read").json() == {"ok": True} and calls["get"] == 2
+    assert client.post("/write").status_code == 500 and calls["post"] == 1  # writes never run twice
+
+
 def test_perf_log_line_counts_queries(caplog):
     from app.core import perf
 

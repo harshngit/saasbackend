@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core import business_time
 from app.core.database import get_db
 from app.core.deps import (
     get_current_user,
@@ -56,8 +57,9 @@ def _date_range(date_from: str | None, date_to: str | None) -> tuple[date | None
 
 @router.post("/check-in", response_model=AttendanceOut, status_code=status.HTTP_201_CREATED)
 def check_in(payload: CheckInBody, user: User = Depends(_mark), db: Session = Depends(get_db)) -> Attendance:
-    """Record one of the four daily checkpoints for the logged-in user."""
-    today = datetime.now(timezone.utc).date()
+    """Record one of the four daily checkpoints for the logged-in user. The day is the
+    organization's calendar day (a 01:00 IST check-in belongs to that IST date)."""
+    today = business_time.today(business_time.org_timezone(db, user.organization_id))
     row = (
         db.query(Attendance)
         .filter(Attendance.user_id == user.id, Attendance.day == today)

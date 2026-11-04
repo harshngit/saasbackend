@@ -36,15 +36,27 @@ def _existing(table: str) -> set[str]:
     return {ix["name"] for ix in sa.inspect(op.get_bind()).get_indexes(table)}
 
 
+def _invalid_on_postgres(name: str) -> bool:
+    """A CREATE INDEX CONCURRENTLY that was interrupted leaves an INVALID index behind:
+    it exists, but PostgreSQL never uses it. Such an index is dropped and built again."""
+    row = op.get_bind().execute(
+        sa.text("SELECT NOT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE c.relname = :name"),
+        {"name": name},
+    ).first()
+    return bool(row and row[0])
+
+
 def upgrade() -> None:
     postgres = op.get_bind().dialect.name == "postgresql"
     for name, table, columns in _INDEXES:
-        if name in _existing(table):
-            continue
         if postgres:
+            if name in _existing(table) and not _invalid_on_postgres(name):
+                continue
             with op.get_context().autocommit_block():
+                op.execute(sa.text(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"'))
                 op.create_index(name, table, columns, postgresql_concurrently=True)
-        else:
+        elif name not in _existing(table):
             op.create_index(name, table, columns)
 
 

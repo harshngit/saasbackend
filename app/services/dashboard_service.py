@@ -19,14 +19,15 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func
+from sqlalchemy import and_, case, func
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from app.core import workflow
+from app.core import business_time, workflow
 from app.models import (
     Customer,
     CustomerPayment,
+    Delivery,
     Expense,
     Invoice,
     Product,
@@ -41,6 +42,7 @@ from app.models import (
 )
 from app.schemas.dashboard import (
     AdminDashboardOut,
+    DashboardToday,
     CashflowPoint,
     DashboardFilters,
     DashboardOrders,
@@ -68,8 +70,9 @@ STOCK_WATCH_N = 10
 _TO_DELIVER = ("reserved", "planned", "loaded", "in_transit", "partially_delivered")
 
 
-def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, datetime]:
-    """Parse a YYYY-MM-DD filter into its date and the instant to compare against."""
+def _day(value: str | None, fallback: date, end: bool = False, tz=None) -> tuple[date, datetime]:  # noqa: ANN001
+    """Parse a YYYY-MM-DD filter (a calendar day in the organization's timezone `tz`)
+    into its date and the UTC instant to compare stored timestamps against."""
     if value is None:
         parsed = fallback
     else:
@@ -79,15 +82,18 @@ def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, da
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Dates must be YYYY-MM-DD"
             )
-    moment = datetime.combine(parsed, time.max if end else time.min, tzinfo=timezone.utc)
+    tz = tz or timezone.utc
+    moment = business_time.day_end(parsed, tz) if end else business_time.day_start(parsed, tz)
     return parsed, moment
 
 
-def _resolve_range(date_from: str | None, date_to: str | None) -> tuple[date, date, datetime, datetime]:
-    """The window to report on — the current month to date when nothing is asked for."""
-    today = datetime.now(timezone.utc).date()
-    start, df = _day(date_from, today.replace(day=1))
-    end, dt = _day(date_to, today, end=True)
+def _resolve_range(date_from: str | None, date_to: str | None, tz=None) -> tuple[date, date, datetime, datetime]:  # noqa: ANN001
+    """The window to report on — the current month to date when nothing is asked for.
+    Days are the organization's (`tz`), both ends inclusive."""
+    tz = tz or timezone.utc
+    today = business_time.today(tz)
+    start, df = _day(date_from, today.replace(day=1), tz=tz)
+    end, dt = _day(date_to, today, end=True, tz=tz)
     if start > end:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="date_from cannot be after date_to"
@@ -129,22 +135,39 @@ def _sales_total(
     return round(sum(total or 0 for (total,) in orders.with_entities(SalesOrder.total)), 2)
 
 
+def _sales_totals(
+    db: Session, org_id: str, customer_id: str | None, company_id: str | None,
+    windows: list[tuple[datetime, datetime]],
+) -> list[float]:
+    """_sales_total for several windows in one query: one conditional SUM per window."""
+    sums = [
+        func.coalesce(func.sum(case((and_(SalesOrder.created_at >= df, SalesOrder.created_at <= dt),
+                                     SalesOrder.total), else_=0)), 0)
+        for df, dt in windows
+    ]
+    row = (
+        _sale_orders(db, org_id, customer_id, company_id)
+        .filter(SalesOrder.created_at >= min(w[0] for w in windows),
+                SalesOrder.created_at <= max(w[1] for w in windows))
+        .with_entities(*sums)
+        .one()
+    )
+    return [round(float(v or 0), 2) for v in row]
+
+
 def _summary(
     db: Session, org_id: str, start: date, end: date, df: datetime, dt: datetime,
     period_sales: float, purchases: float, expenses: float, customer_id: str | None,
-    company_id: str | None = None,
+    company_id: str | None = None, tz=None, totals: tuple[float, float, float] | None = None,  # noqa: ANN001
 ) -> DashboardSummary:
     eff_org = company_id if company_id else org_id
-    today = datetime.now(timezone.utc).date()
-    _, today_start = _day(today.isoformat(), today)
-    _, today_end = _day(today.isoformat(), today, end=True)
-    _, month_start = _day(today.replace(day=1).isoformat(), today)
+    tz = tz or timezone.utc
+    if totals is None:
+        w = _windows(start, end, tz)
+        totals = tuple(_sales_totals(db, org_id, customer_id, company_id, [w["previous"], w["today"], w["month"]]))
+    previous, today_sales, month_sales = totals
 
-    # Previous window of the same length, so growth compares like with like.
-    span = (end - start).days + 1
-    _, prev_from = _day((start - timedelta(days=span)).isoformat(), start)
-    _, prev_to = _day((start - timedelta(days=1)).isoformat(), start, end=True)
-    previous = _sales_total(db, org_id, customer_id, company_id, prev_from, prev_to)
+    # Growth compares with the previous window of the same length (see _windows).
     growth = round((period_sales - previous) / previous * 100, 2) if previous else 0.0
 
     cust_q = db.query(Customer).filter(
@@ -158,8 +181,8 @@ def _summary(
 
     gross_profit = round(period_sales - purchases, 2)
     return DashboardSummary(
-        today_sales=_sales_total(db, org_id, customer_id, company_id, today_start, today_end),
-        month_sales=_sales_total(db, org_id, customer_id, company_id, month_start, today_end),
+        today_sales=today_sales,
+        month_sales=month_sales,
         period_sales=period_sales,
         purchases=purchases,
         expenses=expenses,
@@ -170,18 +193,35 @@ def _summary(
     )
 
 
+def _windows(start: date, end: date, tz) -> dict:  # noqa: ANN001
+    """The org-local windows the summary compares: the previous period of the same length
+    as start..end, today, and this month to date (each as a UTC instant pair)."""
+    today = business_time.today(tz)
+    span = (end - start).days + 1
+    prev_start, prev_end = start - timedelta(days=span), start - timedelta(days=1)
+    return {
+        "previous": (business_time.day_start(prev_start, tz), business_time.day_end(prev_end, tz)),
+        "today": (business_time.day_start(today, tz), business_time.day_end(today, tz)),
+        "month": (business_time.day_start(today.replace(day=1), tz), business_time.day_end(today, tz)),
+    }
+
+
 def _orders(
-    db: Session, org_id: str, customer_id: str | None, company_id: str | None, df: datetime, dt: datetime
+    db: Session, org_id: str, customer_id: str | None, company_id: str | None, df: datetime, dt: datetime,
+    rows: list | None = None,
 ) -> DashboardOrders:
-    eff_org = company_id if company_id else org_id
-    query = db.query(SalesOrder).filter(
-        SalesOrder.organization_id == eff_org,
-        SalesOrder.created_at >= df,
-        SalesOrder.created_at <= dt,
-    )
-    if customer_id:
-        query = query.filter(SalesOrder.customer_id == customer_id)
-    rows = query.with_entities(SalesOrder.status, SalesOrder.fulfilment_status).all()
+    """Order counts for the window, every status. `rows` ((status, fulfilment_status) for
+    the same window) saves the query when the caller already has them."""
+    if rows is None:
+        eff_org = company_id if company_id else org_id
+        query = db.query(SalesOrder).filter(
+            SalesOrder.organization_id == eff_org,
+            SalesOrder.created_at >= df,
+            SalesOrder.created_at <= dt,
+        )
+        if customer_id:
+            query = query.filter(SalesOrder.customer_id == customer_id)
+        rows = query.with_entities(SalesOrder.status, SalesOrder.fulfilment_status).all()
     return DashboardOrders(
         total=len(rows),
         pending=sum(1 for status_, _ in rows if status_ == "awaiting_approval"),
@@ -194,7 +234,7 @@ def _orders(
 def _cashflow(
     db: Session, org_id: str, start: date, end: date, df: datetime, dt: datetime,
     customer_id: str | None, supplier_id: str | None, company_id: str | None = None,
-    expense_rows: list | None = None,
+    expense_rows: list | None = None, tz=None,  # noqa: ANN001
 ) -> list[CashflowPoint]:
     """Money actually received and paid out, per day: customer payments in,
     supplier payments and expenses out."""
@@ -210,7 +250,7 @@ def _cashflow(
     if customer_id:
         payments = payments.filter(CustomerPayment.customer_id == customer_id)
     for received_on, amount in payments.with_entities(CustomerPayment.received_on, CustomerPayment.amount):
-        inflow[received_on.date().isoformat()] += amount or 0
+        inflow[business_time.local_date(received_on, tz or timezone.utc).isoformat()] += amount or 0
 
     paid = db.query(SupplierPayment).filter(
         SupplierPayment.organization_id == eff_org,
@@ -220,11 +260,11 @@ def _cashflow(
     if supplier_id:
         paid = paid.filter(SupplierPayment.supplier_id == supplier_id)
     for paid_on, amount in paid.with_entities(SupplierPayment.paid_on, SupplierPayment.amount):
-        outflow[paid_on.date().isoformat()] += amount or 0
+        outflow[business_time.local_date(paid_on, tz or timezone.utc).isoformat()] += amount or 0
 
     if not supplier_id and not customer_id:
         for expense in expense_rows if expense_rows is not None else _approved_expenses(db, eff_org, df, dt):
-            outflow[expense.expense_date.date().isoformat()] += expense.amount or 0
+            outflow[business_time.local_date(expense.expense_date, tz or timezone.utc).isoformat()] += expense.amount or 0
 
     # One point per day in the window, so the chart has no gaps to interpolate.
     points = []
@@ -394,11 +434,11 @@ def _expense_breakdown(
     ]
 
 
-def _sales_trend(orders: list[SalesOrder], start: date, end: date) -> list[SalesTrendPoint]:
+def _sales_trend(orders: list, start: date, end: date, tz=None) -> list[SalesTrendPoint]:  # noqa: ANN001
     sales: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
     for order in orders:
-        key = order.created_at.date().isoformat()
+        key = business_time.local_date(order.created_at, tz or timezone.utc).isoformat()
         sales[key] += order.total or 0
         counts[key] += 1
     points = []
@@ -467,39 +507,42 @@ def _stock_watch(
 
 
 def _recent_orders(
-    db: Session, org_id: str, customer_id: str | None, company_id: str | None = None
+    db: Session, org_id: str, customer_id: str | None, company_id: str | None = None, tz=None,  # noqa: ANN001
 ) -> list[RecentOrder]:
     eff_org = company_id if company_id else org_id
     query = db.query(SalesOrder).filter(SalesOrder.organization_id == eff_org)
     if customer_id:
         query = query.filter(SalesOrder.customer_id == customer_id)
+    # Each order's (non-credit-note) invoice totals come in the same query.
+    billed = (
+        db.query(Invoice.order_id.label("order_id"),
+                 func.count(Invoice.id).label("invoices"),
+                 func.coalesce(func.sum(func.coalesce(Invoice.total, 0)), 0).label("billed"),
+                 func.coalesce(func.sum(func.coalesce(Invoice.amount_paid, 0)), 0).label("paid"))
+        .filter(Invoice.organization_id == eff_org, Invoice.is_credit_note.is_(False))
+        .group_by(Invoice.order_id)
+        .subquery()
+    )
     orders = (
         query.outerjoin(Customer, Customer.id == SalesOrder.customer_id)
+        .outerjoin(billed, billed.c.order_id == SalesOrder.id)
         .order_by(SalesOrder.created_at.desc())
         .limit(RECENT_ORDERS)
         .with_entities(SalesOrder.id, SalesOrder.order_number, SalesOrder.status, SalesOrder.total,
                        SalesOrder.order_date, SalesOrder.created_at, Customer.id.label("customer_row_id"),
-                       Customer.business_name.label("customer_business_name"), Customer.name.label("customer_name"))
+                       Customer.business_name.label("customer_business_name"), Customer.name.label("customer_name"),
+                       billed.c.invoices, billed.c.billed, billed.c.paid)
         .all()
     )
     if not orders:
         return []
 
-    # One query for the invoices behind all of them, rather than one per order.
-    billed: dict[str, list[Invoice]] = defaultdict(list)
-    for invoice in db.query(Invoice).filter(
-        Invoice.organization_id == eff_org,
-        Invoice.is_credit_note.is_(False),
-        Invoice.order_id.in_([o.id for o in orders]),
-    ).with_entities(Invoice.order_id, Invoice.total, Invoice.amount_paid):
-        billed[invoice.order_id].append(invoice)
-
     recent = []
     for order in orders:
-        invoices = billed.get(order.id, [])
-        total = sum(i.total or 0 for i in invoices)
-        paid = sum(i.amount_paid or 0 for i in invoices)
-        if not invoices or paid <= 0:
+        has_invoices = bool(order.invoices)
+        total = float(order.billed or 0)
+        paid = float(order.paid or 0)
+        if not has_invoices or paid <= 0:
             payment_status = "unpaid"
         elif paid + 0.01 >= total:
             payment_status = "paid"
@@ -514,7 +557,7 @@ def _recent_orders(
                 status=order.status,
                 payment_status=payment_status,
                 total=round(order.total or 0, 2),
-                date=(order.order_date or order.created_at).date().isoformat(),
+                date=business_time.local_date(order.order_date or order.created_at, tz or timezone.utc).isoformat(),
             )
         )
     return recent
@@ -530,25 +573,33 @@ def build_admin_dashboard(
     customer_id: str | None = None,
     supplier_id: str | None = None,
 ) -> AdminDashboardOut:
-    start, end, df, dt = _resolve_range(date_from, date_to)
     eff_org = company_id if company_id else org_id
-    cache_key = (org_id, date_from, date_to, company_id, warehouse_id, customer_id, supplier_id,
-                 datetime.now(timezone.utc).date())
+    tz = business_time.org_timezone(db, eff_org)
+    start, end, df, dt = _resolve_range(date_from, date_to, tz)
+    today = business_time.today(tz)
+    cache_key = (org_id, str(tz), start, end, today, company_id, warehouse_id, customer_id, supplier_id)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
 
     # The period's orders as plain rows (id, customer, total, date, customer name) --
     # everything the summary, top customers, top products and trend need.
-    orders = (
-        _sale_orders(db, eff_org, customer_id, company_id)
-        .filter(SalesOrder.created_at >= df, SalesOrder.created_at <= dt)
-        .outerjoin(Customer, Customer.id == SalesOrder.customer_id)
+    # The window's orders of every status, in one query: the status counts use all of
+    # them, the sales figures only the sale statuses.
+    window = db.query(SalesOrder).filter(
+        SalesOrder.organization_id == eff_org, SalesOrder.created_at >= df, SalesOrder.created_at <= dt)
+    if customer_id:
+        window = window.filter(SalesOrder.customer_id == customer_id)
+    window_rows = (
+        window.outerjoin(Customer, Customer.id == SalesOrder.customer_id)
         .order_by(SalesOrder.created_at)
         .with_entities(SalesOrder.id, SalesOrder.customer_id, SalesOrder.total, SalesOrder.created_at,
+                       SalesOrder.status, SalesOrder.fulfilment_status,
                        Customer.business_name.label("customer_business_name"), Customer.name.label("customer_name"))
         .all()
     )
+    sale_statuses = set(SALE_STATUSES)
+    orders = [o for o in window_rows if o.status in sale_statuses]
     period_sales = round(sum(o.total or 0 for o in orders), 2)
     purchases = round(
         sum(
@@ -562,6 +613,22 @@ def build_admin_dashboard(
     expense_rows = [] if (supplier_id or customer_id) else _approved_expenses(db, eff_org, df, dt)
     expenses = 0.0 if (supplier_id or customer_id) else round(sum(e.amount or 0 for e in expense_rows), 2)
 
+    windows = _windows(start, end, tz)
+    totals = tuple(_sales_totals(db, eff_org, customer_id, company_id,
+                                 [windows["previous"], windows["today"], windows["month"]]))
+    today_from, today_to = windows["today"]
+    today_orders = (
+        _sale_orders(db, eff_org, customer_id, company_id)
+        .filter(SalesOrder.created_at >= today_from, SalesOrder.created_at <= today_to)
+        .count()
+    )
+    delivered_q = db.query(Delivery).filter(
+        Delivery.organization_id == eff_org, Delivery.status == "delivered",
+        Delivery.confirmed_at >= today_from, Delivery.confirmed_at <= today_to,
+    )
+    if customer_id:
+        delivered_q = delivered_q.filter(Delivery.customer_id == customer_id)
+
     result = AdminDashboardOut(
         filters=DashboardFilters(
             date_from=start.isoformat(),
@@ -571,18 +638,22 @@ def build_admin_dashboard(
             customer_id=customer_id,
             supplier_id=supplier_id,
         ),
-        summary=_summary(db, eff_org, start, end, df, dt, period_sales, purchases, expenses, customer_id, company_id),
-        orders=_orders(db, eff_org, customer_id, company_id, df, dt),
+        summary=_summary(db, eff_org, start, end, df, dt, period_sales, purchases, expenses, customer_id, company_id,
+                         tz=tz, totals=totals),
+        today=DashboardToday(date=today.isoformat(), timezone=str(tz), orders=today_orders, sales=totals[1],
+                             delivered=delivered_q.count()),
+        orders=_orders(db, eff_org, customer_id, company_id, df, dt,
+                       rows=[(o.status, o.fulfilment_status) for o in window_rows]),
         cashflow=_cashflow(db, eff_org, start, end, df, dt, customer_id, supplier_id, company_id,
-                           expense_rows=expense_rows),
+                           expense_rows=expense_rows, tz=tz),
         receivables_payables=_receivables_payables(db, eff_org, customer_id, supplier_id, warehouse_id, company_id),
         top_customers=_top_customers(orders),
         top_products=_top_products(db, eff_org, [o.id for o in orders]),
         expense_breakdown=_expense_breakdown(db, eff_org, df, dt, company_id, supplier_id, customer_id,
                                              expense_rows=expense_rows),
-        sales_trend=_sales_trend(orders, start, end),
+        sales_trend=_sales_trend(orders, start, end, tz),
         stock_watch=_stock_watch(db, eff_org, warehouse_id, company_id),
-        recent_orders=_recent_orders(db, eff_org, customer_id, company_id),
+        recent_orders=_recent_orders(db, eff_org, customer_id, company_id, tz),
     )
     _dashboard_cache_put(cache_key, result)
     return result
@@ -617,28 +688,41 @@ def clear_dashboard_cache() -> None:
         _dashboard_cache.clear()
 
 
-def _dashboard_sources() -> tuple:
-    from app.models import (
-        CustomerPaymentAllocation, Delivery, DeliveryItem, PurchaseInvoiceItem, StockMovement,
-    )
+def _not_business_data() -> tuple:
+    """Writes that never change a dashboard figure. Every other write -- orders, invoices,
+    payments and receipts, deliveries and collections, returns, purchases and GRNs,
+    supplier payments, expenses, stock, customers, suppliers, products, and anything
+    added later -- clears the cache, so nothing new can be missed."""
+    from app.models import ActivityLog, Notification, PasswordResetToken, PushDevice, RefreshToken
 
-    return (SalesOrder, SalesOrderItem, Invoice, CustomerPayment, CustomerPaymentAllocation, Customer,
-            Supplier, SupplierPayment, PurchaseInvoice, PurchaseInvoiceItem, Expense, Product, ProductVariant,
-            WarehouseStock, StockMovement, Delivery, DeliveryItem)
+    return (Notification, ActivityLog, PushDevice, RefreshToken, PasswordResetToken, User)
+
+
+def _is_business_write(obj) -> bool:  # noqa: ANN001
+    return not isinstance(obj, _not_business_data())
 
 
 @event.listens_for(Session, "after_flush")
 def _clear_dashboard_cache(session: Session, _flush_context) -> None:  # noqa: ANN001
-    sources = _dashboard_sources()
-    if any(isinstance(obj, sources) for obj in (*session.new, *session.dirty, *session.deleted)):
+    if any(_is_business_write(obj) for obj in (*session.new, *session.dirty, *session.deleted)):
+        session.info["crm_dashboard_changed"] = True
         clear_dashboard_cache()
 
 
 @event.listens_for(Session, "do_orm_execute")
 def _clear_dashboard_cache_on_bulk_write(state) -> None:  # noqa: ANN001
     # Bulk query.update() / delete() bypass after_flush.
-    if (state.is_delete or state.is_update) and state.bind_mapper is not None \
-            and state.bind_mapper.class_ in _dashboard_sources():
+    if (state.is_delete or state.is_update) and (
+            state.bind_mapper is None or not issubclass(state.bind_mapper.class_, _not_business_data())):
+        state.session.info["crm_dashboard_changed"] = True
+        clear_dashboard_cache()
+
+
+@event.listens_for(Session, "after_commit")
+def _clear_dashboard_cache_after_commit(session: Session) -> None:
+    # Again once committed: a request between this session's flush and its commit may
+    # have rebuilt the dashboard from the old figures.
+    if session.info.pop("crm_dashboard_changed", False):
         clear_dashboard_cache()
 
 

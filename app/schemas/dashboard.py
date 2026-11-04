@@ -110,9 +110,21 @@ class DashboardFilters(BaseModel):
     supplier_id: str | None = None
 
 
+class DashboardToday(BaseModel):
+    """Today in the organization's timezone, whatever date range was asked for."""
+
+    date: str = Field(description="Today's date (YYYY-MM-DD) in the organization's timezone")
+    timezone: str = Field(description="The organization's timezone; every date and day boundary in the "
+                                      "dashboard uses it")
+    orders: int = Field(description="Orders placed today (placed / processing / completed)")
+    sales: float = Field(description="Their total amount (same as summary.today_sales)")
+    delivered: int = Field(description="Deliveries confirmed as delivered today")
+
+
 class AdminDashboardOut(BaseModel):
     filters: DashboardFilters
     summary: DashboardSummary
+    today: DashboardToday
     orders: DashboardOrders
     cashflow: list[CashflowPoint]
     receivables_payables: ReceivablesPayables

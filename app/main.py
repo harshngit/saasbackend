@@ -144,6 +144,10 @@ if settings.perf_log:
     perf.install_query_counter(engine)
     perf.install_middleware(app)
 
+from app.core.database import install_disconnect_retry  # noqa: E402
+
+install_disconnect_retry(app)
+
 
 _log = logging.getLogger("crm.startup")
 _error_log = logging.getLogger("crm.errors")

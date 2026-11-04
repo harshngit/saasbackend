@@ -269,17 +269,11 @@ REPORT_REGISTRY: dict[str, dict[str, Any]] = {
 # --------------------------------- Timezone / Helpers ---------------------------------
 
 def get_org_timezone(db: Session, org_id: str) -> ZoneInfo:
-    """Resolve the organization's business timezone or fall back to Asia/Kolkata."""
-    try:
-        org = db.get(Organization, org_id)
-        if org and org.timezone:
-            return ZoneInfo(org.timezone)
-    except Exception:
-        pass
-    try:
-        return ZoneInfo(DEFAULT_BUSINESS_TIMEZONE)
-    except Exception:
-        return ZoneInfo("UTC")
+    """Resolve the organization's business timezone or fall back to Asia/Kolkata.
+    (Kept for existing callers; app.core.business_time is the shared implementation.)"""
+    from app.core import business_time
+
+    return business_time.org_timezone(db, org_id)
 
 
 def _range(

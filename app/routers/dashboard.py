@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
@@ -12,11 +14,29 @@ from app.schemas.dashboard import (
 )
 from app.schemas.staff_overview import DELIVERY, SALES
 from app.schemas.sales_order import OrderOut
-from app.services import dashboard_service, staff_overview_service
+from app.services import dashboard_service, role_service, staff_overview_service
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 _view = require_permission("dashboard", "view")
+_log = logging.getLogger("crm.dashboard")
+
+
+def _firm_wide_view(user: User = Depends(_view), db: Session = Depends(get_db)) -> User:
+    """The admin dashboard shows the whole firm's figures, so besides dashboard:view the
+    caller's role must see all records (data scope "all") -- admins always do. An own- or
+    team-scope role (Sales Officer, Delivery Partner by default) gets 403 and uses its own
+    dashboard (/dashboard/me/sales, /dashboard/me/delivery) instead. Decided by permission
+    and scope, never by role name."""
+    if role_service.is_full_access(user) or role_service.data_scope(db, user) == "all":
+        return user
+    role = role_service.role_for(db, user)
+    _log.info("dashboard/admin refused: role %r has data scope %r",
+              getattr(role, "name", None), role_service.data_scope(db, user))
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="The admin dashboard shows the whole firm's figures; your role only sees its own records",
+    )
 
 
 def _org_id(user: User) -> str:
@@ -51,7 +71,7 @@ def admin_dashboard(
     supplier_id: str | None = Query(
         default=None, description="Narrows purchases, payables and cashflow-out"
     ),
-    user: User = Depends(_view),
+    user: User = Depends(_firm_wide_view),
     db: Session = Depends(get_db),
 ) -> AdminDashboardOut:
     """Every Admin Dashboard widget in one call, for the logged-in user's firm."""

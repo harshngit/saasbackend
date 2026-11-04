@@ -10,9 +10,12 @@ is an order past approval — so the numbers on this page agree with those.
 """
 
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, timezone
+from contextvars import ContextVar
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
+
+from app.core import business_time
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -68,6 +71,20 @@ _OPEN_DELIVERY = OPEN_DELIVERY_STATUSES
 _DELIVERED = ("delivered", "partially_delivered")
 
 
+# The organization's timezone for the request being built: every entry point below sets it
+# (business_time.org_timezone) before computing anything, and every day boundary, "today"
+# and per-day grouping in this module reads it.
+_TZ: ContextVar = ContextVar("staff_overview_tz", default=timezone.utc)
+
+
+def _use_org_timezone(db: Session, staff: User) -> None:
+    _TZ.set(business_time.org_timezone(db, staff.organization_id))
+
+
+def _local_day(moment) -> date:  # noqa: ANN001
+    return business_time.local_date(moment, _TZ.get())
+
+
 def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, datetime]:
     if value is None:
         parsed = fallback
@@ -78,7 +95,8 @@ def _day(value: str | None, fallback: date, end: bool = False) -> tuple[date, da
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Dates must be YYYY-MM-DD"
             )
-    return parsed, datetime.combine(parsed, time.max if end else time.min, tzinfo=timezone.utc)
+    tz = _TZ.get()
+    return parsed, business_time.day_end(parsed, tz) if end else business_time.day_start(parsed, tz)
 
 
 def _resolve_range(period: str | None, date_from: str | None, date_to: str | None):
@@ -88,7 +106,7 @@ def _resolve_range(period: str | None, date_from: str | None, date_to: str | Non
     last 30). Explicit dates are still accepted for a custom range and win when sent,
     and the response says which of the two it ended up using.
     """
-    today = datetime.now(timezone.utc).date()
+    today = business_time.today(_TZ.get())
 
     if date_from or date_to:
         start, df = _day(date_from, today - timedelta(days=DEFAULT_DAYS - 1))
@@ -119,7 +137,7 @@ def _days(start: date, end: date) -> list[str]:
 
 
 def _attendance(db: Session, staff: User) -> AttendanceToday:
-    today = datetime.now(timezone.utc).date()
+    today = business_time.today(_TZ.get())
     row = (
         db.query(Attendance)
         .filter(Attendance.user_id == staff.id, Attendance.day == today)
@@ -262,8 +280,8 @@ def _payments_for(db: Session, staff: User, order_ids: list[str], df=None, dt=No
 def _attendance_activity(db: Session, staff: User, df: datetime, dt: datetime) -> list[StaffActivity]:
     rows = db.query(Attendance).filter(
         Attendance.user_id == staff.id,
-        Attendance.day >= df.date(),
-        Attendance.day <= dt.date(),
+        Attendance.day >= _local_day(df),
+        Attendance.day <= _local_day(dt),
     )
     events = []
     for row in rows:
@@ -324,7 +342,7 @@ def _sorted_feed(events: list[StaffActivity]) -> list[StaffActivity]:
 
 
 def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime, dt: datetime) -> dict:
-    today = datetime.now(timezone.utc).date()
+    today = business_time.today(_TZ.get())
     sales_orders = _their_orders(db, staff).filter(SalesOrder.status.in_(SALE_STATUSES))
 
     in_period = sales_orders.filter(
@@ -332,7 +350,7 @@ def _sales_blocks(db: Session, staff: User, start: date, end: date, df: datetime
     ).order_by(SalesOrder.created_at).all()
 
     def order_day(order: SalesOrder) -> date:
-        return (order.order_date or order.created_at).date()
+        return _local_day(order.order_date or order.created_at)
 
     customers = (
         db.query(Customer)
@@ -504,7 +522,7 @@ def _delivery_blocks(db: Session, staff: User, start: date, end: date, df: datet
 
     def delivery_day(delivery: Delivery) -> date:
         moment = delivery.scheduled_date or delivery.created_at
-        return moment.date() if isinstance(moment, datetime) else moment
+        return _local_day(moment)
 
     in_period = [d for d in deliveries if start <= delivery_day(d) <= end]
     orders = {
@@ -709,6 +727,7 @@ def build_staff_overview(
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> StaffOverviewOut:
+    _use_org_timezone(db, staff)
     name, start, end, df, dt = _resolve_range(period, date_from, date_to)
     role = staff.role_detail
     workspace = (role.workspace if role is not None else None) or None
@@ -776,6 +795,7 @@ def build_my_sales_dashboard(
 ):
     from app.schemas.dashboard import MySalesDashboardOut, MySalesSummary
 
+    _use_org_timezone(db, staff)
     name, start, end, df, dt = _resolve_range(period, date_from, date_to)
     _, _, _, today_df, today_dt = _resolve_range("today", None, None)
     sales = _their_orders(db, staff).filter(SalesOrder.status.in_(SALE_STATUSES))
@@ -791,14 +811,16 @@ def build_my_sales_dashboard(
     orders, amount = totals(df, dt)
     _, today_amount = totals(today_df, today_dt)
 
-    # Same day key as the Staff Detail series: the order date, else when it was created.
-    day = func.date(func.coalesce(SalesOrder.order_date, SalesOrder.created_at))
-    by_day = {
-        _iso_day(d): (round(float(total or 0), 2), int(count or 0))
-        for d, count, total in sales.filter(SalesOrder.created_at >= df, SalesOrder.created_at <= dt)
-        .with_entities(day, func.count(SalesOrder.id), func.sum(SalesOrder.total))
-        .group_by(day)
-    }
+    # Same day key as the Staff Detail series: the order date, else when it was created --
+    # the organization's calendar day, so grouped here rather than by SQL date() (UTC).
+    day_totals: dict[str, list] = {}
+    for order_date, created_at, total in sales.filter(
+        SalesOrder.created_at >= df, SalesOrder.created_at <= dt
+    ).with_entities(SalesOrder.order_date, SalesOrder.created_at, SalesOrder.total):
+        entry = day_totals.setdefault(_local_day(order_date or created_at).isoformat(), [0.0, 0])
+        entry[0] += float(total or 0)
+        entry[1] += 1
+    by_day = {d: (round(v[0], 2), v[1]) for d, v in day_totals.items()}
 
     assigned = (
         db.query(func.count(Customer.id))
@@ -837,7 +859,7 @@ def build_my_sales_dashboard(
                 customer=_customer_ref_from(row.customer_id, row.business_name, row.name),
                 amount=round(row.total or 0, 2),
                 status=row.status,
-                date=(row.order_date or row.created_at).date().isoformat(),
+                date=_local_day(row.order_date or row.created_at).isoformat(),
             )
             for row in recent
         ],
@@ -849,13 +871,15 @@ def build_my_delivery_dashboard(
 ):
     from app.schemas.dashboard import MyDeliveryDashboardOut
 
+    _use_org_timezone(db, staff)
     name, start, end, df, dt = _resolve_range(period, date_from, date_to)
     mine = db.query(Delivery).filter(
         Delivery.organization_id == staff.organization_id, Delivery.delivery_partner_id == staff.id
     )
-    # Same day key as Staff Detail: when it is scheduled, else when it was created.
-    day = func.date(func.coalesce(Delivery.scheduled_date, Delivery.created_at))
-    in_period = mine.filter(day >= start, day <= end).outerjoin(SalesOrder, SalesOrder.id == Delivery.sales_order_id)
+    # Same day key as Staff Detail: when it is scheduled, else when it was created -- the
+    # organization's calendar days start..end, i.e. that timestamp between df and dt.
+    moment = func.coalesce(Delivery.scheduled_date, Delivery.created_at)
+    in_period = mine.filter(moment >= df, moment <= dt).outerjoin(SalesOrder, SalesOrder.id == Delivery.sales_order_id)
 
     counts: dict[str, int] = {}
     delivery_value = 0.0
@@ -871,11 +895,14 @@ def build_my_delivery_dashboard(
         1 for signature, photos in completed.with_entities(Delivery.pod_signature_file_id, Delivery.pod_photo_file_ids)
         if signature or (photos or [])
     )
-    by_day = {
-        _iso_day(d): (int(count or 0), round(float(total or 0), 2))
-        for d, count, total in completed.with_entities(day, func.count(Delivery.id), func.sum(SalesOrder.total))
-        .group_by(day)
-    }
+    day_totals: dict[str, list] = {}
+    for scheduled, created, total in completed.with_entities(
+        Delivery.scheduled_date, Delivery.created_at, SalesOrder.total
+    ):
+        entry = day_totals.setdefault(_local_day(scheduled or created).isoformat(), [0, 0.0])
+        entry[0] += 1
+        entry[1] += float(total or 0)
+    by_day = {d: (v[0], round(v[1], 2)) for d, v in day_totals.items()}
 
     # Receivable: goods handed over (whenever) and not yet paid for -- per delivery, as Staff Detail.
     handed_over = (
