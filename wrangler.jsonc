@@ -11,7 +11,8 @@
       "class_name": "CrmSaasBackend",
       "image": "./Dockerfile",
       "instance_type": "standard-1",
-      "max_instances": 1
+      "max_instances": 1,
+      "constraints": { "regions": ["APAC"] }
     }
   ],
   "durable_objects": {
