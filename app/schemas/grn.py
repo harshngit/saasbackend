@@ -9,7 +9,7 @@ class GRNItemIn(BaseModel):
     product_code: str | None = None
     barcode: str | None = None
     description: str | None = None
-    unit_of_measure_uom: str | None = None
+    unit_of_measure_uom: str | None = Field(default=None, max_length=50)
     ordered_qty: int = Field(default=0, ge=0)
     received_qty: int = Field(default=0, ge=0)
     damaged_qty: int = Field(default=0, ge=0)
@@ -36,7 +36,7 @@ class GRNItemOut(BaseModel):
     product_code: str | None = None
     barcode: str | None = None
     product_name: str
-    unit_of_measure_uom: str | None = None
+    unit_of_measure_uom: str | None = Field(default=None, max_length=50)
     ordered_qty: int = 0
     received_qty: int = 0
     damaged_qty: int = 0

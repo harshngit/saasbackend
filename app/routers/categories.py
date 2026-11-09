@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.models import Brand, Category, SubcategoryVariant, User
+from app.models.category import SUBCATEGORY_NAME_INDEX, TOP_LEVEL_NAME_INDEX
 from app.models.subcategory_variant import name_key
 from app.schemas.brand import BrandOut
 from app.schemas.catalog_hierarchy import CategoryBrandsReplace
@@ -72,6 +73,61 @@ def _validate_parent(db: Session, org_id: str, parent_id: str | None, category: 
         )
 
 
+DUPLICATE_TOP_LEVEL = "A category with this name already exists"
+DUPLICATE_SUBCATEGORY = "This parent already has a subcategory with this name"
+
+
+def _normalized(name: str) -> str:
+    return name.strip().lower()
+
+
+def _sibling_query(db: Session, org_id: str, parent_id: str | None, name: str):
+    """Categories the name must not repeat among: the firm's top-level categories, or the
+    sub categories of one parent. Compared trimmed and case-insensitively -- the same
+    expression the two unique indexes are built on."""
+    query = db.query(Category.id).filter(
+        Category.organization_id == org_id,
+        func.lower(func.trim(Category.name)) == _normalized(name),
+    )
+    if parent_id is None:
+        return query.filter(Category.parent_id.is_(None))
+    return query.filter(Category.parent_id == parent_id)
+
+
+def _duplicate_detail(parent_id: str | None) -> str:
+    return DUPLICATE_TOP_LEVEL if parent_id is None else DUPLICATE_SUBCATEGORY
+
+
+def _reject_duplicate_name(
+    db: Session, org_id: str, parent_id: str | None, name: str, exclude_id: str | None = None
+) -> None:
+    query = _sibling_query(db, org_id, parent_id, name)
+    if exclude_id is not None:
+        query = query.filter(Category.id != exclude_id)
+    if query.first() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_duplicate_detail(parent_id))
+
+
+def _is_name_index_violation(exc: IntegrityError) -> bool:
+    """Only a violation of one of the two category-name indexes is a duplicate name; any
+    other integrity error (a foreign key, a NOT NULL) is not, and is re-raised as is."""
+    message = str(getattr(exc, "orig", exc))
+    return TOP_LEVEL_NAME_INDEX in message or SUBCATEGORY_NAME_INDEX in message
+
+
+def _commit_category(db: Session, cat: Category) -> None:
+    """Commit. Two requests saving the same name at once both pass the pre-check; the
+    unique index stops the second, which then gets the same 409 the pre-check gives."""
+    parent_id = cat.parent_id
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if _is_name_index_violation(exc):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_duplicate_detail(parent_id)) from None
+        raise
+
+
 @router.post("", response_model=CategoryOut, status_code=status.HTTP_201_CREATED)
 def create_category(
     payload: CategoryCreate,
@@ -81,11 +137,10 @@ def create_category(
 ) -> Category:
     org_id = _org_id(user)
     _validate_parent(db, org_id, payload.parent_id)
-    if db.query(Category).filter(Category.organization_id == org_id, Category.name == payload.name).first():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A category with this name already exists")
+    _reject_duplicate_name(db, org_id, payload.parent_id, payload.name)
     cat = Category(organization_id=org_id, **payload.model_dump())
     db.add(cat)
-    db.commit()
+    _commit_category(db, cat)
     db.refresh(cat)
     return cat
 
@@ -114,10 +169,29 @@ def list_categories(
     user: User = Depends(_view),
     search: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    parent_id: str | None = Query(default=None, description="Only the sub categories of this category"),
+    top_level: bool | None = Query(
+        default=None, description="true: only top-level categories; false: only sub categories"
+    ),
+    name: str | None = Query(
+        default=None,
+        description="Exact name, trimmed and case-insensitive. A sub category name can exist under "
+                    "several parents: pass parent_id to resolve one, otherwise every match is "
+                    "returned (each with parent_id / parent_name) and none is picked for you.",
+    ),
     db: Session = Depends(get_db),
 ) -> list[Category]:
     org_id = _org_id(user)
+    # Category.parent is joined eagerly, so parent_name costs no extra query per row.
     query = db.query(Category).filter(Category.organization_id == org_id)
+    if parent_id:
+        query = query.filter(Category.parent_id == parent_id)
+    if top_level is True:
+        query = query.filter(Category.parent_id.is_(None))
+    elif top_level is False:
+        query = query.filter(Category.parent_id.is_not(None))
+    if name is not None and name.strip():
+        query = query.filter(func.lower(func.trim(Category.name)) == _normalized(name))
     if search:
         like = f"%{search}%"
         query = query.filter(or_(Category.name.ilike(like), Category.description.ilike(like)))
@@ -144,14 +218,16 @@ def update_category(
     data = payload.model_dump(exclude_unset=True)
     if "parent_id" in data:
         _validate_parent(db, org_id, data["parent_id"], cat)
-    if "name" in data and data["name"] != cat.name:
-        if db.query(Category).filter(
-            Category.organization_id == org_id, Category.name == data["name"], Category.id != cat.id
-        ).first():
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A category with this name already exists")
+    if "name" in data and data["name"] is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="name cannot be null")
+    # A rename, a move to another parent, or both: check the name among its new siblings.
+    if "name" in data or "parent_id" in data:
+        new_name = data.get("name", cat.name)
+        new_parent = data.get("parent_id", cat.parent_id)
+        _reject_duplicate_name(db, org_id, new_parent, new_name, exclude_id=cat.id)
     for field, value in data.items():
         setattr(cat, field, value)
-    db.commit()
+    _commit_category(db, cat)
     db.refresh(cat)
     return cat
 

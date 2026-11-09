@@ -113,7 +113,7 @@ class QuotationItem(Base):
     )
     product_name: Mapped[str] = mapped_column(String(200), nullable=False)
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
-    uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    uom: Mapped[str | None] = mapped_column(String(50), nullable=True)  # = Product.uom (alembic d5b8f0c3e2a4)
     unit_price: Mapped[float] = mapped_column(Float, nullable=False)
     # Quoted terms per line, carried through to the order on conversion so the
     # customer is billed what they were quoted.

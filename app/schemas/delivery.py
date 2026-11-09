@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.workflow import public_delivery_status, public_order_status
 
@@ -502,6 +502,21 @@ class AppDeliveryConfirmOut(DeliveryOut):
                                "Invoice the delivery before collecting more than the order total.")
 
 
+# The collection status the API reports, derived from the stored reconciliation_status.
+# A field collection is not yet in the customer's accounts: it waits for an accountant.
+COLLECTION_STATUS_BY_RECONCILIATION = {
+    "recorded": "awaiting_reconciliation",
+    "reconciled": "reconciled",
+    "voided": "voided",
+}
+
+
+def collection_status(reconciliation_status: str | None) -> str | None:
+    if reconciliation_status is None:
+        return None
+    return COLLECTION_STATUS_BY_RECONCILIATION.get(reconciliation_status, reconciliation_status)
+
+
 class DeliveryCollectionCreate(BaseModel):
     amount: float = Field(gt=0, description="Collection amount")
     payment_mode: str = Field(default="cash", description="cash | upi | cheque | bank_transfer | card | object")
@@ -527,6 +542,13 @@ class CustomerCollectionCreate(BaseModel):
     allocations: list[CollectionAllocationIn] | None = Field(default_factory=list)
     source: str | None = Field(default="delivery_partner")
     delivery_id: str | None = Field(default=None)
+    order_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("order_id", "sales_order_id"),
+        description="The customer's sales order this money is for (optional). Must belong to "
+                    "customer_id. Saved on the collection and used to settle that order's "
+                    "invoice when the collection is reconciled.",
+    )
 
 
 class CollectionAllocationOut(BaseModel):
@@ -572,6 +594,11 @@ class DeliveryCollectionOut(BaseModel):
     payment_proof_url: str | None = None
     collected_at: datetime
     reconciliation_status: str = Field(description="recorded | reconciled | voided")
+    status: str | None = Field(
+        default=None,
+        description="awaiting_reconciliation | reconciled | voided. Derived from "
+                    "reconciliation_status (recorded = awaiting_reconciliation); not stored.",
+    )
     reconciled_at: datetime | None = None
     reconciled_by_id: str | None = None
     customer_payment_id: str | None = None
@@ -589,6 +616,7 @@ class DeliveryCollectionOut(BaseModel):
     def _populate_computed_fields(self) -> "DeliveryCollectionOut":
         if not self.collector_id and self.delivery_partner_id:
             self.collector_id = self.delivery_partner_id
+        self.status = collection_status(self.reconciliation_status)
         if self.allocations:
             alloc_sum = sum(a.amount for a in self.allocations)
             self.allocated_amount = round(alloc_sum, 2)

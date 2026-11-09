@@ -238,7 +238,7 @@ def load_vehicle(
             VehicleLoadingItem(
                 product_id=product.id,
                 variant_id=it.variant_id,
-                product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                product_name=product.line_item_name(variant),
                 loaded_qty=it.loaded_qty,
                 extra_qty=0,
                 returned_qty=0,
@@ -346,7 +346,7 @@ def add_extra_load(
                 VehicleLoadingItem(
                     product_id=product.id,
                     variant_id=it.variant_id,
-                    product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                    product_name=product.line_item_name(variant),
                     loaded_qty=0,
                     extra_qty=it.quantity,
                     returned_qty=0,

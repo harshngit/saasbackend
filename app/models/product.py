@@ -213,6 +213,23 @@ class Product(Base):
             return sum(v.inventory or 0 for v in self.variations)
         return self.total_inventory or 0
 
+    def line_item_name(self, variant: "ProductVariant | None" = None) -> str:
+        """The name snapshotted onto a document line (quotation, order, invoice, loading).
+
+        "Product (Variant)" can exceed the 200 characters every line's `product_name`
+        column holds (a product name may be 200 and a variant name 150 on its own).
+        SQLite never checks VARCHAR lengths, but PostgreSQL refuses the insert, so the
+        whole save failed with a 500. The label is cut to fit, ending in "…"."""
+        full = self.name if variant is None else f"{self.name} ({variant.name})"
+        if len(full) <= LINE_ITEM_NAME_MAX:
+            return full
+        return full[: LINE_ITEM_NAME_MAX - 1] + "…"
+
+
+# Length of `product_name` on every document line table (quotation_items,
+# sales_order_items, invoice_items, vehicle loading / stock lines).
+LINE_ITEM_NAME_MAX = 200
+
 
 class ProductPricing(Base):
     """Pricing information object for a product (one-to-one)."""

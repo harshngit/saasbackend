@@ -11,7 +11,7 @@ class PurchaseItemIn(BaseModel):
     barcode: str | None = None
     description: str | None = None
     warehouse_id: str | None = None
-    unit_of_measure_uom: str | None = None
+    unit_of_measure_uom: str | None = Field(default=None, max_length=50)
     quantity: int = Field(default=0, ge=0)
     ordered_qty: int | None = Field(default=None, gt=0)
     purchase_price: float = Field(ge=0, description="Unit cost")
@@ -55,7 +55,7 @@ class PurchaseItemOut(BaseModel):
     tax_rate: float = 0.0
     tax: float
     line_total: float
-    unit_of_measure_uom: str | None = None
+    unit_of_measure_uom: str | None = Field(default=None, max_length=50)
     batch_number: str | None = None
     serial_numbers: list[str] | None = None
     expiry_date: datetime | None = None

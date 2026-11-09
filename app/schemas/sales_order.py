@@ -19,7 +19,7 @@ class OrderItemIn(BaseModel):
                     "hardcoded figure. Snapshotted on the line so an invoice raised "
                     "later bills the agreed rate.",
     )
-    uom: str | None = None
+    uom: str | None = Field(default=None, max_length=50)
     cost_price: float | None = None
 
     @field_validator("variant_id", mode="before")
@@ -50,7 +50,7 @@ class OrderItemOut(BaseModel):
     tax_rate: float | None = None
     tax_amount: float = 0
     line_total: float
-    uom: str | None = None
+    uom: str | None = Field(default=None, max_length=50)
     product_image_url: str | None = Field(
         default=None,
         description="Resolved image URL: variant image if present, else product cover image",

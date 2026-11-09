@@ -1,6 +1,11 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+
+# Names are stored trimmed; uniqueness compares them trimmed and case-insensitively.
+CategoryName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=150)]
 
 
 class CategoryOut(BaseModel):
@@ -13,6 +18,11 @@ class CategoryOut(BaseModel):
     description: str | None
     is_active: bool
     parent_id: str | None = None
+    parent_name: str | None = Field(
+        default=None,
+        description="The parent category's name for a sub category (null for a top-level one). "
+                    "Sub category names repeat across parents, so show 'Parent › Name'.",
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -27,14 +37,14 @@ class CategoryOut(BaseModel):
 
 
 class CategoryCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=150)
+    name: CategoryName
     image: str | None = None
     description: str | None = None
     parent_id: str | None = Field(default=None, description="Set to make this a subcategory of another category")
 
 
 class CategoryUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=150)
+    name: CategoryName | None = None
     image: str | None = None
     description: str | None = None
     is_active: bool | None = None

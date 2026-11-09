@@ -101,7 +101,7 @@ class PurchaseReturnItem(Base):
     product_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     barcode: Mapped[str | None] = mapped_column(String(100), nullable=True)
     product_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(50), nullable=True)  # = Product.uom (alembic d5b8f0c3e2a4)
 
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)

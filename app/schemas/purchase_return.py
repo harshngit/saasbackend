@@ -85,7 +85,7 @@ class PurchaseReturnItemOut(BaseModel):
     product_code: str | None = None
     barcode: str | None = None
     product_name: str
-    unit_of_measure_uom: str | None = None
+    unit_of_measure_uom: str | None = Field(default=None, max_length=50)
     quantity: int
     unit_price: float = 0.0
     tax_rate: float = 0.0

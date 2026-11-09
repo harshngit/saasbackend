@@ -628,7 +628,8 @@ def test_16_unreconciled_collection_visibility(collection_setup):
     assert cust_data2["financial_summary"]["unreconciled_collection_count"] == 1
     assert cust_data2["financial_summary"]["outstanding_balance"] == 1500.0
 
-    cust_list = client.get("/customers", headers=s["admin_headers"]).json()
+    # GET /customers is paginated ({"items": [...]}).
+    cust_list = client.get("/customers?page_size=100", headers=s["admin_headers"]).json()["items"]
     cust_item = next(c for c in cust_list if c["id"] == s["cust1"].id)
     assert cust_item["unreconciled_collection_amount"] == 500.0
     assert cust_item["unreconciled_collection_count"] == 1
@@ -709,4 +710,219 @@ def test_18_payment_proof_upload_and_reconciliation_propagation(collection_setup
     pmt = db.get(CustomerPayment, coll_db.customer_payment_id)
     assert pmt is not None
     assert pmt.payment_proof_url == f"/files/{proof_id}" or pmt.payment_proof_url == proof_id
+
+
+def test_19_mobile_payload_order_id_persisted_and_status(collection_setup):
+    """TEST 19 — A mobile payload with customer_id + order_id keeps the order link (it used
+    to be dropped), and create / detail / history all report status awaiting_reconciliation."""
+    s = collection_setup
+    db = s["db"]
+    res = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust1"].id, "order_id": s["orderA"].id, "amount": 200, "payment_mode": "upi"},
+        headers=s["partner_headers"],
+    )
+    assert res.status_code == 201, res.text
+    body = res.json()
+    assert body["order_id"] == s["orderA"].id
+    assert body["sales_order_id"] == s["orderA"].id
+    assert body["customer_id"] == s["cust1"].id
+    assert body["reconciliation_status"] == "recorded"
+    assert body["status"] == "awaiting_reconciliation"
+    db.expire_all()
+    assert db.get(DeliveryCollection, body["id"]).sales_order_id == s["orderA"].id
+
+    detail = client.get(f"/deliveries/collections/{body['id']}", headers=s["partner_headers"])
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "awaiting_reconciliation"
+
+    history = client.get("/deliveries/collections?page_size=100", headers=s["partner_headers"])
+    assert history.status_code == 200
+    row = next(r for r in history.json()["items"] if r["id"] == body["id"])
+    assert row["status"] == "awaiting_reconciliation"
+    assert row["order_id"] == s["orderA"].id
+
+    # sales_order_id is accepted as an alias of order_id.
+    res2 = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust1"].id, "sales_order_id": s["orderB"].id, "amount": 100},
+        headers=s["partner_headers"],
+    )
+    assert res2.status_code == 201, res2.text
+    assert res2.json()["order_id"] == s["orderB"].id
+
+    # customer_id only (no order) still works and has no order link.
+    res3 = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust1"].id, "amount": 50},
+        headers=s["partner_headers"],
+    )
+    assert res3.status_code == 201
+    assert res3.json()["order_id"] is None
+    assert res3.json()["status"] == "awaiting_reconciliation"
+
+
+def test_20_order_id_must_belong_to_customer_and_org(collection_setup):
+    """TEST 20 — order_id of another customer is a 400, of another firm a 404; nothing saved."""
+    s = collection_setup
+    db = s["db"]
+    before = db.query(DeliveryCollection).filter(DeliveryCollection.organization_id == s["org"].id).count()
+
+    wrong_customer = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust2"].id, "order_id": s["orderA"].id, "amount": 100},
+        headers=s["partner_headers"],
+    )
+    assert wrong_customer.status_code == 400
+    assert "does not belong to customer" in wrong_customer.json()["detail"]
+
+    unknown = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust1"].id, "order_id": "no-such-order", "amount": 100},
+        headers=s["partner_headers"],
+    )
+    assert unknown.status_code == 404
+
+    # The other firm cannot attach this firm's order to its own customer.
+    cross = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust_org2"].id, "order_id": s["orderA"].id, "amount": 100},
+        headers=s["org2_headers"],
+    )
+    assert cross.status_code == 404
+
+    db.expire_all()
+    assert db.query(DeliveryCollection).filter(DeliveryCollection.organization_id == s["org"].id).count() == before
+
+
+def test_21_history_filters_status_search_customer_order(collection_setup):
+    """TEST 21 — ?status= and ?search= used to 500 (they named columns the model lacks);
+    customer_id / order_id filters narrow the history."""
+    s = collection_setup
+    h = s["admin_headers"]
+    c1 = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust1"].id, "order_id": s["orderA"].id, "amount": 120, "reference": "UPI-T21-XYZ"},
+        headers=s["partner_headers"],
+    ).json()
+    c2 = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust2"].id, "amount": 80, "notes": "t21 priya"},
+        headers=s["partner_headers"],
+    ).json()
+    assert client.post(f"/deliveries/collections/{c2['id']}/reconcile", headers=h).status_code == 200
+
+    def ids(url: str, headers: dict = h) -> set[str]:
+        r = client.get(url, headers=headers)
+        assert r.status_code == 200, r.text
+        return {x["id"] for x in r.json()["items"]}
+
+    assert c1["id"] in ids("/deliveries/collections?status=awaiting_reconciliation&page_size=100")
+    assert c1["id"] in ids("/deliveries/collections?status=recorded&page_size=100")
+    assert c2["id"] not in ids("/deliveries/collections?status=awaiting_reconciliation&page_size=100")
+    assert c2["id"] in ids("/deliveries/collections?status=reconciled&page_size=100")
+    assert client.get("/deliveries/collections?status=bogus", headers=h).status_code == 422
+
+    assert ids("/deliveries/collections?search=UPI-T21") == {c1["id"]}
+    assert c2["id"] in ids("/deliveries/collections?search=t21 priya&page_size=100")
+    assert c1["id"] in ids("/deliveries/collections?search=Rahul&page_size=100")
+
+    by_customer = ids(f"/deliveries/collections?customer_id={s['cust1'].id}&page_size=100")
+    assert c1["id"] in by_customer and c2["id"] not in by_customer
+    assert ids(f"/deliveries/collections?order_id={s['orderA'].id}&page_size=100") == {c1["id"]}
+
+    reconciled = client.get(f"/deliveries/collections/{c2['id']}", headers=h).json()
+    assert reconciled["status"] == "reconciled"
+
+    # The other firm sees none of it, even when filtering by this firm's customer.
+    assert ids(f"/deliveries/collections?customer_id={s['cust1'].id}", s["org2_headers"]) == set()
+    assert client.get(f"/deliveries/collections/{c1['id']}", headers=s["org2_headers"]).status_code == 404
+
+
+def test_22_customer_payments_list_includes_pending_collections_once(collection_setup):
+    """TEST 22 — GET /customers/{id}/payments shows a mobile collection while it awaits
+    reconciliation, then shows it once as a payment after reconciliation; voided ones drop out."""
+    s = collection_setup
+    h = s["admin_headers"]
+    cid = s["cust1"].id
+    pending = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": cid, "order_id": s["orderA"].id, "amount": 300, "payment_mode": "cash"},
+        headers=s["partner_headers"],
+    ).json()
+    voided = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": cid, "amount": 40},
+        headers=s["partner_headers"],
+    ).json()
+    assert client.post(f"/deliveries/collections/{voided['id']}/void", headers=h).status_code == 200
+
+    rows = client.get(f"/customers/{cid}/payments", headers=h)
+    assert rows.status_code == 200, rows.text
+    pending_rows = [r for r in rows.json() if r["id"] == pending["id"]]
+    assert len(pending_rows) == 1
+    row = pending_rows[0]
+    assert row["status"] == "awaiting_reconciliation"
+    assert row["source"] == "field_collection"
+    assert row["amount"] == 300.0
+    assert row["order_id"] == s["orderA"].id
+    assert row["receipt_number"] is None
+    assert row["collected_by_user_id"] == s["partner"].id
+    assert row["collector"]["id"] == s["partner"].id
+    assert not any(r["id"] == voided["id"] for r in rows.json())
+
+    assert client.post(f"/deliveries/collections/{pending['id']}/reconcile", headers=h).status_code == 200
+    after = client.get(f"/customers/{cid}/payments", headers=h).json()
+    assert not any(r["id"] == pending["id"] for r in after), "pending row must disappear once reconciled"
+    s["db"].expire_all()
+    payment_id = s["db"].get(DeliveryCollection, pending["id"]).customer_payment_id
+    posted = [r for r in after if r["id"] == payment_id]
+    assert len(posted) == 1
+    assert posted[0]["status"] == "reconciled"
+    assert posted[0]["amount"] == 300.0
+
+    # Another firm cannot read this customer's list at all.
+    assert client.get(f"/customers/{cid}/payments", headers=s["org2_headers"]).status_code == 404
+
+
+def test_23_delivery_partner_history_only_own(collection_setup):
+    """TEST 23 — A delivery partner's history holds only their own collections."""
+    s = collection_setup
+    mine = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust2"].id, "amount": 60},
+        headers=s["partner_headers"],
+    ).json()
+    by_admin = client.post(
+        "/customer-payments/collections",
+        json={"customer_id": s["cust2"].id, "amount": 70},
+        headers=s["admin_headers"],
+    ).json()
+    items = client.get("/deliveries/collections?page_size=100", headers=s["partner_headers"]).json()["items"]
+    seen = {x["id"] for x in items}
+    assert mine["id"] in seen
+    assert by_admin["id"] not in seen
+    assert all(x["delivery_partner_id"] == s["partner"].id for x in items)
+
+
+def test_24_payment_date_parsed_or_refused(collection_setup):
+    """TEST 24 — payment_date sets collected_at; an unreadable one is a 422 and saves nothing
+    (it used to be ignored silently and the collection dated "now")."""
+    s = collection_setup
+    db = s["db"]
+    base = {"customer_id": s["cust2"].id, "amount": 10}
+    count = lambda: db.query(DeliveryCollection).filter(  # noqa: E731
+        DeliveryCollection.organization_id == s["org"].id).count()
+
+    before = count()
+    for bad in ("09/11/2026", "yesterday", "2026-13-45"):
+        r = client.post("/customer-payments/collections", json={**base, "payment_date": bad}, headers=s["partner_headers"])
+        assert r.status_code == 422, (bad, r.text)
+    db.expire_all()
+    assert count() == before
+
+    for good, day in (("2026-11-08", "2026-11-08"), ("2026-11-08T10:30:00+05:30", "2026-11-08")):
+        r = client.post("/customer-payments/collections", json={**base, "payment_date": good}, headers=s["partner_headers"])
+        assert r.status_code == 201, (good, r.text)
+        assert r.json()["collected_at"].startswith(day)
 

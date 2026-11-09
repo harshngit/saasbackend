@@ -6,6 +6,10 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_valida
 
 from app.models.enums import ProductStatus
 
+# Largest value a PostgreSQL INTEGER column holds. Without this cap a bigger number passed
+# validation and the insert failed with a 500 (SQLite never checks the range).
+PG_INT_MAX = 2_147_483_647
+
 
 class VariantPricingIn(BaseModel):
     """A variant's own pricing — same fields as the product's `pricing` object.
@@ -48,7 +52,7 @@ class VariantIn(BaseModel):
     # Legacy selling price, kept for existing clients; same value as pricing.selling_price.
     price: float = Field(default=0, ge=0)
     pricing: VariantPricingIn | None = None
-    inventory: int = Field(default=0, ge=0)
+    inventory: int = Field(default=0, ge=0, le=PG_INT_MAX)
     image_url: str | None = None
 
     @model_validator(mode="after")
@@ -97,6 +101,15 @@ class NamedRef(BaseModel):
 
     id: str
     name: str
+
+
+class CategoryRef(NamedRef):
+    """A category or sub category, with its parent. Sub category names repeat across
+    parents (Electronics > Accessories, Footwear > Accessories), so the parent is what tells
+    them apart. Both null for a top-level category."""
+
+    parent_id: str | None = None
+    parent_name: str | None = None
 
 
 class ProductAttachment(BaseModel):
@@ -204,11 +217,11 @@ class ProductProfileIn(BaseModel):
     # 3. Inventory
     inventory_tracking: bool = True
     uom: str | None = Field(default=None, max_length=50, description='Base unit of measure, e.g. "piece", "kg"')
-    opening_stock: int | None = Field(default=None, ge=0)
-    minimum_stock_level: int | None = Field(default=None, ge=0)
-    maximum_stock_level: int | None = Field(default=None, ge=0)
-    reorder_level: int | None = Field(default=None, ge=0)
-    reorder_quantity: int | None = Field(default=None, ge=0)
+    opening_stock: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
+    minimum_stock_level: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
+    maximum_stock_level: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
+    reorder_level: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
+    reorder_quantity: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
     bin_shelf_location: str | None = Field(default=None, max_length=100)
     batch_tracking: bool = False
     serial_number_tracking: bool = False
@@ -227,7 +240,7 @@ class ProductProfileIn(BaseModel):
     preferred_supplier_id: str | None = None
     supplier_product_code: str | None = Field(default=None, max_length=100)
     lead_time: str | None = Field(default=None, max_length=50, description='free text, e.g. "7 days"')
-    minimum_order_quantity: int | None = Field(default=None, ge=0)
+    minimum_order_quantity: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
     purchase_unit: str | None = Field(default=None, max_length=50)
 
     # 6. Sales
@@ -263,7 +276,7 @@ class ProductProfileIn(BaseModel):
     downloadable_product: bool = False
     download_file: str | None = None
     license_key_required: bool = False
-    download_limit: int | None = Field(default=None, ge=0)
+    download_limit: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
 
     # 10. Additional information
     warranty_period: str | None = Field(default=None, max_length=50)
@@ -320,8 +333,8 @@ class ProductOut(ProductProfileIn):
     variations: list[VariantOut]
     # Resolved from category_id / sub_category_id / brand_id / preferred_supplier_id /
     # product_type_id (the Product Type keeps its name even once deactivated).
-    category: NamedRef | None = None
-    subcategory: NamedRef | None = None
+    category: CategoryRef | None = None
+    subcategory: CategoryRef | None = None
     brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
     product_type_ref: NamedRef | None = None
@@ -381,8 +394,8 @@ class ProductListItem(BaseModel):
     total_stock: int
     is_active: bool
     variations: list[VariantOut]
-    category: NamedRef | None = None
-    subcategory: NamedRef | None = None
+    category: CategoryRef | None = None
+    subcategory: CategoryRef | None = None
     brand_ref: NamedRef | None = None
     supplier: NamedRef | None = None
     product_type_id: str | None = None
@@ -432,7 +445,7 @@ class ProductCreate(ProductProfileIn):
     brand: str | None = Field(default=None, max_length=150)
     sku: str | None = Field(default=None, max_length=100)
     category_id: str | None = None
-    total_inventory: int = Field(default=0, ge=0)
+    total_inventory: int = Field(default=0, ge=0, le=PG_INT_MAX)
     variations: list[VariantIn] = Field(default_factory=list)
 
     @field_validator("category_id", mode="before")
@@ -464,7 +477,7 @@ class ProductUpdate(ProductProfileIn):
     brand: str | None = Field(default=None, max_length=150)
     sku: str | None = Field(default=None, max_length=100)
     category_id: str | None = None
-    total_inventory: int | None = Field(default=None, ge=0)
+    total_inventory: int | None = Field(default=None, ge=0, le=PG_INT_MAX)
     is_active: bool | None = None
     variations: list[VariantIn] | None = None
 

@@ -984,5 +984,280 @@ def test_supplier_product_auto_sync_with_category_mapping(client, test_setup, db
     assert client.patch(f"/products/{legacy.id}", json={"description": "x"}, headers=headers_a).status_code == 200
 
 
+def _cat(client, headers, name, parent_id=None):
+    body = {"name": name} if parent_id is None else {"name": name, "parent_id": parent_id}
+    return client.post("/categories", json=body, headers=headers)
+
+
+@pytest.fixture
+def two_parents(client, test_setup):
+    """Org A: Electronics > Accessories, Footwear (no children yet). Names carry a tag so
+    reruns against the same database never collide."""
+    h = test_setup["headers_a"]
+    tag = uuid.uuid4().hex[:6]
+    elec = _cat(client, h, f"Electronics {tag}")
+    foot = _cat(client, h, f"Footwear {tag}")
+    assert elec.status_code == 201 and foot.status_code == 201, (elec.text, foot.text)
+    acc = _cat(client, h, f"Accessories {tag}", elec.json()["id"])
+    assert acc.status_code == 201, acc.text  # 1. Electronics > Accessories
+    return {"tag": tag, "h": h, "hb": test_setup["headers_b"], "elec": elec.json(), "foot": foot.json(), "acc": acc.json()}
+
+
+def test_category_parent_scoped_unique_names(client, two_parents):
+    """Top-level names are unique per organization; sub category names only under their own
+    parent. Compared trimmed and case-insensitively. 409 messages name the rule broken."""
+    t, h, hb = two_parents["tag"], two_parents["h"], two_parents["hb"]
+    elec, foot, acc = two_parents["elec"], two_parents["foot"], two_parents["acc"]
+
+    # 2. The same sub category name under another parent is allowed.
+    acc2 = _cat(client, h, f"Accessories {t}", foot["id"])
+    assert acc2.status_code == 201, acc2.text
+    assert acc2.json()["id"] != acc["id"]
+
+    # 3./4. Under the same parent: case and surrounding spaces do not make a new name.
+    for variant in (f"accessories {t}", f"  Accessories {t}  ", f"ACCESSORIES {t.upper()}"):
+        r = _cat(client, h, variant, elec["id"])
+        assert r.status_code == 409, (variant, r.text)
+        assert r.json() == {"detail": "This parent already has a subcategory with this name"}
+
+    # 5./6. Top level, same rule.
+    for variant in (f"Electronics {t}", f" electronics {t} ", f"ELECTRONICS {t.upper()}"):
+        r = _cat(client, h, variant)
+        assert r.status_code == 409, (variant, r.text)
+        assert r.json() == {"detail": "A category with this name already exists"}
+
+    # A sub category may share a top-level category's name: different scopes.
+    assert _cat(client, h, f"Footwear {t}", elec["id"]).status_code == 201
+    # Names are saved trimmed.
+    trimmed = _cat(client, h, f"  Cables {t}  ", elec["id"])
+    assert trimmed.status_code == 201 and trimmed.json()["name"] == f"Cables {t}"
+
+    # 7. Another organization may use the same names, top level and under a parent.
+    other = _cat(client, hb, f"Electronics {t}")
+    assert other.status_code == 201, other.text
+    assert _cat(client, hb, f"Accessories {t}", other.json()["id"]).status_code == 201
+
+    # 8. Both Accessories stay separately retrievable by id, each with its own parent.
+    a1 = client.get(f"/categories/{acc['id']}", headers=h).json()
+    a2 = client.get(f"/categories/{acc2.json()['id']}", headers=h).json()
+    assert (a1["parent_id"], a1["parent_name"]) == (elec["id"], f"Electronics {t}")
+    assert (a2["parent_id"], a2["parent_name"]) == (foot["id"], f"Footwear {t}")
+    top = client.get(f"/categories/{elec['id']}", headers=h).json()
+    assert top["parent_id"] is None and top["parent_name"] is None
+
+    # 9. Rename onto a name already used under the same parent: 409 (case-insensitive too).
+    cables = trimmed.json()
+    r = client.patch(f"/categories/{cables['id']}", json={"name": f" accessories {t}"}, headers=h)
+    assert r.status_code == 409 and r.json()["detail"] == "This parent already has a subcategory with this name"
+    # 10. ... onto a name used only under another parent: fine.
+    belts = _cat(client, h, f"Belts {t}", foot["id"]).json()
+    r = client.patch(f"/categories/{cables['id']}", json={"name": f"Belts {t}"}, headers=h)
+    assert r.status_code == 200 and r.json()["name"] == f"Belts {t}"
+    # Moving a sub category under a parent that already has its name: 409.
+    r = client.patch(f"/categories/{belts['id']}", json={"parent_id": elec["id"]}, headers=h)
+    assert r.status_code == 409 and r.json()["detail"] == "This parent already has a subcategory with this name"
+    # Renaming a top-level category onto another top-level name: 409; to its own name in new case: fine.
+    r = client.patch(f"/categories/{foot['id']}", json={"name": f"electronics {t}"}, headers=h)
+    assert r.status_code == 409 and r.json()["detail"] == "A category with this name already exists"
+    r = client.patch(f"/categories/{foot['id']}", json={"name": f"FOOTWEAR {t}"}, headers=h)
+    assert r.status_code == 200 and r.json()["name"] == f"FOOTWEAR {t}"
+    assert client.patch(f"/categories/{foot['id']}", json={"name": None}, headers=h).status_code == 422
+    # Org B cannot touch org A's categories.
+    assert client.patch(f"/categories/{foot['id']}", json={"name": "x"}, headers=hb).status_code == 404
+
+
+def _race(client, headers, body, monkeypatch):
+    """Two requests saving the same name at the same moment. The pre-check is switched off
+    so both reach the INSERT; the unique index has to stop the second."""
+    import threading
+
+    from app.routers import categories as categories_router
+
+    monkeypatch.setattr(categories_router, "_reject_duplicate_name", lambda *a, **k: None)
+    barrier, results = threading.Barrier(2), []
+
+    def worker():
+        barrier.wait()
+        results.append(client.post("/categories", json=body, headers=headers))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    return sorted(r.status_code for r in results), [r.json() for r in results]
+
+
+def test_concurrent_duplicate_top_level_category(client, test_setup, monkeypatch):
+    """11. One wins; the other gets the same 409 as the pre-check, never a 500."""
+    codes, bodies = _race(client, test_setup["headers_a"], {"name": f"Race {uuid.uuid4().hex[:6]}"}, monkeypatch)
+    assert codes == [201, 409], bodies
+    assert {"detail": "A category with this name already exists"} in bodies
+
+
+def test_concurrent_duplicate_subcategory(client, two_parents, monkeypatch):
+    """12. Same, for a sub category under one parent."""
+    body = {"name": f"Race Sub {two_parents['tag']}", "parent_id": two_parents["elec"]["id"]}
+    codes, bodies = _race(client, two_parents["h"], body, monkeypatch)
+    assert codes == [201, 409], bodies
+    assert {"detail": "This parent already has a subcategory with this name"} in bodies
+
+
+def test_unrelated_integrity_error_is_not_a_duplicate_name(client, test_setup, monkeypatch, db_session):
+    """Only the two name indexes map to 409. Any other integrity error keeps failing as
+    before (here a forced foreign-key failure), so a real fault is never reported as a
+    duplicate name."""
+    from app.routers import categories as categories_router
+
+    monkeypatch.setattr(categories_router, "_validate_parent", lambda *a, **k: None)
+    monkeypatch.setattr(categories_router, "_reject_duplicate_name", lambda *a, **k: None)
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    raw = TestClient(app, raise_server_exceptions=False)
+    r = raw.post("/categories", json={"name": f"Orphan {uuid.uuid4().hex[:6]}", "parent_id": str(uuid.uuid4())},
+                 headers=test_setup["headers_a"])
+    assert r.status_code == 500
+    assert "already exists" not in r.text
+
+
+def test_category_lookup_and_dropdowns_are_parent_scoped(client, two_parents):
+    """13.-15., 20. Name lookups resolve within a parent; a name alone never picks one."""
+    t, h = two_parents["tag"], two_parents["h"]
+    elec, foot, acc = two_parents["elec"], two_parents["foot"], two_parents["acc"]
+    acc2 = _cat(client, h, f"Accessories {t}", foot["id"]).json()
+
+    def get(params):
+        r = client.get("/categories", params=params, headers=h)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    # 13./14. With the parent: exactly the right one, matched trimmed and case-insensitively.
+    under_elec = get({"name": f" accessories {t} ", "parent_id": elec["id"]})
+    assert [c["id"] for c in under_elec] == [acc["id"]]
+    under_foot = get({"name": f"ACCESSORIES {t.upper()}", "parent_id": foot["id"]})
+    assert [c["id"] for c in under_foot] == [acc2["id"]]
+    # 15. By name alone: both come back, each with its parent; nothing is chosen silently.
+    both = get({"name": f"Accessories {t}"})
+    assert {(c["id"], c["parent_name"]) for c in both} == {
+        (acc["id"], f"Electronics {t}"), (acc2["id"], f"Footwear {t}")}
+    # 20. Dropdown data: children of one parent, and the top-level list.
+    assert {c["id"] for c in get({"parent_id": foot["id"]})} == {acc2["id"]}
+    tops = get({"top_level": "true", "search": t})
+    assert {c["id"] for c in tops} == {elec["id"], foot["id"]} and all(c["parent_name"] is None for c in tops)
+    subs = get({"top_level": "false", "search": t})
+    assert {(c["name"], c["parent_name"]) for c in subs} == {
+        (f"Accessories {t}", f"Electronics {t}"), (f"Accessories {t}", f"Footwear {t}")}
+    listed = get({"search": f"Accessories {t}"})
+    assert sorted(c["parent_name"] for c in listed) == [f"Electronics {t}", f"Footwear {t}"]
+
+
+def test_products_keep_the_right_same_named_subcategory(client, two_parents):
+    """16.-19. Products reference sub categories by id; the response carries the parent so
+    two "Accessories" can be told apart, and one parent's sub category never resolves under
+    another parent."""
+    t, h = two_parents["tag"], two_parents["h"]
+    elec, foot, acc = two_parents["elec"], two_parents["foot"], two_parents["acc"]
+    acc2 = _cat(client, h, f"Accessories {t}", foot["id"]).json()
+
+    p1 = client.post("/products", json={"name": f"Cable {t}", "category_id": elec["id"], "sub_category_id": acc["id"]},
+                     headers=h)
+    p2 = client.post("/products", json={"name": f"Insole {t}", "category_id": foot["id"], "sub_category_id": acc2["id"]},
+                     headers=h)
+    assert p1.status_code == 201 and p2.status_code == 201, (p1.text, p2.text)
+    for prod, cat, sub, parent_name in ((p1, elec, acc, f"Electronics {t}"), (p2, foot, acc2, f"Footwear {t}")):
+        body = client.get(f"/products/{prod.json()['id']}", headers=h).json()
+        assert body["sub_category_id"] == sub["id"]
+        assert body["subcategory"] == {"id": sub["id"], "name": f"Accessories {t}", "parent_id": cat["id"],
+                                       "parent_name": parent_name}
+        assert body["category"] == {"id": cat["id"], "name": cat["name"], "parent_id": None, "parent_name": None}
+    listing = client.get("/products", params={"search": t, "page_size": 100}, headers=h).json()
+    rows = {r["id"]: r for r in listing["items"]}
+    assert rows[p1.json()["id"]]["subcategory"]["parent_name"] == f"Electronics {t}"
+    assert rows[p2.json()["id"]]["subcategory"]["parent_name"] == f"Footwear {t}"
+
+    # 19. Footwear's Accessories cannot be filed under Electronics (ids, not names, decide).
+    r = client.post("/products", json={"name": "x", "category_id": elec["id"], "sub_category_id": acc2["id"]}, headers=h)
+    assert r.status_code == 400 and r.json()["detail"] == "sub_category_id is not a sub category of category_id"
+    r = client.patch(f"/products/{p1.json()['id']}", json={"sub_category_id": acc2["id"]}, headers=h)
+    assert r.status_code == 400
+    # Brand <-> category mapping works by id: mapping Electronics leaves Footwear alone, and a
+    # sub category (even a same-named one) cannot be mapped.
+    brand = client.post("/brands", json={"name": f"Brand {t}"}, headers=h)
+    assert brand.status_code == 201, brand.text
+    r = client.put(f"/categories/{elec['id']}/brands", json={"brand_ids": [brand.json()["id"]]}, headers=h)
+    assert r.status_code == 200, r.text
+    assert [b["id"] for b in client.get(f"/categories/{elec['id']}/brands", headers=h).json()] == [brand.json()["id"]]
+    assert client.put(f"/categories/{acc['id']}/brands", json={"brand_ids": []}, headers=h).status_code == 422
+
+
+def test_category_and_product_lists_load_parents_without_n_plus_one(client, two_parents):
+    """parent_name comes from an eager join: the number of queries does not grow with the
+    number of sub categories or products."""
+    from sqlalchemy import event
+
+    from app.core.database import engine
+
+    t, h, foot = two_parents["tag"], two_parents["h"], two_parents["foot"]
+
+    def count(call):
+        statements = []
+        listener = lambda *a, **k: statements.append(1)  # noqa: E731
+        event.listen(engine, "before_cursor_execute", listener)
+        try:
+            response = call()
+        finally:
+            event.remove(engine, "before_cursor_execute", listener)
+        assert response.status_code == 200, response.text
+        return len(statements)
+
+    few_cats = count(lambda: client.get("/categories", params={"search": t}, headers=h))
+    few_products = count(lambda: client.get("/products", params={"search": t}, headers=h))
+    for i in range(6):
+        sub = _cat(client, h, f"Extra {i} {t}", foot["id"]).json()
+        client.post("/products", json={"name": f"Prod {i} {t}", "category_id": foot["id"], "sub_category_id": sub["id"]},
+                    headers=h)
+    assert count(lambda: client.get("/categories", params={"search": t}, headers=h)) == few_cats
+    assert count(lambda: client.get("/products", params={"search": t}, headers=h)) <= few_products + 1
+
+
+def test_product_create_string_and_integer_limits(client, test_setup, db_session: Session):
+    """Every string at its limit saves; over the limit is 422; an integer beyond a
+    PostgreSQL INTEGER is 422 (it used to reach the insert and fail with a 500)."""
+    h = test_setup["headers_a"]
+    tag = uuid.uuid4().hex[:6]
+    cat = client.post("/categories", json={"name": f"Lim Cat {tag}"}, headers=h).json()
+    sub = client.post("/categories", json={"name": f"Lim Sub {tag}", "parent_id": cat["id"]}, headers=h).json()
+    full = {
+        "name": "N" * 200, "category_id": cat["id"], "sub_category_id": sub["id"],
+        "sku": "S" * 100, "barcode": "B" * 100, "hsn_code": "H" * 20, "uom": "U" * 50,
+        "brand": "b" * 150, "vendor": "v" * 150, "product_type": "t" * 100, "short_name": "s" * 100,
+        "manufacturer": "m" * 150, "model_number": "m" * 100, "color": "c" * 50, "material": "m" * 100,
+        "warranty_period": "w" * 50, "warranty_period_unit": "u" * 20, "country_of_origin": "c" * 100,
+        "total_inventory": 2_147_483_647, "opening_stock": 2_147_483_647,
+        "pricing": {"selling_price": 10.5, "purchase_price": 8.25, "currency": "INR"},
+        "variations": [{"name": "V" * 150, "sku": "vs" * 50, "inventory": 2_147_483_647}],
+    }
+    r = client.post("/products", json=full, headers=h)
+    assert r.status_code == 201, r.text
+    assert r.json()["name"] == "N" * 200
+
+    for field, value in (("name", "N" * 201), ("sku", "S" * 101), ("hsn_code", "H" * 21), ("uom", "U" * 51)):
+        r = client.post("/products", json={"name": "ok", field: value}, headers=h)
+        assert r.status_code == 422, (field, r.text)
+    for field in ("total_inventory", "opening_stock", "reorder_level", "minimum_order_quantity"):
+        r = client.post("/products", json={"name": "ok", field: 3_000_000_000}, headers=h)
+        assert r.status_code == 422, (field, r.text)
+        assert r.json()["detail"][0]["type"] == "less_than_equal"
+    r = client.post("/products", json={"name": "ok", "variations": [{"name": "v", "inventory": 3_000_000_000}]},
+                    headers=h)
+    assert r.status_code == 422
+
+    for ref in ("category_id", "brand_id", "preferred_supplier_id"):
+        r = client.post("/products", json={"name": "ok", ref: str(uuid.uuid4())}, headers=h)
+        assert r.status_code == 400, (ref, r.text)
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])

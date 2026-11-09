@@ -12,7 +12,7 @@ from app.core import scoping
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.pdf_docs import payment_receipt_pdf
 from app.core.files import content_disposition, delete_replaced_file, get_bytes, safe_filename, save_upload
-from app.models import Customer, CustomerDocument, CustomerPayment, Invoice, StoredFile, User
+from app.models import Customer, CustomerDocument, CustomerPayment, DeliveryCollection, Invoice, StoredFile, User
 from app.services import (
     customer_profile_service,
     ledger_service,
@@ -455,14 +455,66 @@ def customer_ledger(
 @router.get("/{customer_id}/payments", response_model=list[CustomerPaymentOut])
 def list_customer_payments(
     customer_id: str, user: User = Depends(_pay_view), db: Session = Depends(get_db)
-) -> list[CustomerPayment]:
-    _owned_customer(db, customer_id, user)
-    return (
+) -> list[CustomerPayment | dict]:
+    """The customer's payments, newest first, plus field collections (mobile / delivery
+    partner) still waiting for an accountant: those have status "awaiting_reconciliation"
+    and are NOT yet in the customer's balance or ledger. Once reconciled, a collection
+    becomes a real payment row here and its pending row disappears, so nothing is listed
+    twice."""
+    customer = _owned_customer(db, customer_id, user)
+    payments: list[CustomerPayment | dict] = (
         db.query(CustomerPayment)
         .filter(CustomerPayment.customer_id == customer_id)
         .order_by(CustomerPayment.received_on.desc(), CustomerPayment.id.desc())
         .all()
     )
+    pending = (
+        db.query(DeliveryCollection)
+        .filter(
+            DeliveryCollection.organization_id == customer.organization_id,
+            DeliveryCollection.customer_id == customer_id,
+            DeliveryCollection.reconciliation_status == "recorded",
+            DeliveryCollection.customer_payment_id.is_(None),
+        )
+        .all()
+    )
+    if not pending:
+        return payments
+    payments.extend(_pending_collection_row(c) for c in pending)
+
+    def _when(row: CustomerPayment | dict) -> float:
+        value = row["received_on"] if isinstance(row, dict) else row.received_on
+        if value is None:
+            return 0.0
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+
+    payments.sort(key=_when, reverse=True)
+    return payments
+
+
+def _pending_collection_row(coll: "DeliveryCollection") -> dict:
+    """A not-yet-reconciled field collection in the shape of a payment row."""
+    return {
+        "id": coll.id,
+        "customer_id": coll.customer_id,
+        "receipt_number": None,
+        "order_id": coll.sales_order_id,
+        "invoice_id": None,
+        "amount": coll.amount,
+        "payment_mode": coll.payment_mode,
+        "reference": coll.reference,
+        "note": coll.notes,
+        "received_on": coll.collected_at,
+        "created_at": coll.created_at,
+        "collected_by_user_id": coll.delivery_partner_id,
+        "collector": coll.delivery_partner,
+        "source": "delivery_cod" if coll.delivery_id else "field_collection",
+        "status": "awaiting_reconciliation",
+        "payment_proof_url": coll.payment_proof_url,
+        "splits": [],
+    }
 
 
 @router.get("/{customer_id}/payments/receipt/{payment_id}")

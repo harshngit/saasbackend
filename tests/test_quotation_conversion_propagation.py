@@ -378,6 +378,150 @@ def test_10_stock_reservation_integrity_on_conversion():
     assert_eq(confirmed_order["fulfilment_status"], "reserved", "Confirmed order is reserved")
 
 
+def test_11_multi_item_decimal_totals():
+    print("\n--- TEST 11: Multi-item quotation, decimal amounts and rounding ---")
+    auth, wh_id, prod_id, cust_id = _setup_org("decimals")
+    q_res = client.post("/quotations", json={
+        "customer_id": cust_id,
+        "items": [
+            {"product_id": prod_id, "quantity": 3, "unit_price": 99.99, "discount_percent": 12.5, "tax_rate": 18},
+            {"product_id": prod_id, "quantity": 2.5, "unit_price": 10.333, "tax_rate": 5},
+        ],
+    }, headers=auth)
+    assert q_res.status_code == 201, q_res.text
+    q = q_res.json()
+    assert q["item_count"] == 2
+    # 3 x 99.99 = 299.97, less 12.5% (37.50) = 262.47, tax 18% = 47.24
+    # 2.5 x 10.333 = 25.8325 -> 25.83, tax 5% = 1.29
+    assert [i["line_total"] for i in q["items"]] == [262.47, 25.83]
+    assert [i["tax_amount"] for i in q["items"]] == [47.24, 1.29]
+    assert q["subtotal"] == 288.3
+    assert q["tax_total"] == 48.53
+    assert q["total"] == 336.83
+    ok("Multi-item decimal totals are rounded per line and summed")
+
+
+def test_12_long_product_and_variant_name_fits_line():
+    """product_name on a quotation line is VARCHAR(200). "Product (Variant)" could be longer,
+    and PostgreSQL then refused the whole quotation with a 500."""
+    print("\n--- TEST 12: Long product + variant name on a quotation line ---")
+    auth, wh_id, prod_id, cust_id = _setup_org("longname")
+    p_res = client.post("/products", json={
+        "name": "P" * 200,
+        "pricing": {"selling_price": 10.0},
+        "variations": [{"name": "V" * 150, "pricing": {"selling_price": 12.0}}],
+    }, headers=auth)
+    assert p_res.status_code == 201, p_res.text
+    product = p_res.json()
+    variant_id = product["variations"][0]["id"]
+    line = {"product_id": product["id"], "variant_id": variant_id, "quantity": 1, "unit_price": 12.0}
+
+    q_res = client.post("/quotations", json={"customer_id": cust_id, "items": [line]}, headers=auth)
+    assert q_res.status_code == 201, q_res.text
+    name = q_res.json()["items"][0]["product_name"]
+    assert len(name) == 200 and name.startswith("P" * 199) and name.endswith("…")
+
+    # Short names are untouched.
+    short = client.post("/quotations", json={"customer_id": cust_id, "items": [
+        {"product_id": prod_id, "quantity": 1, "unit_price": 1}]}, headers=auth)
+    assert short.json()["items"][0]["product_name"] == "Precision Sensor"
+
+    # Update (items replaced) takes the same path.
+    q_id = short.json()["id"]
+    upd = client.patch(f"/quotations/{q_id}", json={"items": [line]}, headers=auth)
+    assert upd.status_code == 200, upd.text
+    assert len(upd.json()["items"][0]["product_name"]) == 200
+    ok("Long product + variant names are cut to fit the line, create and update")
+
+
+def test_13_field_limits_answer_422_not_500():
+    """These fields had no length check, so PostgreSQL rejected the insert/update (500)."""
+    print("\n--- TEST 13: Quotation field limits ---")
+    auth, wh_id, prod_id, cust_id = _setup_org("limits")
+    item = {"product_id": prod_id, "quantity": 1, "unit_price": 5}
+    at_limit = client.post("/quotations", json={
+        "customer_id": cust_id, "payment_terms": "T" * 200, "delivery_terms": "D" * 200,
+        "currency": "C" * 10, "quotation_number": f"Q-{uuid.uuid4().hex}"[:50],
+        "items": [{**item, "uom": "U" * 50}],
+    }, headers=auth)
+    assert at_limit.status_code == 201, at_limit.text
+
+    over = {
+        "payment_terms": "T" * 201,
+        "delivery_terms": "D" * 201,
+        "currency": "Indian Rupee",
+        "quotation_number": "Q" * 51,
+    }
+    for field, value in over.items():
+        r = client.post("/quotations", json={"customer_id": cust_id, field: value, "items": [item]}, headers=auth)
+        assert r.status_code == 422, (field, r.status_code, r.text)
+        assert r.json()["detail"][0]["loc"][-1] == field
+    r = client.post("/quotations", json={"customer_id": cust_id, "items": [{**item, "uom": "U" * 51}]}, headers=auth)
+    assert r.status_code == 422 and r.json()["detail"][0]["loc"][-1] == "uom"
+
+    q_id = at_limit.json()["id"]
+    r = client.patch(f"/quotations/{q_id}", json={"payment_terms": "T" * 201}, headers=auth)
+    assert r.status_code == 422
+    r = client.patch(f"/quotations/{q_id}", json={"payment_terms": "Net 30"}, headers=auth)
+    assert r.status_code == 200 and r.json()["payment_terms"] == "Net 30"
+    ok("Over-long quotation fields answer 422 on create and update")
+
+
+def test_14_invalid_references_and_org_isolation():
+    print("\n--- TEST 14: Invalid references and organization isolation ---")
+    auth, wh_id, prod_id, cust_id = _setup_org("refs")
+    other_auth, _, other_prod, other_cust = _setup_org("refs_other")
+    item = {"product_id": prod_id, "quantity": 1, "unit_price": 5}
+
+    r = client.post("/quotations", json={"customer_id": cust_id, "items": [{"quantity": 1, "unit_price": 5}]}, headers=auth)
+    assert r.status_code == 400 and r.json()["detail"] == "Every quotation line needs a product_id"
+    r = client.post("/quotations", json={"customer_id": cust_id, "items": [{**item, "product_id": other_prod}]}, headers=auth)
+    assert r.status_code == 400, r.text
+    r = client.post("/quotations", json={"customer_id": other_cust, "items": [item]}, headers=auth)
+    assert r.status_code == 400, r.text
+    r = client.post("/quotations", json={"customer_id": cust_id, "items": [{**item, "variant_id": "nope"}]}, headers=auth)
+    assert r.status_code == 400 and r.json()["detail"] == "Invalid variant_id"
+
+    q_id = client.post("/quotations", json={"customer_id": cust_id, "items": [item]}, headers=auth).json()["id"]
+    assert client.get(f"/quotations/{q_id}", headers=other_auth).status_code == 404
+    assert client.patch(f"/quotations/{q_id}", json={"notes": "x"}, headers=other_auth).status_code == 404
+    ok("Invalid references are 400; another firm's quotation is 404")
+
+
+def test_15_long_product_unit_on_order_and_conversion():
+    """A product's unit holds 50 characters, the order line's only held 30, and an order line
+    takes the product's unit when none is sent: saving such an order failed with a 500."""
+    print("\n--- TEST 15: Product unit up to 50 characters on order lines ---")
+    auth, wh_id, _prod, cust_id = _setup_org("longuom")
+    unit = "Carton of twelve 250 ml glass bottles"  # 37 characters: over the old 30, within 50
+    assert 30 < len(unit) <= 50
+    p = client.post("/products", json={"name": "Juice", "uom": unit, "pricing": {"selling_price": 20.0}}, headers=auth)
+    assert p.status_code == 201, p.text
+    pid = p.json()["id"]
+    client.post(f"/warehouses/{wh_id}/stock/adjust", json={"product_id": pid, "quantity": 50}, headers=auth)
+
+    order = client.post("/orders", json={"customer_id": cust_id, "warehouse_id": wh_id,
+                                         "items": [{"product_id": pid, "quantity": 2, "unit_price": 20.0}]}, headers=auth)
+    assert order.status_code == 201, order.text
+    assert order.json()["items"][0]["uom"] == unit
+
+    q = client.post("/quotations", json={"customer_id": cust_id, "items": [
+        {"product_id": pid, "quantity": 1, "unit_price": 20.0, "uom": unit}]}, headers=auth)
+    assert q.status_code == 201, q.text
+    q_id = q.json()["id"]
+    client.patch(f"/quotations/{q_id}", json={"status": "sent"}, headers=auth)
+    client.patch(f"/quotations/{q_id}", json={"status": "accepted"}, headers=auth)
+    conv = client.post(f"/quotations/{q_id}/convert-to-order", json={"warehouse_id": wh_id}, headers=auth)
+    assert conv.status_code == 201, conv.text
+    converted = client.get(f"/orders/{conv.json()['order']['id']}", headers=auth).json()
+    assert converted["items"][0]["uom"] == unit
+
+    too_long = client.post("/orders", json={"customer_id": cust_id, "warehouse_id": wh_id, "items": [
+        {"product_id": pid, "quantity": 1, "unit_price": 20.0, "uom": "U" * 51}]}, headers=auth)
+    assert too_long.status_code == 422, too_long.text
+    ok("Units up to 50 characters save on orders, quotations and conversion; 51 is a 422")
+
+
 def run_all_tests():
     print("\n=======================================================")
     print("TEST SUITE: Quotation -> Order Conversion Propagation")
@@ -392,6 +536,11 @@ def run_all_tests():
     test_8_legacy_quotation_fallback_conversion()
     test_9_duplicate_and_rejected_conversion_protection()
     test_10_stock_reservation_integrity_on_conversion()
+    test_11_multi_item_decimal_totals()
+    test_12_long_product_and_variant_name_fits_line()
+    test_13_field_limits_answer_422_not_500()
+    test_14_invalid_references_and_org_isolation()
+    test_15_long_product_unit_on_order_and_conversion()
 
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")

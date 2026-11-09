@@ -60,7 +60,7 @@ class QuotationItemBase(BaseModel):
     product_id: str | None = None
     variant_id: str | None = None
     quantity: float = Field(gt=0)
-    uom: str | None = None
+    uom: str | None = Field(default=None, max_length=50)
     unit_price: float = Field(ge=0)
     discount: float = Field(default=0, ge=0, description="Per line")
     discount_percent: float | None = Field(default=0, ge=0, le=100, description="Per line discount %")
@@ -85,7 +85,7 @@ class QuotationItemOut(QuotationItemBase):
 
 
 class QuotationBase(BaseModel):
-    quotation_number: str | None = Field(default=None, description="Auto-generated when omitted")
+    quotation_number: str | None = Field(default=None, max_length=50, description="Auto-generated when omitted")
     quotation_date: datetime | None = None
     valid_until: datetime | None = None
     customer_id: str | None = None
@@ -96,10 +96,11 @@ class QuotationBase(BaseModel):
     )
     billing_address: str | None = None
     salesperson_id: str | None = None
-    currency: str | None = "INR"
+    currency: str | None = Field(default="INR", max_length=10)
     shipping_address: str | None = None
-    payment_terms: str | None = None
-    delivery_terms: str | None = None
+    # Same limits as the sales order columns these are copied to on conversion.
+    payment_terms: str | None = Field(default=None, max_length=200)
+    delivery_terms: str | None = Field(default=None, max_length=200)
     notes: str | None = None
     terms_conditions: str | None = None
     status: QuotationStatus | None = Field(

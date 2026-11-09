@@ -545,7 +545,7 @@ def create_direct_invoice(
                 serial_numbers=tracked["serial_numbers"] or None,
                 product_id=product.id,
                 variant_id=variant.id if variant is not None else None,
-                product_name=product.name if variant is None else f"{product.name} ({variant.name})",
+                product_name=product.line_item_name(variant),
                 hsn_code=product.hsn_code,
                 quantity=line["quantity"],
                 unit_price=line["unit_price"],

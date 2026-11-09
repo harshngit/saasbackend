@@ -90,25 +90,29 @@ def _build_items(db: Session, org_id: str, lines) -> list[QuotationItem]:  # noq
     """Validate each quoted line and snapshot the name it was quoted under."""
     built = []
     for item in lines:
+        if not item.product_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Every quotation line needs a product_id",
+            )
         product = db.get(Product, item.product_id)
         if product is None or product.organization_id != org_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Product {item.product_id} not found",
             )
-        variant_name = ""
+        variant = None
         if item.variant_id:
             variant = db.get(ProductVariant, item.variant_id)
             if variant is None or variant.product_id != product.id:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid variant_id"
                 )
-            variant_name = f" ({variant.name})"
         built.append(
             QuotationItem(
                 product_id=product.id,
                 variant_id=item.variant_id,
-                product_name=f"{product.name}{variant_name}",
+                product_name=product.line_item_name(variant),
                 quantity=item.quantity,
                 uom=item.uom,
                 unit_price=item.unit_price,

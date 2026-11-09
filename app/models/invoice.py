@@ -115,7 +115,7 @@ class InvoiceItem(Base):
     discount: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     tax: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    uom: Mapped[str | None] = mapped_column(String(50), nullable=True)  # = Product.uom (alembic d5b8f0c3e2a4)
     tax_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
     tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     # The delivery line this bills, so an invoice traces back to what was handed over.

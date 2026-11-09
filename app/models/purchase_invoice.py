@@ -167,7 +167,7 @@ class PurchaseInvoiceItem(Base):
     tax_rate: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     tax: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     line_total: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(50), nullable=True)  # = Product.uom (alembic d5b8f0c3e2a4)
     batch_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     serial_numbers: Mapped[list[str] | None] = mapped_column(JSON, default=list, nullable=True)
     expiry_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

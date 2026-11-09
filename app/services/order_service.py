@@ -244,7 +244,7 @@ def place_order(
             SalesOrderItem(
                 product_id=product.id,
                 variant_id=line.variant_id,
-                product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                product_name=product.line_item_name(variant),
                 quantity=line.quantity,
                 unit_price=unit_price,
                 discount=disc_amount,
@@ -626,7 +626,7 @@ def update_order(
                 SalesOrderItem(
                     product_id=product.id,
                     variant_id=line.variant_id,
-                    product_name=product.name if not variant else f"{product.name} ({variant.name})",
+                    product_name=product.line_item_name(variant),
                     quantity=line.quantity,
                     unit_price=unit_price,
                     discount=disc_amount,

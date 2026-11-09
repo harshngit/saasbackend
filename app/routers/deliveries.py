@@ -128,6 +128,15 @@ DELIVERY_NOTE_SORTABLE_FIELDS = {
     "created_at": Delivery.created_at,
 }
 
+# ?status= on the collection history: the reported status names, plus the stored
+# reconciliation_status values older clients send.
+_COLLECTION_STATUS_FILTER = {
+    "awaiting_reconciliation": "recorded",
+    "recorded": "recorded",
+    "reconciled": "reconciled",
+    "voided": "voided",
+}
+
 DELIVERY_COLLECTION_SORTABLE_FIELDS = {
     "collected_at": DeliveryCollection.collected_at,
     "business_date": DeliveryCollection.collected_at,
@@ -1166,8 +1175,14 @@ def list_delivery_collections(
     sort_by: str | None = Query(default=None, description="Field to sort by"),
     sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
     search: str | None = None,
-    status: str | None = None,
+    status: str | None = Query(
+        default=None,
+        description="awaiting_reconciliation | reconciled | voided (or the stored "
+                    "reconciliation_status: recorded | reconciled | voided)",
+    ),
     delivery_partner_id: str | None = None,
+    customer_id: str | None = Query(default=None, description="Only this customer's collections"),
+    order_id: str | None = Query(default=None, description="Only collections linked to this sales order"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[DeliveryCollectionOut]:
@@ -1186,16 +1201,33 @@ def list_delivery_collections(
     elif delivery_partner_id:
         q = q.filter(DeliveryCollection.delivery_partner_id == delivery_partner_id)
 
+    if customer_id:
+        q = q.filter(DeliveryCollection.customer_id == customer_id)
+    if order_id:
+        q = q.filter(DeliveryCollection.sales_order_id == order_id)
+
+    # These filters used to name columns the model does not have (status,
+    # collection_number, payment_reference), so any call with ?status= or ?search=
+    # failed with a 500 and the history screen showed nothing.
     if status:
-        q = q.filter(DeliveryCollection.status == status)
+        wanted = status.strip().lower()
+        stored = _COLLECTION_STATUS_FILTER.get(wanted)
+        if stored is None:
+            raise HTTPException(
+                status_code=422,
+                detail="status must be one of: awaiting_reconciliation, recorded, reconciled, voided",
+            )
+        q = q.filter(DeliveryCollection.reconciliation_status == stored)
 
     if search:
         s = f"%{search.strip()}%"
         q = q.filter(
             or_(
-                DeliveryCollection.collection_number.ilike(s),
-                DeliveryCollection.payment_reference.ilike(s),
+                DeliveryCollection.reference.ilike(s),
                 DeliveryCollection.notes.ilike(s),
+                DeliveryCollection.customer_id.in_(
+                    select(Customer.id).where(Customer.organization_id == org_id, Customer.name.ilike(s))
+                ),
             )
         )
 
@@ -1281,6 +1313,25 @@ def record_general_customer_collection(
                         detail="Cannot record collection for a delivery not assigned to you",
                     )
 
+    # 4b. Validate order_id if provided. It used to be dropped silently (the schema had no
+    # such field), so a collection made against an order was saved with no order link.
+    sales_order_id = delivery.sales_order_id if delivery else None
+    if payload.order_id:
+        order = db.get(SalesOrder, payload.order_id)
+        if order is None or order.organization_id != org_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found in your organization")
+        if order.customer_id != customer.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Order {order.order_number} does not belong to customer {customer.name}",
+            )
+        if sales_order_id and sales_order_id != order.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="order_id does not match the order of the given delivery_id",
+            )
+        sales_order_id = order.id
+
     # 5. Validate allocations if provided
     allocations_to_create = []
     if payload.allocations:
@@ -1350,11 +1401,17 @@ def record_general_customer_collection(
     if payload.payment_date:
         if isinstance(payload.payment_date, datetime):
             collected_at = payload.payment_date
-        elif isinstance(payload.payment_date, str):
+        elif isinstance(payload.payment_date, str) and payload.payment_date.strip():
+            # An unreadable date used to be dropped silently and the collection dated "now",
+            # which put it on the wrong day (and the wrong Day-End). Refuse it instead.
             try:
-                collected_at = datetime.fromisoformat(payload.payment_date)
+                collected_at = datetime.fromisoformat(payload.payment_date.strip())
             except ValueError:
-                pass
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="payment_date must be an ISO 8601 date or date-time, e.g. 2026-11-09 or "
+                           "2026-11-09T10:30:00+05:30",
+                ) from None
 
     # A day whose Day-End is submitted / approved takes no new collections.
     day_end_service.require_day_open(db, org_id, user.id, collected_at)
@@ -1362,7 +1419,7 @@ def record_general_customer_collection(
     coll = DeliveryCollection(
         organization_id=org_id,
         delivery_id=delivery.id if delivery else None,
-        sales_order_id=delivery.sales_order_id if delivery else None,
+        sales_order_id=sales_order_id,
         customer_id=customer.id,
         delivery_partner_id=user.id,
         amount=round(payload.amount, 2),

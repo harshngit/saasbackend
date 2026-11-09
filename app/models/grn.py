@@ -74,7 +74,7 @@ class GoodsReceiptNoteItem(Base):
     product_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     barcode: Mapped[str | None] = mapped_column(String(100), nullable=True)
     product_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    unit_of_measure_uom: Mapped[str | None] = mapped_column(String(50), nullable=True)  # = Product.uom (alembic d5b8f0c3e2a4)
 
     ordered_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     received_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

@@ -181,7 +181,7 @@ class SalesOrderItem(Base):
     discount_percent: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
     cost_price: Mapped[float | None] = mapped_column(Float, default=0, nullable=True)
     line_total: Mapped[float] = mapped_column(Float, default=0, nullable=False)
-    uom: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    uom: Mapped[str | None] = mapped_column(String(50), nullable=True)  # = Product.uom (alembic d5b8f0c3e2a4)
     # Snapshot of the tax the line was sold at, so an invoice raised later bills the
     # agreed rate rather than a hardcoded one.
     tax_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
