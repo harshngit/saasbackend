@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crm-saas-backend",
+  "account_id": "fe91aefd4fc01969dc0df33dd88906df",
+  "main": "worker/src/index.js",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+  "vars": { "ENABLE_DOCS": "true" },
+  "containers": [
+    {
+      "class_name": "CrmSaasBackend",
+      "image": "./Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CRM_BACKEND", "class_name": "CrmSaasBackend" }
+    ]
+  },
+  "exports": {
+    "CrmSaasBackend": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

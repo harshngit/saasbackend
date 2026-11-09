@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+venv
+__pycache__
+*.pyc
+.env
+scratch
+tests
+test_smoke.py
+*.txt
+!requirements.txt
+worker
+node_modules
