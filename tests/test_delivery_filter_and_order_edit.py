@@ -413,11 +413,156 @@ def main():
     edit_after_inv = client.patch(f"/orders/{order_inv_id}", json={"notes": "Edit after invoice"}, headers=auth_admin1)
     assert_eq(edit_after_inv.status_code, 400, "Cannot edit order after invoice generated (HTTP 400)")
 
+    print("\n--- Assigned Deliveries: status filters (GET /deliveries?status=) ---")
+    test_assigned_deliveries_status_filters()
+    ok("Assigned Deliveries status filters, search, sort, pagination and scoping")
+
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")
     print("=======================================================")
     if _failed > 0:
         sys.exit(1)
+
+
+def test_assigned_deliveries_status_filters():
+    """The Assigned Deliveries screen (GET /deliveries as a Delivery Partner) filters by the
+    status each card shows: All / Accepted / Pending / Intransit / Delivered.
+
+    Responses carry the public status, but the filter used to compare the stored column
+    with it: "pending" is stored as "planned" (0 results) and "in_transit" also covers
+    stored "loaded" (missed). ?search= also answered 500 (it filtered on a property).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.database import SessionLocal
+    from app.models import Delivery, User
+
+    admin, _ = _register_org("AssignedFilters")
+    dp1_auth, dp1 = _create_staff(admin, "Driver One", "Delivery Partner")
+    dp2_auth, dp2 = _create_staff(admin, "Driver Two", "Delivery Partner")
+    other_admin, _ = _register_org("OtherFirm")
+    other_dp_auth, other_dp = _create_staff(other_admin, "Other Driver", "Delivery Partner")
+
+    db = SessionLocal()
+    try:
+        org_id = db.get(User, dp1["id"]).organization_id
+        other_org = db.get(User, other_dp["id"]).organization_id
+        tag = uuid.uuid4().hex[:6]
+        start = datetime.now(timezone.utc) - timedelta(days=30)
+        made: dict[str, list[str]] = {}
+
+        def add(key, stored, partner, org=org_id, minutes=0, notes=None):
+            d = Delivery(organization_id=org, delivery_note_number=f"DN-{tag}-{len(made.get(key, []))}-{key}",
+                         status=stored, delivery_partner_id=partner, notes=notes,
+                         created_at=start + timedelta(minutes=minutes))
+            db.add(d)
+            db.flush()
+            made.setdefault(key, []).append(d.id)
+
+        # Pending ones are the OLDEST: with the default newest-first order they sit beyond
+        # the first unfiltered page of 10.
+        add("pending", "planned", dp1["id"], minutes=1, notes=f"gate code {tag}")
+        add("pending", "planned", dp1["id"], minutes=2)
+        add("accepted", "accepted", dp1["id"], minutes=10)
+        add("accepted", "ready", dp1["id"], minutes=11)
+        add("in_transit", "loaded", dp1["id"], minutes=20, notes=f"fragile {tag}")
+        add("in_transit", "in_transit", dp1["id"], minutes=21)
+        for i in range(10):
+            add("delivered", "delivered", dp1["id"], minutes=100 + i)
+        add("dp2", "in_transit", dp2["id"], minutes=30)
+        add("dp2", "planned", dp2["id"], minutes=31)
+        add("other_org", "planned", other_dp["id"], org=other_org, minutes=5)
+        db.commit()
+    finally:
+        db.close()
+    mine = {i for k in ("pending", "accepted", "in_transit", "delivered") for i in made[k]}
+
+    def listing(auth, **params):
+        r = client.get("/deliveries", params={"page_size": 100, **params}, headers=auth)
+        assert r.status_code == 200, (params, r.status_code, r.text)
+        return r.json()
+
+    def ids(auth, **params):
+        return {d["id"] for d in listing(auth, **params)["items"]}
+
+    # 1. All: every delivery assigned to this partner, and nobody else's.
+    all_page = listing(dp1_auth)
+    assert {d["id"] for d in all_page["items"]} == mine and all_page["total"] == len(mine)
+    assert ids(dp1_auth, status="all") == mine and ids(dp1_auth, status="") == mine
+
+    # 2.-5. Each Flutter filter, in every spelling seen, matches what the cards show.
+    expected = {
+        "accepted": ({"Accepted", "accepted", "ACCEPTED"}, "accepted"),
+        "pending": ({"Pending", "pending"}, "pending"),
+        "in_transit": ({"Intransit", "intransit", "in_transit", "In Transit", "in-transit"}, "in_transit"),
+        "delivered": ({"Delivered", "delivered"}, "delivered"),
+    }
+    for key, (spellings, public) in expected.items():
+        for spelling in spellings:
+            page = listing(dp1_auth, status=spelling)
+            got = {d["id"] for d in page["items"]}
+            assert got == set(made[key]), (spelling, len(got), len(made[key]))
+            assert page["total"] == len(made[key]), (spelling, page["total"])
+            assert all(d["status"] == public for d in page["items"]), (spelling, {d["status"] for d in page["items"]})
+
+    # Stored values still filter exactly, as before (web consumers).
+    assert ids(dp1_auth, status="loaded") == {made["in_transit"][0]}
+    assert ids(dp1_auth, status="ready") == {made["accepted"][1]}
+    assert ids(dp1_auth, status="planned") == set(made["pending"])
+    bad = client.get("/deliveries", params={"status": "bogus"}, headers=dp1_auth)
+    assert bad.status_code == 422 and "status must be one of" in bad.json()["detail"]
+
+    # 6. Filtering happens before pagination: the pending ones are not on the first
+    #    unfiltered page, yet the filtered first page holds both.
+    first_unfiltered = ids(dp1_auth, page_size=10)
+    assert not (set(made["pending"]) & first_unfiltered)
+    assert ids(dp1_auth, status="Pending", page_size=10) == set(made["pending"])
+
+    # 9. Pagination totals follow the filter.
+    p1 = listing(dp1_auth, status="Delivered", page_size=4, page=1)
+    p3 = listing(dp1_auth, status="Delivered", page_size=4, page=3)
+    assert (p1["total"], p1["total_pages"], len(p1["items"]), len(p3["items"])) == (10, 3, 4, 2)
+    paged = set()
+    for n in (1, 2, 3):
+        paged |= {d["id"] for d in listing(dp1_auth, status="Delivered", page_size=4, page=n)["items"]}
+    assert paged == set(made["delivered"])
+
+    # 7. Search together with a status filter (search used to answer 500).
+    assert ids(dp1_auth, status="Pending", search=f"gate code {tag}") == {made["pending"][0]}
+    assert ids(dp1_auth, status="Intransit", search=f"fragile {tag}") == {made["in_transit"][0]}
+    assert ids(dp1_auth, status="Intransit", search=tag) == set(made["in_transit"])  # tag is in every number
+    assert ids(dp1_auth, status="Delivered", search=f"gate code {tag}") == set()
+    assert ids(dp1_auth, search=f"DN-{tag}-0-accepted") == {made["accepted"][0]}
+
+    # 8. Sorting together with a status filter.
+    asc = [d["id"] for d in listing(dp1_auth, status="Intransit", sort_by="delivery_number", sort_order="asc")["items"]]
+    desc = [d["id"] for d in listing(dp1_auth, status="Intransit", sort_by="delivery_number", sort_order="desc")["items"]]
+    assert set(asc) == set(made["in_transit"]) and asc == list(reversed(desc)) and len(asc) == 2
+
+    # 10. Another partner's deliveries are never exposed, whatever the filter.
+    for spelling in ("all", "Pending", "Intransit"):
+        assert not (ids(dp1_auth, status=spelling) & set(made["dp2"]))
+    assert ids(dp2_auth) == set(made["dp2"])
+    assert ids(dp2_auth, status="Intransit") == {made["dp2"][0]}
+
+    # 11. Organization isolation: the other firm's admin and partner see none of these.
+    assert not (ids(other_admin) & (mine | set(made["dp2"])))
+    assert ids(other_dp_auth, status="Pending") == set(made["other_org"])
+
+    # 12. Transitions still work, and the card moves between filters.
+    pending_id = made["pending"][1]
+    accepted = client.post(f"/deliveries/{pending_id}/accept", headers=dp1_auth)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "accepted" and accepted.json()["internal_status"] == "accepted"
+    assert pending_id not in ids(dp1_auth, status="Pending")
+    assert pending_id in ids(dp1_auth, status="Accepted")
+    # dp2 cannot accept dp1's delivery.
+    assert client.post(f"/deliveries/{made['pending'][0]}/accept", headers=dp2_auth).status_code in (403, 404)
+
+    # 13. Response shape unchanged for existing consumers.
+    item = listing(dp1_auth, status="Delivered", page_size=1)
+    assert set(item) == {"items", "total", "page", "page_size", "total_pages"}
+    assert {"id", "status", "internal_status", "delivery_number"} <= set(item["items"][0])
 
 
 if __name__ == "__main__":
