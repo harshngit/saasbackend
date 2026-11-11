@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # Changing this value changes the image digest and forces a new rollout.
-ENV RESTART_MARKER=2026-11-09-1500
+ENV RESTART_MARKER=202611111245
 
 WORKDIR /app
 
