@@ -397,6 +397,48 @@ def public_delivery_status(value: str | None) -> str | None:
     return PUBLIC_DELIVERY_STATUS.get(value, value)
 
 
+# Stored statuses behind each public status, e.g. "in_transit" -> ("loaded", "in_transit").
+_STORED_FOR_PUBLIC_DELIVERY_STATUS: dict[str, tuple[str, ...]] = {}
+for _stored, _public in PUBLIC_DELIVERY_STATUS.items():
+    _STORED_FOR_PUBLIC_DELIVERY_STATUS.setdefault(_public, ())
+    _STORED_FOR_PUBLIC_DELIVERY_STATUS[_public] += (_stored,)
+del _stored, _public
+
+# Spellings clients send for the same status ("Intransit", "In Transit", "in-transit").
+_DELIVERY_STATUS_ALIASES = {"intransit": "in_transit", "partiallydelivered": "partially_delivered"}
+
+
+def delivery_statuses_for_filter(value: str | None) -> tuple[str, ...] | None:
+    """The stored `Delivery.status` values a `?status=` filter selects.
+
+    Responses report the public status (see PUBLIC_DELIVERY_STATUS), so a filter on a
+    public value must match every stored value shown under it: "pending" is stored as
+    "planned", and "in_transit" covers "loaded" too. Comparing the raw column with the
+    public value -- what the list used to do -- found nothing for "pending" and missed
+    loaded deliveries for "in_transit", although both were on screen under "All".
+
+    A stored value that is not itself a public one ("planned", "ready", "loaded",
+    "failed") still selects exactly that stored value, as before. None, "" and "all"
+    mean no filter. Raises ValueError for anything else.
+    """
+    if value is None:
+        return None
+    key = value.strip().lower().replace(" ", "_").replace("-", "_")
+    if key in ("", "all"):
+        return None
+    key = _DELIVERY_STATUS_ALIASES.get(key.replace("_", ""), key)
+    if key in _STORED_FOR_PUBLIC_DELIVERY_STATUS:
+        return _STORED_FOR_PUBLIC_DELIVERY_STATUS[key]
+    if key in DELIVERY_STATUSES:
+        return (key,)
+    raise ValueError(value)
+
+
+DELIVERY_STATUS_FILTER_VALUES = tuple(_STORED_FOR_PUBLIC_DELIVERY_STATUS) + tuple(
+    s for s in DELIVERY_STATUSES if s not in _STORED_FOR_PUBLIC_DELIVERY_STATUS
+)
+
+
 # --------------------- centralized Delivery transition validation ---------------------
 # The exact set of `Delivery.status` transitions the existing workflow already
 # enforces — extracted from delivery_service.py's own guard clauses (accept/reject/

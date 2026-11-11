@@ -445,13 +445,17 @@ def list_deliveries(
     user: User = Depends(_view),
     status_filter: str | None = Query(
         default=None, alias="status",
-        description="planned | loaded | in_transit | partially_delivered | delivered | "
-                    "failed | cancelled",
+        description="The status shown on each delivery: pending | accepted | in_transit | "
+                    "partially_delivered | delivered | rejected | returned | cancelled "
+                    "(case-insensitive; 'intransit' / 'In Transit' accepted; 'all' or empty = "
+                    "no filter). Stored values planned | ready | loaded | failed also work.",
     ),
     order_id: str | None = Query(default=None),
     delivery_partner_id: str | None = Query(default=None),
     open_only: bool = Query(default=False, description="Only deliveries still out"),
-    search: str | None = Query(default=None, description="matches delivery_number or notes"),
+    search: str | None = Query(
+        default=None, description="matches delivery number, notes, customer name or order number"
+    ),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     sort_by: str | None = Query(default=None, description="Field to sort by"),
@@ -461,20 +465,38 @@ def list_deliveries(
     """The firm's deliveries, newest first. A field role sees only their own."""
     org_id = _org_id(user)
     query = db.query(Delivery).filter(Delivery.organization_id == org_id)
-    if status_filter:
-        query = query.filter(Delivery.status == status_filter)
+    try:
+        stored_statuses = workflow.delivery_statuses_for_filter(status_filter)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="status must be one of: all, " + ", ".join(workflow.DELIVERY_STATUS_FILTER_VALUES),
+        ) from None
+    if stored_statuses is not None:
+        # Before pagination, so total / total_pages count only matching deliveries.
+        query = query.filter(Delivery.status.in_(stored_statuses))
     if order_id:
         query = query.filter(Delivery.sales_order_id == order_id)
     if delivery_partner_id:
         query = query.filter(Delivery.delivery_partner_id == delivery_partner_id)
     if open_only:
         query = query.filter(Delivery.status.in_(workflow.OPEN_DELIVERY_STATUSES))
-    if search:
-        s = f"%{search}%"
+    if search and search.strip():
+        # delivery_number is a Python property, not a column: filtering on it raised and
+        # every ?search= answered 500. The stored column is delivery_note_number.
+        s = f"%{search.strip()}%"
         query = query.filter(
             or_(
-                Delivery.delivery_number.ilike(s),
+                Delivery.delivery_note_number.ilike(s),
                 Delivery.notes.ilike(s),
+                Delivery.customer_id.in_(
+                    select(Customer.id).where(Customer.organization_id == org_id, Customer.name.ilike(s))
+                ),
+                Delivery.sales_order_id.in_(
+                    select(SalesOrder.id).where(
+                        SalesOrder.organization_id == org_id, SalesOrder.order_number.ilike(s)
+                    )
+                ),
             )
         )
     query = scoping.owned_by(query, db, user, Delivery.delivery_partner_id, team_columns=())
