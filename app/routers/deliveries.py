@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, document_filename
 from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
-from app.core import scoping, workflow
+from app.core import business_time, scoping, workflow
 from app.core.sorting import apply_sorting
 from app.models.enums import UserRole
 from app.models import (
@@ -52,6 +52,11 @@ from app.schemas.delivery import (
     DeliveryCapacityOut,
     DeliveryCollectionCreate,
     DeliveryCollectionOut,
+    COLLECTION_STATUS_BY_RECONCILIATION,
+    CollectionSummaryOut,
+    CollectionTotals,
+    DeliverySummaryOut,
+    collection_status,
     DeliveryConfirm,
     DeliveryCustomerBrief,
     DeliveryHistoryOut,
@@ -284,6 +289,13 @@ def _delivery_out(
     # ran — see DeliveryOut.internal_status: distinguishes "loaded" from
     # "in_transit", which the public `status` deliberately reports the same.
     out.internal_status = delivery.status
+    # A planned delivery nobody is assigned to yet reads "unassigned", not "pending".
+    out.status = workflow.public_delivery_status_for(delivery.status, delivery.delivery_partner_id)
+    # Older deliveries were saved without scheduled_date. delivery_date holds the planned
+    # date in that case (it is set to scheduled_date, or the creation time), the same
+    # fallback the partner-availability check already uses.
+    if out.scheduled_date is None:
+        out.scheduled_date = delivery.delivery_date
     for key, value in delivery_service.sync_delivery_view(db, delivery, ctx).items():
         setattr(out, key, value)
 
@@ -440,41 +452,60 @@ def plan_delivery(
     return _delivery_out(db, delivery)
 
 
-@router.get("", response_model=PaginatedResponse[DeliveryOut])
-def list_deliveries(
-    user: User = Depends(_view),
-    status_filter: str | None = Query(
-        default=None, alias="status",
-        description="The status shown on each delivery: pending | accepted | in_transit | "
-                    "partially_delivered | delivered | rejected | returned | cancelled "
-                    "(case-insensitive; 'intransit' / 'In Transit' accepted; 'all' or empty = "
-                    "no filter). Stored values planned | ready | loaded | failed also work.",
-    ),
-    order_id: str | None = Query(default=None),
-    delivery_partner_id: str | None = Query(default=None),
-    open_only: bool = Query(default=False, description="Only deliveries still out"),
-    search: str | None = Query(
-        default=None, description="matches delivery number, notes, customer name or order number"
-    ),
-    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
-    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
-    sort_by: str | None = Query(default=None, description="Field to sort by"),
-    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
-    db: Session = Depends(get_db),
-) -> PaginatedResponse[DeliveryOut]:
-    """The firm's deliveries, newest first. A field role sees only their own."""
+_PICKING_STATUSES = ("not_started", "picking", "picked")
+
+
+def _bad_filter(name: str, allowed) -> HTTPException:  # noqa: ANN001
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=f"{name} must be one of: " + ", ".join(allowed),
+    )
+
+
+def _csv_filter(value: str | None, name: str, allowed) -> list[str] | None:  # noqa: ANN001
+    """A comma-separated filter value, lower-cased and checked against `allowed`."""
+    if not value or not value.strip():
+        return None
+    wanted = [v.strip().lower() for v in value.split(",") if v.strip()]
+    if any(v not in allowed for v in wanted):
+        raise _bad_filter(name, allowed)
+    return wanted
+
+
+def _filtered_deliveries(
+    db: Session,
+    user: User,
+    *,
+    status_filter: str | None = None,
+    internal_status: str | None = None,
+    picking_status: str | None = None,
+    order_id: str | None = None,
+    delivery_partner_id: str | None = None,
+    open_only: bool = False,
+    search: str | None = None,
+):
+    """The deliveries a list (or its summary) covers: this firm's, narrowed by the
+    filters, and only the caller's own for a field role. Every filter is applied in SQL
+    before pagination, so totals count only matching deliveries."""
     org_id = _org_id(user)
     query = db.query(Delivery).filter(Delivery.organization_id == org_id)
     try:
         stored_statuses = workflow.delivery_statuses_for_filter(status_filter)
+        has_partner = workflow.delivery_partner_condition_for_filter(status_filter)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="status must be one of: all, " + ", ".join(workflow.DELIVERY_STATUS_FILTER_VALUES),
-        ) from None
+        raise _bad_filter("status", ("all",) + workflow.DELIVERY_STATUS_FILTER_VALUES) from None
     if stored_statuses is not None:
-        # Before pagination, so total / total_pages count only matching deliveries.
         query = query.filter(Delivery.status.in_(stored_statuses))
+    if has_partner is True:
+        query = query.filter(Delivery.delivery_partner_id.is_not(None))
+    elif has_partner is False:
+        query = query.filter(Delivery.delivery_partner_id.is_(None))
+    internal = _csv_filter(internal_status, "internal_status", workflow.DELIVERY_STATUSES)
+    if internal:
+        query = query.filter(Delivery.status.in_(internal))
+    picking = _csv_filter(picking_status, "picking_status", _PICKING_STATUSES)
+    if picking:
+        query = query.filter(Delivery.picking_status.in_(picking))
     if order_id:
         query = query.filter(Delivery.sales_order_id == order_id)
     if delivery_partner_id:
@@ -499,7 +530,74 @@ def list_deliveries(
                 ),
             )
         )
-    query = scoping.owned_by(query, db, user, Delivery.delivery_partner_id, team_columns=())
+    return scoping.owned_by(query, db, user, Delivery.delivery_partner_id, team_columns=())
+
+
+_STATUS_FILTER_DOC = (
+    "The status shown on each delivery: unassigned | pending | accepted | in_transit | "
+    "partially_delivered | delivered | rejected | returned | cancelled (case-insensitive; "
+    "intransit / In Transit accepted; all or empty = no filter). Stored values "
+    "planned | ready | loaded | failed also work."
+)
+
+
+@router.get("/summary", response_model=DeliverySummaryOut)
+def delivery_summary(
+    user: User = Depends(_view),
+    order_id: str | None = Query(default=None),
+    delivery_partner_id: str | None = Query(default=None),
+    search: str | None = Query(default=None, description="Same matching as GET /deliveries"),
+    db: Session = Depends(get_db),
+) -> DeliverySummaryOut:
+    """Delivery counts per status in one call: the same deliveries GET /deliveries lists
+    with these filters (a field role counts only their own). One grouped query."""
+    query = _filtered_deliveries(db, user, order_id=order_id, delivery_partner_id=delivery_partner_id, search=search)
+    no_partner = Delivery.delivery_partner_id.is_(None)
+    rows = (
+        query.order_by(None)
+        .with_entities(Delivery.status, no_partner, func.count(Delivery.id))
+        .group_by(Delivery.status, no_partner)
+        .all()
+    )
+    by_status = {key: 0 for key in workflow.PUBLIC_DELIVERY_STATUS_ORDER}
+    by_internal = {key: 0 for key in workflow.DELIVERY_STATUSES}
+    for stored, unassigned, count in rows:
+        public = workflow.public_delivery_status_for(stored, None if unassigned else "assigned")
+        by_status[public] = by_status.get(public, 0) + count
+        by_internal[stored] = by_internal.get(stored, 0) + count
+    return DeliverySummaryOut(total=sum(by_internal.values()), by_status=by_status, by_internal_status=by_internal)
+
+
+@router.get("", response_model=PaginatedResponse[DeliveryOut])
+def list_deliveries(
+    user: User = Depends(_view),
+    status_filter: str | None = Query(default=None, alias="status", description=_STATUS_FILTER_DOC),
+    internal_status: str | None = Query(
+        default=None,
+        description="Stored workflow status, comma-separated: planned, accepted, rejected, ready, "
+                    "loaded, in_transit, partially_delivered, delivered, failed, cancelled",
+    ),
+    picking_status: str | None = Query(
+        default=None, description="Warehouse picking stage, comma-separated: not_started, picking, picked"
+    ),
+    order_id: str | None = Query(default=None),
+    delivery_partner_id: str | None = Query(default=None),
+    open_only: bool = Query(default=False, description="Only deliveries still out"),
+    search: str | None = Query(
+        default=None, description="matches delivery number, notes, customer name or order number"
+    ),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
+    sort_by: str | None = Query(default=None, description="Field to sort by"),
+    sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
+    db: Session = Depends(get_db),
+) -> PaginatedResponse[DeliveryOut]:
+    """The firm's deliveries, newest first. A field role sees only their own."""
+    query = _filtered_deliveries(
+        db, user, status_filter=status_filter, internal_status=internal_status,
+        picking_status=picking_status, order_id=order_id, delivery_partner_id=delivery_partner_id,
+        open_only=open_only, search=search,
+    )
     query = apply_sorting(
         query,
         sort_by=sort_by,
@@ -1189,6 +1287,124 @@ def _is_delivery_partner(user: User) -> bool:
     return False
 
 
+def _filtered_collections(
+    db: Session,
+    user: User,
+    *,
+    status_filter: str | None = None,
+    search: str | None = None,
+    delivery_partner_id: str | None = None,
+    collected_by_user_id: str | None = None,
+    customer_id: str | None = None,
+    order_id: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+):
+    """The collections the history (or its summary) covers. A Delivery Partner / own-scope
+    user only ever gets their own; the collector filters apply to everyone else."""
+    org_id = _org_id(user)
+    q = db.query(DeliveryCollection).filter(DeliveryCollection.organization_id == org_id)
+
+    data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
+    if _is_delivery_partner(user) or data_scope == "own":
+        if user.system_role != "admin" and user.effective_system_role != "admin":
+            q = q.filter(DeliveryCollection.delivery_partner_id == user.id)
+    else:
+        # The collector is stored as delivery_partner_id; collected_by_user_id is the
+        # same thing under the name the payment screens use.
+        for collector in {delivery_partner_id, collected_by_user_id} - {None, ""}:
+            q = q.filter(DeliveryCollection.delivery_partner_id == collector)
+
+    if customer_id:
+        q = q.filter(DeliveryCollection.customer_id == customer_id)
+    if order_id:
+        q = q.filter(DeliveryCollection.sales_order_id == order_id)
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="date_from is after date_to")
+    if date_from or date_to:
+        # Whole days in the firm's business timezone, both ends inclusive.
+        tz = business_time.org_timezone(db, org_id)
+        if date_from:
+            q = q.filter(DeliveryCollection.collected_at >= business_time.day_start(date_from, tz))
+        if date_to:
+            q = q.filter(DeliveryCollection.collected_at <= business_time.day_end(date_to, tz))
+
+    # These filters used to name columns the model does not have (status,
+    # collection_number, payment_reference), so any call with ?status= or ?search=
+    # failed with a 500 and the history screen showed nothing.
+    if status_filter:
+        stored = _COLLECTION_STATUS_FILTER.get(status_filter.strip().lower())
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="status must be one of: awaiting_reconciliation, recorded, reconciled, voided",
+            )
+        q = q.filter(DeliveryCollection.reconciliation_status == stored)
+
+    if search and search.strip():
+        s = f"%{search.strip()}%"
+        q = q.filter(
+            or_(
+                DeliveryCollection.reference.ilike(s),
+                DeliveryCollection.notes.ilike(s),
+                DeliveryCollection.customer_id.in_(
+                    select(Customer.id).where(Customer.organization_id == org_id, Customer.name.ilike(s))
+                ),
+            )
+        )
+    return q
+
+
+_DATE_DOC = "YYYY-MM-DD, inclusive, in the firm's business timezone (by collected_at)"
+
+
+@router.get("/collections/summary", response_model=CollectionSummaryOut)
+def delivery_collections_summary(
+    search: str | None = None,
+    status_filter: str | None = Query(default=None, alias="status", description="Same values as the history"),
+    delivery_partner_id: str | None = None,
+    collected_by_user_id: str | None = Query(default=None, description="The collector (same as delivery_partner_id)"),
+    customer_id: str | None = None,
+    order_id: str | None = None,
+    date_from: date | None = Query(default=None, description=_DATE_DOC),
+    date_to: date | None = Query(default=None, description=_DATE_DOC),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CollectionSummaryOut:
+    """Count and amount of the collections GET /deliveries/collections would list with the
+    same filters: in total, per status and per payment mode. Two grouped queries."""
+    q = _filtered_collections(
+        db, user, status_filter=status_filter, search=search, delivery_partner_id=delivery_partner_id,
+        collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
+        date_from=date_from, date_to=date_to,
+    ).order_by(None)
+    amount = func.coalesce(func.sum(DeliveryCollection.amount), 0.0)
+    by_status = {key: CollectionTotals(count=0, amount=0.0) for key in COLLECTION_STATUS_BY_RECONCILIATION.values()}
+    for stored, count, total in (
+        q.with_entities(DeliveryCollection.reconciliation_status, func.count(DeliveryCollection.id), amount)
+        .group_by(DeliveryCollection.reconciliation_status)
+        .all()
+    ):
+        by_status[collection_status(stored)] = CollectionTotals(count=count, amount=round(float(total), 2))
+    by_mode = {
+        (mode or "unknown"): CollectionTotals(count=count, amount=round(float(total), 2))
+        for mode, count, total in (
+            q.with_entities(DeliveryCollection.payment_mode, func.count(DeliveryCollection.id), amount)
+            .group_by(DeliveryCollection.payment_mode)
+            .all()
+        )
+    }
+    return CollectionSummaryOut(
+        total=CollectionTotals(
+            count=sum(t.count for t in by_status.values()),
+            amount=round(sum(t.amount for t in by_status.values()), 2),
+        ),
+        by_status=by_status,
+        by_payment_mode=by_mode,
+    )
+
+
 @router.get("/collections", response_model=PaginatedResponse[DeliveryCollectionOut])
 @router.get("/collections/all", response_model=PaginatedResponse[DeliveryCollectionOut])
 def list_delivery_collections(
@@ -1203,8 +1419,11 @@ def list_delivery_collections(
                     "reconciliation_status: recorded | reconciled | voided)",
     ),
     delivery_partner_id: str | None = None,
+    collected_by_user_id: str | None = Query(default=None, description="The collector (same as delivery_partner_id)"),
     customer_id: str | None = Query(default=None, description="Only this customer's collections"),
     order_id: str | None = Query(default=None, description="Only collections linked to this sales order"),
+    date_from: date | None = Query(default=None, description=_DATE_DOC),
+    date_to: date | None = Query(default=None, description=_DATE_DOC),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[DeliveryCollectionOut]:
@@ -1213,45 +1432,11 @@ def list_delivery_collections(
     Delivery Partners only see collections where they are the assigned partner.
     Accountants and Admins see all collections for their organization.
     """
-    org_id = _org_id(user)
-    q = db.query(DeliveryCollection).filter(DeliveryCollection.organization_id == org_id)
-
-    data_scope = getattr(user.role_detail, "data_scope", "all") if user.role_detail else "all"
-    if _is_delivery_partner(user) or data_scope == "own":
-        if user.system_role != "admin" and user.effective_system_role != "admin":
-            q = q.filter(DeliveryCollection.delivery_partner_id == user.id)
-    elif delivery_partner_id:
-        q = q.filter(DeliveryCollection.delivery_partner_id == delivery_partner_id)
-
-    if customer_id:
-        q = q.filter(DeliveryCollection.customer_id == customer_id)
-    if order_id:
-        q = q.filter(DeliveryCollection.sales_order_id == order_id)
-
-    # These filters used to name columns the model does not have (status,
-    # collection_number, payment_reference), so any call with ?status= or ?search=
-    # failed with a 500 and the history screen showed nothing.
-    if status:
-        wanted = status.strip().lower()
-        stored = _COLLECTION_STATUS_FILTER.get(wanted)
-        if stored is None:
-            raise HTTPException(
-                status_code=422,
-                detail="status must be one of: awaiting_reconciliation, recorded, reconciled, voided",
-            )
-        q = q.filter(DeliveryCollection.reconciliation_status == stored)
-
-    if search:
-        s = f"%{search.strip()}%"
-        q = q.filter(
-            or_(
-                DeliveryCollection.reference.ilike(s),
-                DeliveryCollection.notes.ilike(s),
-                DeliveryCollection.customer_id.in_(
-                    select(Customer.id).where(Customer.organization_id == org_id, Customer.name.ilike(s))
-                ),
-            )
-        )
+    q = _filtered_collections(
+        db, user, status_filter=status, search=search, delivery_partner_id=delivery_partner_id,
+        collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
+        date_from=date_from, date_to=date_to,
+    )
 
     q = apply_sorting(
         q,

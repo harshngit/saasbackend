@@ -416,6 +416,10 @@ def main():
     print("\n--- Assigned Deliveries: status filters (GET /deliveries?status=) ---")
     test_assigned_deliveries_status_filters()
     ok("Assigned Deliveries status filters, search, sort, pagination and scoping")
+    test_delivery_summary_and_internal_filters()
+    ok("Delivery summary counts, internal_status / picking_status filters, unassigned, scheduled_date")
+    test_order_cancel_follows_or_refuses_deliveries()
+    ok("Order cancel cancels its deliveries, or refuses when one is already out")
 
     print("\n=======================================================")
     print(f"RESULTS: {_passed} passed, {_failed} failed")
@@ -563,6 +567,138 @@ def test_assigned_deliveries_status_filters():
     item = listing(dp1_auth, status="Delivered", page_size=1)
     assert set(item) == {"items", "total", "page", "page_size", "total_pages"}
     assert {"id", "status", "internal_status", "delivery_number"} <= set(item["items"][0])
+
+
+def _seed_deliveries(org_id: str, rows: list[tuple[str, str | None, dict]]) -> list[str]:
+    """Insert deliveries directly: (stored status, partner id, extra columns)."""
+    from app.core.database import SessionLocal
+    from app.models import Delivery
+
+    db = SessionLocal()
+    try:
+        tag, made = uuid.uuid4().hex[:6], []
+        for i, (stored, partner, extra) in enumerate(rows):
+            d = Delivery(organization_id=org_id, delivery_note_number=f"DS-{tag}-{i}", status=stored,
+                         delivery_partner_id=partner, **extra)
+            db.add(d)
+            db.flush()
+            made.append(d.id)
+        db.commit()
+        return made
+    finally:
+        db.close()
+
+
+def _org_of(user_id: str) -> str:
+    from app.core.database import SessionLocal
+    from app.models import User
+
+    db = SessionLocal()
+    try:
+        return db.get(User, user_id).organization_id
+    finally:
+        db.close()
+
+
+def test_delivery_summary_and_internal_filters():
+    """GET /deliveries/summary (one call instead of one per status), the internal_status /
+    picking_status filters, the "unassigned" status and the scheduled_date fallback."""
+    from datetime import datetime, timezone
+
+    admin, _ = _register_org("Summary")
+    dp_auth, dp = _create_staff(admin, "Driver S", "Delivery Partner")
+    org = _org_of(dp["id"])
+    when = datetime(2026, 11, 20, 9, 0, tzinfo=timezone.utc)
+    ids = _seed_deliveries(org, [
+        ("planned", None, {"delivery_date": when}),               # 0 unassigned, no scheduled_date
+        ("planned", dp["id"], {}),                                 # 1 pending
+        ("accepted", dp["id"], {"picking_status": "picking"}),     # 2 accepted, picking
+        ("accepted", dp["id"], {"picking_status": "not_started"}), # 3 accepted
+        ("ready", dp["id"], {"picking_status": "picked"}),         # 4 accepted (ready)
+        ("loaded", dp["id"], {}),                                  # 5 in_transit
+        ("in_transit", dp["id"], {}),                              # 6 in_transit
+        ("delivered", dp["id"], {}),                               # 7 delivered
+        ("failed", dp["id"], {}),                                  # 8 returned
+        ("rejected", dp["id"], {}),                                # 9 rejected
+        ("cancelled", None, {}),                                   # 10 cancelled
+    ])
+
+    s = client.get("/deliveries/summary", headers=admin)
+    assert s.status_code == 200, s.text
+    body = s.json()
+    assert body["total"] == 11
+    assert body["by_status"] == {"unassigned": 1, "pending": 1, "accepted": 3, "in_transit": 2,
+                                 "partially_delivered": 0, "delivered": 1, "rejected": 1,
+                                 "returned": 1, "cancelled": 1}
+    assert body["by_internal_status"]["planned"] == 2 and body["by_internal_status"]["failed"] == 1
+    assert body["by_internal_status"]["ready"] == 1 and body["by_internal_status"]["loaded"] == 1
+    assert sum(body["by_internal_status"].values()) == 11
+    # Each count equals what the list returns for that filter.
+    for key, count in body["by_status"].items():
+        listed = client.get("/deliveries", params={"status": key, "page_size": 1}, headers=admin).json()
+        assert listed["total"] == count, (key, listed["total"], count)
+    # A delivery partner's summary counts only their own (no unassigned / other rows).
+    mine = client.get("/deliveries/summary", headers=dp_auth).json()
+    assert mine["total"] == 9 and mine["by_status"]["unassigned"] == 0 and mine["by_status"]["cancelled"] == 0
+    # Filters narrow the summary like the list.
+    assert client.get("/deliveries/summary", params={"delivery_partner_id": dp["id"]}, headers=admin).json()["total"] == 9
+
+    def listed_ids(**params):
+        r = client.get("/deliveries", params={"page_size": 100, **params}, headers=admin)
+        assert r.status_code == 200, r.text
+        return {d["id"]: d for d in r.json()["items"]}
+
+    # "unassigned" is its own status, both in the list and as a filter; "pending" keeps
+    # only deliveries waiting for a named partner.
+    assert set(listed_ids(status="unassigned")) == {ids[0]}
+    assert set(listed_ids(status="Pending")) == {ids[1]}
+    assert set(listed_ids(status="planned")) == {ids[0], ids[1]}  # stored value: both
+    rows = listed_ids()
+    assert rows[ids[0]]["status"] == "unassigned" and rows[ids[1]]["status"] == "pending"
+    # internal_status / picking_status filters (comma-separated).
+    assert set(listed_ids(internal_status="ready")) == {ids[4]}
+    assert set(listed_ids(internal_status="loaded,in_transit")) == {ids[5], ids[6]}
+    assert set(listed_ids(picking_status="picking")) == {ids[2]}
+    assert set(listed_ids(status="accepted", picking_status="not_started")) == {ids[3]}
+    for bad in ({"internal_status": "picking"}, {"picking_status": "loaded"}, {"status": "bogus"}):
+        r = client.get("/deliveries", params=bad, headers=admin)
+        assert r.status_code == 422, (bad, r.text)
+    # scheduled_date falls back to delivery_date when it was never saved.
+    assert rows[ids[0]]["scheduled_date"].startswith("2026-11-20")
+
+
+def test_order_cancel_follows_or_refuses_deliveries():
+    """Cancelling an order cancels its deliveries; if one is already loaded / in transit,
+    the cancel is refused (it used to go through and leave that delivery in transit under
+    a cancelled order whenever the order's own fulfilment_status lagged behind)."""
+    admin, _ = _register_org("CancelRule")
+    product = _create_product(admin, "Cancel Widget")
+    customer = _create_customer(admin, "Cancel Cust")
+
+    def new_order():
+        r = client.post("/orders", json={"customer_id": customer["id"], "items": [
+            {"product_id": product["id"], "quantity": 1, "unit_price": 10}]}, headers=admin)
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    o1 = new_order()
+    org = o1["organization_id"]
+    planned, accepted = _seed_deliveries(org, [("planned", None, {"sales_order_id": o1["id"]}),
+                                               ("accepted", None, {"sales_order_id": o1["id"]})])
+    r = client.patch(f"/orders/{o1['id']}/cancel", json={"reason": "customer changed mind"}, headers=admin)
+    assert r.status_code == 200, r.text
+    for did in (planned, accepted):
+        d = client.get(f"/deliveries/by-id/{did}", headers=admin).json()
+        assert d["status"] == "cancelled" and d["internal_status"] == "cancelled", d["status"]
+
+    # The order still says not_started, but its delivery is already on the vehicle.
+    o2 = new_order()
+    (loaded,) = _seed_deliveries(org, [("loaded", None, {"sales_order_id": o2["id"]})])
+    r = client.patch(f"/orders/{o2['id']}/cancel", json={}, headers=admin)
+    assert r.status_code == 400, r.text
+    assert "already out" in r.json()["detail"] and "(in_transit)" in r.json()["detail"]
+    assert client.get(f"/orders/{o2['id']}", headers=admin).json()["status"] != "cancelled"
+    assert client.get(f"/deliveries/by-id/{loaded}", headers=admin).json()["internal_status"] == "loaded"
 
 
 if __name__ == "__main__":
