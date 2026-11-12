@@ -473,11 +473,17 @@ def convert_lead_to_customer(
             detail="Lost lead cannot be converted to customer. Reopen the lead first.",
         )
 
+    # Converting creates a Customer, so a Delivery Partner needs customers.create
+    # on their role (not granted by default; an admin can grant it).
+    from app.core.deps import has_permission
     from app.models.enums import UserRole
-    if user.role == UserRole.DELIVERY_PARTNER or (user.role_detail and user.role_detail.name == "Delivery Partner"):
+    is_delivery_partner = user.role == UserRole.DELIVERY_PARTNER or (
+        user.role_detail and user.role_detail.name == "Delivery Partner"
+    )
+    if is_delivery_partner and not has_permission(db, user, "customers", "create"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Delivery partners cannot create customers",
+            detail="You don't have permission to create customers",
         )
 
     # 1. The Lead already points at a Customer — never create a second one.

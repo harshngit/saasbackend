@@ -94,6 +94,15 @@ def require_roles(*roles: UserRole) -> Callable[[User], User]:
     return _guard
 
 
+def has_permission(db: Session, user: User, module: str, action: str) -> bool:
+    """True when the user's role matrix grants module.action (admin/super_admin always)."""
+    if user.effective_system_role in (SystemRole.ADMIN.value, SystemRole.SUPER_ADMIN.value):
+        return True
+    role = db.get(Role, user.role_id) if user.role_id else None
+    perms = (role.permissions if role else {}) or {}
+    return bool(perms.get(module, {}).get(action, False))
+
+
 def require_permission(module: str, action: str) -> Callable[[User], User]:
     """Gate a module action by the staff user's role permission matrix.
 
@@ -103,11 +112,7 @@ def require_permission(module: str, action: str) -> Callable[[User], User]:
     """
 
     def _guard(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
-        if user.effective_system_role in (SystemRole.ADMIN.value, SystemRole.SUPER_ADMIN.value):
-            return user
-        role = db.get(Role, user.role_id) if user.role_id else None
-        perms = (role.permissions if role else {}) or {}
-        if not perms.get(module, {}).get(action, False):
+        if not has_permission(db, user, module, action):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"You don't have permission to {action} {module}",
