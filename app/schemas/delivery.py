@@ -573,6 +573,35 @@ class CollectionAllocationOut(BaseModel):
 
 
 
+class DeliverySummaryOut(BaseModel):
+    """GET /deliveries/summary: counts in one call. Every key is always present (0 when none)."""
+
+    total: int
+    by_status: dict[str, int] = Field(
+        description="By the public status each delivery shows: unassigned, pending, accepted, in_transit, "
+                    "partially_delivered, delivered, rejected, returned, cancelled",
+    )
+    by_internal_status: dict[str, int] = Field(
+        description="By the stored workflow status: planned, accepted, rejected, ready, loaded, in_transit, "
+                    "partially_delivered, delivered, failed, cancelled (failed is shown as returned)",
+    )
+
+
+class CollectionTotals(BaseModel):
+    count: int
+    amount: float
+
+
+class CollectionSummaryOut(BaseModel):
+    """GET /deliveries/collections/summary: totals for the collections the history would list."""
+
+    total: CollectionTotals = Field(description="All matching collections, whatever their status")
+    by_status: dict[str, CollectionTotals] = Field(
+        description="awaiting_reconciliation, reconciled, voided (always present)"
+    )
+    by_payment_mode: dict[str, CollectionTotals]
+
+
 class DeliveryCollectionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

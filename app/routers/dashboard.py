@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_permission
+from app.core.id_filters import normalize_ids
 from app.models import Customer, SalesOrder, Supplier, User, Warehouse
 from app.schemas.dashboard import (
     AdminDashboardOut,
@@ -47,47 +48,67 @@ def _org_id(user: User) -> str:
     return user.organization_id
 
 
-def _in_org(db: Session, model, record_id: str | None, org_id: str, label: str) -> None:  # noqa: ANN001
-    """A filter naming something outside the firm is a mistake worth reporting,
-    rather than silently returning an empty dashboard."""
-    if record_id is None:
+def _all_in_org(db: Session, model, ids: tuple[str, ...], org_id: str, label: str) -> None:  # noqa: ANN001
+    """Every ID in a filter must belong to the firm. One that does not -- unknown, or
+    another firm's -- is a mistake worth reporting rather than silently returning an
+    empty dashboard, and it rejects the whole request. One query for all of them."""
+    if not ids:
         return
-    record = db.get(model, record_id)
-    if record is None or record.organization_id != org_id:
+    found = {
+        row[0]
+        for row in db.query(model.id).filter(model.id.in_(ids), model.organization_id == org_id)
+    }
+    if len(found) != len(ids):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"{label} is not in your firm"
         )
+
+
+_MULTI = (
+    "One or more IDs: repeat the parameter (?{name}=A&{name}=B), separate with commas "
+    "(?{name}=A,B), or both. "
+)
 
 
 @router.get("/admin", response_model=AdminDashboardOut)
 def admin_dashboard(
     date_from: str | None = Query(default=None, description="YYYY-MM-DD; defaults to the 1st of this month"),
     date_to: str | None = Query(default=None, description="YYYY-MM-DD; defaults to today"),
-    company_id: str | None = Query(default=None, description="Filter by company/organization ID"),
-    warehouse_id: str | None = Query(default=None, description="Narrows purchases and warehouse metrics"),
-    customer_id: str | None = Query(
-        default=None, description="Narrows sales, orders, receivables and cashflow-in"
+    company_id: list[str] | None = Query(
+        default=None, description=_MULTI.format(name="company_id") + "Must be your own organization."
     ),
-    supplier_id: str | None = Query(
-        default=None, description="Narrows purchases, payables and cashflow-out"
+    warehouse_id: list[str] | None = Query(
+        default=None,
+        description=_MULTI.format(name="warehouse_id") + "Narrows purchases and warehouse metrics; "
+        "Stock Watch flags a product that is low in ANY selected warehouse.",
+    ),
+    customer_id: list[str] | None = Query(
+        default=None, description=_MULTI.format(name="customer_id") + "Narrows sales, orders, receivables and cashflow-in"
+    ),
+    supplier_id: list[str] | None = Query(
+        default=None, description=_MULTI.format(name="supplier_id") + "Narrows purchases, payables and cashflow-out"
     ),
     user: User = Depends(_firm_wide_view),
     db: Session = Depends(get_db),
 ) -> AdminDashboardOut:
     """Every Admin Dashboard widget in one call, for the logged-in user's firm."""
     org_id = _org_id(user)
-    if company_id is not None and company_id != org_id:
+    company_ids = normalize_ids(company_id)
+    warehouse_ids = normalize_ids(warehouse_id)
+    customer_ids = normalize_ids(customer_id)
+    supplier_ids = normalize_ids(supplier_id)
+    if any(cid != org_id for cid in company_ids):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="company_id is not in your firm"
         )
-    _in_org(db, Warehouse, warehouse_id, org_id, "warehouse_id")
-    _in_org(db, Customer, customer_id, org_id, "customer_id")
-    _in_org(db, Supplier, supplier_id, org_id, "supplier_id")
+    _all_in_org(db, Warehouse, warehouse_ids, org_id, "warehouse_id")
+    _all_in_org(db, Customer, customer_ids, org_id, "customer_id")
+    _all_in_org(db, Supplier, supplier_ids, org_id, "supplier_id")
 
     return dashboard_service.build_admin_dashboard(
         db, org_id,
-        date_from=date_from, date_to=date_to, company_id=company_id,
-        warehouse_id=warehouse_id, customer_id=customer_id, supplier_id=supplier_id,
+        date_from=date_from, date_to=date_to, company_ids=company_ids,
+        warehouse_ids=warehouse_ids, customer_ids=customer_ids, supplier_ids=supplier_ids,
     )
 
 

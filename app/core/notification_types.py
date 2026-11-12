@@ -37,6 +37,11 @@ STOCK_ALERT = "stock_alert"
 # Platform scope: addressed to platform users (no organization), never to a tenant feed.
 ORGANIZATION_CREATED = "organization_created"
 UPGRADE_REQUESTED = "upgrade_requested"
+# Support tickets (in-app only: never in _PUSHED below).
+TICKET_CREATED = "ticket_created"
+TICKET_REPLIED_BY_PLATFORM = "ticket_replied_by_platform"
+TICKET_REPLIED_BY_CUSTOMER = "ticket_replied_by_customer"
+TICKET_STATUS_CHANGED = "ticket_status_changed"
 
 # event -> in-app `type` (category). Existing categories are kept exactly as before.
 EVENT_CATEGORY: dict[str, str] = {
@@ -62,11 +67,17 @@ EVENT_CATEGORY: dict[str, str] = {
     STOCK_ALERT: "inventory",
     ORGANIZATION_CREATED: "platform",
     UPGRADE_REQUESTED: "platform",
+    TICKET_CREATED: "support",
+    TICKET_REPLIED_BY_PLATFORM: "support",
+    TICKET_REPLIED_BY_CUSTOMER: "support",
+    TICKET_STATUS_CHANGED: "support",
 }
 
 # Events addressed to platform users. Their notifications carry organization_id = NULL,
 # so they can never appear in -- or be counted against -- a tenant's notifications.
-PLATFORM_EVENTS = frozenset({ORGANIZATION_CREATED, UPGRADE_REQUESTED})
+PLATFORM_EVENTS = frozenset({
+    ORGANIZATION_CREATED, UPGRADE_REQUESTED, TICKET_CREATED, TICKET_REPLIED_BY_CUSTOMER,
+})
 
 # Keys any event may carry: who acted (a user id), and -- for an event whose subject can
 # vary -- nothing else. Everything else is per event, below.
@@ -96,6 +107,12 @@ EVENT_DATA_KEYS: dict[str, tuple[str, ...]] = {
     STOCK_ALERT: ("product_id", "variant_id", "warehouse_id", "status"),
     ORGANIZATION_CREATED: ("target_organization_id",),
     UPGRADE_REQUESTED: ("target_organization_id", "upgrade_request_id"),
+    # Ticket notifications carry the ticket's id and number only -- never its status, a
+    # message body or an internal note.
+    TICKET_CREATED: ("ticket_id", "ticket_number"),
+    TICKET_REPLIED_BY_PLATFORM: ("ticket_id", "ticket_number"),
+    TICKET_REPLIED_BY_CUSTOMER: ("ticket_id", "ticket_number"),
+    TICKET_STATUS_CHANGED: ("ticket_id", "ticket_number"),
 }
 
 ALL_EVENTS = frozenset(EVENT_CATEGORY)
@@ -126,6 +143,10 @@ _ENTITY: dict[str, tuple[str, str, str]] = {
     DAY_END_STATUS_CHANGED: ("day_end", "day_end_id", "/delivery-day-ends/{id}"),
     STOCK_ALERT: ("product", "product_id", "/warehouses/stock?warehouse_id={warehouse_id}&product_id={id}"),
     ORGANIZATION_CREATED: ("organization", "target_organization_id", "/superadmin/organizations/{id}"),
+    TICKET_CREATED: ("support_ticket", "ticket_id", "/platform/support/tickets/{id}"),
+    TICKET_REPLIED_BY_CUSTOMER: ("support_ticket", "ticket_id", "/platform/support/tickets/{id}"),
+    TICKET_REPLIED_BY_PLATFORM: ("support_ticket", "ticket_id", "/support/tickets/{id}"),
+    TICKET_STATUS_CHANGED: ("support_ticket", "ticket_id", "/support/tickets/{id}"),
 }
 
 

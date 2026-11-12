@@ -408,6 +408,34 @@ del _stored, _public
 _DELIVERY_STATUS_ALIASES = {"intransit": "in_transit", "partiallydelivered": "partially_delivered"}
 
 
+# A planned delivery with no partner named yet. Not a stored status: `planned` is shown as
+# "unassigned" when delivery_partner_id is empty, and as "pending" once a partner is named
+# (waiting for that partner to accept). See public_delivery_status_for().
+UNASSIGNED_DELIVERY_STATUS = "unassigned"
+
+
+def public_delivery_status_for(stored: str | None, delivery_partner_id: str | None) -> str | None:
+    """The public status of one delivery, which (unlike public_delivery_status) also
+    knows whether a partner is assigned."""
+    if stored == "planned" and not delivery_partner_id:
+        return UNASSIGNED_DELIVERY_STATUS
+    return public_delivery_status(stored)
+
+
+def normalize_delivery_status_filter(value: str | None) -> str | None:
+    """The canonical key of a `?status=` value ("Intransit" -> "in_transit"), or None for
+    no filter (None, "", "all"). Raises ValueError for an unknown value."""
+    if value is None:
+        return None
+    key = value.strip().lower().replace(" ", "_").replace("-", "_")
+    if key in ("", "all"):
+        return None
+    key = _DELIVERY_STATUS_ALIASES.get(key.replace("_", ""), key)
+    if key in _STORED_FOR_PUBLIC_DELIVERY_STATUS or key in DELIVERY_STATUSES or key == UNASSIGNED_DELIVERY_STATUS:
+        return key
+    raise ValueError(value)
+
+
 def delivery_statuses_for_filter(value: str | None) -> tuple[str, ...] | None:
     """The stored `Delivery.status` values a `?status=` filter selects.
 
@@ -420,22 +448,39 @@ def delivery_statuses_for_filter(value: str | None) -> tuple[str, ...] | None:
     A stored value that is not itself a public one ("planned", "ready", "loaded",
     "failed") still selects exactly that stored value, as before. None, "" and "all"
     mean no filter. Raises ValueError for anything else.
+
+    "pending" and "unassigned" both select stored "planned"; the caller separates them
+    on delivery_partner_id (see delivery_partner_condition_for_filter).
     """
-    if value is None:
+    key = normalize_delivery_status_filter(value)
+    if key is None:
         return None
-    key = value.strip().lower().replace(" ", "_").replace("-", "_")
-    if key in ("", "all"):
-        return None
-    key = _DELIVERY_STATUS_ALIASES.get(key.replace("_", ""), key)
+    if key == UNASSIGNED_DELIVERY_STATUS:
+        return ("planned",)
     if key in _STORED_FOR_PUBLIC_DELIVERY_STATUS:
         return _STORED_FOR_PUBLIC_DELIVERY_STATUS[key]
-    if key in DELIVERY_STATUSES:
-        return (key,)
-    raise ValueError(value)
+    return (key,)
 
 
-DELIVERY_STATUS_FILTER_VALUES = tuple(_STORED_FOR_PUBLIC_DELIVERY_STATUS) + tuple(
+def delivery_partner_condition_for_filter(value: str | None) -> bool | None:
+    """For a `?status=` value: True = only deliveries WITH a partner ("pending"),
+    False = only WITHOUT one ("unassigned"), None = no partner condition."""
+    key = normalize_delivery_status_filter(value)
+    if key == "pending":
+        return True
+    if key == UNASSIGNED_DELIVERY_STATUS:
+        return False
+    return None
+
+
+DELIVERY_STATUS_FILTER_VALUES = (UNASSIGNED_DELIVERY_STATUS,) + tuple(_STORED_FOR_PUBLIC_DELIVERY_STATUS) + tuple(
     s for s in DELIVERY_STATUSES if s not in _STORED_FOR_PUBLIC_DELIVERY_STATUS
+)
+
+# Public statuses, in lifecycle order, for summaries (every key always present).
+PUBLIC_DELIVERY_STATUS_ORDER = (
+    UNASSIGNED_DELIVERY_STATUS, "pending", "accepted", "in_transit", "partially_delivered",
+    "delivered", "rejected", "returned", "cancelled",
 )
 
 

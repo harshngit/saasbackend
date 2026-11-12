@@ -926,3 +926,65 @@ def test_24_payment_date_parsed_or_refused(collection_setup):
         assert r.status_code == 201, (good, r.text)
         assert r.json()["collected_at"].startswith(day)
 
+
+def test_25_history_date_and_collector_filters_and_summary(collection_setup):
+    """TEST 25 — date_from / date_to / collected_by_user_id on the history, and
+    GET /deliveries/collections/summary with the same filters."""
+    s = collection_setup
+    h = s["admin_headers"]
+
+    def collect(headers, day, amount, mode="cash"):
+        r = client.post("/customer-payments/collections", json={
+            "customer_id": s["cust1"].id, "amount": amount, "payment_mode": mode,
+            "payment_date": f"{day}T12:00:00+05:30"}, headers=headers)
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    a = collect(s["partner_headers"], "2026-10-01", 100)
+    b = collect(s["partner_headers"], "2026-10-02", 50, "upi")
+    c = collect(h, "2026-10-02", 30)
+    assert client.post(f"/deliveries/collections/{b}/reconcile", headers=h).status_code == 200
+    v = collect(s["partner_headers"], "2026-10-03", 20)
+    assert client.post(f"/deliveries/collections/{v}/void", headers=h).status_code == 200
+
+    def ids(**params):
+        r = client.get("/deliveries/collections", params={"page_size": 100, **params}, headers=h)
+        assert r.status_code == 200, r.text
+        return {x["id"] for x in r.json()["items"]}
+
+    window = {"date_from": "2026-10-01", "date_to": "2026-10-03"}
+    assert ids(**window) >= {a, b, c, v}
+    assert ids(date_from="2026-10-02", date_to="2026-10-02") >= {b, c} and not ids(
+        date_from="2026-10-02", date_to="2026-10-02") & {a, v}
+    assert a not in ids(date_from="2026-10-02") and a in ids(date_to="2026-10-01")
+    mine = ids(collected_by_user_id=s["partner"].id, **window)
+    assert {a, b, v} <= mine and c not in mine
+    assert ids(collected_by_user_id=s["admin"].id, **window) & {a, b, c, v} == {c}
+    assert ids(delivery_partner_id=s["partner"].id, **window) == mine  # same filter, older name
+    bad = client.get("/deliveries/collections", params={"date_from": "2026-10-05", "date_to": "2026-10-01"}, headers=h)
+    assert bad.status_code == 422
+    assert client.get("/deliveries/collections", params={"date_from": "01-10-2026"}, headers=h).status_code == 422
+
+    summary = client.get("/deliveries/collections/summary", params=window, headers=h)
+    assert summary.status_code == 200, summary.text
+    body = summary.json()
+    # Only this test's four collections fall in the window for this firm.
+    assert body["total"] == {"count": 4, "amount": 200.0}
+    assert body["by_status"] == {
+        "awaiting_reconciliation": {"count": 2, "amount": 130.0},
+        "reconciled": {"count": 1, "amount": 50.0},
+        "voided": {"count": 1, "amount": 20.0},
+    }
+    assert body["by_payment_mode"]["upi"] == {"count": 1, "amount": 50.0}
+    assert body["by_payment_mode"]["cash"] == {"count": 3, "amount": 150.0}
+    only = client.get("/deliveries/collections/summary", params={**window, "status": "awaiting_reconciliation",
+                                                                 "collected_by_user_id": s["partner"].id}, headers=h)
+    assert only.json()["total"] == {"count": 1, "amount": 100.0}
+    # A delivery partner's summary covers only their own collections, whatever they ask for.
+    dp = client.get("/deliveries/collections/summary", params={**window, "collected_by_user_id": s["admin"].id},
+                    headers=s["partner_headers"]).json()
+    assert dp["total"]["count"] == 3
+    # Another firm sees nothing of this one.
+    assert client.get("/deliveries/collections/summary", params=window, headers=s["org2_headers"]).json()["total"] == {
+        "count": 0, "amount": 0.0}
+

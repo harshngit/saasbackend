@@ -87,6 +87,11 @@ class StockWatchItem(BaseModel):
     minimum_stock_level: int | None = None
     stock_percentage: int = Field(description="Stock as a % of the minimum level; 0 when out")
     status: str = Field(description="out_of_stock | low_stock | healthy")
+    warehouse_id: str | None = Field(
+        default=None,
+        description="With a warehouse filter: the selected warehouse whose stock is shown (the worst "
+                    "one when several are selected). Null without a warehouse filter.",
+    )
 
 
 class RecentOrder(BaseModel):
@@ -104,10 +109,14 @@ class DashboardFilters(BaseModel):
 
     date_from: str
     date_to: str
-    company_id: str | None = None
-    warehouse_id: str | None = None
-    customer_id: str | None = None
-    supplier_id: str | None = None
+    company_id: str | None = Field(default=None, description="The selected ID; several are comma-joined (sorted)")
+    warehouse_id: str | None = Field(default=None, description="The selected ID; several are comma-joined (sorted)")
+    customer_id: str | None = Field(default=None, description="The selected ID; several are comma-joined (sorted)")
+    supplier_id: str | None = Field(default=None, description="The selected ID; several are comma-joined (sorted)")
+    company_ids: list[str] = Field(default_factory=list, description="Selected company IDs (empty = no filter)")
+    warehouse_ids: list[str] = Field(default_factory=list, description="Selected warehouse IDs (empty = no filter)")
+    customer_ids: list[str] = Field(default_factory=list, description="Selected customer IDs (empty = no filter)")
+    supplier_ids: list[str] = Field(default_factory=list, description="Selected supplier IDs (empty = no filter)")
 
 
 class DashboardToday(BaseModel):

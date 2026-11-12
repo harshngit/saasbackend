@@ -1210,6 +1210,28 @@ def cancel_order(
             detail=f"Goods are already {order.fulfilment_status.replace('_', ' ')}. "
                    "Use the delivery return flow to bring them back to the warehouse.",
         )
+    # The order's fulfilment_status can lag behind its deliveries (older records). Check
+    # the deliveries themselves: one that is loaded, in transit or (partly) delivered can
+    # not be cancelled, and cancelling the order anyway left that delivery "in transit"
+    # under a cancelled order.
+    linked_deliveries = (
+        db.query(Delivery)
+        .filter(Delivery.sales_order_id == order.id, Delivery.organization_id == order.organization_id)
+        .all()
+    )
+    stuck = [
+        d for d in linked_deliveries
+        if d.status != "cancelled" and "cancelled" not in workflow.DELIVERY_TRANSITIONS.get(d.status, set())
+    ]
+    if stuck:
+        listed = ", ".join(
+            f"{d.delivery_number} ({workflow.public_delivery_status(d.status)})" for d in stuck
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This order has deliveries that are already out: {listed}. "
+                   "Use the delivery return flow to bring the goods back before cancelling the order.",
+        )
     stock_service.release_for_order(db, order.id)
     for item in order.items:
         item.reserved_quantity = 0
@@ -1220,18 +1242,10 @@ def cancel_order(
         order.reject_reason = payload.reason
     notification_service.notify_order_status_changed(db, order, previous_status, actor_id=user.id)
 
-    linked_deliveries = (
-        db.query(Delivery)
-        .filter(Delivery.sales_order_id == order.id, Delivery.organization_id == order.organization_id)
-        .all()
-    )
+    # Every linked delivery is cancellable here (checked above), so all of them follow
+    # the order: a cancelled order never keeps a live delivery.
     for delivery in linked_deliveries:
         if delivery.status == "cancelled":
-            continue
-        if "cancelled" not in workflow.DELIVERY_TRANSITIONS.get(delivery.status, set()):
-            # Not reachable in practice given the DISPATCHED_FULFILMENT guard
-            # above, but skipped rather than raised so an edge case here can
-            # never block the order cancellation that was already approved.
             continue
         delivery_service.cancel(db, delivery, reason=payload.reason, actor=user)
 

@@ -140,6 +140,7 @@ def normalize_file_url(value: str | None) -> str | None:
 
 def _persist(
     db: Session, org_id: str | None, filename: str, content: bytes, content_type: str,
+    uploaded_by_user_id: str | None = None,
 ) -> "StoredFile":  # noqa: F821
     """Create the StoredFile row and, when R2 is configured, upload the bytes
     to it. Shared by save_upload/save_bytes so there is exactly one place that
@@ -166,6 +167,7 @@ def _persist(
         filename=safe_filename(filename),
         content_type=content_type or "application/octet-stream",
         size=len(content),
+        uploaded_by_user_id=uploaded_by_user_id,
     )
 
     r2_uploaded_key: str | None = None
@@ -451,6 +453,12 @@ def file_is_referenced(db: Session, file_id: str) -> bool:
     if cat_refs > 0:
         return True
 
+    # 10. Support ticket attachments (referenced by id, not by URL)
+    from app.models import SupportTicketAttachment
+
+    if db.query(SupportTicketAttachment.id).filter(SupportTicketAttachment.stored_file_id == file_id).first():
+        return True
+
     return False
 
 
@@ -525,8 +533,12 @@ def save_upload(
     allow_video: bool = False,
     allow_any: bool = False,
     max_bytes: int = MAX_UPLOAD_BYTES,
+    uploaded_by_user_id: str | None = None,
 ) -> tuple[str, int]:
     """Validate and store one upload. Returns its public URL and byte size.
+
+    `uploaded_by_user_id` is recorded on the file when given (POST /files/upload does);
+    support ticket attachments require it to match the attaching user.
 
     The returned URL/size contract is unchanged regardless of whether R2 is
     configured — every existing caller keeps working without modification.
@@ -541,7 +553,7 @@ def save_upload(
             detail=f"File too large (max {max_bytes // (1024 * 1024)} MB)",
         )
 
-    stored = _persist(db, org_id, file.filename or "upload", content, content_type)
+    stored = _persist(db, org_id, file.filename or "upload", content, content_type, uploaded_by_user_id)
     return public_url(request, stored.id), stored.size
 
 

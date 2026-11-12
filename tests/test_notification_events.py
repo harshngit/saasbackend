@@ -480,7 +480,10 @@ def test_should_push_allowlist(event, data, expected):
 def test_every_event_has_a_push_decision():
     # A new event must be added to the allowlist on purpose (or stay in-app only on purpose).
     in_app_only = {nt.ORDER_STATUS_CHANGED, nt.FOLLOW_UP_OVERDUE, nt.PAYMENT_RECEIVED, nt.EXPENSE_CREATED,
-                   nt.DAY_END_SUBMITTED}
+                   nt.DAY_END_SUBMITTED,
+                   # Support tickets: in-app only by decision (D11), never pushed.
+                   nt.TICKET_CREATED, nt.TICKET_REPLIED_BY_PLATFORM, nt.TICKET_REPLIED_BY_CUSTOMER,
+                   nt.TICKET_STATUS_CHANGED}
     assert set(nt._PUSHED) | in_app_only == nt.ALL_EVENTS
 
 

@@ -96,6 +96,7 @@ from app.routers import (
     settings as settings_router,
     suppliers,
     superadmin,
+    support,
     teams,
     users,
     vehicle_stock,
@@ -369,6 +370,8 @@ app.include_router(organizations.router)
 app.include_router(settings_router.router)
 app.include_router(superadmin.router)
 app.include_router(platform.router)
+app.include_router(support.org_router)
+app.include_router(support.platform_router)
 app.include_router(leads.router)
 app.include_router(quotations.router)
 app.include_router(payment_receipts.router)
