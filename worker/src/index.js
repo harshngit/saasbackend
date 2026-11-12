@@ -84,4 +84,14 @@ export default {
   async fetch(request, env) {
     return getContainer(env.CRM_BACKEND).fetch(request);
   },
+
+  // Keep-warm: container idle sleep mein na jaye, taaki pehli request fail na ho.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      getContainer(env.CRM_BACKEND)
+        .fetch(new Request("https://keepwarm.internal/health"))
+        .then((r) => console.log("keep-warm", r.status))
+        .catch((e) => console.log("keep-warm failed", String(e)))
+    );
+  },
 };
