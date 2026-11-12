@@ -215,7 +215,8 @@ def test_orders_at_0030_and_2350_ist_belong_to_that_ist_day(db, fixed_today):
                              "delivered": 1, "delivered_orders": 0, "pending_orders": 2,
                              "delivered_amount": 0.0, "pending_amount": 350.0}
     assert set(body["filters"]) == {"date_from", "date_to", "company_id", "warehouse_id", "customer_id",
-                                    "supplier_id"}  # unchanged
+                                    "supplier_id",  # unchanged
+                                    "company_ids", "warehouse_ids", "customer_ids", "supplier_ids"}  # added
     assert body["summary"]["today_sales"] == 350.0
     trend = {p["date"]: p for p in body["sales_trend"]}
     assert (trend["2026-11-05"]["orders"], trend["2026-11-05"]["sales"]) == (2, 350.0)

@@ -53,6 +53,7 @@ from app.models.oauth_exchange_ticket import OAuthExchangeTicket
 from app.models.oauth_registration_ticket import OAuthRegistrationTicket
 from app.models.plan import Plan
 from app.models.platform_request import PlatformFeatureRequest, PlatformUpgradeRequest
+from app.models.support_ticket import SupportTicket, SupportTicketAttachment, SupportTicketMessage
 from app.models.product import Product, ProductPricing, ProductVariant
 from app.models.subscription_payment import SubscriptionPayment
 from app.models.refresh_token import RefreshToken
@@ -202,6 +203,9 @@ __all__ = [
     "PLATFORM_STAFF_ROLES",
     "PlatformUpgradeRequest",
     "PlatformFeatureRequest",
+    "SupportTicket",
+    "SupportTicketMessage",
+    "SupportTicketAttachment",
     "STAFF_ROLES",
     "STAFF_ROLE_NAME",
     "LEGACY_ROLE_BY_NAME",

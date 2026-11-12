@@ -101,42 +101,42 @@ def _resolve_range(date_from: str | None, date_to: str | None, tz=None) -> tuple
     return start, end, df, dt
 
 
-def _sale_orders(db: Session, org_id: str, customer_id: str | None, company_id: str | None = None):
+def _sale_orders(db: Session, org_id: str, customer_ids: tuple[str, ...], company_id: str | None = None):
     eff_org = company_id if company_id else org_id
     query = db.query(SalesOrder).filter(
         SalesOrder.organization_id == eff_org, SalesOrder.status.in_(SALE_STATUSES)
     )
-    if customer_id:
-        query = query.filter(SalesOrder.customer_id == customer_id)
+    if customer_ids:
+        query = query.filter(SalesOrder.customer_id.in_(customer_ids))
     return query
 
 
 def _purchase_invoices(
-    db: Session, org_id: str, supplier_id: str | None, warehouse_id: str | None, company_id: str | None = None
+    db: Session, org_id: str, supplier_ids: tuple[str, ...], warehouse_ids: tuple[str, ...], company_id: str | None = None
 ):
     eff_org = company_id if company_id else org_id
     query = db.query(PurchaseInvoice).filter(
         PurchaseInvoice.organization_id == eff_org, PurchaseInvoice.status == "approved"
     )
-    if supplier_id:
-        query = query.filter(PurchaseInvoice.supplier_id == supplier_id)
-    if warehouse_id:
-        query = query.filter(PurchaseInvoice.warehouse_id == warehouse_id)
+    if supplier_ids:
+        query = query.filter(PurchaseInvoice.supplier_id.in_(supplier_ids))
+    if warehouse_ids:
+        query = query.filter(PurchaseInvoice.warehouse_id.in_(warehouse_ids))
     return query
 
 
 def _sales_total(
-    db: Session, org_id: str, customer_id: str | None, company_id: str | None, df: datetime, dt: datetime
+    db: Session, org_id: str, customer_ids: tuple[str, ...], company_id: str | None, df: datetime, dt: datetime
 ) -> float:
     # Only the totals are read -- not whole orders with their customers and lines.
-    orders = _sale_orders(db, org_id, customer_id, company_id).filter(
+    orders = _sale_orders(db, org_id, customer_ids, company_id).filter(
         SalesOrder.created_at >= df, SalesOrder.created_at <= dt
     )
     return round(sum(total or 0 for (total,) in orders.with_entities(SalesOrder.total)), 2)
 
 
 def _sales_totals(
-    db: Session, org_id: str, customer_id: str | None, company_id: str | None,
+    db: Session, org_id: str, customer_ids: tuple[str, ...], company_id: str | None,
     windows: list[tuple[datetime, datetime]],
 ) -> list[float]:
     """_sales_total for several windows in one query: one conditional SUM per window."""
@@ -146,7 +146,7 @@ def _sales_totals(
         for df, dt in windows
     ]
     row = (
-        _sale_orders(db, org_id, customer_id, company_id)
+        _sale_orders(db, org_id, customer_ids, company_id)
         .filter(SalesOrder.created_at >= min(w[0] for w in windows),
                 SalesOrder.created_at <= max(w[1] for w in windows))
         .with_entities(*sums)
@@ -157,14 +157,14 @@ def _sales_totals(
 
 def _summary(
     db: Session, org_id: str, start: date, end: date, df: datetime, dt: datetime,
-    period_sales: float, purchases: float, expenses: float, customer_id: str | None,
+    period_sales: float, purchases: float, expenses: float, customer_ids: tuple[str, ...],
     company_id: str | None = None, tz=None, totals: tuple[float, float, float] | None = None,  # noqa: ANN001
 ) -> DashboardSummary:
     eff_org = company_id if company_id else org_id
     tz = tz or timezone.utc
     if totals is None:
         w = _windows(start, end, tz)
-        totals = tuple(_sales_totals(db, org_id, customer_id, company_id, [w["previous"], w["today"], w["month"]]))
+        totals = tuple(_sales_totals(db, org_id, customer_ids, company_id, [w["previous"], w["today"], w["month"]]))
     previous, today_sales, month_sales = totals
 
     # Growth compares with the previous window of the same length (see _windows).
@@ -175,8 +175,8 @@ def _summary(
         Customer.created_at >= df,
         Customer.created_at <= dt,
     )
-    if customer_id:
-        cust_q = cust_q.filter(Customer.id == customer_id)
+    if customer_ids:
+        cust_q = cust_q.filter(Customer.id.in_(customer_ids))
     new_customers = cust_q.count()
 
     gross_profit = round(period_sales - purchases, 2)
@@ -207,7 +207,7 @@ def _windows(start: date, end: date, tz) -> dict:  # noqa: ANN001
 
 
 def _orders(
-    db: Session, org_id: str, customer_id: str | None, company_id: str | None, df: datetime, dt: datetime,
+    db: Session, org_id: str, customer_ids: tuple[str, ...], company_id: str | None, df: datetime, dt: datetime,
     rows: list | None = None,
 ) -> DashboardOrders:
     """Order counts for the window, every status. `rows` ((status, fulfilment_status) for
@@ -219,8 +219,8 @@ def _orders(
             SalesOrder.created_at >= df,
             SalesOrder.created_at <= dt,
         )
-        if customer_id:
-            query = query.filter(SalesOrder.customer_id == customer_id)
+        if customer_ids:
+            query = query.filter(SalesOrder.customer_id.in_(customer_ids))
         rows = query.with_entities(SalesOrder.status, SalesOrder.fulfilment_status).all()
     return DashboardOrders(
         total=len(rows),
@@ -233,7 +233,7 @@ def _orders(
 
 def _cashflow(
     db: Session, org_id: str, start: date, end: date, df: datetime, dt: datetime,
-    customer_id: str | None, supplier_id: str | None, company_id: str | None = None,
+    customer_ids: tuple[str, ...], supplier_ids: tuple[str, ...], company_id: str | None = None,
     expense_rows: list | None = None, tz=None,  # noqa: ANN001
 ) -> list[CashflowPoint]:
     """Money actually received and paid out, per day: customer payments in,
@@ -247,8 +247,8 @@ def _cashflow(
         CustomerPayment.received_on >= df,
         CustomerPayment.received_on <= dt,
     )
-    if customer_id:
-        payments = payments.filter(CustomerPayment.customer_id == customer_id)
+    if customer_ids:
+        payments = payments.filter(CustomerPayment.customer_id.in_(customer_ids))
     for received_on, amount in payments.with_entities(CustomerPayment.received_on, CustomerPayment.amount):
         inflow[business_time.local_date(received_on, tz or timezone.utc).isoformat()] += amount or 0
 
@@ -257,12 +257,12 @@ def _cashflow(
         SupplierPayment.paid_on >= df,
         SupplierPayment.paid_on <= dt,
     )
-    if supplier_id:
-        paid = paid.filter(SupplierPayment.supplier_id == supplier_id)
+    if supplier_ids:
+        paid = paid.filter(SupplierPayment.supplier_id.in_(supplier_ids))
     for paid_on, amount in paid.with_entities(SupplierPayment.paid_on, SupplierPayment.amount):
         outflow[business_time.local_date(paid_on, tz or timezone.utc).isoformat()] += amount or 0
 
-    if not supplier_id and not customer_id:
+    if not supplier_ids and not customer_ids:
         for expense in expense_rows if expense_rows is not None else _approved_expenses(db, eff_org, df, dt):
             outflow[business_time.local_date(expense.expense_date, tz or timezone.utc).isoformat()] += expense.amount or 0
 
@@ -302,21 +302,21 @@ def _due_days(customer: Customer | None) -> int:
 
 
 def _receivables_payables(
-    db: Session, org_id: str, customer_id: str | None, supplier_id: str | None,
-    warehouse_id: str | None = None, company_id: str | None = None,
+    db: Session, org_id: str, customer_ids: tuple[str, ...], supplier_ids: tuple[str, ...],
+    warehouse_ids: tuple[str, ...] = (), company_id: str | None = None,
 ) -> ReceivablesPayables:
     """Balances are a position, not a period — they are always "as of now", so the
     date filter does not apply to them. Only the columns the figures need are read."""
     eff_org = company_id if company_id else org_id
     customers = db.query(Customer).filter(Customer.organization_id == eff_org)
-    if customer_id:
-        customers = customers.filter(Customer.id == customer_id)
+    if customer_ids:
+        customers = customers.filter(Customer.id.in_(customer_ids))
     customers = customers.with_entities(Customer.id, Customer.outstanding_balance, Customer.payment_terms).all()
     receivables = round(sum(max(c.outstanding_balance or 0, 0) for c in customers), 2)
 
     suppliers = db.query(Supplier).filter(Supplier.organization_id == eff_org)
-    if supplier_id:
-        suppliers = suppliers.filter(Supplier.id == supplier_id)
+    if supplier_ids:
+        suppliers = suppliers.filter(Supplier.id.in_(supplier_ids))
     payables = round(sum(
         max(round((opening or 0) + (purchased or 0) - (paid or 0), 2), 0)  # Supplier.outstanding_payable
         for opening, purchased, paid in suppliers.with_entities(
@@ -330,8 +330,8 @@ def _receivables_payables(
         Invoice.is_credit_note.is_(False),
         Invoice.status != "paid",
     )
-    if customer_id:
-        invoices = invoices.filter(Invoice.customer_id == customer_id)
+    if customer_ids:
+        invoices = invoices.filter(Invoice.customer_id.in_(customer_ids))
     overdue_receivables = 0.0
     for issued, inv_customer_id, total, amount_paid in invoices.with_entities(
         Invoice.invoice_date, Invoice.customer_id, Invoice.total, Invoice.amount_paid
@@ -346,10 +346,10 @@ def _receivables_payables(
         PurchaseInvoice.status == "approved",
         PurchaseInvoice.payment_status != "paid",
     )
-    if supplier_id:
-        purchases = purchases.filter(PurchaseInvoice.supplier_id == supplier_id)
-    if warehouse_id:
-        purchases = purchases.filter(PurchaseInvoice.warehouse_id == warehouse_id)
+    if supplier_ids:
+        purchases = purchases.filter(PurchaseInvoice.supplier_id.in_(supplier_ids))
+    if warehouse_ids:
+        purchases = purchases.filter(PurchaseInvoice.warehouse_id.in_(warehouse_ids))
     overdue_payables = 0.0
     for issued, total, returned, amount_paid in purchases.with_entities(
         PurchaseInvoice.invoice_date, PurchaseInvoice.total, PurchaseInvoice.return_amount, PurchaseInvoice.amount_paid
@@ -419,10 +419,10 @@ def _top_products(db: Session, org_id: str, order_ids: list[str]) -> list[TopPro
 
 def _expense_breakdown(
     db: Session, org_id: str, df: datetime, dt: datetime,
-    company_id: str | None = None, supplier_id: str | None = None, customer_id: str | None = None,
+    company_id: str | None = None, supplier_ids: tuple[str, ...] = (), customer_ids: tuple[str, ...] = (),
     expense_rows: list | None = None,
 ) -> list[ExpenseSlice]:
-    if supplier_id or customer_id:
+    if supplier_ids or customer_ids:
         return []
     eff_org = company_id if company_id else org_id
     totals: dict[str, float] = defaultdict(float)
@@ -451,24 +451,45 @@ def _sales_trend(orders: list, start: date, end: date, tz=None) -> list[SalesTre
 
 
 def _stock_watch(
-    db: Session, org_id: str, warehouse_id: str | None = None, company_id: str | None = None
+    db: Session, org_id: str, warehouse_ids: tuple[str, ...] = (), company_id: str | None = None
 ) -> list[StockWatchItem]:
+    """Products out of stock or at/below their minimum level.
+
+    With a warehouse filter each selected warehouse is judged on its own stock (D1): a
+    product is flagged when it is low in ANY selected warehouse -- stock is never added
+    up across warehouses first, which would hide a warehouse that has run low. The item
+    shows that warehouse's figures (the worst one when several qualify). Without a
+    warehouse filter nothing changes: the product's overall stock is used."""
     eff_org = company_id if company_id else org_id
     watch: list[StockWatchItem] = []
 
-    wh_stock_map: dict[str, float] = {}
-    if warehouse_id:
-        ws_rows = db.query(WarehouseStock).filter(
+    # (warehouse, product) -> on hand, variants of a product summed within a warehouse.
+    wh_stock_map: dict[tuple[str, str], float] = {}
+    if warehouse_ids:
+        for wh_id, product_id, on_hand in db.query(
+            WarehouseStock.warehouse_id, WarehouseStock.product_id, WarehouseStock.on_hand_quantity
+        ).filter(
             WarehouseStock.organization_id == eff_org,
-            WarehouseStock.warehouse_id == warehouse_id,
-        ).all()
-        for ws in ws_rows:
-            wh_stock_map[ws.product_id] = wh_stock_map.get(ws.product_id, 0.0) + (ws.on_hand_quantity or 0.0)
+            WarehouseStock.warehouse_id.in_(warehouse_ids),
+        ):
+            key = (wh_id, product_id)
+            wh_stock_map[key] = wh_stock_map.get(key, 0.0) + (on_hand or 0.0)
+
+    def _flag(stock: int, minimum: int | None) -> str | None:
+        if stock <= 0:
+            return "out_of_stock"
+        if minimum and stock <= minimum:
+            return "low_stock"
+        return None
+
+    def _pct(stock: int, minimum: int | None) -> int:
+        # Against the minimum level, so 100% means "just at the reorder line".
+        return round(stock / minimum * 100) if minimum else 0
 
     # Columns only -- a Product row eagerly joins seven relations. Product.total_stock is
     # the variants' inventory when the product has variants, else total_inventory.
     variant_stock: dict[str, int] = {}
-    if not warehouse_id:
+    if not warehouse_ids:
         for product_id, inventory in (
             db.query(ProductVariant.product_id, ProductVariant.inventory)
             .join(Product, Product.id == ProductVariant.product_id)
@@ -478,28 +499,33 @@ def _stock_watch(
     for product in db.query(Product).filter(Product.organization_id == eff_org).with_entities(
         Product.id, Product.name, Product.total_inventory, Product.minimum_stock_level
     ):
-        if warehouse_id:
-            stock = int(wh_stock_map.get(product.id, 0))
-        elif product.id in variant_stock:
-            stock = variant_stock[product.id]
-        else:
-            stock = product.total_inventory or 0
         minimum = product.minimum_stock_level
-        if stock <= 0:
-            status_ = "out_of_stock"
-        elif minimum and stock <= minimum:
-            status_ = "low_stock"
+        if warehouse_ids:
+            # Every selected warehouse separately; keep the worst one that is flagged.
+            flagged = []
+            for wh_id in warehouse_ids:
+                stock = int(wh_stock_map.get((wh_id, product.id), 0))
+                status_ = _flag(stock, minimum)
+                if status_:
+                    flagged.append((status_ != "out_of_stock", _pct(stock, minimum), wh_id, stock, status_))
+            if not flagged:
+                continue
+            _, _, warehouse_id, stock, status_ = min(flagged)
         else:
-            continue
+            warehouse_id = None
+            stock = variant_stock[product.id] if product.id in variant_stock else (product.total_inventory or 0)
+            status_ = _flag(stock, minimum)
+            if not status_:
+                continue
         watch.append(
             StockWatchItem(
                 product_id=product.id,
                 product_name=product.name,
                 stock=stock,
                 minimum_stock_level=minimum,
-                # Against the minimum level, so 100% means "just at the reorder line".
-                stock_percentage=round(stock / minimum * 100) if minimum else 0,
+                stock_percentage=_pct(stock, minimum),
                 status=status_,
+                warehouse_id=warehouse_id,
             )
         )
     watch.sort(key=lambda item: (item.status != "out_of_stock", item.stock_percentage))
@@ -507,12 +533,12 @@ def _stock_watch(
 
 
 def _recent_orders(
-    db: Session, org_id: str, customer_id: str | None, company_id: str | None = None, tz=None,  # noqa: ANN001
+    db: Session, org_id: str, customer_ids: tuple[str, ...], company_id: str | None = None, tz=None,  # noqa: ANN001
 ) -> list[RecentOrder]:
     eff_org = company_id if company_id else org_id
     query = db.query(SalesOrder).filter(SalesOrder.organization_id == eff_org)
-    if customer_id:
-        query = query.filter(SalesOrder.customer_id == customer_id)
+    if customer_ids:
+        query = query.filter(SalesOrder.customer_id.in_(customer_ids))
     # Each order's (non-credit-note) invoice totals come in the same query.
     billed = (
         db.query(Invoice.order_id.label("order_id"),
@@ -568,16 +594,22 @@ def build_admin_dashboard(
     org_id: str,
     date_from: str | None = None,
     date_to: str | None = None,
-    company_id: str | None = None,
-    warehouse_id: str | None = None,
-    customer_id: str | None = None,
-    supplier_id: str | None = None,
+    company_ids: tuple[str, ...] = (),
+    warehouse_ids: tuple[str, ...] = (),
+    customer_ids: tuple[str, ...] = (),
+    supplier_ids: tuple[str, ...] = (),
 ) -> AdminDashboardOut:
+    """The filters arrive normalized (app.core.id_filters.normalize_ids): sorted, distinct
+    tuples, empty = no filter, already checked to belong to the firm. Each narrows the
+    figures it always narrowed, with IN instead of =; no figure gains a new filter."""
+    # Every company id equals the caller's own organization (checked by the router).
+    company_id = company_ids[0] if company_ids else None
     eff_org = company_id if company_id else org_id
     tz = business_time.org_timezone(db, eff_org)
     start, end, df, dt = _resolve_range(date_from, date_to, tz)
     today = business_time.today(tz)
-    cache_key = (org_id, str(tz), start, end, today, company_id, warehouse_id, customer_id, supplier_id)
+    # Sorted tuples: A+B and B+A share one entry, A / B / A+B never do.
+    cache_key = (org_id, str(tz), start, end, today, company_ids, warehouse_ids, customer_ids, supplier_ids)
     cached = _dashboard_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -588,8 +620,8 @@ def build_admin_dashboard(
     # them, the sales figures only the sale statuses.
     window = db.query(SalesOrder).filter(
         SalesOrder.organization_id == eff_org, SalesOrder.created_at >= df, SalesOrder.created_at <= dt)
-    if customer_id:
-        window = window.filter(SalesOrder.customer_id == customer_id)
+    if customer_ids:
+        window = window.filter(SalesOrder.customer_id.in_(customer_ids))
     window_rows = (
         window.outerjoin(Customer, Customer.id == SalesOrder.customer_id)
         .order_by(SalesOrder.created_at)
@@ -604,23 +636,23 @@ def build_admin_dashboard(
     purchases = round(
         sum(
             total or 0
-            for (total,) in _purchase_invoices(db, eff_org, supplier_id, warehouse_id, company_id).filter(
+            for (total,) in _purchase_invoices(db, eff_org, supplier_ids, warehouse_ids, company_id).filter(
                 PurchaseInvoice.invoice_date >= df, PurchaseInvoice.invoice_date <= dt
             ).with_entities(PurchaseInvoice.total)
         ),
         2,
     )
-    expense_rows = [] if (supplier_id or customer_id) else _approved_expenses(db, eff_org, df, dt)
-    expenses = 0.0 if (supplier_id or customer_id) else round(sum(e.amount or 0 for e in expense_rows), 2)
+    expense_rows = [] if (supplier_ids or customer_ids) else _approved_expenses(db, eff_org, df, dt)
+    expenses = 0.0 if (supplier_ids or customer_ids) else round(sum(e.amount or 0 for e in expense_rows), 2)
 
     windows = _windows(start, end, tz)
-    totals = tuple(_sales_totals(db, eff_org, customer_id, company_id,
+    totals = tuple(_sales_totals(db, eff_org, customer_ids, company_id,
                                  [windows["previous"], windows["today"], windows["month"]]))
     today_from, today_to = windows["today"]
     # Today's placed orders split into fully delivered (completed) and the rest, in one query.
     fully_delivered = or_(SalesOrder.status == "completed", SalesOrder.fulfilment_status == "delivered")
     today_orders, delivered_orders, today_amount, delivered_amount = (
-        _sale_orders(db, eff_org, customer_id, company_id)
+        _sale_orders(db, eff_org, customer_ids, company_id)
         .filter(SalesOrder.created_at >= today_from, SalesOrder.created_at <= today_to)
         .with_entities(
             func.count(SalesOrder.id),
@@ -635,19 +667,25 @@ def build_admin_dashboard(
         Delivery.organization_id == eff_org, Delivery.status == "delivered",
         Delivery.confirmed_at >= today_from, Delivery.confirmed_at <= today_to,
     )
-    if customer_id:
-        delivered_q = delivered_q.filter(Delivery.customer_id == customer_id)
+    if customer_ids:
+        delivered_q = delivered_q.filter(Delivery.customer_id.in_(customer_ids))
 
     result = AdminDashboardOut(
         filters=DashboardFilters(
             date_from=start.isoformat(),
             date_to=end.isoformat(),
-            company_id=company_id,
-            warehouse_id=warehouse_id,
-            customer_id=customer_id,
-            supplier_id=supplier_id,
+            # The original single-value fields: one ID as before, several comma-joined
+            # (sorted), none -> null. The *_ids lists carry the same IDs as arrays.
+            company_id=",".join(company_ids) or None,
+            warehouse_id=",".join(warehouse_ids) or None,
+            customer_id=",".join(customer_ids) or None,
+            supplier_id=",".join(supplier_ids) or None,
+            company_ids=list(company_ids),
+            warehouse_ids=list(warehouse_ids),
+            customer_ids=list(customer_ids),
+            supplier_ids=list(supplier_ids),
         ),
-        summary=_summary(db, eff_org, start, end, df, dt, period_sales, purchases, expenses, customer_id, company_id,
+        summary=_summary(db, eff_org, start, end, df, dt, period_sales, purchases, expenses, customer_ids, company_id,
                          tz=tz, totals=totals),
         today=DashboardToday(
             date=today.isoformat(), timezone=str(tz), orders=today_orders, sales=totals[1],
@@ -656,18 +694,18 @@ def build_admin_dashboard(
             delivered_amount=delivered_amount,
             pending_amount=round(float(today_amount or 0) - delivered_amount, 2),
         ),
-        orders=_orders(db, eff_org, customer_id, company_id, df, dt,
+        orders=_orders(db, eff_org, customer_ids, company_id, df, dt,
                        rows=[(o.status, o.fulfilment_status) for o in window_rows]),
-        cashflow=_cashflow(db, eff_org, start, end, df, dt, customer_id, supplier_id, company_id,
+        cashflow=_cashflow(db, eff_org, start, end, df, dt, customer_ids, supplier_ids, company_id,
                            expense_rows=expense_rows, tz=tz),
-        receivables_payables=_receivables_payables(db, eff_org, customer_id, supplier_id, warehouse_id, company_id),
+        receivables_payables=_receivables_payables(db, eff_org, customer_ids, supplier_ids, warehouse_ids, company_id),
         top_customers=_top_customers(orders),
         top_products=_top_products(db, eff_org, [o.id for o in orders]),
-        expense_breakdown=_expense_breakdown(db, eff_org, df, dt, company_id, supplier_id, customer_id,
+        expense_breakdown=_expense_breakdown(db, eff_org, df, dt, company_id, supplier_ids, customer_ids,
                                              expense_rows=expense_rows),
         sales_trend=_sales_trend(orders, start, end, tz),
-        stock_watch=_stock_watch(db, eff_org, warehouse_id, company_id),
-        recent_orders=_recent_orders(db, eff_org, customer_id, company_id, tz),
+        stock_watch=_stock_watch(db, eff_org, warehouse_ids, company_id),
+        recent_orders=_recent_orders(db, eff_org, customer_ids, company_id, tz),
     )
     _dashboard_cache_put(cache_key, result)
     return result

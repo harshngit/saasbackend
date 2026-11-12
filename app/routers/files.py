@@ -66,6 +66,7 @@ def upload_file(
         request,
         allow_any=True,  # generic slot — the per-field routes do the type checking
         max_bytes=MAX_UPLOAD_BYTES,
+        uploaded_by_user_id=user.id,  # lets a later attach check who uploaded it
     )
     stored_id = url.rsplit("/", 1)[-1]
     db.commit()

@@ -54,6 +54,8 @@ CANONICAL_PREFIXES: dict[str, str] = {
     "var": "VAR",
     "company": "CMP",
     "cmp": "CMP",
+    "ticket": "TKT",
+    "tkt": "TKT",
 }
 
 MASTER_SERIES = {"SUP", "PRD", "VAR"}
@@ -279,6 +281,29 @@ def next_variant_code(db: Session, org_id: str) -> str:
     from app.models.product import ProductVariant
 
     return next_master_number(db, org_id, ProductVariant.variant_code, "VAR")
+
+
+# Series numbered across the whole platform, not per firm (support tickets). Their
+# counters live in number_sequences under this fixed key in place of an organization id
+# (the column has no foreign key); no firm prefix override applies to them.
+GLOBAL_SERIES = {"TKT"}
+GLOBAL_SEQUENCE_OWNER = "__platform__"
+
+
+def next_global_number(db: Session, series: str, year: int | None = None) -> str:
+    """Next PREFIX-YEAR-SEQUENCE for a platform-wide series, e.g. TKT-2026-0001.
+
+    The same atomic counter as every other series (_allocate_next: UPDATE ... SET
+    last_number = last_number + 1 RETURNING), so concurrent requests never get the same
+    number. The year is the Asia/Kolkata business year. The counter row is part of the
+    caller's transaction: if the caller rolls back, the number is not used up."""
+    canonical = normalize_series(series)
+    if canonical not in GLOBAL_SERIES:
+        raise ValueError(f"'{series}' is not a platform-wide series")
+    year = year or get_business_year()  # no organization: DEFAULT_BUSINESS_TIMEZONE (Asia/Kolkata)
+    # column=None: the counter is the only source of these numbers, so it starts at 0
+    # (first number 0001) and is never reseeded from existing rows.
+    return _allocate_next(db, GLOBAL_SEQUENCE_OWNER, None, canonical, year, f"{canonical}-{year}-")
 
 
 def next_number(

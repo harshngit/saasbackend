@@ -593,3 +593,74 @@ def notify_upgrade_requested(db: Session, org, plan_name: str | None, *, request
         data=nt.build_data(nt.UPGRADE_REQUESTED, target_organization_id=org.id, upgrade_request_id=request_id),
         exclude_user_ids=[actor_id], actor_id=actor_id, dedupe_key=key,
     )
+
+
+# ------------------------------------------------------------------ support tickets
+# In-app only (none of these events is in notification_types._PUSHED). `data` is exactly
+# {"event", "ticket_id", "ticket_number"}: no actor, no status, and titles/bodies name the
+# ticket only -- never its subject, a message or an internal note (internal notes notify
+# nobody at all). Recipients exclude the person who acted.
+
+_TICKET_STATUS_LABEL = {
+    "open": "Open", "in_progress": "In progress", "waiting_on_customer": "Waiting on you",
+    "resolved": "Resolved", "closed": "Closed",
+}
+
+
+def _ticket_data(event: str, ticket) -> dict:  # noqa: ANN001
+    return nt.build_data(event, ticket_id=ticket.id, ticket_number=ticket.ticket_number)
+
+
+def _active_platform_user(db: Session, user_id: str | None) -> User | None:
+    user = db.get(User, user_id) if user_id else None
+    if user is None or user.organization_id is not None or not user.is_active:
+        return None
+    return user if user.system_role in PLATFORM_ROLES else None
+
+
+def notify_ticket_created(db: Session, ticket, org_name: str | None, actor_id: str | None) -> list[Notification]:  # noqa: ANN001
+    return notify_users(
+        db, platform_users(db), f"New support ticket {ticket.ticket_number}",
+        f"{org_name or 'An organization'} raised a support ticket.",
+        link=f"/platform/support/tickets/{ticket.id}",
+        data=_ticket_data(nt.TICKET_CREATED, ticket),
+        exclude_user_ids=[actor_id], dedupe_key=f"ticket_created:{ticket.id}",
+    )
+
+
+def notify_ticket_customer_reply(db: Session, ticket, message_id: str, actor_id: str | None) -> list[Notification]:  # noqa: ANN001
+    """The assigned platform user, or every platform user while nobody is assigned."""
+    assignee = _active_platform_user(db, ticket.assigned_to_user_id)
+    recipients = [assignee] if assignee is not None else platform_users(db)
+    return notify_users(
+        db, recipients, f"New reply on {ticket.ticket_number}", "The customer replied to the ticket.",
+        link=f"/platform/support/tickets/{ticket.id}",
+        data=_ticket_data(nt.TICKET_REPLIED_BY_CUSTOMER, ticket),
+        exclude_user_ids=[actor_id], dedupe_key=f"ticket_reply:{message_id}",
+    )
+
+
+def notify_ticket_platform_reply(db: Session, ticket, message_id: str, actor_id: str | None) -> list[Notification]:  # noqa: ANN001
+    """The ticket's creator. Only ever called for a public reply."""
+    creator = _member(db, ticket.created_by_user_id, ticket.organization_id)
+    return notify_users(
+        db, [creator], f"Support replied on {ticket.ticket_number}", "There is a new reply on your support ticket.",
+        link=f"/support/tickets/{ticket.id}",
+        data=_ticket_data(nt.TICKET_REPLIED_BY_PLATFORM, ticket),
+        organization_id=ticket.organization_id,
+        exclude_user_ids=[actor_id], dedupe_key=f"ticket_reply:{message_id}",
+    )
+
+
+def notify_ticket_status_changed(db: Session, ticket, actor_id: str | None) -> list[Notification]:  # noqa: ANN001
+    """The ticket's creator, once per status transition."""
+    creator = _member(db, ticket.created_by_user_id, ticket.organization_id)
+    stamp = ticket.last_activity_at.isoformat() if ticket.last_activity_at else ""
+    return notify_users(
+        db, [creator], f"Ticket {ticket.ticket_number} updated",
+        f"Your support ticket is now {_TICKET_STATUS_LABEL.get(ticket.status, ticket.status)}.",
+        link=f"/support/tickets/{ticket.id}",
+        data=_ticket_data(nt.TICKET_STATUS_CHANGED, ticket),
+        organization_id=ticket.organization_id,
+        exclude_user_ids=[actor_id], dedupe_key=f"ticket_status:{ticket.id}:{ticket.status}:{stamp}",
+    )

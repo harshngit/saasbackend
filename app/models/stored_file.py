@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, LargeBinary, String
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -45,6 +45,16 @@ class StoredFile(Base):
     # a data backfill, and a Phase 2 R2 migration can null out `data` once its bytes
     # are safely uploaded and verified (app/scripts/move_files_to_r2.py).
     storage_key: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    # Who uploaded it (alembic e7f1a2b3c4d5). Set by POST /files/upload; NULL for files
+    # uploaded before the column existed or through paths that do not record it. A NULL
+    # uploader is never guessed: such a file cannot be attached where ownership is required
+    # (support ticket attachments).
+    uploaded_by_user_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL", name="fk_stored_files_uploaded_by_user_id"),
+        nullable=True,
+        index=True,
+    )
     data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
