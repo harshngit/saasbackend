@@ -5,7 +5,6 @@ from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, document_filename
 from app.models import Customer, Lead, Quotation, User
-from app.core.pdf_docs import quotation_pdf
 from app.services import quotation_service
 from app.schemas.quotation import (
     BulkDelete,
@@ -160,6 +159,8 @@ def quotation_pdf_download(
     quotation = quotation_service.get_quotation(db, _org_id(user), id, user)
     customer = db.get(Customer, quotation.customer_id) if quotation.customer_id else None
     lead = db.get(Lead, quotation.lead_id) if quotation.lead_id else None
+    from app.core.pdf_docs import quotation_pdf  # lazy: fpdf is only loaded when a PDF is actually built
+
     body = quotation_pdf(user.organization, customer, quotation, lead=lead)
     return Response(
         content=body,

@@ -34,3 +34,7 @@ saas_firebase_flutter.md
 API_LIST.md
 API_USAGE_GUIDE.md
 FLUTTER_INTEGRATION_GUIDE.md
+
+# Output of scripts/data_audit.py and scripts/fix_delivery_customers.py (contains customer data)
+audit_out/
+*.audit.jsonl
