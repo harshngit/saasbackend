@@ -117,3 +117,25 @@ class PurchaseReturnItem(Base):
     purchase_return: Mapped["PurchaseReturn"] = relationship(back_populates="items")
     product: Mapped["Product | None"] = relationship(foreign_keys=[product_id], lazy="joined")  # noqa: F821
     variant: Mapped["ProductVariant | None"] = relationship(foreign_keys=[variant_id], lazy="joined")  # noqa: F821
+    # Read-only figures for the return screen's "Ordered / Received / Previously returned"
+    # columns. Filled by purchase_return_service.attach_line_figures() for single-return
+    # responses (detail, create, edit, confirm...); None in lists, to keep them cheap.
+    @property
+    def _figures(self) -> dict:
+        return self.__dict__.get("_line_figures") or {}
+
+    @property
+    def ordered_qty(self) -> int | None:
+        return self._figures.get("ordered_qty")
+
+    @property
+    def received_qty(self) -> int | None:
+        return self._figures.get("received_qty")
+
+    @property
+    def previously_returned_qty(self) -> int | None:
+        return self._figures.get("previously_returned_qty")
+
+    @property
+    def returnable_qty(self) -> int | None:
+        return self._figures.get("returnable_qty")

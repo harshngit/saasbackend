@@ -133,6 +133,19 @@ def setup_base_data(auth, org_id):
         assert r_purch.status_code == 201, r_purch.text
         purch_data = r_purch.json()
         purch_id = purch_data["id"]
+        # Received in full (as a confirmed GRN would record) and the stock is in this
+        # warehouse: a return is capped by both.
+        s2 = SessionLocal()  # own session: committing `db` would expire the objects returned below
+        try:
+            for p_item in s2.query(PurchaseInvoiceItem).filter(PurchaseInvoiceItem.invoice_id == purch_id):
+                p_item.received_qty = p_item.quantity
+            s2.add(WarehouseStock(organization_id=org_id, warehouse_id=warehouse.id, product_id=product1.id,
+                                  variant_id=None, on_hand_quantity=100))
+            s2.add(WarehouseStock(organization_id=org_id, warehouse_id=warehouse.id, product_id=product2.id,
+                                  variant_id=variant2.id, on_hand_quantity=50))
+            s2.commit()
+        finally:
+            s2.close()
 
         return {
             "supplier": supplier,

@@ -12,9 +12,11 @@ import os
 import sys
 import uuid
 
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from fastapi.testclient import TestClient
+from app.models import WarehouseStock
 from app.main import app
 from app.core.database import SessionLocal
 from app.models import (
@@ -118,6 +120,7 @@ def setup_test_purchase(auth, org_id, total_qty=100, unit_price=1000.0):
             product_id=prod.id,
             product_name=prod.name,
             quantity=total_qty,
+            received_qty=total_qty,  # received in full (a confirmed GRN); returns are capped by this
             purchase_price=unit_price,
             tax_rate=0.0,
             tax=0.0,
@@ -128,6 +131,8 @@ def setup_test_purchase(auth, org_id, total_qty=100, unit_price=1000.0):
         # Update inventory and supplier totals for confirmed PO
         prod.total_inventory = total_qty
         supplier.total_purchases = po_total
+        db.add(WarehouseStock(organization_id=org_id, warehouse_id=wh.id, product_id=prod.id,
+                              variant_id=None, on_hand_quantity=total_qty))
 
         # Auto-create linked SupplierInvoice
         sinv = SupplierInvoice(
