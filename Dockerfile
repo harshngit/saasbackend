@@ -9,7 +9,7 @@ ENV RESTART_MARKER=202611131648
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --default-timeout=100 --retries 10 -r requirements.txt
 
 COPY . .
 
