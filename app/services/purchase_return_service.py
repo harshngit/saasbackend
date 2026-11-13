@@ -121,6 +121,76 @@ def recalculate_purchase_and_supplier_invoice_returns(
         supplier_payment_service.recalculate_supplier_invoice(db, sinv)
 
 
+def received_quantity(purchase: PurchaseInvoice, item: PurchaseInvoiceItem) -> int:
+    """What was actually received on this purchase line: the accepted quantity of its
+    confirmed GRNs (`received_qty`, rolled up by grn_service). Never the ordered
+    quantity -- goods that never arrived cannot be sent back.
+
+    Legacy exception: a purchase that put stock in before GRN lines tracked receipts
+    (`stock_added` with no received quantity on any line) counts as fully received."""
+    rec = int(item.received_qty or 0)
+    if rec == 0 and purchase.stock_added and not any((i.received_qty or 0) for i in purchase.items):
+        return int(item.quantity or 0)
+    return rec
+
+
+def attach_line_figures(db: Session, record: PurchaseReturn) -> PurchaseReturn:
+    """Give each line its ordered / received / previously-returned / returnable figures
+    (from the source purchase line) for the single-return API responses."""
+    purchase = record.purchase
+    lines_by_id = {i.id: i for i in purchase.items} if purchase is not None else {}
+    for ri in record.items:
+        p_item = lines_by_id.get(ri.purchase_item_id)
+        if p_item is None:
+            ri.__dict__["_line_figures"] = {}
+            continue
+        received = received_quantity(purchase, p_item)
+        prev = get_previously_returned_quantity(db, p_item.id, exclude_return_id=record.id)
+        ri.__dict__["_line_figures"] = {
+            "ordered_qty": int(p_item.quantity or 0),
+            "received_qty": received,
+            "previously_returned_qty": prev,
+            "returnable_qty": max(received - prev, 0),
+        }
+    return record
+
+
+def return_warehouse_id(db: Session, org_id: str, warehouse_id: str | None, purchase: PurchaseInvoice | None) -> str:
+    """The warehouse the goods leave from: the return's, else the purchase's, else the firm default."""
+    from app.services import stock_service
+
+    wh = stock_service.owned_warehouse(db, warehouse_id or (purchase.warehouse_id if purchase else None), org_id)
+    if wh is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Warehouse not found in your organization")
+    return wh.id
+
+
+def check_return_stock(db: Session, org_id: str, warehouse_id: str, items: list) -> None:  # noqa: ANN001
+    """Every product's total on this return must be available in the warehouse
+    (on hand minus what is reserved for orders). 400 naming the product otherwise."""
+    from app.models import Warehouse as _Warehouse
+    from app.services import stock_service
+
+    wanted: dict[tuple[str, str | None], list] = {}
+    for it in items:
+        if not it.product_id:
+            continue
+        entry = wanted.setdefault((it.product_id, it.variant_id), [0, it.product_name])
+        entry[0] += int(it.quantity or 0)
+    wh = db.get(_Warehouse, warehouse_id)
+    wh_name = wh.name if wh is not None else warehouse_id
+    for (pid, vid), (qty, name) in wanted.items():
+        avail = max(int(stock_service.available(db, warehouse_id, pid, vid)), 0)
+        if qty > avail:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Not enough stock of '{name}' in warehouse '{wh_name}' to return {qty}: "
+                    f"only {avail} can be returned (available stock)."
+                ),
+            )
+
+
 def validate_and_build_return_items(
     db: Session,
     org_id: str,
@@ -128,7 +198,7 @@ def validate_and_build_return_items(
     items_in: list[PurchaseReturnItemCreate],
     exclude_return_id: str | None = None,
 ) -> list[PurchaseReturnItem]:
-    """Validate return quantities against received purchase line quantities minus
+    """Validate return quantities against RECEIVED purchase line quantities minus
     previously returned quantities to strictly prevent over-returns."""
     if not items_in:
         raise HTTPException(
@@ -171,7 +241,7 @@ def validate_and_build_return_items(
             )
 
         # Cumulative return validation: received_qty - already_returned_qty
-        received_qty = match_item.quantity
+        received_qty = received_quantity(purchase, match_item)
         prev_returned = get_previously_returned_quantity(
             db, match_item.id, exclude_return_id=exclude_return_id
         )
@@ -181,9 +251,9 @@ def validate_and_build_return_items(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"Return quantity ({item_in.quantity}) exceeds eligible return quantity "
-                    f"({eligible_qty}) for item '{match_item.product_name}' (Total ordered: {received_qty}, "
-                    f"Already returned: {prev_returned})"
+                    f"Return quantity ({item_in.quantity}) for '{match_item.product_name}' exceeds eligible "
+                    f"return quantity: only {eligible_qty} allowed (received {received_qty}, already returned "
+                    f"{prev_returned}, ordered {match_item.quantity})"
                 ),
             )
 
@@ -294,6 +364,8 @@ def create_purchase_return(
     )
 
     built_items = validate_and_build_return_items(db, org_id, purchase, payload.items)
+    warehouse_id = return_warehouse_id(db, org_id, warehouse_id, purchase)
+    check_return_stock(db, org_id, warehouse_id, built_items)
 
     purchase_return = PurchaseReturn(
         organization_id=org_id,
@@ -368,9 +440,56 @@ def update_purchase_return(
         purchase_return.items.clear()
         purchase_return.items.extend(built_items)
 
+    if payload.items is not None or payload.warehouse_id is not None:
+        # Re-check the stock rule whenever the lines or the source warehouse change.
+        wh_id = return_warehouse_id(db, org_id, purchase_return.warehouse_id, purchase_return.purchase)
+        check_return_stock(db, org_id, wh_id, purchase_return.items)
+
     db.commit()
     db.refresh(purchase_return)
     return purchase_return
+
+
+def _move_return_stock(
+    db: Session,
+    org_id: str,
+    return_record: PurchaseReturn,
+    sign: int,
+    user_id: str | None,
+) -> float:
+    """Move every line's stock through stock_service (warehouse row, catalog counter and
+    stock_movements ledger together, under row locks). Returns the value moved."""
+    from app.services import stock_service
+
+    wh_id = return_warehouse_id(db, org_id, return_record.warehouse_id, return_record.purchase)
+    return_record.warehouse_id = wh_id
+    purchase_no = return_record.purchase.invoice_number if return_record.purchase else return_record.return_number
+    lines = [ri for ri in return_record.items if ri.product_id]
+    stock_service.lock_stock_items(db, org_id, wh_id, lines)
+    if sign < 0:
+        check_return_stock(db, org_id, wh_id, lines)  # re-checked under the lock
+    moved_value = 0.0
+    for ri in lines:
+        if sign < 0:
+            reason = ri.reason or return_record.reason
+            note = f"Return {return_record.return_number} on {purchase_no}" + (f" — {reason}" if reason else "")
+        else:
+            note = f"Cancelled Return {return_record.return_number} on {purchase_no}"
+        stock_service.adjust_on_hand(
+            db,
+            org_id,
+            wh_id,
+            ri.product_id,
+            ri.variant_id,
+            float(sign * ri.quantity),
+            movement_type="purchase_return",
+            note=note,
+            created_by=user_id,
+            batch={"batch_number": ri.batch_number, "expiry_date": ri.expiry_date} if ri.batch_number else None,
+            serial_numbers=ri.serial_numbers,
+        )
+        moved_value += ri.line_total or 0.0
+    return moved_value
 
 
 def deduct_inventory_for_return(
@@ -379,74 +498,14 @@ def deduct_inventory_for_return(
     return_record: PurchaseReturn,
     user_id: str | None = None,
 ) -> None:
-    """Atomically deduct inventory and log StockMovement upon return confirmation / dispatch."""
+    """Deduct inventory (exactly once) and reduce the supplier's purchase total."""
     if return_record.stock_deducted:
-        return  # Deduct exactly once
-
-    reversed_value = 0.0
-    purchase_no = return_record.purchase.invoice_number if return_record.purchase else return_record.return_number
-
-    for ri in return_record.items:
-        if ri.variant_id:
-            variant = db.get(ProductVariant, ri.variant_id)
-            if variant is None or variant.product.organization_id != org_id:
-                continue
-            new_bal = (variant.inventory or 0) - ri.quantity
-            if new_bal < 0:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Cannot return more than available stock for variant '{variant.name or ri.product_name}' (Current: {variant.inventory}, Requested: {ri.quantity})",
-                )
-            variant.inventory = new_bal
-            balance_after = new_bal
-        else:
-            product = db.get(Product, ri.product_id) if ri.product_id else None
-            if product is None or product.organization_id != org_id:
-                continue
-            new_bal = (product.total_inventory or 0) - ri.quantity
-            if new_bal < 0:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Cannot return more than available stock for product '{product.name}' (Current: {product.total_inventory}, Requested: {ri.quantity})",
-                )
-            product.total_inventory = new_bal
-            balance_after = new_bal
-
-        # Also decrement WarehouseStock if warehouse is set
-        if return_record.warehouse_id:
-            wh_stock = (
-                db.query(WarehouseStock)
-                .filter(
-                    WarehouseStock.warehouse_id == return_record.warehouse_id,
-                    WarehouseStock.product_id == ri.product_id,
-                    WarehouseStock.variant_id == ri.variant_id,
-                )
-                .first()
-            )
-            if wh_stock:
-                wh_stock.quantity = max((wh_stock.quantity or 0) - ri.quantity, 0)
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                warehouse_id=return_record.warehouse_id,
-                product_id=ri.product_id,
-                variant_id=ri.variant_id,
-                movement_type="purchase_return",
-                quantity=-ri.quantity,
-                balance_after=balance_after,
-                note=f"Return {return_record.return_number} on {purchase_no}" + (f" — {ri.reason or return_record.reason}" if (ri.reason or return_record.reason) else ""),
-                created_by=user_id,
-            )
-        )
-        reversed_value += ri.line_total
-
-    # Supplier financial adjustment: reduce supplier's total_purchases
+        return
+    reversed_value = _move_return_stock(db, org_id, return_record, -1, user_id)
     if return_record.supplier_id and reversed_value:
         supplier = db.get(Supplier, return_record.supplier_id)
         if supplier:
             supplier.total_purchases = round(max((supplier.total_purchases or 0) - reversed_value, 0.0), 2)
-
     return_record.stock_deducted = True
 
 
@@ -456,63 +515,57 @@ def restore_inventory_for_return(
     return_record: PurchaseReturn,
     user_id: str | None = None,
 ) -> None:
-    """Restore inventory and adjust supplier totals if a return was cancelled after stock deduction."""
+    """Put the stock back and restore the supplier total when a deducted return is cancelled."""
     if not return_record.stock_deducted:
         return
-
-    reversed_value = 0.0
-    purchase_no = return_record.purchase.invoice_number if return_record.purchase else return_record.return_number
-
-    for ri in return_record.items:
-        if ri.variant_id:
-            variant = db.get(ProductVariant, ri.variant_id)
-            if variant is None or variant.product.organization_id != org_id:
-                continue
-            new_bal = (variant.inventory or 0) + ri.quantity
-            variant.inventory = new_bal
-            balance_after = new_bal
-        else:
-            product = db.get(Product, ri.product_id) if ri.product_id else None
-            if product is None or product.organization_id != org_id:
-                continue
-            new_bal = (product.total_inventory or 0) + ri.quantity
-            product.total_inventory = new_bal
-            balance_after = new_bal
-
-        if return_record.warehouse_id:
-            wh_stock = (
-                db.query(WarehouseStock)
-                .filter(
-                    WarehouseStock.warehouse_id == return_record.warehouse_id,
-                    WarehouseStock.product_id == ri.product_id,
-                    WarehouseStock.variant_id == ri.variant_id,
-                )
-                .first()
-            )
-            if wh_stock:
-                wh_stock.quantity = (wh_stock.quantity or 0) + ri.quantity
-
-        db.add(
-            StockMovement(
-                organization_id=org_id,
-                warehouse_id=return_record.warehouse_id,
-                product_id=ri.product_id,
-                variant_id=ri.variant_id,
-                movement_type="purchase_return",
-                quantity=ri.quantity,
-                balance_after=balance_after,
-                note=f"Cancelled Return {return_record.return_number} on {purchase_no}",
-                created_by=user_id,
-            )
-        )
-        reversed_value += ri.line_total
-
+    reversed_value = _move_return_stock(db, org_id, return_record, +1, user_id)
     if return_record.supplier_id and reversed_value:
         supplier = db.get(Supplier, return_record.supplier_id)
         if supplier:
             supplier.total_purchases = round((supplier.total_purchases or 0) + reversed_value, 2)
-
     return_record.stock_deducted = False
+
+
+def revalidate_draft(db: Session, org_id: str, purchase_return: PurchaseReturn) -> None:
+    """Re-apply the quantity rule to a saved draft before its stock moves: the draft may
+    be old, and receipts or other returns may have changed since it was saved."""
+    purchase = purchase_return.purchase
+    if purchase is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source purchase invoice not found")
+    validate_and_build_return_items(
+        db,
+        org_id,
+        purchase,
+        [
+            PurchaseReturnItemCreate(
+                purchase_item_id=ri.purchase_item_id,
+                product_id=ri.product_id,
+                variant_id=ri.variant_id,
+                quantity=ri.quantity,
+                unit_price=ri.unit_price,
+                tax_rate=ri.tax_rate,
+            )
+            for ri in purchase_return.items
+        ],
+        exclude_return_id=purchase_return.id,
+    )
+
+
+def _locked_return(db: Session, org_id: str, return_id: str) -> PurchaseReturn:
+    """The return row under SELECT ... FOR UPDATE, so two concurrent confirms (a retry,
+    a double click) run one after the other and the second sees the first's result."""
+    from sqlalchemy.orm import lazyload
+
+    record = (
+        db.query(PurchaseReturn)
+        .filter(PurchaseReturn.id == return_id, PurchaseReturn.organization_id == org_id)
+        .options(lazyload("*"))
+        .with_for_update()
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Purchase return not found")
+    return record
 
 
 def confirm_purchase_return(
@@ -521,28 +574,29 @@ def confirm_purchase_return(
     return_id: str,
     user_id: str | None = None,
 ) -> PurchaseReturn:
-    """Transition: draft -> confirmed (deducts stock and records lifecycle timestamp)."""
-    purchase_return = db.get(PurchaseReturn, return_id)
-    if purchase_return is None or purchase_return.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Purchase return not found",
-        )
+    """Transition: draft -> confirmed. One transaction: the quantity rule and the stock
+    rule are re-checked, stock leaves the warehouse, supplier and purchase balances are
+    recalculated and the status changes -- all of it or none of it. A repeated confirm
+    (retry / double click) is refused with 400 and changes nothing."""
+    try:
+        purchase_return = _locked_return(db, org_id, return_id)
+        if purchase_return.status != "draft":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot confirm purchase return in status '{purchase_return.status}'. Only 'draft' returns can be confirmed.",
+            )
+        revalidate_draft(db, org_id, purchase_return)
+        deduct_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
+        purchase_return.status = "confirmed"
+        purchase_return.confirmed_at = _now()
+        purchase_return.confirmed_by = user_id
+        db.flush()
+        recalculate_purchase_and_supplier_invoice_returns(db, purchase_return.purchase_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    if purchase_return.status != "draft":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot confirm purchase return in status '{purchase_return.status}'. Only 'draft' returns can be confirmed.",
-        )
-
-    deduct_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
-    purchase_return.status = "confirmed"
-    purchase_return.confirmed_at = _now()
-    purchase_return.confirmed_by = user_id
-    db.flush()
-    recalculate_purchase_and_supplier_invoice_returns(db, purchase_return.purchase_id)
-
-    db.commit()
     db.refresh(purchase_return)
     return purchase_return
 
@@ -567,6 +621,8 @@ def dispatch_purchase_return(
             detail=f"Cannot dispatch purchase return in status '{purchase_return.status}'. Only 'draft' or 'confirmed' returns can be dispatched.",
         )
 
+    if purchase_return.status == "draft":
+        revalidate_draft(db, org_id, purchase_return)
     if not purchase_return.stock_deducted:
         deduct_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
     if not purchase_return.confirmed_at:

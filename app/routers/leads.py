@@ -30,6 +30,13 @@ _edit = require_permission("leads", "edit")
 _delete = require_permission("leads", "delete")
 
 
+def _can_convert(user: User = Depends(_edit), db: Session = Depends(get_db)) -> User:
+    """leads.edit, plus customers.create for a Delivery Partner -- checked before the
+    lead is looked up or the body is used, so an unauthorized caller always gets 403."""
+    lead_service.ensure_can_convert(db, user)
+    return user
+
+
 def _org_id(user: User) -> str:
     if not user.organization_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No organization on this account")
@@ -126,7 +133,7 @@ def update_lead(
 def convert_lead_to_customer(
     id: str,
     payload: LeadConvertToCustomerIn | None = None,
-    user: User = Depends(_edit),
+    user: User = Depends(_can_convert),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> dict:

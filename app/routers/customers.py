@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session, lazyload, selectinload
 from app.core.database import get_db
 from app.core import scoping
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.core.pdf_docs import payment_receipt_pdf
 from app.core.files import content_disposition, delete_replaced_file, get_bytes, safe_filename, save_upload
 from app.models import Customer, CustomerDocument, CustomerPayment, DeliveryCollection, Invoice, StoredFile, User
 from app.services import (
@@ -520,6 +519,8 @@ def payment_receipt(
     payment = db.get(CustomerPayment, payment_id)
     if payment is None or payment.customer_id != customer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+    from app.core.pdf_docs import payment_receipt_pdf  # lazy: fpdf is only loaded when a PDF is actually built
+
     pdf = payment_receipt_pdf(user.organization, customer, payment)
     return Response(
         content=pdf, media_type="application/pdf",

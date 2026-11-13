@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, document_filename
-from app.core.pdf_docs import delivery_challan_pdf, delivery_receipt_pdf
 from app.core import business_time, scoping, workflow
 from app.core.sorting import apply_sorting
 from app.models.enums import UserRole
@@ -1135,6 +1134,8 @@ def delivery_challan(
         db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
     )
     vehicle = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
+    from app.core.pdf_docs import delivery_challan_pdf  # lazy: fpdf is only loaded when a PDF is actually built
+
     body = delivery_challan_pdf(user.organization, delivery, order, customer, partner, vehicle)
     return Response(
         content=body,
@@ -2134,6 +2135,8 @@ def get_delivery_receipt(
     customer = delivery.customer or (order.customer if order else None)
     partner = db.get(User, delivery.delivery_partner_id) if delivery.delivery_partner_id else None
     vehicle = db.get(Vehicle, delivery.vehicle_id) if delivery.vehicle_id else None
+
+    from app.core.pdf_docs import delivery_receipt_pdf  # lazy: fpdf is only loaded when a PDF is actually built
 
     pdf_bytes = delivery_receipt_pdf(
         user.organization,

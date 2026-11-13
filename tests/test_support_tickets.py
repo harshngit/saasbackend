@@ -242,6 +242,56 @@ def test_reply_close_reopen_rules(world):
     db.close()
 
 
+def test_cross_org_and_cross_staff_access_is_404_on_every_action(world):
+    """Org A users (admin or staff) get 404, never 403, on org B's ticket for every action,
+    and a STAFF user gets 404 on another STAFF user's ticket in the same org. None of
+    these attempts changes the ticket."""
+    other_org = _create(world["admin_b"], subject="Org B private")
+    other_staff = _create(world["staff_a2"], subject="Staff A2 private")
+    cases = [(world["admin_a"], other_org), (world["staff_a1"], other_org), (world["staff_a1"], other_staff)]
+    for headers, t in cases:
+        tid = t["id"]
+        _set(tid, status="open")
+        assert client.get(f"/support/tickets/{tid}", headers=headers).status_code == 404
+        assert client.post(f"/support/tickets/{tid}/messages", json={"body": "hi"}, headers=headers).status_code == 404
+        assert client.post(f"/support/tickets/{tid}/close", headers=headers).status_code == 404
+        _set(tid, status="closed", closed_at=datetime.now(timezone.utc))  # reopenable, but not by them
+        assert client.post(f"/support/tickets/{tid}/reopen", headers=headers).status_code == 404
+        assert tid not in {x["id"] for x in client.get("/support/tickets", params={"page_size": 100},
+                                                         headers=headers).json()["items"]}
+        db = SessionLocal()
+        try:
+            assert db.get(SupportTicket, tid).status == "closed"
+            assert db.query(SupportTicketMessage).filter(SupportTicketMessage.ticket_id == tid).count() == 0
+        finally:
+            db.close()
+
+
+def test_internal_notes_never_in_any_org_facing_response(world):
+    secret = "INTERNAL-ONLY-" + uuid.uuid4().hex
+    t = _create(world["staff_a1"], subject="Internal note leak check")
+    tid = t["id"]
+    r = client.post(f"/platform/support/tickets/{tid}/messages", json={"body": secret, "is_internal": True},
+                    headers=world["super"])
+    assert r.status_code == 201
+    org_responses = []
+    for headers in (world["staff_a1"], world["admin_a"]):
+        org_responses.append(client.get(f"/support/tickets/{tid}", headers=headers))
+        org_responses.append(client.get("/support/tickets", params={"search": t["ticket_number"]}, headers=headers))
+    org_responses.append(client.post(f"/support/tickets/{tid}/messages", json={"body": "customer reply"},
+                                     headers=world["staff_a1"]))
+    org_responses.append(client.post(f"/support/tickets/{tid}/close", headers=world["staff_a1"]))
+    org_responses.append(client.post(f"/support/tickets/{tid}/reopen", headers=world["admin_a"]))
+    for resp in org_responses:
+        assert resp.status_code in (200, 201), resp.text
+        assert secret not in resp.text, resp.request.url
+        body = resp.json()
+        for m in body.get("messages", []) if isinstance(body, dict) else []:
+            assert m["is_internal"] is False and m["author_type"] in ("customer", "platform"), m
+    # the platform still sees it
+    assert secret in client.get(f"/platform/support/tickets/{tid}", headers=world["super"]).text
+
+
 def test_locked_org_can_raise_and_read(world):
     t = _create(world["admin_l"])
     assert client.get(f"/support/tickets/{t['id']}", headers=world["admin_l"]).status_code == 200

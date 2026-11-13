@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     # Each step costs several database round trips on every container start. Leave on
     # until `alembic upgrade head` runs as part of every deploy; then set false.
     run_startup_migrations: bool = True
+    # Run the startup work (config summaries, DB round-trip log, the schema steps above,
+    # seeding, the reminder sweep) in a background thread so the port opens at once and
+    # /health answers immediately. false = the old behaviour: all of it runs before the
+    # first request is served (useful locally on an empty database).
+    startup_tasks_in_background: bool = True
 
     # --- One-off inline-upload -> stored-file conversion (app/services/file_migration_service.py) ---
     # Runs a full table scan across 8 models; off by default so it never runs implicitly

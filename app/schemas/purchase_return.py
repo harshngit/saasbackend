@@ -95,6 +95,23 @@ class PurchaseReturnItemOut(BaseModel):
     batch_number: str | None = None
     serial_numbers: list[str] | None = None
     expiry_date: datetime | None = None
+    # From the source purchase line; null when the line is no longer linked.
+    ordered_qty: int | None = None
+    received_qty: int | None = None
+    previously_returned_qty: int | None = None
+    returnable_qty: int | None = None
+
+    @computed_field
+    def receivedQty(self) -> int | None:
+        return self.received_qty
+
+    @computed_field
+    def previouslyReturnedQty(self) -> int | None:
+        return self.previously_returned_qty
+
+    @computed_field
+    def returnableQty(self) -> int | None:
+        return self.returnable_qty
 
     @computed_field
     def purchaseItemId(self) -> str | None:

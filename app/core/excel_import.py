@@ -3,7 +3,6 @@ import io
 from datetime import date, datetime
 from typing import Any
 
-from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, Field
 
 
@@ -54,6 +53,8 @@ class ImportSummaryOut(BaseModel):
 
 def generate_xlsx_template(columns: list[str], example_row: list[Any] | None = None) -> bytes:
     """Generate a clean .xlsx template with the exact provided columns."""
+    from openpyxl import Workbook  # lazy: only loaded for template downloads
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Template"
@@ -104,6 +105,8 @@ def parse_spreadsheet_rows(
             return rows, errors
     else:
         try:
+            from openpyxl import load_workbook  # lazy: only loaded for imports
+
             wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
             ws = wb.active
             if ws is None:

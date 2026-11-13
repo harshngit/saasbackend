@@ -260,6 +260,8 @@ def test_startup_schema_steps_follow_run_startup_migrations(monkeypatch, enabled
 
     calls = []
     monkeypatch.setattr(main.settings, "run_startup_migrations", enabled)
+    # inline, so the steps have finished when on_startup() returns
+    monkeypatch.setattr(main.settings, "startup_tasks_in_background", False)
     monkeypatch.setattr(main, "auto_add_missing_columns", lambda: calls.append("auto_add_missing_columns"))
     monkeypatch.setattr(main, "extend_pg_enum_types", lambda: calls.append("extend_pg_enum_types"))
     monkeypatch.setattr(reminder_service, "start_background_sweeps", lambda: False)

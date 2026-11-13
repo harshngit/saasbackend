@@ -125,20 +125,6 @@ app = FastAPI(
     openapi_url="/openapi.json" if settings.enable_docs else None,
 )
 
-# CORS: with credentials enabled, browsers reject a wildcard "*" origin.
-# Support explicit production origins (e.g. https://crm-saas.asynk.in) alongside
-# regex matching for localhost / 127.0.0.1 development ports.
-_cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-if "*" in settings.cors_origin_list:
-    app.add_middleware(CORSMiddleware, allow_origin_regex=".*", **_cors_kwargs)
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_origin_regex=settings.cors_origin_regex if settings.cors_origin_regex else None,
-        **_cors_kwargs,
-    )
-
 if settings.perf_log:
     from app.core import perf
 
@@ -151,49 +137,52 @@ install_disconnect_retry(app)
 
 from app.core import request_guard  # noqa: E402
 
-# Added last = outermost, so it sees the client's own disconnect.
+# Outside every other app middleware except the two below; CORS and the error
+# middleware pass `receive` through untouched, so it still sees the client's disconnect.
 request_guard.install(app, engine, settings.read_request_timeout_seconds)
+
+from app.core.error_responses import (  # noqa: E402
+    UnhandledErrorMiddleware,
+    log_unhandled,
+    server_error_response,
+)
+
+# An unhandled exception becomes a JSON 500 here, INSIDE CORS, so the browser can read it.
+app.add_middleware(UnhandledErrorMiddleware)
+
+# CORS is added LAST so it is the outermost app middleware: every response -- 4xx, 429,
+# 500, 503 from the request guard -- passes through it and gets its CORS headers.
+# With credentials enabled, browsers reject a wildcard "*" origin, so "*" becomes a
+# regex; explicit production origins (e.g. https://crm-saas.asynk.in) sit alongside
+# regex matching for localhost / 127.0.0.1 development ports.
+_cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+if "*" in settings.cors_origin_list:
+    _cors_kwargs.update(allow_origin_regex=".*")
+else:
+    _cors_kwargs.update(
+        allow_origins=settings.cors_origin_list,
+        allow_origin_regex=settings.cors_origin_regex if settings.cors_origin_regex else None,
+    )
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
+# Same rules, for the last-resort handler below (which runs outside CORS).
+_cors_rules = CORSMiddleware(app=None, **_cors_kwargs)
 
 
 _log = logging.getLogger("crm.startup")
-_error_log = logging.getLogger("crm.errors")
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    path = request.url.path
-    method = request.method
-
-    delivery_id = None
-    if "deliveries" in path:
-        parts = path.strip("/").split("/")
-        if len(parts) >= 2 and parts[0] == "deliveries":
-            if parts[1] not in ("load-batch", "assigned", "partners", "history", "stats", "by-id"):
-                delivery_id = parts[1]
-            elif parts[1] == "by-id" and len(parts) >= 3:
-                delivery_id = parts[2]
-
-    delivery_context = f" [delivery_id: {delivery_id}]" if delivery_id else ""
-    _error_log.exception(
-        "Unhandled exception processing %s %s%s: %s",
-        method,
-        path,
-        delivery_context,
-        exc,
-    )
-
+    """Last resort, for an exception raised outside UnhandledErrorMiddleware (e.g. in
+    CORS itself). Runs outside CORS, so it adds CORS headers itself -- only for an
+    origin CORS would allow (it used to echo back any origin)."""
+    log_unhandled(request, exc)
     origin = request.headers.get("origin")
     headers = {}
-    if origin:
-        headers["access-control-allow-origin"] = origin
-        headers["access-control-allow-credentials"] = "true"
-        headers["vary"] = "Origin"
-
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "An unexpected server error occurred. Please try again later or contact support."},
-        headers=headers if headers else None,
-    )
+    if origin and _cors_rules.is_allowed_origin(origin):
+        headers = {"access-control-allow-origin": origin, "access-control-allow-credentials": "true",
+                   "vary": "Origin"}
+    return server_error_response(headers)
 
 
 # Shown by /health and the startup log, so a deploy can be confirmed. The BUILD_TAG
@@ -202,9 +191,30 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 BUILD_TAG = settings.build_tag.strip() or "2026-11-04-deliveries-n-plus-one"
 
 
+# What the startup work is doing: pending -> running -> done. Read by tests and logs only;
+# /health never waits for it.
+STARTUP_STATE: dict[str, object] = {"state": "pending", "seconds": None}
+
+
 @app.on_event("startup")
 def on_startup() -> None:
+    """Returns at once (by default) so uvicorn opens the port and /health answers while
+    the startup work below runs in a background thread. Nothing in it is needed to
+    serve a request: the schema is migrated by `python -m app.core.ensure_migrated`
+    before uvicorn starts, and the rest are logs, idempotent backfills and the
+    reminder sweep. STARTUP_TASKS_IN_BACKGROUND=false runs it inline, as before."""
     _log.info("Starting CRM API — build: %s", BUILD_TAG)
+    if settings.startup_tasks_in_background:
+        import threading
+
+        threading.Thread(target=run_startup_tasks, name="startup-tasks", daemon=True).start()
+    else:
+        run_startup_tasks()
+
+
+def run_startup_tasks() -> None:
+    STARTUP_STATE["state"] = "running"
+    begun = time.perf_counter()
     try:
         email_service.log_startup_config()
     except Exception:  # noqa: BLE001
@@ -287,7 +297,8 @@ def on_startup() -> None:
     except Exception:  # noqa: BLE001
         _log.exception("Follow-up reminder sweep could not start")
 
-    _log.info("CRM API startup complete — build: %s", BUILD_TAG)
+    STARTUP_STATE.update(state="done", seconds=round(time.perf_counter() - begun, 3))
+    _log.info("CRM API startup tasks complete in %.1fs — build: %s", STARTUP_STATE["seconds"], BUILD_TAG)
 
 
 def _database_target() -> str:

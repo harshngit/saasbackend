@@ -10,7 +10,7 @@ venv/
 *.db
 *.sqlite3
 
-# PostgreSQL dumps (pre-backfill / rehearsal / cutover backups — never committed)
+# PostgreSQL dumps (pre-backfill / rehearsal / cutover backups â€” never committed)
 *.dump
 
 # OS / editor
@@ -42,3 +42,6 @@ node_modules/
 node_modules/
 .wrangler/
 .dev.vars
+# Output of scripts/data_audit.py and scripts/fix_delivery_customers.py (contains customer data)
+audit_out/
+*.audit.jsonl

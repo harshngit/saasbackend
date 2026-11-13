@@ -8,7 +8,6 @@ from app.core.database import get_db
 from app.core import workflow
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, decode_data_url, document_filename, get_bytes
-from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf
 from app.core.sorting import apply_sorting
 from app.models import (
     Customer,
@@ -889,6 +888,8 @@ def download_invoice_pdf(
     settings = _with_pdf_overrides(
         workflow.invoice_settings(user.organization), template_variant, thermal_layout
     )
+    from app.core.pdf_docs import invoice_detailed_pdf, invoice_simple_pdf  # lazy: fpdf is only loaded when a PDF is actually built
+
     builder = invoice_simple_pdf if format == "simple" else invoice_detailed_pdf
 
     item_images: dict[str, bytes] = {}

@@ -439,6 +439,23 @@ def bulk_delete_leads(db: Session, org_id: str, ids: list[str], user: User) -> i
     return len(leads)
 
 
+def ensure_can_convert(db: Session, user: User) -> None:
+    """Converting a lead creates a Customer, so a Delivery Partner also needs
+    customers.create on their role (not granted by default; an admin can grant it).
+    Other roles only need leads.edit, as before."""
+    from app.core.deps import has_permission
+    from app.models.enums import UserRole
+
+    is_delivery_partner = user.role == UserRole.DELIVERY_PARTNER or (
+        user.role_detail is not None and user.role_detail.name == "Delivery Partner"
+    )
+    if is_delivery_partner and not has_permission(db, user, "customers", "create"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to create customers",
+        )
+
+
 def convert_lead_to_customer(
     db: Session, org_id: str, user: User, lead: Lead, payload: LeadConvertToCustomerIn | None
 ) -> dict:
@@ -473,18 +490,9 @@ def convert_lead_to_customer(
             detail="Lost lead cannot be converted to customer. Reopen the lead first.",
         )
 
-    # Converting creates a Customer, so a Delivery Partner needs customers.create
-    # on their role (not granted by default; an admin can grant it).
-    from app.core.deps import has_permission
-    from app.models.enums import UserRole
-    is_delivery_partner = user.role == UserRole.DELIVERY_PARTNER or (
-        user.role_detail and user.role_detail.name == "Delivery Partner"
-    )
-    if is_delivery_partner and not has_permission(db, user, "customers", "create"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You don't have permission to create customers",
-        )
+    # Also enforced by the router (as a dependency, before the lead lookup); kept
+    # here so any other caller of this service gets the same rule.
+    ensure_can_convert(db, user)
 
     # 1. The Lead already points at a Customer — never create a second one.
     #    - Already converted (by us, or by the request we were racing): an

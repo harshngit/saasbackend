@@ -49,7 +49,7 @@ def create_purchase_return(
     ret = purchase_return_service.create_purchase_return(
         db, org_id, payload, user_id=user.id
     )
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
 
 
 @router.get("", response_model=PurchaseReturnListResponse)
@@ -94,7 +94,7 @@ def get_purchase_return(
     """Retrieve detailed purchase return record by UUID or return_number."""
     org_id = _org_id(user)
     ret = purchase_return_service.get_purchase_return_detail(db, org_id, id)
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
 
 
 @router.patch("/{id}", response_model=PurchaseReturnOut)
@@ -110,7 +110,7 @@ def update_purchase_return(
     ret = purchase_return_service.update_purchase_return(
         db, org_id, id, payload, user_id=user.id
     )
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
 
 
 @router.post("/{id}/confirm", response_model=PurchaseReturnOut)
@@ -125,7 +125,7 @@ def confirm_purchase_return(
     ret = purchase_return_service.confirm_purchase_return(
         db, org_id, id, user_id=user.id
     )
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
 
 
 @router.post("/{id}/dispatch", response_model=PurchaseReturnOut)
@@ -140,7 +140,7 @@ def dispatch_purchase_return(
     ret = purchase_return_service.dispatch_purchase_return(
         db, org_id, id, user_id=user.id
     )
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
 
 
 @router.post("/{id}/complete", response_model=PurchaseReturnOut)
@@ -155,7 +155,7 @@ def complete_purchase_return(
     ret = purchase_return_service.complete_purchase_return(
         db, org_id, id, user_id=user.id
     )
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
 
 
 @router.post("/{id}/cancel", response_model=PurchaseReturnOut)
@@ -172,4 +172,4 @@ def cancel_purchase_return(
     ret = purchase_return_service.cancel_purchase_return(
         db, org_id, id, cancel_reason=cancel_reason, user_id=user.id
     )
-    return PurchaseReturnOut.model_validate(ret)
+    return PurchaseReturnOut.model_validate(purchase_return_service.attach_line_figures(db, ret))
