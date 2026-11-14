@@ -43,6 +43,7 @@ from app.models import (
 from app.schemas.dashboard import (
     AdminDashboardOut,
     DashboardToday,
+    DashboardTodayOverall,
     CashflowPoint,
     DashboardFilters,
     DashboardOrders,
@@ -589,6 +590,33 @@ def _recent_orders(
     return recent
 
 
+def _today_figures(db: Session, org_id: str, tz, today, today_from: datetime, today_to: datetime) -> DashboardToday:  # noqa: ANN001
+    """`today` for the whole organization (no customer filter) -- the same definitions."""
+    fully_delivered = or_(SalesOrder.status == "completed", SalesOrder.fulfilment_status == "delivered")
+    orders, delivered_orders, amount, delivered_amount = (
+        _sale_orders(db, org_id, ())
+        .filter(SalesOrder.created_at >= today_from, SalesOrder.created_at <= today_to)
+        .with_entities(
+            func.count(SalesOrder.id),
+            func.coalesce(func.sum(case((fully_delivered, 1), else_=0)), 0),
+            func.coalesce(func.sum(SalesOrder.total), 0),
+            func.coalesce(func.sum(case((fully_delivered, SalesOrder.total), else_=0)), 0),
+        )
+        .one()
+    )
+    amount = round(float(amount or 0), 2)
+    delivered_amount = round(float(delivered_amount or 0), 2)
+    delivered = db.query(Delivery).filter(
+        Delivery.organization_id == org_id, Delivery.status == "delivered",
+        Delivery.confirmed_at >= today_from, Delivery.confirmed_at <= today_to,
+    ).count()
+    return DashboardToday(
+        date=today.isoformat(), timezone=str(tz), orders=int(orders or 0), sales=amount, delivered=delivered,
+        delivered_orders=int(delivered_orders or 0), pending_orders=int(orders or 0) - int(delivered_orders or 0),
+        delivered_amount=delivered_amount, pending_amount=round(amount - delivered_amount, 2),
+    )
+
+
 def build_admin_dashboard(
     db: Session,
     org_id: str,
@@ -670,7 +698,26 @@ def build_admin_dashboard(
     if customer_ids:
         delivered_q = delivered_q.filter(Delivery.customer_id.in_(customer_ids))
 
+    today_block = DashboardToday(
+        date=today.isoformat(), timezone=str(tz), orders=today_orders, sales=totals[1],
+        delivered=delivered_q.count(),
+        delivered_orders=int(delivered_orders or 0), pending_orders=today_orders - int(delivered_orders or 0),
+        delivered_amount=delivered_amount,
+        pending_amount=round(float(today_amount or 0) - delivered_amount, 2),
+    )
+    # The same figures with no filter at all: only the customer filter ever narrowed
+    # `today` (the window is always today; company = own org), so without one they are
+    # identical and are reused instead of queried again.
+    overall = today_block if not customer_ids else _today_figures(db, org_id, tz, today, today_from, today_to)
+    received_today = (
+        db.query(func.coalesce(func.sum(CustomerPayment.amount), 0))
+        .filter(CustomerPayment.organization_id == org_id,
+                CustomerPayment.received_on >= today_from, CustomerPayment.received_on <= today_to)
+        .scalar()
+    )
+
     result = AdminDashboardOut(
+        today_overall=DashboardTodayOverall(**overall.model_dump(), received=round(float(received_today or 0), 2)),
         filters=DashboardFilters(
             date_from=start.isoformat(),
             date_to=end.isoformat(),
@@ -687,13 +734,7 @@ def build_admin_dashboard(
         ),
         summary=_summary(db, eff_org, start, end, df, dt, period_sales, purchases, expenses, customer_ids, company_id,
                          tz=tz, totals=totals),
-        today=DashboardToday(
-            date=today.isoformat(), timezone=str(tz), orders=today_orders, sales=totals[1],
-            delivered=delivered_q.count(),
-            delivered_orders=int(delivered_orders or 0), pending_orders=today_orders - int(delivered_orders or 0),
-            delivered_amount=delivered_amount,
-            pending_amount=round(float(today_amount or 0) - delivered_amount, 2),
-        ),
+        today=today_block,
         orders=_orders(db, eff_org, customer_ids, company_id, df, dt,
                        rows=[(o.status, o.fulfilment_status) for o in window_rows]),
         cashflow=_cashflow(db, eff_org, start, end, df, dt, customer_ids, supplier_ids, company_id,

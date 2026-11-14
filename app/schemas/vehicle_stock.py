@@ -35,6 +35,9 @@ class VehicleLoadingItemOut(BaseModel):
     product_id: str | None
     variant_id: str | None
     product_name: str
+    sku: str | None = None
+    uom: str | None = None
+    variant_name: str | None = None
     loaded_qty: int
     extra_qty: int
     returned_qty: int
@@ -82,6 +85,35 @@ class VehicleLoadingOut(BaseModel):
     status: str
     items: list[VehicleLoadingItemOut]
     created_at: datetime
+    updated_at: datetime
+
+
+class VehicleLoadSummaryOut(BaseModel):
+    """One row of the Vehicle Stock page tables (today's loads, load history).
+
+    `id` is the loading session id: open the detail page with GET /vehicle-stock/{id}.
+    Units are summed over the session's lines:
+      order_units      loaded at the first load (what was loaded for the orders)
+      loaded_units     everything that went on the vehicle (first load + extra loads)
+      delivered_units  delivered to customers
+      returned_units   returned to the warehouse at end of day
+      available_units  still on the vehicle: loaded - delivered - returned
+    """
+
+    id: str
+    date: datetime
+    vehicle_id: str | None = None
+    vehicle_number: str | None = None
+    delivery_partner_id: str
+    driver_name: str | None = None
+    warehouse_id: str | None = None
+    order_units: int
+    loaded_units: int
+    delivered_units: int
+    returned_units: int
+    available_units: int
+    item_count: int
+    status: str
     updated_at: datetime
 
 

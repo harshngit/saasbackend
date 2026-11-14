@@ -70,6 +70,29 @@ class VehicleLoadingItem(Base):
     delivered_qty: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     loading: Mapped["VehicleLoading"] = relationship(back_populates="items")
+    # Read-only, batch-loaded (one query per list, not per line) for the sku / uom /
+    # variant name columns of the vehicle stock screens.
+    product: Mapped["Product | None"] = relationship(  # noqa: F821
+        foreign_keys=[product_id], lazy="selectin", viewonly=True
+    )
+    variant: Mapped["ProductVariant | None"] = relationship(  # noqa: F821
+        foreign_keys=[variant_id], lazy="selectin", viewonly=True
+    )
+
+    @property
+    def sku(self) -> str | None:
+        """The variant's SKU when the line is a variant, else the product's."""
+        if self.variant is not None and self.variant.sku:
+            return self.variant.sku
+        return self.product.sku if self.product is not None else None
+
+    @property
+    def uom(self) -> str | None:
+        return self.product.uom if self.product is not None else None
+
+    @property
+    def variant_name(self) -> str | None:
+        return self.variant.name if self.variant is not None else None
 
     @property
     def remaining_qty(self) -> int:

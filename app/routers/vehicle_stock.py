@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -30,6 +30,7 @@ from app.schemas.vehicle_stock import (
     LoadedLineOut,
     ReconcileBody,
     VehicleLoadingCreate,
+    VehicleLoadSummaryOut,
     VehicleLoadingOut,
     VehicleReconciliationOut,
 )
@@ -549,3 +550,138 @@ def list_all_loadings(
     )
     return paginate(q, page=page, page_size=page_size)
 
+
+
+# ------------------------------------------------------------------ Vehicle Stock page tables
+
+
+def _summary(loading: VehicleLoading) -> VehicleLoadSummaryOut:
+    items = loading.items or []
+    order_units = sum(i.loaded_qty or 0 for i in items)
+    loaded = order_units + sum(i.extra_qty or 0 for i in items)
+    delivered = sum(i.delivered_qty or 0 for i in items)
+    returned = sum(i.returned_qty or 0 for i in items)
+    return VehicleLoadSummaryOut(
+        id=loading.id,
+        date=loading.date,
+        vehicle_id=loading.vehicle_id,
+        vehicle_number=loading.vehicle.vehicle_number if loading.vehicle is not None else None,
+        delivery_partner_id=loading.delivery_partner_id,
+        driver_name=loading.delivery_partner.name if loading.delivery_partner is not None else None,
+        warehouse_id=loading.warehouse_id,
+        order_units=order_units,
+        loaded_units=loaded,
+        delivered_units=delivered,
+        returned_units=returned,
+        available_units=max(loaded - delivered - returned, 0),
+        item_count=len(items),
+        status=loading.status,
+        updated_at=loading.updated_at,
+    )
+
+
+def _scoped_loadings(db: Session, user: User, org_id: str):  # noqa: ANN202
+    q = db.query(VehicleLoading).filter(VehicleLoading.organization_id == org_id)
+    # Same scope rule as GET /vehicle-stock: an "own"-scope user (Delivery Partner)
+    # sees only their own sessions; Vehicle Stock is excluded from Team Scope.
+    return scoping.owned_by(q, db, user, VehicleLoading.delivery_partner_id, team_columns=())
+
+
+@router.get("/today", response_model=list[VehicleLoadSummaryOut])
+def todays_vehicle_loads(
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> list[VehicleLoadSummaryOut]:
+    """"Today's Vehicle Load Information": every vehicle that is loaded right now
+    (status active, whatever day it was loaded) plus every session started today
+    (business day in the organization's timezone, default Asia/Kolkata), closed or not.
+    Active sessions first, then newest first. Not paginated (one row per vehicle run)."""
+    from sqlalchemy import or_
+
+    from app.core import business_time
+
+    org_id = _org_id(user)
+    tz = business_time.org_timezone(db, org_id)
+    day = business_time.today(tz)
+    q = _scoped_loadings(db, user, org_id).filter(
+        or_(
+            VehicleLoading.status == "active",
+            VehicleLoading.date.between(business_time.day_start(day, tz), business_time.day_end(day, tz)),
+        )
+    )
+    rows = q.order_by(VehicleLoading.date.desc(), VehicleLoading.id.desc()).all()
+    rows.sort(key=lambda r: r.status != "active")  # stable: active first, newest first within
+    return [_summary(r) for r in rows]
+
+
+@router.get("/history", response_model=PaginatedResponse[VehicleLoadSummaryOut])
+def vehicle_load_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: str | None = Query(default=None, description="Vehicle number or driver name (partial, case-insensitive)"),
+    date_from: date | None = Query(default=None, description="Loaded on/after (YYYY-MM-DD, organization timezone)"),
+    date_to: date | None = Query(default=None, description="Loaded on/before (YYYY-MM-DD, organization timezone)"),
+    vehicle_id: str | None = Query(default=None),
+    delivery_partner_id: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status", description="active or closed"),
+    sort_by: str | None = Query(default=None, description="date, vehicle_number, delivery_partner, status, updated_at"),
+    sort_order: str = Query(default="desc", description="asc or desc"),
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> PaginatedResponse[VehicleLoadSummaryOut]:
+    """"Vehicle Load History": every loading session, newest first, paginated, with
+    `total`. Open a row with GET /vehicle-stock/{id}."""
+    from sqlalchemy import or_
+
+    from app.core import business_time
+
+    org_id = _org_id(user)
+    tz = business_time.org_timezone(db, org_id)
+    q = _scoped_loadings(db, user, org_id)
+    if vehicle_id:
+        q = q.filter(VehicleLoading.vehicle_id == vehicle_id)
+    if delivery_partner_id:
+        q = q.filter(VehicleLoading.delivery_partner_id == delivery_partner_id)
+    if status_filter:
+        q = q.filter(VehicleLoading.status == status_filter.strip().lower())
+    if date_from:
+        q = q.filter(VehicleLoading.date >= business_time.day_start(date_from, tz))
+    if date_to:
+        q = q.filter(VehicleLoading.date <= business_time.day_end(date_to, tz))
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        q = q.filter(or_(
+            VehicleLoading.vehicle_id.in_(
+                select(Vehicle.id).where(Vehicle.organization_id == org_id, Vehicle.vehicle_number.ilike(term))
+            ),
+            VehicleLoading.delivery_partner_id.in_(
+                select(User.id).where(User.organization_id == org_id, User.name.ilike(term))
+            ),
+        ))
+    q = apply_sorting(
+        q,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sortable_fields=VEHICLE_LOADING_SORTABLE_FIELDS,
+        default_order=[VehicleLoading.date.desc(), VehicleLoading.created_at.desc(), VehicleLoading.id.desc()],
+        secondary_key=VehicleLoading.id.desc(),
+    )
+    result = paginate(q, page=page, page_size=page_size)
+    return PaginatedResponse[VehicleLoadSummaryOut](
+        items=[_summary(r) for r in result.items],
+        total=result.total,
+        page=result.page,
+        page_size=result.page_size,
+        total_pages=result.total_pages,
+    )
+
+
+@router.get("/{id}", response_model=VehicleLoadingOut)
+def get_loading_session(
+    id: str,
+    user: User = Depends(_view),
+    db: Session = Depends(get_db),
+) -> VehicleLoading:
+    """One loading session by id (active or closed) -- the detail page for a row of
+    /today or /history. An "own"-scope user only reaches their own sessions."""
+    return _owned(db, id, _org_id(user), user)
