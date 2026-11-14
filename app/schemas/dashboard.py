@@ -134,10 +134,19 @@ class DashboardToday(BaseModel):
     pending_amount: float = Field(description="Total amount of pending_orders (sales - delivered_amount)")
 
 
+class DashboardTodayOverall(DashboardToday):
+    """Today for the WHOLE organization: ignores every filter (date range, company,
+    warehouse, customer, supplier). For the "Today's Sales" card. `today` above, by
+    contrast, follows the customer filter."""
+
+    received: float = Field(description="Customer payments received today (all customers)")
+
+
 class AdminDashboardOut(BaseModel):
     filters: DashboardFilters
     summary: DashboardSummary
     today: DashboardToday
+    today_overall: DashboardTodayOverall
     orders: DashboardOrders
     cashflow: list[CashflowPoint]
     receivables_payables: ReceivablesPayables

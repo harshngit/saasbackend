@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Request, Response, UploadFile, status,
+)
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -99,6 +101,7 @@ def expense_categories(_user: User = Depends(_view)) -> dict:
 def create_expense(
     payload: ExpenseCreate,
     response: Response,
+    background: BackgroundTasks,
     idempotency_key: str | None = Header(
         default=None, alias="Idempotency-Key", max_length=100,
         description="Optional. Send the same key when retrying a create (e.g. after a timeout): the "
@@ -243,15 +246,39 @@ def create_expense(
         entry.created_at = expense.created_at + timedelta(microseconds=n)
     if creator_is_admin:
         expense_service._post_gl(db, expense, "expense")
-        notification_service.notify_expense_status_changed(db, expense, actor_id=user.id)
-    else:
-        notification_service.notify_org_admins(
-            db, expense.organization_id, "New expense submitted",
-            f"{expense.category}: Rs {expense.amount:,.2f}", type="expense", link=expense.id,
-            data=nt.build_data(nt.EXPENSE_CREATED, expense_id=expense.id))
     db.commit()
     db.refresh(expense)
+    # The notifications (one row per recipient, with its duplicate check, realtime event
+    # and push) are written after the response has been sent, in their own session:
+    # they cost a database round trip or more per recipient and the caller does not
+    # wait for them. Same rows and content as before.
+    background.add_task(_notify_expense_created, expense.id, user.id, creator_is_admin)
     return expense
+
+
+def _notify_expense_created(expense_id: str, actor_id: str, creator_is_admin: bool) -> None:
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        expense = db.get(Expense, expense_id)
+        if expense is None:
+            return
+        if creator_is_admin:
+            notification_service.notify_expense_status_changed(db, expense, actor_id=actor_id)
+        else:
+            notification_service.notify_org_admins(
+                db, expense.organization_id, "New expense submitted",
+                f"{expense.category}: Rs {expense.amount:,.2f}", type="expense", link=expense.id,
+                data=nt.build_data(nt.EXPENSE_CREATED, expense_id=expense.id))
+        db.commit()
+    except Exception:  # noqa: BLE001 -- the expense is saved; a notification failure must not surface
+        db.rollback()
+        import logging
+
+        logging.getLogger("crm.expenses").exception("Expense %s: notifications failed", expense_id)
+    finally:
+        db.close()
 
 
 def _by_idempotency_key(db: Session, org_id: str, user_id: str, key: str) -> Expense | None:
