@@ -5,7 +5,8 @@ import jwt
 from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import RedirectResponse
-from sqlalchemy import func
+from sqlalchemy import func, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -157,19 +158,45 @@ def _user_by_login_email(db: Session, email: str) -> User | None:
     return matches[0] if len(matches) == 1 else None
 
 
+# A login must answer within seconds, never hang: inside the login's own transactions no
+# statement may run longer than LOGIN_STATEMENT_TIMEOUT and no lock is waited for longer
+# than LOGIN_LOCK_TIMEOUT. Set per transaction (set_config(..., true) = SET LOCAL), so it
+# is safe behind PgBouncer and touches no other request.
+LOGIN_STATEMENT_TIMEOUT = "8s"
+LOGIN_LOCK_TIMEOUT = "3s"
+LOGIN_BUSY_DETAIL = "Login is temporarily unavailable because the server is busy. Please try again in a moment."
+
+
+def _bound_login_transaction(db: Session) -> None:
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            text("SELECT set_config('statement_timeout', :s, true), set_config('lock_timeout', :l, true)"),
+            {"s": LOGIN_STATEMENT_TIMEOUT, "l": LOGIN_LOCK_TIMEOUT},
+        )
+
+
 @router.post("/login", response_model=AuthResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
-    user = _user_by_login_email(db, str(payload.email))
-    if user is None or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
+    try:
+        _bound_login_transaction(db)
+        user = _user_by_login_email(db, str(payload.email))
+        if user is None or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+        if not user.is_active:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is deactivated")
 
-    # Lazily lock the org if its trial has expired, so the response reflects reality.
-    org_service.apply_trial_expiry(db, user.organization)
+        # Lazily lock the org if its trial has expired, so the response reflects reality.
+        org_service.apply_trial_expiry(db, user.organization)
+        if not db.in_transaction():  # the expiry above committed: bound the next transaction too
+            _bound_login_transaction(db)
 
-    tokens = auth_service.issue_tokens(db, user)
-    return auth_service.build_auth_response(user, tokens)
+        tokens = auth_service.issue_tokens(db, user)
+        return auth_service.build_auth_response(user, tokens)
+    except OperationalError as exc:
+        # statement_timeout / lock_timeout (or a dropped connection): a clear, fast error.
+        db.rollback()
+        logger.warning("Login could not finish: %s", type(getattr(exc, "orig", exc)).__name__)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=LOGIN_BUSY_DETAIL) from exc
 
 
 @router.get("/google", status_code=status.HTTP_307_TEMPORARY_REDIRECT)

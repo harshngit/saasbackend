@@ -617,6 +617,28 @@ def _today_figures(db: Session, org_id: str, tz, today, today_from: datetime, to
     )
 
 
+def _today_due_amount(db: Session, org_id: str, today_from: datetime, today_to: datetime) -> float:
+    """Unpaid on today's orders (whole organization), in one query: per order, its total
+    minus the amount paid on its non-void invoices, floored at 0 -- the order screen's
+    remaining balance for the order itself."""
+    paid = (
+        db.query(Invoice.order_id.label("order_id"), func.coalesce(func.sum(Invoice.amount_paid), 0).label("paid"))
+        .filter(Invoice.organization_id == org_id, Invoice.order_id.isnot(None),
+                ~Invoice.status.in_(("void", "cancelled")))
+        .group_by(Invoice.order_id)
+        .subquery()
+    )
+    remaining = func.coalesce(SalesOrder.total, 0) - func.coalesce(paid.c.paid, 0)
+    total = (
+        _sale_orders(db, org_id, ())
+        .filter(SalesOrder.created_at >= today_from, SalesOrder.created_at <= today_to)
+        .outerjoin(paid, paid.c.order_id == SalesOrder.id)
+        .with_entities(func.coalesce(func.sum(case((remaining > 0, remaining), else_=0)), 0))
+        .scalar()
+    )
+    return round(float(total or 0), 2)
+
+
 def build_admin_dashboard(
     db: Session,
     org_id: str,
@@ -716,8 +738,11 @@ def build_admin_dashboard(
         .scalar()
     )
 
+    due_today = _today_due_amount(db, org_id, today_from, today_to)
+
     result = AdminDashboardOut(
-        today_overall=DashboardTodayOverall(**overall.model_dump(), received=round(float(received_today or 0), 2)),
+        today_overall=DashboardTodayOverall(**overall.model_dump(), received=round(float(received_today or 0), 2),
+                                            due_amount=due_today),
         filters=DashboardFilters(
             date_from=start.isoformat(),
             date_to=end.isoformat(),

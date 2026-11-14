@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class SupplierInvoiceItemIn(BaseModel):
@@ -50,7 +50,10 @@ class SupplierInvoiceCreate(BaseModel):
     supplier_id: str
     purchase_id: str
     supplier_invoice_number: str = Field(..., min_length=1, max_length=100)
-    supplier_invoice_date: datetime | None = None
+    # Also accepted as `invoice_date` (the name the responses carry too). It used to be
+    # silently dropped under that name, and the invoice was dated today.
+    supplier_invoice_date: datetime | None = Field(
+        default=None, validation_alias=AliasChoices("supplier_invoice_date", "invoice_date"))
     due_date: datetime | None = None
     notes: str | None = None
     attachment_url: str | None = None
@@ -66,7 +69,8 @@ class SupplierInvoiceCreate(BaseModel):
 
 class SupplierInvoiceUpdate(BaseModel):
     supplier_invoice_number: str | None = Field(default=None, max_length=100)
-    supplier_invoice_date: datetime | None = None
+    supplier_invoice_date: datetime | None = Field(
+        default=None, validation_alias=AliasChoices("supplier_invoice_date", "invoice_date"))
     due_date: datetime | None = None
     notes: str | None = None
     attachment_url: str | None = None
