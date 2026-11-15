@@ -140,6 +140,9 @@ class DashboardTodayOverall(DashboardToday):
     contrast, follows the customer filter."""
 
     received: float = Field(description="Customer payments received today (all customers)")
+    due_amount: float = Field(
+        description="Still unpaid on today's orders: each order's total minus what is paid on its "
+                    "invoices (void / cancelled invoices ignored), never below 0 per order")
 
 
 class AdminDashboardOut(BaseModel):

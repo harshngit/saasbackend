@@ -277,6 +277,7 @@ def auto_add_missing_columns() -> None:
             # Per-column isolation: one failure must not skip every later column.
             try:
                 with engine.begin() as conn:
+                    _limit_lock_wait(conn)
                     conn.execute(text(ddl))
             except Exception:  # noqa: BLE001
                 logger.exception("Could not add column %s.%s", table.name, column.name)
@@ -363,13 +364,45 @@ _RELAX_NOT_NULL = [
 ]
 
 
+# Startup schema steps run while the app is serving (and every container start). A DDL
+# statement queues for its table lock behind any open transaction on that table, and every
+# later write to the table then queues behind the DDL -- e.g. one session left idle in a
+# transaction on `users` plus a no-op `ALTER TABLE users ...` stops every login (its
+# last_login UPDATE). So each step first checks the catalog and does nothing when the
+# change is already there, and any DDL that does run gives up after STARTUP_DDL_LOCK_TIMEOUT
+# instead of waiting (it is retried on the next start).
+STARTUP_DDL_LOCK_TIMEOUT = "5s"
+
+
+def _limit_lock_wait(conn) -> None:  # noqa: ANN001
+    """Inside the current transaction only (PgBouncer-safe): give up on a lock after a few seconds."""
+    if conn.dialect.name == "postgresql":
+        conn.execute(text(f"SET LOCAL lock_timeout = '{STARTUP_DDL_LOCK_TIMEOUT}'"))
+
+
+def _column_info(table: str, column: str) -> dict | None:
+    inspector = inspect(engine)
+    if not inspector.has_table(table):
+        return None
+    return next((c for c in inspector.get_columns(table) if c["name"] == column), None)
+
+
+def _index_exists(name: str) -> bool:
+    with engine.connect() as conn:
+        return bool(conn.execute(text("SELECT 1 FROM pg_indexes WHERE indexname = :n"), {"n": name}).first())
+
+
 def relax_not_null_columns() -> None:
     """Drop NOT NULL on columns the model no longer requires (Postgres only)."""
     if engine.dialect.name != "postgresql":
         return
     for table, column in _RELAX_NOT_NULL:
+        info = _column_info(table, column)
+        if info is None or info.get("nullable", True):
+            continue  # already nullable (or absent): no lock taken
         try:
             with engine.begin() as conn:
+                _limit_lock_wait(conn)
                 conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" DROP NOT NULL'))
             logger.info("Auto-migrated: dropped NOT NULL on %s.%s", table, column)
         except Exception:  # noqa: BLE001
@@ -388,8 +421,12 @@ def widen_columns_to_text() -> None:
     if engine.dialect.name != "postgresql":
         return
     for table, column in _WIDEN_TO_TEXT:
+        info = _column_info(table, column)
+        if info is None or str(info.get("type", "")).upper() == "TEXT":
+            continue  # already TEXT (or absent): no lock taken
         try:
             with engine.begin() as conn:
+                _limit_lock_wait(conn)
                 conn.execute(text(f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE TEXT'))
             logger.info("Auto-migrated: widened %s.%s to TEXT", table, column)
         except Exception:  # noqa: BLE001
@@ -417,6 +454,7 @@ def add_columns_with_default() -> None:
             continue
         try:
             with engine.begin() as conn:
+                _limit_lock_wait(conn)
                 conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {coltype} NOT NULL DEFAULT {default}'))
             logger.info("Auto-migrated: added %s.%s (NOT NULL default %s)", table, column, default)
         except Exception:  # noqa: BLE001
@@ -438,6 +476,7 @@ def drop_legacy_columns() -> None:
         existing = {col["name"] for col in inspector.get_columns(table)}
         if column in existing:
             with engine.begin() as conn:
+                _limit_lock_wait(conn)
                 conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN IF EXISTS "{column}"'))
             logger.info("Auto-migrated: dropped legacy column %s.%s", table, column)
 
@@ -521,8 +560,11 @@ def enforce_unique_email() -> None:
         )
         return
 
+    if engine.dialect.name == "postgresql" and _index_exists("ux_users_email_ci"):
+        return  # already there: CREATE INDEX IF NOT EXISTS would still lock the table first
     try:
         with engine.begin() as conn:
+            _limit_lock_wait(conn)
             conn.execute(
                 text('CREATE UNIQUE INDEX IF NOT EXISTS "ux_users_email_ci" ON "users" (LOWER("email"))')
             )
@@ -562,8 +604,11 @@ def enforce_unique_google_id() -> None:
         )
         return
 
+    if engine.dialect.name == "postgresql" and _index_exists("ux_users_google_id"):
+        return  # already there: CREATE INDEX IF NOT EXISTS would still lock the table first
     try:
         with engine.begin() as conn:
+            _limit_lock_wait(conn)
             conn.execute(
                 text('CREATE UNIQUE INDEX IF NOT EXISTS "ux_users_google_id" ON "users" ("google_id")')
             )

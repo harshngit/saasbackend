@@ -42,7 +42,7 @@ def issue_tokens(db: Session, user: User) -> TokenPair:
     """
     access = create_access_token(user.id, user.effective_system_role, user.organization_id)
     refresh = create_refresh_token(user.id)
-    user.last_login = datetime.now(timezone.utc)
+    stamp_last_login(db, user)
 
     db.add(
         RefreshToken(
@@ -53,6 +53,29 @@ def issue_tokens(db: Session, user: User) -> TokenPair:
     )
     db.commit()
     return TokenPair(access_token=access, refresh_token=refresh)
+
+
+LAST_LOGIN_LOCK_TIMEOUT = "2s"
+
+
+def stamp_last_login(db: Session, user: User) -> None:
+    """Set users.last_login -- but never let it hold up a sign-in. It is the only write
+    to the user's own row on sign-in, so if another transaction holds that row (one left
+    idle in a transaction, a long update) the UPDATE would wait for as long as that lasts.
+    It runs in a savepoint with a short lock timeout; on timeout the stamp is skipped and
+    the sign-in carries on."""
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    now = datetime.now(timezone.utc)
+    try:
+        with db.begin_nested():
+            if db.get_bind().dialect.name == "postgresql":
+                db.execute(text("SELECT set_config('lock_timeout', :t, true)"), {"t": LAST_LOGIN_LOCK_TIMEOUT})
+            user.last_login = now
+            db.flush()
+    except OperationalError:
+        logger.warning("last_login not stamped for user %s: the row is locked by another transaction", user.id)
 
 
 def get_active_refresh(db: Session, token: str) -> RefreshToken | None:
