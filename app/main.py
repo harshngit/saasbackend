@@ -185,10 +185,27 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     return server_error_response(headers)
 
 
-# Shown by /health and the startup log, so a deploy can be confirmed. The BUILD_TAG
-# environment variable (set per release, e.g. to the git commit) wins; otherwise this
-# label -- bump it in every release.
-BUILD_TAG = settings.build_tag.strip() or "2026-11-04-deliveries-n-plus-one"
+# Shown by /health and the startup log, so a deploy can be confirmed. First choice: the
+# first word of the first line of DEPLOY_MARKER_PATH, which the deploy script writes on
+# every deploy (the git short SHA). The BUILD_TAG env var reaches the container late
+# (it showed the previous deploy), so it is only the fallback; then this label.
+DEPLOY_MARKER_PATH = "/app/.deploy-marker"
+_DEFAULT_BUILD_LABEL = "2026-11-04-deliveries-n-plus-one"
+
+
+def build_label() -> str:
+    """Read on every call (a tiny file), so it is right as soon as the marker exists."""
+    try:
+        with open(DEPLOY_MARKER_PATH, encoding="utf-8", errors="replace") as marker:
+            words = marker.readline().split()
+        if words:
+            return words[0]
+    except OSError:
+        pass
+    return (os.environ.get("BUILD_TAG") or settings.build_tag).strip() or _DEFAULT_BUILD_LABEL
+
+
+BUILD_TAG = build_label()
 
 
 # What the startup work is doing: pending -> running -> done. Read by tests and logs only;
@@ -203,7 +220,7 @@ def on_startup() -> None:
     serve a request: the schema is migrated by `python -m app.core.ensure_migrated`
     before uvicorn starts, and the rest are logs, idempotent backfills and the
     reminder sweep. STARTUP_TASKS_IN_BACKGROUND=false runs it inline, as before."""
-    _log.info("Starting CRM API — build: %s", BUILD_TAG)
+    _log.info("Starting CRM API — build: %s", build_label())
     if settings.startup_tasks_in_background:
         import threading
 
@@ -298,7 +315,7 @@ def run_startup_tasks() -> None:
         _log.exception("Follow-up reminder sweep could not start")
 
     STARTUP_STATE.update(state="done", seconds=round(time.perf_counter() - begun, 3))
-    _log.info("CRM API startup tasks complete in %.1fs — build: %s", STARTUP_STATE["seconds"], BUILD_TAG)
+    _log.info("CRM API startup tasks complete in %.1fs — build: %s", STARTUP_STATE["seconds"], build_label())
 
 
 def _database_target() -> str:
@@ -338,7 +355,7 @@ def health() -> dict[str, str | None]:
     outage is visible from outside without needing the platform logs.
     """
     state, detail = _database_state()
-    body: dict[str, str | None] = {"status": "ok", "build": BUILD_TAG, "database": state}
+    body: dict[str, str | None] = {"status": "ok", "build": build_label(), "database": state}
     if detail:
         body["database_target"] = _database_target()
         body["database_error"] = detail
