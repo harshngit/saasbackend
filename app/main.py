@@ -221,6 +221,10 @@ def on_startup() -> None:
     before uvicorn starts, and the rest are logs, idempotent backfills and the
     reminder sweep. STARTUP_TASKS_IN_BACKGROUND=false runs it inline, as before."""
     _log.info("Starting CRM API — build: %s", build_label())
+    # Set by Cloudflare Containers inside every instance (not by us); "unknown" elsewhere.
+    _log.info("Container location: %s, region: %s, country: %s",
+              *(os.environ.get(name) or "unknown"
+                for name in ("CLOUDFLARE_LOCATION", "CLOUDFLARE_REGION", "CLOUDFLARE_COUNTRY_A2")))
     if settings.startup_tasks_in_background:
         import threading
 
