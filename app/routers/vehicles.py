@@ -18,6 +18,7 @@ from app.core.sorting import apply_sorting
 from app.models import Delivery, User, Vehicle, VehicleAssignmentHistory, VehicleLoading
 from app.schemas.bulk import BulkDelete, BulkDeleteResult
 from app.schemas.pagination import PaginatedResponse
+from app.services import activity_service
 from app.schemas.vehicle import (
     DeliveryPartnerBrief,
     VehicleActivityOut,
@@ -474,7 +475,15 @@ def bulk_delete_vehicles(
             )
 
     try:
+        # Audit trail: one entry per vehicle, written in the same transaction as the
+        # delete, so it exists exactly when the delete happened (a refused or failed
+        # batch leaves neither).
         for v in vehicles:
+            activity_service.record(
+                db, org_id, user, "vehicle", "Vehicle deleted",
+                f"{v.vehicle_number} deleted (bulk delete of {len(vehicles)})",
+                entity_type="vehicle", entity_id=v.id, action="deleted",
+            )
             db.delete(v)
         db.commit()
     except IntegrityError as exc:
@@ -503,5 +512,10 @@ def delete_vehicle(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"{used} delivery(s) name this vehicle. Set is_active false instead.",
         )
+    # Audit trail, in the same transaction as the delete (see bulk_delete_vehicles).
+    activity_service.record(
+        db, org_id, user, "vehicle", "Vehicle deleted", f"{vehicle.vehicle_number} deleted",
+        entity_type="vehicle", entity_id=vehicle.id, action="deleted",
+    )
     db.delete(vehicle)
     db.commit()

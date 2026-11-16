@@ -1007,15 +1007,54 @@ def test_vehicle_bulk_delete_and_guards():
     r = client.post("/vehicles/bulk-delete", json={"ids": [clean_id, used_id]}, headers=auth)
     check("Vehicle with delivery history in batch -> 409 Conflict", r.status_code == 409, r.text)
 
+    from app.models import ActivityLog
+
+    def _vehicle_audit(vehicle_id):
+        s = db_session()
+        try:
+            return s.query(ActivityLog).filter(
+                ActivityLog.organization_id == org_id,
+                ActivityLog.entity_type == "vehicle",
+                ActivityLog.entity_id == vehicle_id,
+            ).all()
+        finally:
+            s.close()
+
     db = db_session()
     try:
         check("Clean vehicle was NOT deleted (batch rolled back)", db.get(Vehicle, clean_id) is not None)
     finally:
         db.close()
+    check("Refused batch wrote no audit entry", _vehicle_audit(clean_id) == [])
 
     # Clean vehicle deletes cleanly via DELETE alias
     r = client.request("DELETE", "/vehicles/bulk-delete", json={"ids": [clean_id]}, headers=auth)
     check("Clean vehicle bulk deleted -> 200, deleted=1", r.status_code == 200 and r.json().get("deleted") == 1, r.text)
+    entries = _vehicle_audit(clean_id)
+    check("Bulk delete wrote one audit entry for the vehicle",
+          len(entries) == 1 and entries[0].action == "deleted" and entries[0].type == "vehicle"
+          and entries[0].user_id is not None and "bulk delete of 1" in (entries[0].description or ""),
+          [(e.action, e.description) for e in entries])
+
+    # Single-vehicle DELETE: refused -> no entry; deleted -> one entry
+    s = db_session()
+    try:
+        v_single = Vehicle(organization_id=org_id, vehicle_number=f"GJ-{uuid.uuid4().hex[:6]}")
+        s.add(v_single)
+        s.commit()
+        single_id, single_number = v_single.id, v_single.vehicle_number
+    finally:
+        s.close()
+    r = client.delete(f"/vehicles/{used_id}", headers=auth)
+    check("Single delete of a vehicle with deliveries -> 409", r.status_code == 409, r.text)
+    check("Refused single delete wrote no audit entry", _vehicle_audit(used_id) == [])
+    r = client.delete(f"/vehicles/{single_id}", headers=auth)
+    check("Single delete -> 204", r.status_code == 204, r.text)
+    entries = _vehicle_audit(single_id)
+    check("Single delete wrote one audit entry for the vehicle",
+          len(entries) == 1 and entries[0].action == "deleted" and entries[0].user_id is not None
+          and entries[0].description == f"{single_number} deleted",
+          [(e.action, e.description) for e in entries])
 
 
 # ---------------------------------------------------------------------------
