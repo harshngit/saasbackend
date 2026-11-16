@@ -171,9 +171,36 @@ async function proxyToContainer(request, env) {
   return busyResponse(request, env);
 }
 
+// ---------------------------------------------------------------------------
+// CORS preflight answered here, without waking or reaching the container.
+// Only a real preflight (OPTIONS + allowed Origin + Access-Control-Request-Method);
+// anything else -- including a preflight from an origin that is not allowed -- goes
+// to the container exactly as before. Mirrors the backend's CORSMiddleware
+// (allow_credentials=True, allow_methods=["*"], allow_headers=["*"]).
+// ---------------------------------------------------------------------------
+const PREFLIGHT_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+const PREFLIGHT_MAX_AGE = "7200";
+
+function preflightResponse(request, env) {
+  if (request.method !== "OPTIONS") return null;
+  const origin = request.headers.get("Origin");
+  if (!request.headers.has("Access-Control-Request-Method")) return null;
+  if (!originAllowed(origin, env)) return null;
+  const headers = new Headers({
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Methods": PREFLIGHT_METHODS,
+    "Access-Control-Max-Age": PREFLIGHT_MAX_AGE,
+    Vary: "Origin, Access-Control-Request-Headers",
+  });
+  const requested = request.headers.get("Access-Control-Request-Headers");
+  if (requested) headers.set("Access-Control-Allow-Headers", requested);
+  return new Response(null, { status: 204, headers });
+}
+
 export default {
   async fetch(request, env) {
-    return proxyToContainer(request, env);
+    return preflightResponse(request, env) || proxyToContainer(request, env);
   },
 
   // Keep-warm: container idle sleep mein na jaye, taaki pehli request fail na ho.
