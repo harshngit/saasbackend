@@ -80,9 +80,100 @@ export class CrmSaasBackend extends Container {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Container errors -> clean 503 with CORS headers, and one retry for safe requests
+//
+// When the container is starting, restarting or overloaded, the containers library does not throw:
+// it RETURNS a plain-text 500 ("Error proxying request to container...", "Container suddenly
+// disconnected...", "Failed to start container...") or a 503 ("There is no Container instance...").
+// Those responses carry no CORS headers, so the browser shows a CORS error instead of the real
+// problem. Here we (1) retry GET/HEAD/OPTIONS once, and (2) otherwise answer with a JSON 503
+// that has CORS headers, so the frontend can show "server busy" and retry.
+// Real answers from the app itself (including its own 4xx/5xx JSON errors) pass through untouched.
+// ---------------------------------------------------------------------------
+const CONTAINER_ERROR_PREFIXES = [
+  "Error proxying request to container",
+  "Container suddenly disconnected",
+  "Failed to start container",
+  "There is no Container instance available",
+];
+const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const RETRY_DELAY_MS = 1500;
+
+function originAllowed(origin, env) {
+  if (!origin) return false;
+  if (LOCAL_ORIGIN.test(origin)) return true;
+  const list = String(env.CORS_ORIGINS || "https://crm-saas.asynk.in")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.includes(origin) || list.includes("*");
+}
+
+async function isContainerError(res) {
+  if (res.status !== 500 && res.status !== 503) return false;
+  const type = res.headers.get("content-type") || "";
+  if (!type.startsWith("text/plain")) return false;
+  try {
+    const text = await res.clone().text();
+    return CONTAINER_ERROR_PREFIXES.some((p) => text.startsWith(p));
+  } catch {
+    return false;
+  }
+}
+
+function busyResponse(request, env) {
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "Retry-After": "5",
+    "Cache-Control": "no-store",
+    Vary: "Origin",
+  });
+  const origin = request.headers.get("Origin");
+  if (originAllowed(origin, env)) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Access-Control-Allow-Credentials", "true");
+  }
+  const body = { detail: "Server is busy or restarting. Please retry in a few seconds.", code: "container_unavailable" };
+  return new Response(JSON.stringify(body), { status: 503, headers });
+}
+
+async function proxyToContainer(request, env) {
+  const container = getContainer(env.CRM_BACKEND);
+  const canRetry = RETRYABLE_METHODS.has(request.method);
+  const spare = canRetry ? request.clone() : null;
+  const path = new URL(request.url).pathname;
+
+  let res = null;
+  try {
+    res = await container.fetch(request);
+  } catch (e) {
+    console.log("container-error: fetch threw", request.method, path, String(e));
+  }
+  if (res && !(await isContainerError(res))) return res;
+  if (res) console.log("container-error: library response", res.status, request.method, path);
+
+  if (canRetry) {
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    try {
+      const retry = await container.fetch(spare);
+      if (!(await isContainerError(retry))) {
+        console.log("container-error: retry ok", request.method, path);
+        return retry;
+      }
+    } catch (e) {
+      console.log("container-error: retry threw", request.method, path, String(e));
+    }
+  }
+
+  console.log("container-error: returning 503", request.method, path);
+  return busyResponse(request, env);
+}
+
 export default {
   async fetch(request, env) {
-    return getContainer(env.CRM_BACKEND).fetch(request);
+    return proxyToContainer(request, env);
   },
 
   // Keep-warm: container idle sleep mein na jaye, taaki pehli request fail na ho.
