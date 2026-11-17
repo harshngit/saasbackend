@@ -92,6 +92,95 @@ class Invoice(Base):
     order: Mapped["SalesOrder | None"] = relationship(lazy="joined")  # noqa: F821
     delivery: Mapped["Delivery | None"] = relationship(lazy="joined")  # noqa: F821
 
+    # ---------------------------------------------------------------- GST breakdown
+    # Derived, never stored: the taxable value of each line (its value before tax less its
+    # share of the bill-level discount, split as gst_calc splits it) and the CGST + SGST /
+    # IGST split, from the seller's and the buyer's state (GSTIN state code first, else the
+    # state on the record). Unknown supply type -> the split fields are null.
+
+    def _seller(self):  # noqa: ANN202
+        from sqlalchemy.orm import object_session
+
+        from app.models.organization import Organization
+
+        session = object_session(self)
+        return session.get(Organization, self.organization_id) if session is not None else None
+
+    @property
+    def customer_gstin(self) -> str | None:
+        return self.customer.gst_number if self.customer is not None else None
+
+    @property
+    def seller_gstin(self) -> str | None:
+        org = self._seller()
+        return org.gst_number if org is not None else None
+
+    @property
+    def place_of_supply(self) -> str | None:
+        """The buyer's state (where the goods are supplied), lower-case."""
+        from app.services import gst_calc
+
+        c = self.customer
+        return gst_calc.state_of(c.gst_number if c else None, c.state if c else None)
+
+    @property
+    def supply_type(self) -> str | None:
+        """intra_state | inter_state | null when either side's state is unknown."""
+        intra = self._intra_state()
+        return None if intra is None else ("intra_state" if intra else "inter_state")
+
+    def _intra_state(self) -> bool | None:
+        from app.services import gst_calc
+
+        org, c = self._seller(), self.customer
+        return gst_calc.is_intra_state(
+            org.gst_number if org else None, org.state if org else None,
+            c.gst_number if c else None, c.state if c else None,
+        )
+
+    def gst_lines(self) -> dict[str, dict]:
+        """Per item id: taxable_value + the CGST / SGST / IGST split."""
+        from app.services import gst_calc
+
+        items = list(self.items or [])
+        shares = gst_calc.split_discount([gst_calc.money(i.line_total) for i in items], self.discount or 0)
+        intra = self._intra_state()
+        out = {}
+        for item, share in zip(items, shares):
+            tax = item.tax_amount if item.tax_amount is not None else item.tax
+            out[item.id] = {
+                "taxable_value": float(gst_calc.money(item.line_total) - share),
+                **gst_calc.gst_split(tax or 0, item.tax_rate or 0, intra),
+            }
+        return out
+
+    @property
+    def taxable_total(self) -> float:
+        return round(sum(v["taxable_value"] for v in self.gst_lines().values()), 2)
+
+    @property
+    def tax_amount(self) -> float:
+        """The same figure as `tax`, under the name the lines use."""
+        return self.tax
+
+    def _tax_total(self, key: str) -> float | None:
+        values = [v[key] for v in self.gst_lines().values()]
+        if any(v is None for v in values):
+            return None
+        return round(sum(values), 2)
+
+    @property
+    def cgst_total(self) -> float | None:
+        return self._tax_total("cgst_amount")
+
+    @property
+    def sgst_total(self) -> float | None:
+        return self._tax_total("sgst_amount")
+
+    @property
+    def igst_total(self) -> float | None:
+        return self._tax_total("igst_amount")
+
 
 class InvoiceItem(Base):
     __tablename__ = "invoice_items"
@@ -134,6 +223,39 @@ class InvoiceItem(Base):
     invoice: Mapped["Invoice"] = relationship(back_populates="items")
     product: Mapped["Product | None"] = relationship(foreign_keys=[product_id], lazy="joined")  # noqa: F821
     variant: Mapped["ProductVariant | None"] = relationship(foreign_keys=[variant_id], lazy="joined")  # noqa: F821
+
+    def _gst(self) -> dict:
+        if self.invoice is None:
+            return {}
+        return self.invoice.gst_lines().get(self.id, {})
+
+    @property
+    def taxable_value(self) -> float | None:
+        return self._gst().get("taxable_value")
+
+    @property
+    def cgst_rate(self) -> float | None:
+        return self._gst().get("cgst_rate")
+
+    @property
+    def cgst_amount(self) -> float | None:
+        return self._gst().get("cgst_amount")
+
+    @property
+    def sgst_rate(self) -> float | None:
+        return self._gst().get("sgst_rate")
+
+    @property
+    def sgst_amount(self) -> float | None:
+        return self._gst().get("sgst_amount")
+
+    @property
+    def igst_rate(self) -> float | None:
+        return self._gst().get("igst_rate")
+
+    @property
+    def igst_amount(self) -> float | None:
+        return self._gst().get("igst_amount")
 
     @property
     def product_image_url(self) -> str | None:
