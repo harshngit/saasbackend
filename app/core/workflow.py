@@ -123,6 +123,7 @@ ALLOWED_ITEM_COLUMNS = (
     "discount",
     "tax_rate",
     "tax_amount",
+    "taxable_value",
     "batch_number",
     "expiry_date",
     "amount",

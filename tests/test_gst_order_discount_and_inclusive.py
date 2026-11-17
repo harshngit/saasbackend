@@ -292,3 +292,110 @@ def test_order_status_label_follows_confirmation(firm):
     assert _db_order(draft["id"])["order_status"] == "Draft"
     client.post(f"/orders/{draft['id']}/confirm", headers=firm["h"])
     assert _db_order(draft["id"])["order_status"] == "Confirmed"
+
+
+# ------------------------------------------------- 5. no double billing (QA 17 Nov, item 1)
+def test_delivery_invoice_refused_when_order_is_invoiced_as_a_whole(firm):
+    o = _order(firm, [("p18", 4)])
+    r = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"], params={"allow_upfront": True})
+    assert r.status_code == 201, r.text                     # the whole order, no delivery_id
+    r = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"],
+                    json={"delivery_id": _delivery(firm, o["id"], 1)})
+    assert r.status_code == 409, r.text
+    assert "the same goods twice" in r.json()["detail"]
+    db = SessionLocal()
+    try:
+        from app.models import Invoice
+        assert db.query(Invoice).filter(Invoice.order_id == o["id"]).count() == 1   # nothing billed twice
+    finally:
+        db.close()
+
+
+def test_delivery_invoices_still_work_without_a_whole_order_invoice(firm):
+    o = _order(firm, [("p18", 2)])
+    r1 = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"], json={"delivery_id": _delivery(firm, o["id"], 1)})
+    r2 = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"], json={"delivery_id": _delivery(firm, o["id"], 1)})
+    assert r1.status_code == 201 and r2.status_code == 201, (r1.text, r2.text)
+
+
+# ------------------------------------------------------------- 6. invoice PDF (GST layout)
+GST_COLS = ["product", "hsn_sac", "quantity", "rate", "taxable_value", "tax_rate", "tax_amount", "amount"]
+
+
+def _pdf_texts(monkeypatch, f, invoice_id, fmt="detailed"):
+    from app.core import invoice_regular_pdf as reg
+    seen = []
+    original = reg._Doc.text
+
+    def spy(self, x, y, width, text, size_px, **kw):
+        seen.append(str(text or ""))
+        return original(self, x, y, width, text, size_px, **kw)
+
+    monkeypatch.setattr(reg._Doc, "text", spy)
+    r = client.get(f"/invoices/{invoice_id}/pdf", headers=f["h"], params={"format": fmt})
+    assert r.status_code == 200 and r.content[:4] == b"%PDF", r.text[:300]
+    return seen
+
+
+def _value_after(texts, label):
+    return texts[texts.index(label) + 1]
+
+
+def test_more_than_five_item_columns_can_be_saved(firm):
+    r = client.patch("/invoice-settings", headers=firm["h"], json={"item_table": {"columns": GST_COLS}})
+    assert r.status_code == 200, r.text
+    assert r.json()["item_table"]["columns"] == GST_COLS
+
+
+def test_detailed_pdf_prints_gst_columns_and_cgst_sgst(firm, monkeypatch):
+    client.patch("/invoice-settings", headers=firm["h"], json={"item_table": {"columns": GST_COLS}})
+    o = _order(firm, [("p18", 2)], discount=200.0)          # taxable 1800, GST 324 -> 162 + 162
+    inv = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"], params={"allow_upfront": True}).json()
+    t = _pdf_texts(monkeypatch, firm, inv["id"])
+    for header in ("TAXABLE VALUE", "GST %", "GST AMOUNT"):
+        assert header in t, (header, t)
+    assert "TAX)" in t or "AMOUNT (BEFORE TAX)" in t, t      # wrapped, not cut off
+    assert not any("…" in x for x in t), t
+    assert "Place of supply: Maharashtra" in t
+    assert _value_after(t, "Discount").endswith("200.00")
+    assert _value_after(t, "Taxable Value").endswith("1,800.00")
+    assert _value_after(t, "CGST").endswith("162.00") and _value_after(t, "SGST").endswith("162.00")
+    assert "IGST" not in t and "Total GST" not in t and "Tax" not in t
+    assert _value_after(t, "Grand Total").endswith("2,124.00")
+
+
+def test_detailed_pdf_igst_unknown_state_and_zero_gst(firm, monkeypatch):
+    t = _pdf_texts(monkeypatch, firm, _bill(firm, firm["other_state"])["id"])
+    assert _value_after(t, "IGST").endswith("180.00") and "CGST" not in t
+    assert "Place of supply: Karnataka" in t
+    t = _pdf_texts(monkeypatch, firm, _bill(firm, firm["unknown"])["id"])
+    assert _value_after(t, "Total GST").endswith("180.00") and "CGST" not in t and "IGST" not in t
+    r = client.post("/invoices", headers=firm["h"], json={
+        "customer_id": firm["local"], "warehouse_id": firm["wh"],
+        "items": [{"product_id": firm["p"]["p0"], "quantity": 1}]})
+    t = _pdf_texts(monkeypatch, firm, r.json()["id"])
+    assert _value_after(t, "CGST").endswith("0.00") and _value_after(t, "SGST").endswith("0.00")  # printed at 0
+
+
+def test_simple_pdf_explains_its_total_without_gst_columns(firm, monkeypatch):
+    client.patch("/invoice-settings", headers=firm["h"], json={"item_table": {"columns": GST_COLS}})
+    o = _order(firm, [("p18", 2)], discount=200.0)
+    inv = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"], params={"allow_upfront": True}).json()
+    t = _pdf_texts(monkeypatch, firm, inv["id"], fmt="simple")
+    assert "GST %" not in t and "GST AMOUNT" not in t and "TAXABLE VALUE" not in t
+    assert _value_after(t, "Discount").endswith("200.00")
+    assert _value_after(t, "Total GST").endswith("324.00")
+    assert _value_after(t, "Grand Total").endswith("2,124.00")
+
+
+# ------------------------------------------- 7. GST report agrees with the saved invoice tax
+def test_gst_report_taxable_value_is_after_the_invoice_discount(firm):
+    o = _order(firm, [("p18", 2)], discount=200.0)                  # taxable 1800, GST 324
+    inv = client.post(f"/orders/{o['id']}/invoice", headers=firm["h"], params={"allow_upfront": True}).json()
+    r = client.get("/reports/gst-summary", headers=firm["h"], params={"group_by": "transaction", "page_size": 100})
+    assert r.status_code == 200, r.text
+    row = next(x for x in r.json()["rows"] if x["document_number"] == inv["invoice_number"])
+    assert (row["taxable_value"], row["tax_amount"], row["total_amount"]) == (1800.0, 324.0, 2124.0)
+    assert row["taxable_value"] == inv["taxable_total"] and row["tax_amount"] == inv["tax"]
+    s = client.get("/reports/gst-summary", headers=firm["h"]).json()["rows"][0]
+    assert (s["taxable_value"], s["tax_amount"]) == (1800.0, 324.0)

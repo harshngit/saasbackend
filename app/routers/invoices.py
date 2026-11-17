@@ -213,6 +213,30 @@ def generate_from_order(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="That delivery belongs to a different order",
             )
+        # An invoice for the whole order (no delivery_id: the one raised automatically
+        # at order creation, or the aggregate one after full delivery) already bills
+        # these goods. Its lines point at no delivery, so the per-delivery "already
+        # invoiced" count below cannot see them; without this check the same goods
+        # would be billed twice.
+        whole_order = (
+            db.query(Invoice)
+            .filter(
+                Invoice.order_id == order.id,
+                Invoice.organization_id == org_id,
+                Invoice.delivery_id.is_(None),
+                Invoice.is_credit_note.is_(False),
+            )
+            .first()
+        )
+        if whole_order:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"This order is already invoiced as a whole ({whole_order.invoice_number}); "
+                    f"a delivery-wise invoice would bill the same goods twice "
+                    f"(Invoice ID: {whole_order.id})"
+                ),
+            )
         if delivery.delivered_total <= 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

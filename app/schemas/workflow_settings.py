@@ -238,8 +238,6 @@ class ItemTableSettings(BaseModel):
     def validate_columns(cls, v: list[str]) -> list[str]:
         if not v:
             raise ValueError("Item table columns list cannot be empty")
-        if len(v) > 5:
-            raise ValueError("Item table cannot have more than 5 columns")
         if len(v) != len(set(v)):
             raise ValueError("Duplicate columns are not allowed in item table")
         for col in v:
@@ -268,8 +266,6 @@ class ItemTableSettingsUpdate(BaseModel):
             return v
         if not v:
             raise ValueError("Item table columns list cannot be empty")
-        if len(v) > 5:
-            raise ValueError("Item table cannot have more than 5 columns")
         if len(v) != len(set(v)):
             raise ValueError("Duplicate columns are not allowed in item table")
         for col in v:

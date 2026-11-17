@@ -1595,6 +1595,13 @@ def _iso_date(value) -> str:
     return value.date().isoformat() if hasattr(value, "date") else str(value)[:10]
 
 
+def _invoice_taxable(inv) -> float:
+    """A sales invoice's taxable value: its pre-tax subtotal less the invoice-level
+    discount. GST is charged after that discount (gst_calc), so this is the base the
+    invoice's stored `tax` was worked out on."""
+    return max((inv.subtotal or 0.0) - (inv.discount or 0.0), 0.0)
+
+
 def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
     registry = REPORT_REGISTRY["gst-summary"]
     group_by = params.get("group_by") or "summary"
@@ -1706,7 +1713,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
                 "party_name": (cust.business_name or cust.name) if cust else (inv.walk_in_name or "Walk-in"),
                 "gst_number": cust.gst_number if cust else None,
                 "status": inv.status,
-                "taxable_value": round(inv.subtotal or 0.0, 2),
+                "taxable_value": round(_invoice_taxable(inv), 2),
                 "tax_amount": round(inv.tax or 0.0, 2),
                 "total_amount": round(inv.total or 0.0, 2),
             })
@@ -1954,7 +1961,7 @@ def _gst_aggregate(db: Session, org_id: str, df: datetime | None, dt: datetime |
     rows = [
         {
             "type": "Output GST (Sales Invoices)",
-            "taxable_value": round(sum(i.subtotal for i in invoices), 2),
+            "taxable_value": round(sum(_invoice_taxable(i) for i in invoices), 2),
             "tax_amount": round(gross_output_gst, 2),
             "description": f"Tax on {len(invoices)} issued tax sales invoices",
         },
@@ -1973,7 +1980,7 @@ def _gst_aggregate(db: Session, org_id: str, df: datetime | None, dt: datetime |
         {
             "type": "Net GST Liability",
             "taxable_value": round(
-                (sum(i.subtotal for i in invoices) - sales_return_taxable)
+                (sum(_invoice_taxable(i) for i in invoices) - sales_return_taxable)
                 - (sum(i.subtotal for i in sup_invoices) - purchase_return_taxable),
                 2,
             ),
