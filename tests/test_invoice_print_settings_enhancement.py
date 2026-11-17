@@ -242,9 +242,11 @@ def run_tests():
         r = client.patch("/invoice-settings", json={"item_table": {"columns": ["product", "quantity", "rate"]}}, headers=auth1)
         assert_eq(r.status_code, 422, "Missing amount column rejected with 422")
 
-        # More than 5 columns rejected
-        r = client.patch("/invoice-settings", json={"item_table": {"columns": ["product", "hsn_sac", "quantity", "rate", "tax_amount", "amount"]}}, headers=auth1)
-        assert_eq(r.status_code, 422, "More than 5 columns rejected with 422")
+        # More than 5 columns accepted (the cap was lifted for the detailed GST invoice)
+        many_cols = ["product", "hsn_sac", "quantity", "rate", "taxable_value", "tax_rate", "tax_amount", "amount"]
+        r = client.patch("/invoice-settings", json={"item_table": {"columns": many_cols}}, headers=auth1)
+        assert_eq(r.status_code, 200, "More than 5 columns accepted with 200")
+        assert_eq(r.json()["item_table"]["columns"], many_cols, "All 8 columns saved in order")
 
         # Valid 5-column item table patch
         valid_cols_5 = ["product", "product_image", "quantity", "rate", "amount"]

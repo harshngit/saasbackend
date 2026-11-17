@@ -59,17 +59,23 @@ COLUMNS = {
     "rate": ("Rate", 20, "R"),
     "mrp": ("MRP", 18, "R"),
     "discount": ("Discount", 16, "R"),
-    "tax_rate": ("Tax Rate", 14, "R"),
-    "tax_amount": ("Tax Amount", 18, "R"),
+    "taxable_value": ("Taxable Value", 20, "R"),
+    "tax_rate": ("GST %", 14, "R"),
+    "tax_amount": ("GST Amount", 18, "R"),
     "batch_number": ("Batch Number", 16, "C"),
     "expiry_date": ("Expiry Date", 18, "C"),
-    "amount": ("Amount", 24, "R"),
+    # line_total: the line's value before tax (also for tax-inclusive items).
+    "amount": ("Amount (before tax)", 24, "R"),
 }
 DEFAULT_COLUMNS = ["product", "hsn_sac", "quantity", "rate", "amount"]
+# Per-line GST columns belong on the detailed tax invoice only; the simple copy shows
+# GST once, in its totals, and keeps to the old five-column limit.
+GST_COLUMNS = ("taxable_value", "tax_rate", "tax_amount")
+SIMPLE_MAX_COLUMNS = 5
 
 # The frontend's only definition of the simple format (InvoicePrintView.jsx): the same
-# document with payment details, the footer's terms / footer text / signature, and the
-# Discount and Tax total rows hidden.
+# document without payment details or the footer's terms / footer text / signature. GST
+# appears once, as a Total GST row (see _totals), with no per-line GST columns.
 
 
 # ------------------------------------------------------------------ formatting
@@ -349,6 +355,9 @@ def _cell(item, key: str) -> str:
     if key == "tax_amount":
         amount = item.tax_amount if item.tax_amount is not None else item.tax
         return inr(amount) if amount is not None else dash
+    if key == "taxable_value":
+        value = item.taxable_value
+        return inr(value if value is not None else item.line_total)
     if key == "batch_number":
         return item.batch_number or dash
     if key == "expiry_date":
@@ -358,9 +367,10 @@ def _cell(item, key: str) -> str:
     return dash
 
 
-def _columns(settings: dict) -> list[str]:
+def _columns(settings: dict, simple: bool = False) -> list[str]:
     """resolveActiveColumns(): configured order, unknown keys dropped, product/amount
-    guaranteed, product_image only with show_product_image."""
+    guaranteed, product_image only with show_product_image. The simple format drops the
+    per-line GST columns and keeps at most SIMPLE_MAX_COLUMNS (product and amount always)."""
     cfg = settings.get("item_table") or {}
     configured = cfg.get("columns") or DEFAULT_COLUMNS
     seen: list[str] = []
@@ -370,7 +380,13 @@ def _columns(settings: dict) -> list[str]:
     for key in ("product", "amount"):
         if key not in seen:
             seen.append(key)
-    return [key for key in seen if key != "product_image" or cfg.get("show_product_image")]
+    keys = [key for key in seen if key != "product_image" or cfg.get("show_product_image")]
+    if simple:
+        keys = [key for key in keys if key not in GST_COLUMNS]
+        while len(keys) > SIMPLE_MAX_COLUMNS:
+            drop = next(k for k in reversed(keys) if k not in ("product", "amount"))
+            keys.remove(drop)
+    return keys
 
 
 # ------------------------------------------------------------------ sections
@@ -564,6 +580,9 @@ def _party(doc: _Doc, customer, invoice, settings: dict) -> bool:
         rows.append((f"Ph: {phone}", "", NEUTRAL[500]))
     if party.get("show_customer_gstin", fields.get("show_customer_gstin", True)) and gstin:
         rows.append((f"GSTIN: {gstin}", "", NEUTRAL[500]))
+    place = getattr(invoice, "place_of_supply", None)
+    if place:
+        rows.append((f"Place of supply: {place.title()}", "", NEUTRAL[500]))
 
     col_w = (doc.width - doc.px(16)) / 2 if show_ship else doc.width
     bill = _party_column(doc, "Bill To", rows, col_w, accent)
@@ -585,9 +604,9 @@ _HEADER_BORDER = {"grid": ("box", 2, 300), "minimal": ("bottom", 1, 200)}
 _ROW_BORDER = {"grid": ("box", 1, 200), "banded": ("bottom", 1, 50), "minimal": None}
 
 
-def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None) -> None:
+def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None, simple: bool = False) -> None:
     style = doc.theme["table"]
-    keys = _columns(settings)
+    keys = _columns(settings, simple)
     total_weight = sum(COLUMNS[k][1] for k in keys)
     pad_x = doc.px(12 if style == "wide" else 6)
     # flex-grow with flex-basis 0: each cell keeps its padding, the rest is shared by weight.
@@ -596,7 +615,19 @@ def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None) -> None
     row_pad = doc.px(ROW_PAD_PX.get(doc.theme["base_template"], 6.0))
     head_size = doc.table_px * 0.62
     head_color = doc.primary if doc.theme["accent"] == "bold" else NEUTRAL[400]
-    head_h = doc.px(12) + doc.line(head_size)
+    # A heading too wide for its column (e.g. "Amount (before tax)" with 8 columns) wraps
+    # onto a second line instead of being cut off; a third line would still be truncated.
+    spacing_slack = 1.05  # the headings print with 0.025em letter spacing; measure() ignores it
+    head_labels = []
+    for key, w in zip(keys, widths):
+        inner = (w - 2 * pad_x) / spacing_slack
+        lines = doc.wrap(COLUMNS[key][0].upper(), inner, head_size, "B")
+        if len(lines) > 2:
+            lines = [lines[0], doc.fit(" ".join(lines[1:]), inner, head_size, "B")]
+        head_labels.append(lines)
+    head_lines = max(len(lines) for lines in head_labels)
+    head_line_h = doc.line(head_size)
+    head_h = doc.px(12) + head_line_h * head_lines
     # As in the frontend, the picture sits inside the product cell whenever
     # show_product_image is on; a "product_image" column itself only prints a dash.
     show_images = bool((settings.get("item_table") or {}).get("show_product_image") and item_images)
@@ -607,10 +638,11 @@ def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None) -> None
         y = doc.y
         kind, bpx, shade = _HEADER_BORDER.get(style, ("bottom", 2, 200))
         x = doc.left
-        for key, w in zip(keys, widths):
-            label = COLUMNS[key][0].upper()
-            doc.text(x + pad_x, y, w - 2 * pad_x, doc.fit(label, w - 2 * pad_x, head_size, "B"), head_size,
-                     style="B", color=head_color, align=COLUMNS[key][2], spacing_em=0.025, height=head_h)
+        for key, w, lines in zip(keys, widths, head_labels):
+            for n, label in enumerate(lines):
+                doc.text(x + pad_x, y + doc.px(6) + n * head_line_h, w - 2 * pad_x, label, head_size,
+                         style="B", color=head_color, align=COLUMNS[key][2], spacing_em=0.025,
+                         height=head_line_h)
             x += w
         if kind == "box":
             doc.box(doc.left, y, doc.width, head_h, border=NEUTRAL[shade], border_px=bpx)
@@ -651,22 +683,35 @@ def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None) -> None
 
 
 def _totals(doc: _Doc, invoice, settings: dict, simple: bool = False) -> None:
-    """SummaryTotals(). Every amount is the invoice's stored figure; Additional Charges and
-    Round Off are shown whenever set, since the Total includes them. The simple format hides
-    the Discount and Tax rows (InvoicePrintView.jsx's preset turns show_discount and
-    show_tax_amount off); the Total still includes both."""
+    """SummaryTotals(). Every amount is the invoice's stored or computed figure.
+
+    Detailed: Subtotal, Discount (when > 0), Taxable Value, then the GST split by supply
+    type -- CGST + SGST (intra_state), IGST (inter_state), or only Total GST when the
+    supply type is unknown -- printed even at 0.00, then Additional Charges / Round Off
+    when set, and Grand Total.
+    Simple: Subtotal, Discount (when > 0), Total GST, charges / round off, Grand Total,
+    so the copy still explains its own total."""
     fields = settings.get("fields") or {}
     style = doc.theme["totals"]
     rows = [("Subtotal", inr(invoice.subtotal))]
-    if not simple and fields.get("show_discount", True) and invoice.discount:
+    if fields.get("show_discount", True) and invoice.discount:
         rows.append(("Discount", f"-{inr(invoice.discount)}"))
-    if not simple and fields.get("show_tax_amount", True) and invoice.tax:
-        rows.append(("Tax", inr(invoice.tax)))
+    if fields.get("show_tax_amount", True):
+        supply = None if simple else getattr(invoice, "supply_type", None)
+        if not simple:
+            rows.append(("Taxable Value", inr(invoice.taxable_total)))
+        if supply == "intra_state":
+            rows.append(("CGST", inr(invoice.cgst_total)))
+            rows.append(("SGST", inr(invoice.sgst_total)))
+        elif supply == "inter_state":
+            rows.append(("IGST", inr(invoice.igst_total)))
+        else:
+            rows.append(("Total GST", inr(invoice.tax)))
     if invoice.additional_charges:
         rows.append(("Additional Charges", inr(invoice.additional_charges)))
     if invoice.round_off:
         rows.append(("Round Off", inr(invoice.round_off)))
-    total = ("Total", inr(invoice.total))
+    total = ("Grand Total", inr(invoice.total))
     size, lh = doc.body_px, doc.line(doc.body_px)
 
     if style == "inline":
@@ -849,7 +894,7 @@ def render_regular_invoice(
     doc.y += gap
     if _party(doc, customer, invoice, settings):
         doc.y += gap
-    _table(doc, invoice, settings, item_images)
+    _table(doc, invoice, settings, item_images, simple)
     doc.y += gap
     _totals(doc, invoice, settings, simple)
     doc.y += gap

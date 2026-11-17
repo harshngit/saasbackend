@@ -467,6 +467,7 @@ COLUMN_WEIGHTS = {
     "discount": 16.0,
     "tax_rate": 14.0,
     "tax_amount": 18.0,
+    "taxable_value": 20.0,
     "batch_number": 16.0,
     "expiry_date": 18.0,
     "amount": 24.0,
@@ -482,8 +483,9 @@ COLUMN_HEADERS = {
     "rate": "Rate",
     "mrp": "MRP",
     "discount": "Disc",
-    "tax_rate": "Tax %",
-    "tax_amount": "Tax",
+    "tax_rate": "GST %",
+    "tax_amount": "GST",
+    "taxable_value": "Taxable",
     "batch_number": "Batch",
     "expiry_date": "Expiry",
     "amount": "Amount",
@@ -501,6 +503,7 @@ COLUMN_ALIGNS = {
     "discount": "R",
     "tax_rate": "R",
     "tax_amount": "R",
+    "taxable_value": "R",
     "batch_number": "C",
     "expiry_date": "C",
     "amount": "R",
@@ -881,6 +884,9 @@ def _get_item_cell_value(item, col_key: str) -> str:
         return f"{(item.tax_rate or 0):g}"
     elif col_key == "tax_amount":
         return _money(item.tax)
+    elif col_key == "taxable_value":
+        value = getattr(item, "taxable_value", None)
+        return _money(value if value is not None else item.line_total)
     elif col_key == "batch_number":
         return _s(item.batch_number or "-")
     elif col_key == "expiry_date":
@@ -1142,6 +1148,11 @@ def invoice_detailed_pdf(
         active_cols.insert(0, "product")
     if "amount" not in active_cols:
         active_cols.append("amount")
+    # The 5-column limit on the saved setting was lifted for the A4/A5 detailed invoice;
+    # a receipt roll keeps the old limit for a configured list (product/amount kept).
+    if item_table_cfg.get("columns"):
+        while len(active_cols) > 5:
+            active_cols.remove(next(c for c in reversed(active_cols) if c not in ("product", "amount")))
 
     total_weight = sum(COLUMN_WEIGHTS[c] for c in active_cols)
     scale = width / total_weight
