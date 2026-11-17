@@ -12,7 +12,9 @@ from app.core import scoping
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, delete_replaced_file, get_bytes, safe_filename, save_upload
 from app.models import Customer, CustomerDocument, CustomerPayment, DeliveryCollection, Invoice, StoredFile, User
+from app.schemas.customer_payment_lists import CollectedPaymentsOut, PendingPaymentsOut
 from app.services import (
+    customer_payment_lists,
     customer_profile_service,
     ledger_service,
     lookup_service,
@@ -481,6 +483,69 @@ def list_customer_payments(
 
     payments.sort(key=_when, reverse=True)
     return payments
+
+
+@router.get("/{customer_id}/payments/pending", response_model=PendingPaymentsOut)
+def list_pending_payments(
+    customer_id: str,
+    from_date: str | None = Query(default=None, description="Invoice date from (YYYY-MM-DD, organization's timezone)"),
+    to_date: str | None = Query(default=None, description="Invoice date to (YYYY-MM-DD, inclusive)"),
+    due_from: str | None = Query(default=None, description="Due date from (YYYY-MM-DD)"),
+    due_to: str | None = Query(default=None, description="Due date to (YYYY-MM-DD, inclusive)"),
+    overdue: bool | None = Query(default=None, description="true = only overdue, false = only not overdue"),
+    payment_status: str | None = Query(default=None, description="unpaid | partial"),
+    search: str | None = Query(default=None, description="Invoice number contains"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="invoice_date | due_date | invoice_number | total | outstanding"),
+    sort_order: str | None = Query(default=None, description="asc | desc"),
+    user: User = Depends(_pay_view),
+    db: Session = Depends(get_db),
+) -> PendingPaymentsOut:
+    """The customer's invoices that still have money owing, oldest due date first.
+
+    Outstanding = invoice total - amount paid / allocated - credit notes issued against it
+    (the customer ledger's own figure). Credit notes, void / cancelled and fully settled
+    invoices are not listed. Overdue = the due date is before today in the organization's
+    timezone; an invoice without a due date is never overdue. `summary` covers every row
+    matching the filters, not just this page."""
+    customer = _owned_customer(db, customer_id, user)
+    return customer_payment_lists.pending(
+        db, customer, from_date=from_date, to_date=to_date, due_from=due_from, due_to=due_to, overdue=overdue,
+        payment_status=payment_status, search=search, page=page, page_size=page_size,
+        sort_by=sort_by, sort_order=sort_order,
+    )
+
+
+@router.get("/{customer_id}/payments/collected", response_model=CollectedPaymentsOut)
+def list_collected_payments(
+    customer_id: str,
+    from_date: str | None = Query(default=None, description="Payment date from (YYYY-MM-DD, organization's timezone)"),
+    to_date: str | None = Query(default=None, description="Payment date to (YYYY-MM-DD, inclusive)"),
+    payment_mode: str | None = Query(default=None, description="cash | upi | card | … (also matches a split's tender)"),
+    payment_status: str | None = Query(default=None, description="recorded (the only state a listed payment has)"),
+    search: str | None = Query(default=None, description="Receipt number, transaction reference or invoice number contains"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=100),
+    sort_by: str | None = Query(default=None, description="payment_date | amount | receipt_number"),
+    sort_order: str | None = Query(default=None, description="asc | desc"),
+    user: User = Depends(_pay_view),
+    db: Session = Depends(get_db),
+) -> CollectedPaymentsOut:
+    """The customer's recorded payments, newest first, each listed once with the invoices
+    it was applied to and any part held on account (unallocated).
+
+    Only finalized payments: a field / delivery collection still awaiting reconciliation
+    is NOT here (GET /customers/{id}/payments shows those); once reconciled it appears
+    once, as the payment the reconciliation recorded (`source: delivery_collection`). A
+    voided payment is deleted and never listed. `summary` covers every row matching the
+    filters, not just this page."""
+    customer = _owned_customer(db, customer_id, user)
+    return customer_payment_lists.collected(
+        db, customer, from_date=from_date, to_date=to_date, payment_mode=payment_mode,
+        payment_status=payment_status, search=search, page=page, page_size=page_size,
+        sort_by=sort_by, sort_order=sort_order,
+    )
 
 
 def _pending_collection_row(coll: "DeliveryCollection") -> dict:
