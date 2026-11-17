@@ -26,7 +26,7 @@ from app.core.realtime import queue_event
 from app.models import Customer, Delivery, Invoice, Organization, Product, ProductVariant, SalesOrder, SalesOrderItem, User
 from app.schemas.sales_order import OrderUpdate
 from app.core import notification_types as nt
-from app.services import entitlement_service, notification_service, numbering_service, stock_service
+from app.services import entitlement_service, gst_calc, notification_service, numbering_service, stock_service
 
 
 class OrderLine:
@@ -65,6 +65,28 @@ class OrderLine:
         self.tax_rate = tax_rate
         self.uom = uom
         self.cost_price = cost_price
+
+
+def stored_line_pricing(item) -> dict:  # noqa: ANN001
+    """An order line's pricing input for gst_calc, read back from what was stored.
+
+    `line_total` is the line's value before tax. When it is below the amount entered on
+    the line (price x qty - line discount), the price was tax-inclusive and the difference
+    is the GST that price contained -- so it is recovered exactly, not recomputed."""
+    value = gst_calc.money(item.line_total)
+    entered = gst_calc.money((item.unit_price or 0) * (item.quantity or 0) - (item.discount or 0))
+    rate = item.tax_rate
+    inclusive_tax = entered - value if (rate and entered > value) else None
+    return {"value": value, "rate": rate, "inclusive_tax": inclusive_tax}
+
+
+def apply_line_tax(items, priced: list[dict], order_discount) -> float:  # noqa: ANN001
+    """Split the order-level discount over the lines and set each line's GST on what is
+    left. Returns the order's total line tax."""
+    taxed = gst_calc.tax_lines(priced, order_discount or 0)
+    for item, line in zip(items, taxed):
+        item.tax_amount = float(line.tax)
+    return float(sum((line.tax for line in taxed), gst_calc.ZERO))
 
 
 def next_order_number(db: Session, org_id: str) -> str:
@@ -201,7 +223,7 @@ def place_order(
     )
 
     subtotal = 0.0
-    line_tax = 0.0
+    priced: list[dict] = []
     wanted: list[dict] = []
     for line in lines:
         product = db.get(Product, line.product_id)
@@ -227,13 +249,17 @@ def place_order(
         disc_pct = getattr(line, "discount_percent", None) or 0
         if disc_amount == 0 and disc_pct > 0:
             disc_amount = round(gross * disc_pct / 100, 2)
-        line_total = round(gross - disc_amount, 2)
         # The line's own rate, else the product's. Never a hardcoded figure — an
         # invoice raised later bills this snapshot.
         rate = line.tax_rate if line.tax_rate is not None else product.tax_rate
-        tax_amount = round(line_total * (rate or 0) / 100, 2)
+        # line_total is the line's value BEFORE tax (a tax-inclusive price is taken apart);
+        # tax_amount is set below, once the order-level discount is split over the lines.
+        value, inclusive_tax = gst_calc.pre_tax_value(
+            gross - disc_amount, rate, gst_calc.effective_tax_inclusive(product, variant))
+        line_total = float(value)
+        tax_amount = 0.0
+        priced.append({"value": value, "rate": rate, "inclusive_tax": inclusive_tax})
         subtotal += line_total
-        line_tax += tax_amount
         cost_price = (
             line.cost_price
             if getattr(line, "cost_price", None) is not None
@@ -277,9 +303,10 @@ def place_order(
             )
 
     order.subtotal = round(subtotal, 2)
+    line_tax = apply_line_tax(order.items, priced, order_level_discount)
     # An order-level tax overrides the per-line total when one is sent, so callers
     # written against the old flat `tax` field keep working.
-    order.tax = order_level_tax if order_level_tax else round(line_tax, 2)
+    order.tax = order_level_tax if order_level_tax else line_tax
     order.total = round(order.subtotal - order_level_discount + order.tax, 2)
 
     warnings = []
@@ -387,6 +414,10 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
 
     # Lifecycle status
     order.status = "placed"
+    # The free-text label was set to "Draft" at creation; keep it from contradicting the
+    # status (a label the user typed themselves is left alone).
+    if (order.order_status or "Draft") == "Draft":
+        order.order_status = "Confirmed"
 
     # Credit warnings
     warnings: list[str] = []
@@ -584,7 +615,7 @@ def update_order(
         db.flush()
 
         subtotal = 0.0
-        line_tax = 0.0
+        priced: list[dict] = []
         wanted: list[dict] = []
         for line in payload.items:
             product = db.get(Product, line.product_id)
@@ -611,11 +642,13 @@ def update_order(
             disc_pct = getattr(line, "discount_percent", None) or 0
             if disc_amount == 0 and disc_pct > 0:
                 disc_amount = round(gross * disc_pct / 100, 2)
-            line_total = round(gross - disc_amount, 2)
             rate = line.tax_rate if line.tax_rate is not None else product.tax_rate
-            tax_amount = round(line_total * (rate or 0) / 100, 2)
+            value, inclusive_tax = gst_calc.pre_tax_value(
+                gross - disc_amount, rate, gst_calc.effective_tax_inclusive(product, variant))
+            line_total = float(value)
+            tax_amount = 0.0  # set below, after the order-level discount is split
+            priced.append({"value": value, "rate": rate, "inclusive_tax": inclusive_tax})
             subtotal += line_total
-            line_tax += tax_amount
             cost_price = (
                 line.cost_price
                 if getattr(line, "cost_price", None) is not None
@@ -659,10 +692,11 @@ def update_order(
         order.subtotal = round(subtotal, 2)
         if payload.discount is not None:
             order.discount = payload.discount
+        line_tax = apply_line_tax(order.items, priced, order.discount)
         if payload.tax is not None:
             order.tax = payload.tax
         else:
-            order.tax = round(line_tax, 2)
+            order.tax = line_tax
         order.total = round(order.subtotal - order.discount + order.tax, 2)
 
         db.flush()
@@ -681,6 +715,13 @@ def update_order(
         if payload.discount is not None:
             order.discount = payload.discount
             recalculate = True
+            # The discount is before tax: re-split it and re-tax the stored lines (unless
+            # a flat order-level tax is being sent in the same call).
+            was_line_tax = abs((order.tax or 0) - sum((it.tax_amount or 0) for it in order.items)) <= 0.01
+            line_tax = apply_line_tax(
+                order.items, [stored_line_pricing(it) for it in order.items], order.discount)
+            if payload.tax is None and was_line_tax:  # a flat order-level tax stays as it was
+                order.tax = line_tax
         if payload.tax is not None:
             order.tax = payload.tax
             recalculate = True

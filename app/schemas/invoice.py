@@ -67,8 +67,17 @@ class InvoiceItemOut(BaseModel):
     unit_price: float
     discount: float
     tax: float = Field(description="Tax amount on the line")
+    tax_amount: float | None = Field(default=None, description="Same as `tax` (GST on the line)")
     tax_rate: float | None = Field(default=None, description="The rate it was billed at, as a %")
-    line_total: float
+    line_total: float = Field(description="The line's value before tax, after its own line discount")
+    taxable_value: float | None = Field(
+        default=None, description="line_total less the line's share of the invoice-level discount; GST is charged on this")
+    cgst_rate: float | None = Field(default=None, description="Intra-state supply: half the rate. Null when the supply type is unknown")
+    cgst_amount: float | None = None
+    sgst_rate: float | None = None
+    sgst_amount: float | None = None
+    igst_rate: float | None = Field(default=None, description="Inter-state supply: the full rate")
+    igst_amount: float | None = None
     # Which lot and which units went out on this line.
     batch_number: str | None = None
     expiry_date: datetime | None = None
@@ -105,6 +114,18 @@ class InvoiceOut(BaseModel):
     subtotal: float
     discount: float
     tax: float
+    tax_amount: float | None = Field(default=None, description="Same as `tax`")
+    taxable_total: float | None = Field(default=None, description="Sum of the lines' taxable_value")
+    cgst_total: float | None = Field(default=None, description="Null when the supply type is unknown")
+    sgst_total: float | None = None
+    igst_total: float | None = None
+    supply_type: str | None = Field(
+        default=None,
+        description="intra_state (CGST + SGST) | inter_state (IGST) | null when the seller's or the "
+                    "buyer's state is unknown. State = GSTIN state code, else the state on the record")
+    place_of_supply: str | None = Field(default=None, description="The buyer's state, lower-case")
+    customer_gstin: str | None = None
+    seller_gstin: str | None = None
     additional_charges: float | None = None
     round_off: float | None = None
     total: float

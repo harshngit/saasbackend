@@ -87,6 +87,16 @@ def _validate_supplier(db: Session, org_id: str, supplier_id: str | None) -> Non
         )
 
 
+def _mirror_tax_inclusive(product: Product) -> None:
+    """`pricing.tax_inclusive` is the one canonical tax-inclusive flag (the only one the API
+    takes, and the one order / invoice GST reads via gst_calc). The two older product
+    columns are kept equal to it so nothing that still reads them disagrees."""
+    if product.pricing is not None:
+        flag = bool(product.pricing.tax_inclusive)
+        product.tax_inclusive = flag
+        product.tax_inclusive_price = flag
+
+
 def _validate_brand(db: Session, org_id: str, brand_id: str | None) -> None:
     if brand_id is None:
         return
@@ -337,6 +347,7 @@ def create_product(
         tax_inclusive=pricing_data.get("tax_inclusive", False),
         currency=pricing_data.get("currency"),
     )
+    _mirror_tax_inclusive(product)
     db.add(product)
     db.commit()
     db.refresh(product)
@@ -690,6 +701,7 @@ def update_product(
                     setattr(product.pricing, p_field, p_value)
         if product.pricing and product.pricing.selling_price is not None:
             product.price = product.pricing.selling_price
+        _mirror_tax_inclusive(product)
 
     # Variants are UPSERTED, never replaced: a variant named by id is updated in place
     # and keeps that id, one with no id is created, and one simply left out of the

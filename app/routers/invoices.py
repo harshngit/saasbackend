@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.services.tracking_service import TrackingError
 from app.services import (
+    gst_calc,
     lookup_service,
     numbering_service,
     payment_service,
@@ -315,21 +316,33 @@ def generate_from_order(
         created_by=user.id,
     )
 
-    subtotal = 0.0
-    tax_total = 0.0
+    # The order-level discount is split over the order's lines exactly as the order did
+    # (gst_calc), so a line billed here carries its share -- also on a part delivery.
+    order_shares = dict(zip(
+        [it.id for it in order.items],
+        gst_calc.split_discount([gst_calc.money(it.line_total) for it in order.items], order.discount or 0),
+    ))
+    subtotal = gst_calc.ZERO
+    bill_discount = gst_calc.ZERO
+    tax_total = gst_calc.ZERO
+    whole_lines = True
     for line in lines:
         item = line["order_item"]
         quantity = line["quantity"]
         # Per-unit figures from the order line, applied to the billed quantity, so a
         # part delivery is billed proportionally rather than for the whole line.
         ordered = item.quantity or 1
-        share = quantity / ordered
-        discount = round((item.discount or 0) * share, 2)
-        line_total = round((item.unit_price or 0) * quantity - discount, 2)
-        rate = item.tax_rate or 0
-        tax_amount = round(line_total * rate / 100, 2)
-        subtotal += line_total
-        tax_total += tax_amount
+        share = gst_calc.dec(quantity) / gst_calc.dec(ordered)
+        whole_lines = whole_lines and share == 1
+        discount = round((item.discount or 0) * float(share), 2)
+        # line_total = value before tax (as on the order line); tax = the order line's
+        # GST, already net of the order-level discount, for the quantity billed.
+        value = gst_calc.money(gst_calc.dec(item.line_total) * share)
+        bill_discount += gst_calc.money(order_shares.get(item.id, gst_calc.ZERO) * share)
+        tax_amount = float(gst_calc.money(gst_calc.dec(item.tax_amount) * share))
+        line_total = float(value)
+        subtotal += value
+        tax_total += gst_calc.dec(tax_amount)
         invoice.items.append(
             InvoiceItem(
                 product_id=item.product_id,
@@ -348,7 +361,7 @@ def generate_from_order(
             )
         )
 
-    if delivery is None:
+    if whole_lines and len(lines) == len(order.items):
         # Billing the whole order: carry the order's own totals, so an order-level
         # discount or a flat order-level tax is billed exactly as agreed.
         invoice.subtotal = order.subtotal
@@ -356,12 +369,12 @@ def generate_from_order(
         invoice.tax = order.tax
         invoice.total = order.total
     else:
-        # Billing one delivery: only the lines it handed over, with their own taxes.
-        # An order-level discount belongs to the order as a whole, not to a part of it.
-        invoice.subtotal = round(subtotal, 2)
-        invoice.discount = 0
-        invoice.tax = round(tax_total, 2)
-        invoice.total = round(invoice.subtotal + invoice.tax, 2)
+        # Billing part of the order (one delivery, or what is left to bill): only the
+        # lines handed over, each with its share of the order-level discount and its GST.
+        invoice.subtotal = float(subtotal)
+        invoice.discount = float(bill_discount)
+        invoice.tax = float(tax_total)
+        invoice.total = float(subtotal - bill_discount + tax_total)
 
     # The receivable starts here, not when the order was placed — an order is a
     # promise, an invoice is a bill. The direct-invoice route below does the same.
@@ -465,8 +478,8 @@ def create_direct_invoice(
     # One pass to resolve and price every line, so nothing moves until the whole
     # basket is known to be valid and in stock.
     lines: list[dict] = []
+    priced: list[dict] = []
     subtotal = 0.0
-    line_tax_total = 0.0
     for entry in payload.items:
         product = db.get(Product, entry.product_id)
         if product is None or product.organization_id != org_id:
@@ -485,21 +498,29 @@ def create_direct_invoice(
         unit_price = entry.unit_price
         if unit_price is None:
             unit_price = (variant.price if variant is not None else None) or product.price or 0
-        line_total = round(unit_price * entry.quantity - entry.discount, 2)
         # The line's own rate, else the product's — never a hardcoded percentage.
         rate = entry.tax_rate if entry.tax_rate is not None else product.tax_rate
-        if rate is not None:
-            tax_amount = round(line_total * rate / 100, 2)
-        else:
-            tax_amount = round(entry.tax, 2)
+        # line_total = value before tax (a tax-inclusive price is taken apart); the GST is
+        # set after the loop, once the bill-level discount is split over the lines.
+        value, inclusive_tax = gst_calc.pre_tax_value(
+            unit_price * entry.quantity - entry.discount, rate, gst_calc.effective_tax_inclusive(product, variant))
+        line_total = float(value)
+        tax_amount = 0.0
+        priced.append({"value": value, "rate": rate, "inclusive_tax": inclusive_tax, "flat_tax": entry.tax})
         subtotal += line_total
-        line_tax_total += tax_amount
         lines.append({
             "product": product, "variant": variant, "quantity": entry.quantity,
             "unit_price": unit_price, "discount": entry.discount, "line_total": line_total,
             "tax_rate": rate, "tax_amount": tax_amount,
             "batch_number": entry.batch_number, "serial_numbers": entry.serial_numbers,
         })
+
+    # The bill-level discount is a discount before tax: split it over the lines, then GST
+    # on what is left (gst_calc -- the same rule the order uses).
+    taxed = gst_calc.tax_lines(priced, payload.discount or 0)
+    for line, t in zip(lines, taxed):
+        line["tax_amount"] = float(t.tax)
+    line_tax_total = float(sum((t.tax for t in taxed), gst_calc.ZERO))
 
     wanted = [
         {"product_id": line["product"].id,

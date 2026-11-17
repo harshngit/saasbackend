@@ -165,4 +165,20 @@ WHERE je.source_id IN (SELECT id FROM qa_rows)
 GROUP BY je.id
 ORDER BY je.effective_date;
 
+-- ---------------------------------------------------------------------------------------
+-- C. FK proof: every foreign key pointing at the tables the cleanup touches, with its
+-- ON DELETE rule, as it exists in THIS database (production may differ from a fresh one).
+-- ---------------------------------------------------------------------------------------
+SELECT ct.relname AS child_table, a.attname AS child_column, pt.relname AS parent_table,
+       CASE c.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END AS on_delete
+FROM pg_constraint c
+JOIN pg_class ct ON ct.oid = c.conrelid
+JOIN pg_class pt ON pt.oid = c.confrelid
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+WHERE c.contype = 'f'
+  AND pt.relname IN ('customers','suppliers','products','purchase_invoices','goods_receipt_notes','purchase_returns',
+                     'quotations','supplier_invoices','expenses','journal_entries',
+                     'purchase_invoice_items','product_variants','stock_batches','supplier_payments')
+ORDER BY pt.relname, ct.relname, a.attname;
+
 ROLLBACK;
