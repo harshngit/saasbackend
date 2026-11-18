@@ -432,6 +432,17 @@ def _stack_height(doc: _Doc, lines, extra_first_px: float = 0.0) -> float:
     return sum(doc.line(size) for _, size, _, _ in lines) + doc.px(extra_first_px)
 
 
+def _wrap_stack(doc: _Doc, lines, width: float) -> tuple[list, set]:
+    """Wrap each line to `width` (a GST invoice must show the seller block in full, never cut
+    with an ellipsis). Returns the wrapped lines and the indexes where an original line starts."""
+    out, starts = [], set()
+    for text, size, style, color in lines:
+        starts.add(len(out))
+        for part in doc.wrap(text, width, size, style):
+            out.append((part, size, style, color))
+    return out, starts
+
+
 def _draw_stack(doc: _Doc, x: float, y: float, width: float, lines, align: str = "L", spacing=None) -> float:
     for index, (text, size, style, color) in enumerate(lines):
         doc.text(x, y, width, doc.fit(text, width, size, style), size, style=style, color=color,
@@ -453,11 +464,14 @@ def _header(doc: _Doc, org, invoice, settings: dict, logo: bytes | None) -> None
     if header == "banner-split":
         pad = doc.px(16)
         name_lines = [(company["name"], doc.heading_px, "B", WHITE)] if biz.get("show_business_name", True) else []
-        sub = (("Tax Invoice").upper(), 12.0, "", _mix(WHITE, doc.primary, 0.85))
+        # 1.05: the name prints with 0.025em letter spacing, which measure() ignores.
+        name_lines, _ = _wrap_stack(doc, name_lines, (width - 2 * pad) / 1.05)
+        sub =(("Tax Invoice").upper(), 12.0, "", _mix(WHITE, doc.primary, 0.85))
         banner_h = pad * 2 + _stack_height(doc, name_lines) + doc.px(2) + doc.line(12.0)
         doc.ensure(banner_h)
         doc.box(x0, doc.y, width, banner_h, fill=doc.primary, radius_px=12)
-        y = _draw_stack(doc, x0 + pad, doc.y + pad, width - 2 * pad, name_lines, align="C", spacing={0: 0.025})
+        y = _draw_stack(doc, x0 + pad, doc.y + pad, width - 2 * pad, name_lines, align="C",
+                        spacing={i: 0.025 for i in range(len(name_lines))})
         _draw_stack(doc, x0 + pad, y + doc.px(2), width - 2 * pad, [sub], align="C", spacing={0: 0.2})
         doc.y += banner_h + doc.px(10)
 
@@ -471,6 +485,7 @@ def _header(doc: _Doc, org, invoice, settings: dict, logo: bytes | None) -> None
         right = _meta_lines(doc, invoice, inv_cfg, fields, NEUTRAL[500])
         right_w = max((doc.measure(t, s, st) for t, s, st, _ in right), default=0)
         left_w = width - right_w - doc.px(12)
+        left, _ = _wrap_stack(doc, left, left_w)
         h = max(_stack_height(doc, left), _stack_height(doc, right))
         _draw_stack(doc, x0, doc.y, left_w, left)
         _draw_stack(doc, x0 + width - right_w, doc.y, right_w, right, align="R")
@@ -503,7 +518,11 @@ def _header(doc: _Doc, org, invoice, settings: dict, logo: bytes | None) -> None
     gap = doc.px(16 if header in ("split", "split-alt") else 12)
     text_x_off = doc.px(logo_px + 10) if show_logo else 0.0
     company_w = max(inner_w - right_w - gap - text_x_off, inner_w * 0.3)
-    left_h = max(_stack_height(doc, lines) + (doc.px(2) if len(lines) > 1 else 0), doc.px(logo_px) if show_logo else 0)
+    original_count = len(lines)
+    lines, starts = _wrap_stack(doc, lines, company_w)
+    # The 2px gap sits above the second original line (the address), however many lines the name wraps to.
+    gap_at = sorted(starts)[1] if original_count > 1 else None
+    left_h = max(_stack_height(doc, lines) + (doc.px(2) if original_count > 1 else 0), doc.px(logo_px) if show_logo else 0)
 
     content_h = max(left_h, right_h)
     if on_color:
@@ -528,9 +547,9 @@ def _header(doc: _Doc, org, invoice, settings: dict, logo: bytes | None) -> None
             doc.image(logo, company_x, y, doc.px(logo_px), doc.px(logo_px))
     ty = y
     for index, (text, size, style, color) in enumerate(lines):
-        if index == 1:
+        if index == gap_at:
             ty += doc.px(2)  # mt-0.5 above the address
-        doc.text(company_x + text_x_off, ty, company_w, doc.fit(text, company_w, size, style), size, style=style, color=color)
+        doc.text(company_x + text_x_off, ty, company_w, text, size, style=style, color=color)
         ty += doc.line(size)
 
     ry = y
@@ -586,7 +605,9 @@ def _party(doc: _Doc, customer, invoice, settings: dict) -> bool:
 
     col_w = (doc.width - doc.px(16)) / 2 if show_ship else doc.width
     bill = _party_column(doc, "Bill To", rows, col_w, accent)
-    ship = _party_column(doc, "Ship To", [(shipping, "", NEUTRAL[500])], col_w, accent) if show_ship else []
+    ship_rows = [(name, "", NEUTRAL[800])] if party.get("show_customer_name", True) else []
+    ship_rows.append((shipping, "", NEUTRAL[500]))
+    ship = _party_column(doc, "Ship To", ship_rows, col_w, accent) if show_ship else []
     height = max(_stack_height(doc, bill), _stack_height(doc, ship)) + doc.px(2)
     doc.ensure(height)
     for column, x in ((bill, doc.left), (ship, doc.left + col_w + doc.px(16))):
