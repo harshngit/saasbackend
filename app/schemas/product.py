@@ -143,12 +143,12 @@ class ProductFileField(str, Enum):
 
 
 class ProductPricingIn(BaseModel):
-    purchase_price: float = Field(default=0.0, ge=0)
-    selling_price: float = Field(default=0.0, ge=0)
-    mrp: float | None = Field(default=None, ge=0)
-    wholesale_price: float | None = Field(default=None, ge=0)
-    dealer_price: float | None = Field(default=None, ge=0)
-    discount_percent: float | None = Field(default=None, ge=0, le=100)
+    purchase_price: float = 0.0
+    selling_price: float = 0.0
+    mrp: float | None = None
+    wholesale_price: float | None = None
+    dealer_price: float | None = None
+    discount_percent: float | None = None
     tax_inclusive: bool = False
     currency: str | None = Field(default=None, max_length=10)
 
@@ -167,12 +167,12 @@ class ProductPricingOut(BaseModel):
 
 
 class ProductPricingUpdate(BaseModel):
-    purchase_price: float | None = Field(default=None, ge=0)
-    selling_price: float | None = Field(default=None, ge=0)
-    mrp: float | None = Field(default=None, ge=0)
-    wholesale_price: float | None = Field(default=None, ge=0)
-    dealer_price: float | None = Field(default=None, ge=0)
-    discount_percent: float | None = Field(default=None, ge=0, le=100)
+    purchase_price: float | None = None
+    selling_price: float | None = None
+    mrp: float | None = None
+    wholesale_price: float | None = None
+    dealer_price: float | None = None
+    discount_percent: float | None = None
     tax_inclusive: bool | None = None
     currency: str | None = Field(default=None, max_length=10)
 
@@ -453,15 +453,6 @@ class ProductCreate(ProductProfileIn):
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
 
-    @field_validator("sku", mode="before")
-    @classmethod
-    def _trim_sku(cls, v: object) -> object:
-        # Trimmed, and blank means "no SKU", so "" never counts as a duplicate.
-        if isinstance(v, str):
-            v = v.strip()
-            return v or None
-        return v
-
     @field_validator("cover_image")
     @classmethod
     def _validate_cover_image(cls, v: str | None) -> str | None:
@@ -494,15 +485,6 @@ class ProductUpdate(ProductProfileIn):
     @classmethod
     def _blank_to_none(cls, v: object) -> object:
         return None if v == "" else v
-
-    @field_validator("sku", mode="before")
-    @classmethod
-    def _trim_sku(cls, v: object) -> object:
-        # Trimmed, and blank means "no SKU", so "" never counts as a duplicate.
-        if isinstance(v, str):
-            v = v.strip()
-            return v or None
-        return v
 
     @field_validator("cover_image")
     @classmethod
