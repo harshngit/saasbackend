@@ -166,6 +166,21 @@ class Customer(Base):
             if getattr(c, "reconciliation_status", None) == "recorded" and getattr(c, "organization_id", None) == self.organization_id
         )
 
+    @property
+    def collection_status(self) -> str | None:
+        """'pending_approval' while any field collection from this customer waits for
+        an admin to reconcile it (the money is in a delivery partner's hand but not yet
+        off the balance); None otherwise. An approved collection is already off
+        outstanding_balance, so it needs no status of its own."""
+        return "pending_approval" if self.unreconciled_collection_count else None
+
+    @property
+    def collectable_amount(self) -> float:
+        """What a delivery partner may still collect: the outstanding balance less the
+        collections already submitted and awaiting approval. 0 means nothing is left
+        to collect until an admin approves or voids the pending ones."""
+        return round(max(float(self.outstanding_balance or 0.0) - self.unreconciled_collection_amount, 0.0), 2)
+
 
 class CustomerPayment(Base):
     """One payment received, and the receipt that acknowledges it.

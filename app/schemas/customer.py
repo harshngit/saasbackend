@@ -44,6 +44,16 @@ class CustomerOut(BaseModel):
     unreconciled_collection_count: int = Field(
         default=0, description="Count of field collections pending accountant reconciliation"
     )
+    collection_status: str | None = Field(
+        default=None,
+        description="pending_approval while a submitted field collection waits for admin approval; "
+                    "null otherwise (an approved collection is already off outstanding_balance)",
+    )
+    collectable_amount: float = Field(
+        default=0.0,
+        description="outstanding_balance less collections awaiting approval: the most a delivery "
+                    "partner can still collect. Hide the Collect button when this is 0",
+    )
     category: str | None
     notes: str | None
     is_active: bool
