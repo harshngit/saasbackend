@@ -1488,9 +1488,17 @@ def record_general_customer_collection(
     """
     org_id = _org_id(user)
 
-    # 1. Validate customer existence and organization
-    customer = db.get(Customer, payload.customer_id)
-    if customer is None or customer.organization_id != org_id:
+    # 1. Validate customer existence and organization. The row is locked for the rest of
+    # the transaction so two partners submitting at the same moment are checked one
+    # after the other against the same pending total (no double collection).
+    customer = (
+        db.query(Customer)
+        .filter(Customer.id == payload.customer_id, Customer.organization_id == org_id)
+        .with_for_update(of=Customer)  # the customer row only, not its eager-loaded joins
+        .populate_existing()
+        .first()
+    )
+    if customer is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found in your organization")
 
     # 2. Validate amount > 0
@@ -1503,6 +1511,28 @@ def record_general_customer_collection(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Collection amount ({payload.amount:.2f}) exceeds customer's total outstanding balance ({cust_outstanding:.2f})",
+        )
+
+    # 3b. ...less what has already been collected and is waiting for admin approval.
+    # outstanding_balance only drops on approval, so without this a second partner
+    # (or the same one, twice) could collect the same balance again.
+    pending = round(float(
+        db.query(func.coalesce(func.sum(DeliveryCollection.amount), 0.0))
+        .filter(
+            DeliveryCollection.organization_id == org_id,
+            DeliveryCollection.customer_id == customer.id,
+            DeliveryCollection.reconciliation_status == "recorded",
+        )
+        .scalar() or 0.0
+    ), 2)
+    collectable = round(max(cust_outstanding - pending, 0.0), 2)
+    if pending and round(payload.amount, 2) > round(collectable + 0.01, 2):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{pending:.2f} has already been collected from this customer and is awaiting admin "
+                f"approval; at most {collectable:.2f} can still be collected"
+            ),
         )
 
     # 4. Validate delivery_id if provided
