@@ -1840,6 +1840,19 @@ def record_delivery_collection(
                     detail="Cannot record collection for a delivery not assigned to you",
                 )
 
+    # Lock the customer row for the rest of the transaction, as POST /collections/customer
+    # does: two collections for the same customer (from either endpoint) are then checked
+    # one after the other against the same pending total.
+    customer = None
+    if delivery.customer_id:
+        customer = (
+            db.query(Customer)
+            .filter(Customer.id == delivery.customer_id, Customer.organization_id == org_id)
+            .with_for_update(of=Customer)
+            .populate_existing()
+            .first()
+        )
+
     # Validate collection amount does not exceed remaining outstanding balance on linked order/invoice
     if delivery.sales_order_id:
         so = db.get(SalesOrder, delivery.sales_order_id)
@@ -1876,6 +1889,30 @@ def record_delivery_collection(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Collection amount exceeds remaining balance",
                 )
+
+            # Invoiced order: its amount is in the customer's outstanding_balance, so also
+            # count collections awaiting approval from the customer's other orders and the
+            # general customer collections -- the same block as POST /collections/customer.
+            # (An order not invoiced yet is not in outstanding_balance; the check above covers it.)
+            if inv and customer is not None:
+                pending = round(float(
+                    db.query(func.coalesce(func.sum(DeliveryCollection.amount), 0.0))
+                    .filter(
+                        DeliveryCollection.organization_id == org_id,
+                        DeliveryCollection.customer_id == customer.id,
+                        DeliveryCollection.reconciliation_status == "recorded",
+                    )
+                    .scalar() or 0.0
+                ), 2)
+                collectable = round(max(float(customer.outstanding_balance or 0.0) - pending, 0.0), 2)
+                if pending and round(payload.amount, 2) > round(collectable + 0.01, 2):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"{pending:.2f} has already been collected from this customer and is awaiting "
+                            f"admin approval; at most {collectable:.2f} can still be collected"
+                        ),
+                    )
 
     # A day whose Day-End is submitted / approved takes no new collections.
     day_end_service.require_day_open(

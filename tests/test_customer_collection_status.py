@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.core.database import Base, SessionLocal, engine  # noqa: E402
 from app.core.security import create_access_token, hash_password  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Customer, Organization, User  # noqa: E402
+from app.models import Customer, Delivery, Invoice, Organization, SalesOrder, User  # noqa: E402
 from app.models.enums import UserRole  # noqa: E402
 from app.services import entitlement_service, role_service  # noqa: E402
 
@@ -44,7 +44,7 @@ def _user(db, org_id, role, system_role):
              system_role=system_role, role=role, password_hash=hash_password("Password123!"), is_active=True)
     db.add(u)
     db.flush()
-    return {"Authorization": f"Bearer {create_access_token(u.id, system_role, org_id)}"}
+    return {"Authorization": f"Bearer {create_access_token(u.id, system_role, org_id)}"}, u.id
 
 
 @pytest.fixture
@@ -56,14 +56,15 @@ def firm():
         db.add(org)
         db.flush()
         role_service.seed_default_roles(db, org.id)
-        admin = _user(db, org.id, UserRole.ADMIN, "admin")
-        partner_a = _user(db, org.id, UserRole.DELIVERY_PARTNER, "delivery_partner")
-        partner_b = _user(db, org.id, UserRole.DELIVERY_PARTNER, "delivery_partner")
+        admin, _ = _user(db, org.id, UserRole.ADMIN, "admin")
+        partner_a, a_id = _user(db, org.id, UserRole.DELIVERY_PARTNER, "delivery_partner")
+        partner_b, _ = _user(db, org.id, UserRole.DELIVERY_PARTNER, "delivery_partner")
         cust = Customer(organization_id=org.id, name="ABC Traders", opening_balance=5000.0, outstanding_balance=5000.0)
         clear = Customer(organization_id=org.id, name="Paid Up")
         db.add_all([cust, clear])
         db.commit()
-        return {"admin": admin, "a": partner_a, "b": partner_b, "cust": cust.id, "clear": clear.id}
+        return {"admin": admin, "a": partner_a, "b": partner_b, "cust": cust.id, "clear": clear.id,
+                "org": org.id, "a_id": a_id}
     finally:
         db.close()
 
@@ -121,3 +122,54 @@ def test_approval_and_void_clear_the_status(firm):
     assert r.status_code == 200, r.text
     c = _listed(firm, firm["cust"])
     assert c["collection_status"] is None and c["collectable_amount"] == 3000.0
+
+
+def _delivery(f, total, invoiced):
+    """An order for ABC Traders with a delivery assigned to partner A; when invoiced, an
+    invoice for it and the amount added to the customer's balance."""
+    partner_id = f["a_id"]
+    db = SessionLocal()
+    try:
+        tag = uuid.uuid4().hex[:8]
+        so = SalesOrder(organization_id=f["org"], customer_id=f["cust"], order_number=f"ORD-{tag}", total=total,
+                        status="confirmed", fulfilment_status="planned", assigned_delivery_partner_id=partner_id)
+        db.add(so)
+        db.flush()
+        d = Delivery(organization_id=f["org"], sales_order_id=so.id, customer_id=f["cust"],
+                     delivery_partner_id=partner_id, delivery_note_number=f"DLV-{tag}", status="planned")
+        db.add(d)
+        if invoiced:
+            db.add(Invoice(organization_id=f["org"], invoice_number=f"INV-{tag}", order_id=so.id,
+                           customer_id=f["cust"], subtotal=total, total=total))
+            cust = db.get(Customer, f["cust"])
+            cust.total_billed = (cust.total_billed or 0) + total
+            cust.recompute_outstanding()
+        db.commit()
+        return d.id
+    finally:
+        db.close()
+
+
+def _collect_on_delivery(h, delivery_id, amount):
+    return client.post(f"/deliveries/{delivery_id}/collections", headers=h,
+                       json={"amount": amount, "payment_mode": "cash"})
+
+
+def test_per_delivery_collection_counts_pending_customer_collections(firm):
+    # Customer owes 5000 opening + 3000 invoiced order = 8000.
+    d = _delivery(firm, 3000, True)
+    assert _listed(firm, firm["cust"])["outstanding_balance"] == 8000.0
+    assert _collect(firm["b"], firm["cust"], 6000).status_code == 201      # general, pending
+    r = _collect_on_delivery(firm["a"], d, 3000)                             # only 2000 left
+    assert r.status_code == 409, r.text
+    assert "awaiting admin approval; at most 2000.00" in r.json()["detail"]
+    assert _collect_on_delivery(firm["a"], d, 2000).status_code == 201
+    assert _collect_on_delivery(firm["a"], d, 1).status_code == 409          # 1000 left on the order, 0 for the customer
+    assert _listed(firm, firm["cust"])["collectable_amount"] == 0.0
+
+
+def test_per_delivery_collection_on_uninvoiced_order_is_not_blocked_by_customer_balance(firm):
+    assert _collect(firm["b"], firm["cust"], 5000).status_code == 201       # whole balance pending
+    d = _delivery(firm, 500, False)                               # not invoiced: not in the balance
+    assert _collect_on_delivery(firm["a"], d, 500).status_code == 201
+    assert _collect_on_delivery(firm["a"], d, 1).status_code == 400          # the order check still applies
