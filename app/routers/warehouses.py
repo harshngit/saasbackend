@@ -150,6 +150,8 @@ def stock_positions(
     product_id: str | None = Query(default=None),
     search: str | None = Query(default=None),
     low_stock_only: bool = Query(default=False, description="Only items at or below their minimum level"),
+    is_active: bool | None = Query(default=None, description="true: only active products (for transaction pickers)"),
+    status_filter: str | None = Query(default=None, alias="status", description="product status: active | inactive | discontinued"),
     sort_by: str | None = Query(default=None, description="Field to sort by"),
     sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
@@ -168,6 +170,10 @@ def stock_positions(
     products_query = db.query(Product).filter(Product.organization_id == org_id)
     if product_id:
         products_query = products_query.filter(Product.id == product_id)
+    if is_active is not None:
+        products_query = products_query.filter(Product.is_active == is_active)
+    if status_filter is not None:
+        products_query = products_query.filter(Product.status == status_filter)
     if search:
         s = f"%{search.strip()}%"
         products_query = products_query.filter(

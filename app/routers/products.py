@@ -2,13 +2,13 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.core.files import delete_replaced_file, save_upload
+from app.core.files import delete_replaced_file, extract_file_id_from_url, save_upload
 from app.models import (
     Brand,
     Category,
@@ -19,6 +19,7 @@ from app.models import (
     ProductStatus,
     ProductVariant,
     StockBatch,
+    StoredFile,
     Supplier,
     User,
 )
@@ -182,6 +183,59 @@ def _validate_product_type(db: Session, org_id: str, product_type: str | None) -
         )
 
 
+DUPLICATE_SKU = "A product with this SKU already exists."
+COVER_IMAGE_REQUIRED = "Primary product image is required."
+
+
+def _ensure_unique_sku(db: Session, org_id: str, sku: str | None, exclude_id: str | None = None) -> None:
+    """One product per SKU in a firm, compared trimmed and case-insensitively -- the same
+    way product lookups by code match it (lookup_service.by_id_or_code), so a SKU always
+    resolves to exactly one product."""
+    if not sku:
+        return
+    key = sku.strip().lower()
+    if db.get_bind().dialect.name == "postgresql":
+        # Two requests saving the same SKU at once: the second waits for the first to
+        # commit, then sees its row and is refused. Released at commit/rollback.
+        db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"product-sku:{org_id}:{key}"})
+    query = db.query(Product.id).filter(
+        Product.organization_id == org_id, func.lower(func.trim(Product.sku)) == key
+    )
+    if exclude_id is not None:
+        query = query.filter(Product.id != exclude_id)
+    if query.first() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=DUPLICATE_SKU)
+
+
+def _validate_new_cover_image(db: Session, org_id: str, value: str | None) -> None:
+    """A new product needs its Primary Product Image: an image uploaded through
+    POST /files/upload (its `/files/{id}` url), or an external http(s) image URL as the
+    product file slots already accept. Existing products are not checked."""
+    if value is None or not value.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=COVER_IMAGE_REQUIRED)
+    val = value.strip()
+    file_id = extract_file_id_from_url(val)
+    if file_id is not None and lookup_service.looks_like_uuid(file_id):
+        stored = db.get(StoredFile, file_id)
+        if stored is None or stored.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Primary product image was not found. Please upload the image again.",
+            )
+        if not (stored.content_type or "").lower().startswith("image/"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Primary product image must be an image file.",
+            )
+        return
+    if not val.lower().startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Primary product image must be an uploaded image. Upload it with POST /files/upload "
+                   "and send the returned url.",
+        )
+
+
 def _variant_columns(variant: dict) -> dict:
     """A VariantIn dump as ProductVariant column values: the nested pricing object is
     flattened (selling_price is the `price` column) and the internal id is dropped."""
@@ -312,6 +366,8 @@ def create_product(
     catalog_hierarchy_service.validate_product_catalog_hierarchy(
         db, org_id, payload.preferred_supplier_id, payload.brand_id, payload.category_id
     )
+    _validate_new_cover_image(db, org_id, payload.cover_image)
+    _ensure_unique_sku(db, org_id, payload.sku)
     data = payload.model_dump()
     variations = data.pop("variations")
     has_variants = data.pop("has_variants")
@@ -622,6 +678,10 @@ def update_product(
         )
     if "product_type" in data:
         _validate_product_type(db, org_id, data["product_type"])
+    # Only a changed SKU is checked, so re-saving a product keeps its own SKU (and an
+    # older duplicate saved before this rule does not block unrelated edits).
+    if data.get("sku") and (data["sku"].lower() != (product.sku or "").strip().lower()):
+        _ensure_unique_sku(db, org_id, data["sku"], exclude_id=product.id)
     # The Product Type must fit the sub category the product ends up with -- checked when
     # either of the two changes. Re-sending them unchanged leaves a product's existing
     # reference alone, including one whose sub category has since been deleted.
@@ -676,6 +736,10 @@ def update_product(
         product.is_active = product.status == ProductStatus.ACTIVE.value
     elif "is_active" in data and "status" not in data:
         product.status = ProductStatus.ACTIVE.value if product.is_active else ProductStatus.INACTIVE.value
+    elif "is_active" in data and "status" in data:
+        # Sent together but disagreeing: status decides, so is_active=true / status=active
+        # filters always return the same products.
+        product.is_active = product.status == ProductStatus.ACTIVE.value
 
     if pricing_data is not None:
         if product.pricing is None:

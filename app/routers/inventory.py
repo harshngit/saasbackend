@@ -202,6 +202,7 @@ def stock_board(
     search: str | None = Query(default=None, description="matches name / sku / brand"),
     category_id: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status", description="active | inactive | discontinued"),
     sort_by: str | None = Query(default=None, description="Field to sort by"),
     sort_order: str | None = Query(default=None, description="Sort order: asc or desc"),
     db: Session = Depends(get_db),
@@ -216,6 +217,8 @@ def stock_board(
         query = query.filter(Product.category_id == category_id)
     if is_active is not None:
         query = query.filter(Product.is_active == is_active)
+    if status_filter is not None:
+        query = query.filter(Product.status == status_filter)
     query = apply_sorting(
         query,
         sort_by=sort_by,
