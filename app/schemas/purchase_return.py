@@ -38,7 +38,7 @@ class PurchaseReturnItemCreate(BaseModel):
     purchase_item_id: str | None = None
     product_id: str | None = None
     variant_id: str | None = None
-    quantity: int = Field(gt=0, description="Quantity to return (must be positive)")
+    quantity: int = Field(gt=0, le=1_000_000, description="Quantity to return: a whole number from 1 to 1,000,000")
     unit_price: float | None = Field(default=None, ge=0)
     tax_rate: float | None = Field(default=None, ge=0)
     reason: str | None = None

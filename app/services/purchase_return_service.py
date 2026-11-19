@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -209,6 +209,9 @@ def validate_and_build_return_items(
     # Map purchase line items by ID and by (product_id, variant_id)
     purchase_items_by_id = {item.id: item for item in purchase.items}
     built_items: list[PurchaseReturnItem] = []
+    # Quantity already asked for on each purchase line by earlier lines of this same
+    # request, so two lines for one product cannot together pass the returnable limit.
+    requested_in_request: dict[str, int] = {}
 
     for item_in in items_in:
         if item_in.quantity <= 0:
@@ -246,14 +249,16 @@ def validate_and_build_return_items(
             db, match_item.id, exclude_return_id=exclude_return_id
         )
         eligible_qty = max(received_qty - prev_returned, 0)
+        asked_before = requested_in_request.get(match_item.id, 0)
+        requested_in_request[match_item.id] = asked_before + item_in.quantity
 
-        if item_in.quantity > eligible_qty:
+        if asked_before + item_in.quantity > eligible_qty:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"Return quantity ({item_in.quantity}) for '{match_item.product_name}' exceeds eligible "
-                    f"return quantity: only {eligible_qty} allowed (received {received_qty}, already returned "
-                    f"{prev_returned}, ordered {match_item.quantity})"
+                    f"Return quantity cannot exceed returnable quantity. '{match_item.product_name}': "
+                    f"requested {asked_before + item_in.quantity}, returnable {eligible_qty} "
+                    f"(received {received_qty}, already returned {prev_returned})."
                 ),
             )
 
@@ -312,13 +317,121 @@ def validate_and_build_return_items(
     return built_items
 
 
+def _bad_request(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+def _lock_purchase(db: Session, purchase_id: str | None) -> None:
+    """SELECT ... FOR UPDATE on the source purchase row. Every path that checks the
+    returnable quantity (create, edit, confirm) takes this lock first, so two requests on
+    one purchase run one after the other and the second counts the first's quantities."""
+    if purchase_id:
+        db.query(PurchaseInvoice.id).filter(PurchaseInvoice.id == purchase_id).with_for_update().first()
+
+
+def _clean_reason(reason: str | None) -> str:
+    """The return reason, required: null, empty and whitespace-only are refused."""
+    text = (reason or "").strip()
+    if not text:
+        raise _bad_request("Return reason is required.")
+    if len(text) > 255:
+        raise _bad_request("Return reason must be at most 255 characters.")
+    return text
+
+
+def _confirmed_grns(db: Session, org_id: str, purchase_id: str) -> list[GoodsReceiptNote]:
+    return (
+        db.query(GoodsReceiptNote)
+        .filter(
+            GoodsReceiptNote.organization_id == org_id,
+            GoodsReceiptNote.purchase_id == purchase_id,
+            GoodsReceiptNote.status == "confirmed",
+        )
+        .order_by(GoodsReceiptNote.received_date.desc(), GoodsReceiptNote.created_at.desc())
+        .all()
+    )
+
+
+def _source_grn(
+    db: Session, org_id: str, purchase: PurchaseInvoice, grn_id: str | None, purchase_item_ids: set[str]
+) -> GoodsReceiptNote | None:
+    """The goods receipt the returned goods came in on. A GRN sent by the client must be a
+    confirmed GRN of this purchase. Otherwise: the latest confirmed GRN of the purchase that
+    received one of the returned lines, else its latest confirmed GRN, else None (a purchase
+    with no GRN, e.g. stock added before GRNs existed -- none is made up)."""
+    if grn_id:
+        grn = db.get(GoodsReceiptNote, grn_id)
+        if grn is None or grn.organization_id != org_id or grn.purchase_id != purchase.id:
+            raise _bad_request("Goods receipt does not belong to the selected purchase.")
+        if grn.status != "confirmed":
+            raise _bad_request("Goods receipt is not confirmed.")
+        return grn
+    grns = _confirmed_grns(db, org_id, purchase.id)
+    for grn in grns:
+        if any(
+            gi.purchase_item_id in purchase_item_ids and (gi.received_qty or 0) > 0
+            for gi in (getattr(grn, "items", None) or [])
+        ):
+            return grn
+    return grns[0] if grns else None
+
+
+def _allowed_warehouse_ids(db: Session, org_id: str, purchase: PurchaseInvoice) -> set[str]:
+    """Warehouses the purchase's goods were received into: its confirmed GRNs' warehouses,
+    or the purchase's own warehouse when it has no GRN warehouse. Empty when unknown."""
+    ids = {g.warehouse_id for g in _confirmed_grns(db, org_id, purchase.id) if g.warehouse_id}
+    if not ids and purchase.warehouse_id:
+        ids.add(purchase.warehouse_id)
+    return ids
+
+
+def _source_warehouse_id(
+    db: Session, org_id: str, purchase: PurchaseInvoice, grn: GoodsReceiptNote | None, requested: str | None
+) -> str | None:
+    """The warehouse the goods leave from, taken from the purchase / goods receipt. A
+    warehouse sent by the client must be one the purchase's goods went into."""
+    allowed = _allowed_warehouse_ids(db, org_id, purchase)
+    if requested:
+        if allowed and requested not in allowed:
+            raise _bad_request("Warehouse does not match the selected purchase.")
+        return requested
+    if grn is not None and grn.warehouse_id:
+        return grn.warehouse_id
+    return purchase.warehouse_id
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _check_return_date(return_date: datetime, purchase: PurchaseInvoice, grn: GoodsReceiptNote | None) -> None:
+    """A return cannot be dated before the purchase or the goods receipt, or in the future
+    (one day of slack for time zones). Compared by calendar date."""
+    rd = _as_utc(return_date)
+    if rd > _now() + timedelta(days=1):
+        raise _bad_request("Return date cannot be in the future.")
+    purchase_date = purchase.purchase_date or purchase.invoice_date
+    if purchase_date is not None and rd.date() < _as_utc(purchase_date).date():
+        raise _bad_request(
+            f"Return date cannot be earlier than the purchase date ({_as_utc(purchase_date).date().isoformat()})."
+        )
+    if grn is not None and grn.received_date is not None and rd.date() < _as_utc(grn.received_date).date():
+        raise _bad_request(
+            f"Return date cannot be earlier than the goods receipt date "
+            f"({_as_utc(grn.received_date).date().isoformat()})."
+        )
+
+
 def create_purchase_return(
     db: Session,
     org_id: str,
     payload: PurchaseReturnCreate,
     user_id: str | None = None,
+    require_reason: bool = True,
 ) -> PurchaseReturn:
-    """Create a new Purchase Return record in 'draft' status without immediate inventory deduction."""
+    """Create a new Purchase Return record in 'draft' status without immediate inventory deduction.
+    Supplier, warehouse and GRN come from the source purchase; nothing is written unless
+    every line is valid."""
     purchase = db.get(PurchaseInvoice, payload.purchase_id)
     if purchase is None or purchase.organization_id != org_id:
         raise HTTPException(
@@ -332,51 +445,44 @@ def create_purchase_return(
             detail=f"Cannot create a return for purchase invoice in state '{purchase.status}'",
         )
 
-    supplier_id = payload.supplier_id or purchase.supplier_id
-    if supplier_id:
-        supplier = db.get(Supplier, supplier_id)
-        if supplier is None or supplier.organization_id != org_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Supplier not found in your organization",
-            )
+    reason = _clean_reason(payload.reason) if require_reason else ((payload.reason or "").strip() or None)
 
-    grn_id = payload.grn_id
-    if grn_id:
-        grn = db.get(GoodsReceiptNote, grn_id)
-        if grn is None or grn.organization_id != org_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Goods receipt note not found in your organization",
-            )
+    # Supplier: always the purchase's. A different supplier_id from the client is refused.
+    if purchase.supplier_id:
+        if payload.supplier_id and payload.supplier_id != purchase.supplier_id:
+            raise _bad_request("Supplier does not match the selected purchase.")
+        supplier_id = purchase.supplier_id
+    else:
+        supplier_id = payload.supplier_id
+        if supplier_id:
+            supplier = db.get(Supplier, supplier_id)
+            if supplier is None or supplier.organization_id != org_id:
+                raise _bad_request("Supplier not found in your organization")
 
-    warehouse_id = payload.warehouse_id or purchase.warehouse_id
-    if warehouse_id:
-        warehouse = db.get(Warehouse, warehouse_id)
-        if warehouse is None or warehouse.organization_id != org_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Warehouse not found in your organization",
-            )
+    _lock_purchase(db, purchase.id)
+    built_items = validate_and_build_return_items(db, org_id, purchase, payload.items)
+
+    grn = _source_grn(db, org_id, purchase, payload.grn_id, {i.purchase_item_id for i in built_items})
+    warehouse_id = _source_warehouse_id(db, org_id, purchase, grn, payload.warehouse_id)
+    warehouse_id = return_warehouse_id(db, org_id, warehouse_id, purchase)
+    return_date = payload.return_date or _now()
+    _check_return_date(return_date, purchase, grn)
+    check_return_stock(db, org_id, warehouse_id, built_items)
 
     return_number = numbering_service.next_number(
         db, org_id, PurchaseReturn.return_number, "PR"
     )
-
-    built_items = validate_and_build_return_items(db, org_id, purchase, payload.items)
-    warehouse_id = return_warehouse_id(db, org_id, warehouse_id, purchase)
-    check_return_stock(db, org_id, warehouse_id, built_items)
 
     purchase_return = PurchaseReturn(
         organization_id=org_id,
         return_number=return_number,
         purchase_id=purchase.id,
         supplier_id=supplier_id,
-        grn_id=grn_id,
+        grn_id=grn.id if grn is not None else None,
         warehouse_id=warehouse_id,
         status="draft",
-        return_date=payload.return_date or _now(),
-        reason=payload.reason,
+        return_date=return_date,
+        reason=reason,
         notes=payload.notes,
         created_by=user_id,
     )
@@ -409,10 +515,9 @@ def update_purchase_return(
             detail=f"Cannot edit purchase return in status '{purchase_return.status}'. Only 'draft' returns can be edited.",
         )
 
-    if payload.return_date is not None:
-        purchase_return.return_date = payload.return_date
+    purchase = purchase_return.purchase
     if payload.reason is not None:
-        purchase_return.reason = payload.reason
+        purchase_return.reason = _clean_reason(payload.reason)
     if payload.notes is not None:
         purchase_return.notes = payload.notes
     if payload.warehouse_id is not None:
@@ -423,22 +528,35 @@ def update_purchase_return(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Warehouse not found in your organization",
                 )
+            if purchase is not None:
+                _source_warehouse_id(db, org_id, purchase, None, payload.warehouse_id)  # must match the purchase
             purchase_return.warehouse_id = payload.warehouse_id
+        elif purchase is not None:
+            purchase_return.warehouse_id = _source_warehouse_id(db, org_id, purchase, purchase_return.grn, None)
         else:
             purchase_return.warehouse_id = None
 
     if payload.items is not None:
-        purchase = purchase_return.purchase
         if purchase is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Source purchase invoice not found",
             )
+        _lock_purchase(db, purchase.id)
         built_items = validate_and_build_return_items(
             db, org_id, purchase, payload.items, exclude_return_id=purchase_return.id
         )
         purchase_return.items.clear()
         purchase_return.items.extend(built_items)
+        if purchase_return.grn_id is None:
+            grn = _source_grn(db, org_id, purchase, None, {i.purchase_item_id for i in built_items})
+            purchase_return.grn_id = grn.id if grn is not None else None
+
+    if payload.return_date is not None:
+        if purchase is not None:
+            grn = db.get(GoodsReceiptNote, purchase_return.grn_id) if purchase_return.grn_id else None
+            _check_return_date(payload.return_date, purchase, grn)
+        purchase_return.return_date = payload.return_date
 
     if payload.items is not None or payload.warehouse_id is not None:
         # Re-check the stock rule whenever the lines or the source warehouse change.
@@ -568,6 +686,26 @@ def _locked_return(db: Session, org_id: str, return_id: str) -> PurchaseReturn:
     return record
 
 
+# The only allowed moves: draft -> confirmed -> dispatched -> completed, and cancel from
+# draft or confirmed. No shortcuts (draft -> dispatched / completed, confirmed -> completed).
+_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"confirmed", "cancelled"},
+    "confirmed": {"dispatched", "cancelled"},
+    "dispatched": {"completed"},
+    "completed": set(),
+    "cancelled": set(),
+}
+
+
+def _require_transition(record: PurchaseReturn, target: str) -> None:
+    if target not in _TRANSITIONS.get(record.status, set()):
+        nxt = {"confirmed": "a draft", "dispatched": "a confirmed", "completed": "a dispatched"}.get(target)
+        hint = f" Only {nxt} return can be {target}." if nxt else ""
+        raise _bad_request(
+            f"Invalid purchase return status transition: '{record.status}' to '{target}'.{hint}"
+        )
+
+
 def confirm_purchase_return(
     db: Session,
     org_id: str,
@@ -580,12 +718,14 @@ def confirm_purchase_return(
     (retry / double click) is refused with 400 and changes nothing."""
     try:
         purchase_return = _locked_return(db, org_id, return_id)
-        if purchase_return.status != "draft":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot confirm purchase return in status '{purchase_return.status}'. Only 'draft' returns can be confirmed.",
-            )
+        _require_transition(purchase_return, "confirmed")
+        _lock_purchase(db, purchase_return.purchase_id)
         revalidate_draft(db, org_id, purchase_return)
+        if purchase_return.grn_id is None and purchase_return.purchase is not None:
+            # Drafts saved before the GRN was linked automatically.
+            grn = _source_grn(db, org_id, purchase_return.purchase, None,
+                              {ri.purchase_item_id for ri in purchase_return.items})
+            purchase_return.grn_id = grn.id if grn is not None else None
         deduct_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
         purchase_return.status = "confirmed"
         purchase_return.confirmed_at = _now()
@@ -607,22 +747,10 @@ def dispatch_purchase_return(
     return_id: str,
     user_id: str | None = None,
 ) -> PurchaseReturn:
-    """Transition: confirmed / draft -> dispatched."""
-    purchase_return = db.get(PurchaseReturn, return_id)
-    if purchase_return is None or purchase_return.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Purchase return not found",
-        )
-
-    if purchase_return.status not in ("draft", "confirmed"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot dispatch purchase return in status '{purchase_return.status}'. Only 'draft' or 'confirmed' returns can be dispatched.",
-        )
-
-    if purchase_return.status == "draft":
-        revalidate_draft(db, org_id, purchase_return)
+    """Transition: confirmed -> dispatched. The stock already left on confirm; nothing moves
+    here (the guard below only covers a confirmed return without its stock flag)."""
+    purchase_return = _locked_return(db, org_id, return_id)
+    _require_transition(purchase_return, "dispatched")
     if not purchase_return.stock_deducted:
         deduct_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
     if not purchase_return.confirmed_at:
@@ -646,19 +774,9 @@ def complete_purchase_return(
     return_id: str,
     user_id: str | None = None,
 ) -> PurchaseReturn:
-    """Transition: confirmed / dispatched -> completed (terminal state)."""
-    purchase_return = db.get(PurchaseReturn, return_id)
-    if purchase_return is None or purchase_return.organization_id != org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Purchase return not found",
-        )
-
-    if purchase_return.status not in ("confirmed", "dispatched"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot complete purchase return in status '{purchase_return.status}'. Only 'confirmed' or 'dispatched' returns can be completed.",
-        )
+    """Transition: dispatched -> completed (terminal state). No stock moves here."""
+    purchase_return = _locked_return(db, org_id, return_id)
+    _require_transition(purchase_return, "completed")
 
     if not purchase_return.stock_deducted:
         deduct_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
@@ -681,19 +799,21 @@ def cancel_purchase_return(
     cancel_reason: str | None = None,
     user_id: str | None = None,
 ) -> PurchaseReturn:
-    """Transition: draft / confirmed / dispatched -> cancelled (reverses stock if deducted)."""
-    purchase_return = db.get(PurchaseReturn, return_id)
-    if purchase_return is None or purchase_return.organization_id != org_id:
+    """Transition: draft / confirmed -> cancelled. A confirmed return's stock is put back
+    (once: the stock_deducted flag guards it). Dispatched and completed returns cannot be
+    cancelled -- the goods have left for the supplier."""
+    purchase_return = _locked_return(db, org_id, return_id)
+    if purchase_return.status in ("dispatched", "completed"):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Purchase return not found",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A {purchase_return.status} purchase return cannot be cancelled.",
         )
-
-    if purchase_return.status in ("completed", "cancelled"):
+    if purchase_return.status == "cancelled":
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot cancel a '{purchase_return.status}' purchase return.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This purchase return is already cancelled.",
         )
+    _require_transition(purchase_return, "cancelled")
 
     if purchase_return.stock_deducted:
         restore_inventory_for_return(db, org_id, purchase_return, user_id=user_id)
@@ -846,11 +966,12 @@ def process_legacy_purchase_return(
     payload = PurchaseReturnCreate(
         purchase_id=purchase.id,
         supplier_id=purchase.supplier_id,
-        warehouse_id=purchase.warehouse_id,
         reason=reason,
         items=items_in,
     )
-    ret = create_purchase_return(db, org_id, payload, user_id=user.id)
+    # Older API: reason stays optional here; the warehouse comes from the purchase / GRN.
+    ret = create_purchase_return(db, org_id, payload, user_id=user.id, require_reason=False)
     ret = confirm_purchase_return(db, org_id, ret.id, user_id=user.id)
+    ret = dispatch_purchase_return(db, org_id, ret.id, user_id=user.id)
     ret = complete_purchase_return(db, org_id, ret.id, user_id=user.id)
     return ret

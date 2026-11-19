@@ -208,7 +208,7 @@ def test_the_new_confirm_code_produces_no_flags(db, world, monkeypatch):
     stock_service.adjust_on_hand(db, world["org"].id, world["main"].id, p.id, None, 10.0, "purchase_in")
     db.commit()
     ret = purchase_return_service.create_purchase_return(
-        db, world["org"].id, PurchaseReturnCreate(purchase_id=pi.id, items=[{"product_id": p.id, "quantity": 4}]))
+        db, world["org"].id, PurchaseReturnCreate(purchase_id=pi.id, reason="Damaged", items=[{"product_id": p.id, "quantity": 4}]))
     purchase_return_service.confirm_purchase_return(db, world["org"].id, ret.id)
     [line] = audit.audit_lines(db)
     assert line["flags"] == "" and line["movement_qty"] == "4" and line["warehouse_on_hand_now"] == "6"
