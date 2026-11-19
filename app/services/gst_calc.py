@@ -18,7 +18,7 @@ Amounts are Decimal, rounded half-up to 2 places.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 CENT = Decimal("0.01")
 ZERO = Decimal("0")
@@ -100,16 +100,22 @@ def tax_lines(lines: list[dict], bill_discount=0) -> list[TaxedLine]:  # noqa: A
     return out
 
 
-def gst_split(tax, rate, intra_state: bool | None) -> dict:  # noqa: ANN001
+def gst_split(tax, rate, intra_state: bool | None, odd_paisa_to_sgst: bool = False) -> dict:  # noqa: ANN001
     """CGST + SGST (half each) inside one state, IGST between states. None when the
-    supply type cannot be told (no state on either side): the whole tax is left unsplit."""
+    supply type cannot be told (no state on either side): the whole tax is left unsplit.
+
+    When a line's GST is an odd number of paise it cannot be halved exactly: the extra
+    paisa goes to CGST, or to SGST when `odd_paisa_to_sgst` (Invoice.gst_lines alternates
+    it so the invoice's CGST and SGST totals differ by at most 0.01)."""
     tax = money(tax)
     r = dec(rate)
     if intra_state is None:
         return {"supply_type": None, "cgst_rate": None, "cgst_amount": None, "sgst_rate": None,
                 "sgst_amount": None, "igst_rate": None, "igst_amount": None}
     if intra_state:
-        cgst = money(tax / 2)
+        half = (tax / 2).quantize(CENT, rounding=ROUND_DOWN)
+        odd = tax - 2 * half
+        cgst = half if odd_paisa_to_sgst else half + odd
         return {"supply_type": "intra_state", "cgst_rate": float(r / 2), "cgst_amount": float(cgst),
                 "sgst_rate": float(r / 2), "sgst_amount": float(tax - cgst),
                 "igst_rate": 0.0, "igst_amount": 0.0}

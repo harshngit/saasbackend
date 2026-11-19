@@ -354,7 +354,7 @@ def test_detailed_pdf_prints_gst_columns_and_cgst_sgst(firm, monkeypatch):
     t = _pdf_texts(monkeypatch, firm, inv["id"])
     for header in ("TAXABLE VALUE", "GST %", "GST AMOUNT"):
         assert header in t, (header, t)
-    assert "TAX)" in t or "AMOUNT (BEFORE TAX)" in t, t      # wrapped, not cut off
+    assert "PRE-TAX AMT" in t, t      # short enough to fit on one line, not cut off
     assert not any("…" in x for x in t), t
     assert "Place of supply: Maharashtra" in t
     assert _value_after(t, "Discount").endswith("200.00")
