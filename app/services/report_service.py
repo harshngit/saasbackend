@@ -1865,6 +1865,11 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
                 return False
         return True
 
+    for r in rows:
+        # Tax whose CGST / SGST / IGST split cannot be told (party state unknown), so
+        # cgst + sgst + igst + unsplit = tax_amount on every row.
+        r["unsplit_tax_amount"] = round(r["tax_amount"] or 0.0, 2) if r["cgst_total"] is None else 0.0
+
     rows = [r for r in rows if _keep(r)]
 
     def _sort_key(row: dict):
@@ -1924,6 +1929,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
             {"key": "cgst_total", "label": "CGST", "type": "currency"},
             {"key": "sgst_total", "label": "SGST", "type": "currency"},
             {"key": "igst_total", "label": "IGST", "type": "currency"},
+            {"key": "unsplit_tax_amount", "label": "Unsplit Tax", "type": "currency"},
             {"key": "total_amount", "label": "Total", "type": "currency"},
         ],
     }
