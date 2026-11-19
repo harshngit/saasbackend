@@ -146,12 +146,19 @@ class Invoice(Base):
         shares = gst_calc.split_discount([gst_calc.money(i.line_total) for i in items], self.discount or 0)
         intra = self._intra_state()
         out = {}
+        odd_lines = 0
         for item, share in zip(items, shares):
             tax = item.tax_amount if item.tax_amount is not None else item.tax
+            # A line whose GST is an odd number of paise gives the extra paisa to CGST and
+            # SGST in turn (1st such line CGST, 2nd SGST, ...), so the invoice's CGST and
+            # SGST totals are equal, or differ by 0.01 when the count of such lines is odd.
+            odd = gst_calc.money(tax or 0) % gst_calc.Decimal("0.02") != 0
             out[item.id] = {
                 "taxable_value": float(gst_calc.money(item.line_total) - share),
-                **gst_calc.gst_split(tax or 0, item.tax_rate or 0, intra),
+                **gst_calc.gst_split(tax or 0, item.tax_rate or 0, intra, odd_paisa_to_sgst=odd and odd_lines % 2 == 1),
             }
+            if odd:
+                odd_lines += 1
         return out
 
     @property

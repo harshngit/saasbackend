@@ -65,7 +65,7 @@ COLUMNS = {
     "batch_number": ("Batch Number", 16, "C"),
     "expiry_date": ("Expiry Date", 18, "C"),
     # line_total: the line's value before tax (also for tax-inclusive items).
-    "amount": ("Amount (before tax)", 24, "R"),
+    "amount": ("Pre-Tax Amt", 24, "R"),
 }
 DEFAULT_COLUMNS = ["product", "hsn_sac", "quantity", "rate", "amount"]
 # Per-line GST columns belong on the detailed tax invoice only; the simple copy shows
@@ -621,6 +621,17 @@ def _party(doc: _Doc, customer, invoice, settings: dict) -> bool:
     return True
 
 
+_WRAP_COLUMNS = ("product", "description")
+
+
+def _draw_lines(doc: _Doc, x: float, y: float, width: float, lines: list[str], row_h: float, align: str) -> None:
+    """A cell's wrapped lines, as a block centred vertically in the row."""
+    line_h = doc.line(doc.table_px)
+    top = y + (row_h - line_h * len(lines)) / 2
+    for n, text in enumerate(lines):
+        doc.text(x, top + n * line_h, width, text, doc.table_px, align=align, height=line_h)
+
+
 _HEADER_BORDER = {"grid": ("box", 2, 300), "minimal": ("bottom", 1, 200)}
 _ROW_BORDER = {"grid": ("box", 1, 200), "banded": ("bottom", 1, 50), "minimal": None}
 
@@ -673,7 +684,19 @@ def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None, simple:
 
     doc.ensure(head_h + row_h)
     draw_header()
+    line_h = doc.line(doc.table_px)
+    img_w = doc.px(img_px + 6)
     for index, item in enumerate(invoice.items):
+        # Product name and description wrap onto as many lines as they need (never cut with
+        # an ellipsis); the row grows to the tallest cell.
+        has_img = show_images and item.id in item_images
+        wrapped = {}
+        for key, w in zip(keys, widths):
+            if key in _WRAP_COLUMNS:
+                text_w = w - 2 * pad_x - (img_w if key == "product" and has_img else 0)
+                wrapped[key] = doc.wrap(_cell(item, key), text_w, doc.table_px)
+        lines_n = max((len(v) for v in wrapped.values()), default=1)
+        row_h = 2 * row_pad + max(line_h * lines_n, doc.px(img_px) if show_images else 0)
         if doc.ensure(row_h):
             draw_header()  # repeat the column headings on every continuation page
         y = doc.y
@@ -689,8 +712,9 @@ def _table(doc: _Doc, invoice, settings: dict, item_images: dict | None, simple:
                     if drawn:
                         text_x += doc.px(img_px + 6)
                         text_w -= doc.px(img_px + 6)
-                doc.text(text_x, y, text_w, doc.fit(_cell(item, key), text_w, doc.table_px), doc.table_px,
-                         align="L", height=row_h)
+                _draw_lines(doc, text_x, y, text_w, wrapped.get(key, [""]), row_h, "L")
+            elif key in wrapped:
+                _draw_lines(doc, x + pad_x, y, inner, wrapped[key], row_h, COLUMNS[key][2])
             else:
                 doc.text(x + pad_x, y, inner, doc.fit(_cell(item, key), inner, doc.table_px), doc.table_px,
                          align=COLUMNS[key][2], height=row_h)
