@@ -1602,6 +1602,44 @@ def _invoice_taxable(inv) -> float:
     return max((inv.subtotal or 0.0) - (inv.discount or 0.0), 0.0)
 
 
+_GST_PARTS = ("cgst_total", "sgst_total", "igst_total")
+
+
+def _invoice_gst_parts(inv) -> dict:
+    """A sales invoice's CGST / SGST / IGST: exactly the invoice API's cgst_total /
+    sgst_total / igst_total (null when the supply type cannot be told)."""
+    return {"cgst_total": inv.cgst_total, "sgst_total": inv.sgst_total, "igst_total": inv.igst_total}
+
+
+def _document_gst_parts(org, party, tax) -> dict:  # noqa: ANN001
+    """CGST / SGST / IGST for a document that stores no split (returns, supplier invoices):
+    its tax split by the seller's and the party's state, with the invoice rule (half each
+    within a state, the odd paisa to CGST; IGST between states; null when either state is
+    unknown)."""
+    from app.services import gst_calc
+
+    intra = gst_calc.is_intra_state(
+        getattr(org, "gst_number", None), getattr(org, "state", None),
+        getattr(party, "gst_number", None), getattr(party, "state", None),
+    )
+    split = gst_calc.gst_split(tax or 0.0, 0, intra)
+    return {k: split[k.replace("_total", "_amount")] for k in _GST_PARTS}
+
+
+def _sum_gst_parts(parts_list, sign: float = 1.0) -> dict:
+    """Totals of the known CGST / SGST / IGST, plus the tax of documents whose split is
+    unknown (`unsplit_tax_amount`), so cgst + sgst + igst + unsplit = the tax total."""
+    out = {k: 0.0 for k in _GST_PARTS}
+    out["unsplit_tax_amount"] = 0.0
+    for parts, tax in parts_list:
+        if parts["cgst_total"] is None:
+            out["unsplit_tax_amount"] += tax or 0.0
+            continue
+        for k in _GST_PARTS:
+            out[k] += parts[k] or 0.0
+    return {k: round(v * sign, 2) + 0.0 for k, v in out.items()}
+
+
 def _gst_summary(db: Session, org_id: str, df: datetime | None, dt: datetime | None, params: dict) -> dict:
     registry = REPORT_REGISTRY["gst-summary"]
     group_by = params.get("group_by") or "summary"
@@ -1688,6 +1726,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
         return scope if statuses is None else tuple(s for s in scope if s in statuses)
 
     rows: list[dict[str, Any]] = []
+    org = db.get(Organization, org_id)
 
     if "sales_invoice" in active and _statuses_for("sales_invoice"):
         q = db.query(Invoice).filter(
@@ -1715,6 +1754,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
                 "status": inv.status,
                 "taxable_value": round(_invoice_taxable(inv), 2),
                 "tax_amount": round(inv.tax or 0.0, 2),
+                **_invoice_gst_parts(inv),
                 "total_amount": round(inv.total or 0.0, 2),
             })
 
@@ -1745,6 +1785,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
                 "status": r.return_status,
                 "taxable_value": round(taxable, 2),
                 "tax_amount": round(tax, 2),
+                **_document_gst_parts(org, cust, round(tax, 2)),
                 "total_amount": round(r.credit_amount if r.credit_amount is not None else taxable + tax, 2),
             })
 
@@ -1772,6 +1813,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
                 "status": si.status,
                 "taxable_value": round(si.subtotal or 0.0, 2),
                 "tax_amount": round(si.tax_amount or 0.0, 2),
+                **_document_gst_parts(org, sup, round(si.tax_amount or 0.0, 2)),
                 "total_amount": round(si.grand_total or 0.0, 2),
             })
 
@@ -1802,6 +1844,7 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
                 "status": r.status,
                 "taxable_value": round(total - tax, 2),
                 "tax_amount": round(tax, 2),
+                **_document_gst_parts(org, sup, round(tax, 2)),
                 "total_amount": round(total, 2),
             })
 
@@ -1843,6 +1886,11 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
         summary[f"{c}_count"] = t["count"]
         summary[f"{c}_taxable_value"] = round(t["taxable_value"], 2)
         summary[f"{c}_tax_amount"] = round(t["tax_amount"], 2)
+        parts = _sum_gst_parts([(r, r["tax_amount"]) for r in rows if r["gst_classification"] == c])
+        summary[f"{c}_cgst_total"] = parts["cgst_total"]
+        summary[f"{c}_sgst_total"] = parts["sgst_total"]
+        summary[f"{c}_igst_total"] = parts["igst_total"]
+        summary[f"{c}_unsplit_tax_amount"] = parts["unsplit_tax_amount"]
     summary["net_tax_amount"] = round(
         (totals["output"]["tax_amount"] - totals["output_adjustment"]["tax_amount"])
         - (totals["input"]["tax_amount"] - totals["input_adjustment"]["tax_amount"]),
@@ -1873,6 +1921,9 @@ def _gst_transactions(db: Session, org_id: str, df: datetime | None, dt: datetim
             {"key": "status", "label": "Status", "type": "status"},
             {"key": "taxable_value", "label": "Taxable Value", "type": "currency"},
             {"key": "tax_amount", "label": "Tax Amount", "type": "currency"},
+            {"key": "cgst_total", "label": "CGST", "type": "currency"},
+            {"key": "sgst_total", "label": "SGST", "type": "currency"},
+            {"key": "igst_total", "label": "IGST", "type": "currency"},
             {"key": "total_amount", "label": "Total", "type": "currency"},
         ],
     }
@@ -1951,34 +2002,65 @@ def _gst_aggregate(db: Session, org_id: str, df: datetime | None, dt: datetime |
     gst_adjustments = round(sales_return_gst + purchase_return_gst, 2)
     net_gst = round(output_gst - input_gst, 2)
 
+    # CGST / SGST / IGST per row: sales invoices exactly as the invoice API; returns and
+    # supplier invoices split by the seller's and the party's state (_document_gst_parts).
+    org = db.get(Organization, org_id)
+
+    def _sr_tax(r) -> float:  # noqa: ANN001
+        return round(sum((item.tax_rate or 0.0) / 100.0 * (item.line_total or 0.0) for item in r.items), 2)
+
+    def _pr_tax(r) -> float:  # noqa: ANN001
+        return round(sum(item.tax_amount or 0.0 for item in r.items), 2)
+
+    output_parts = _sum_gst_parts([(_invoice_gst_parts(i), i.tax) for i in invoices])
+    sales_return_parts = _sum_gst_parts(
+        [(_document_gst_parts(org, r.customer, _sr_tax(r)), _sr_tax(r)) for r in sales_returns], sign=-1.0)
+    input_parts = _sum_gst_parts(
+        [(_document_gst_parts(org, i.supplier, round(i.tax_amount or 0.0, 2)), i.tax_amount) for i in sup_invoices])
+    purchase_return_parts = _sum_gst_parts(
+        [(_document_gst_parts(org, r.supplier, _pr_tax(r)), _pr_tax(r)) for r in purchase_returns])
+    net_parts = {
+        k: round(output_parts[k] + sales_return_parts[k] - (input_parts[k] - purchase_return_parts[k]), 2) + 0.0
+        for k in output_parts
+    }
+
     summary = {
         "output_gst": output_gst,
         "input_gst": input_gst,
         "gst_adjustments": gst_adjustments,
         "net_gst": net_gst,
+        # Net liability by component, matching the Net GST Liability row.
+        "cgst_total": net_parts["cgst_total"],
+        "sgst_total": net_parts["sgst_total"],
+        "igst_total": net_parts["igst_total"],
+        "unsplit_tax_amount": net_parts["unsplit_tax_amount"],
     }
 
     rows = [
         {
             "type": "Output GST (Sales Invoices)",
+            **output_parts,
             "taxable_value": round(sum(_invoice_taxable(i) for i in invoices), 2),
             "tax_amount": round(gross_output_gst, 2),
             "description": f"Tax on {len(invoices)} issued tax sales invoices",
         },
         {
             "type": "Output GST Adjustment (Sales Returns)",
+            **sales_return_parts,
             "taxable_value": round(-sales_return_taxable, 2),
             "tax_amount": round(-sales_return_gst, 2),
             "description": f"Deduction for {len(sales_returns)} approved sales returns / credit notes",
         },
         {
             "type": "Input GST (Purchase Invoices)",
+            **input_parts,
             "taxable_value": round(sum(i.subtotal for i in sup_invoices), 2),
             "tax_amount": round(gross_input_gst, 2),
             "description": f"Input tax credit on {len(sup_invoices)} supplier purchase invoices (before purchase-return reversals)",
         },
         {
             "type": "Net GST Liability",
+            **net_parts,
             "taxable_value": round(
                 (sum(_invoice_taxable(i) for i in invoices) - sales_return_taxable)
                 - (sum(i.subtotal for i in sup_invoices) - purchase_return_taxable),
@@ -2003,6 +2085,9 @@ def _gst_aggregate(db: Session, org_id: str, df: datetime | None, dt: datetime |
             {"key": "type", "label": "GST Classification", "type": "text"},
             {"key": "taxable_value", "label": "Taxable Value", "type": "currency"},
             {"key": "tax_amount", "label": "Tax Amount", "type": "currency"},
+            {"key": "cgst_total", "label": "CGST", "type": "currency"},
+            {"key": "sgst_total", "label": "SGST", "type": "currency"},
+            {"key": "igst_total", "label": "IGST", "type": "currency"},
             {"key": "description", "label": "Description", "type": "text"},
         ],
     }

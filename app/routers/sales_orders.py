@@ -204,6 +204,11 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             out.warehouse_name = wh.name
         seen: set[tuple[str, str | None]] = set()
         summary = []
+        if ctx is None:
+            # Same figures as stock_summary per item, in two queries instead of two per item.
+            batch = stock_service.stock_summaries(
+                db, [(order.warehouse_id, i.product_id, i.variant_id) for i in order.items if i.product_id]
+            )
         for item in order.items:
             key = (item.product_id, item.variant_id)
             if not item.product_id or key in seen:
@@ -212,9 +217,7 @@ def _order_out(db: Session, order: SalesOrder, warnings: list[str] | None = None
             if ctx is not None:
                 summary.append(ctx["stock"][(order.warehouse_id, item.product_id, item.variant_id)])
             else:
-                summary.append(
-                    stock_service.stock_summary(db, order.warehouse_id, item.product_id, item.variant_id)
-                )
+                summary.append(batch[(order.warehouse_id, item.product_id, item.variant_id)])
         out.stock_summary = summary
     out.warnings = warnings or []
 

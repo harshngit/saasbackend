@@ -117,7 +117,7 @@ class PurchaseInvoice(Base):
     )
 
     items: Mapped[list["PurchaseInvoiceItem"]] = relationship(
-        back_populates="invoice", cascade="all, delete-orphan", lazy="joined"
+        back_populates="invoice", cascade="all, delete-orphan", lazy="selectin"
     )
     supplier: Mapped["Supplier | None"] = relationship(lazy="joined")  # noqa: F821
     # Read-only: the receiving warehouse, so list and detail both carry its name. Loaded with

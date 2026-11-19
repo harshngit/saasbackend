@@ -112,7 +112,7 @@ class SalesOrder(Base):
     )
 
     items: Mapped[list["SalesOrderItem"]] = relationship(
-        back_populates="order", cascade="all, delete-orphan", lazy="joined"
+        back_populates="order", cascade="all, delete-orphan", lazy="selectin"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined")  # noqa: F821
     salesperson: Mapped["User | None"] = relationship(  # noqa: F821

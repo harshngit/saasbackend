@@ -73,7 +73,7 @@ class Delivery(Base):
     )
 
     items: Mapped[list["DeliveryItem"]] = relationship(
-        back_populates="delivery", cascade="all, delete-orphan", lazy="joined"
+        back_populates="delivery", cascade="all, delete-orphan", lazy="selectin"
     )
     collections: Mapped[list["DeliveryCollection"]] = relationship(
         back_populates="delivery", cascade="all, delete-orphan", lazy="select"

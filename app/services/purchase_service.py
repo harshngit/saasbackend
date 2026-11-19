@@ -195,7 +195,10 @@ def calculate_header_totals(
             detail="Overall discount cannot be negative",
         )
 
-    effective_discount = round(overall_discount if overall_discount > 0 else item_discounts, 2)
+    # The order-level discount is taken off ON TOP of the item discounts (it used to replace
+    # them, so a bill with both was saved with too high a total). GST stays as worked out on
+    # each line. The stored `discount` is the whole discount: item discounts + order-level.
+    effective_discount = round(item_discounts + overall_discount, 2)
     effective_tax = round(header_tax if header_tax > 0 else item_taxes, 2)
 
     grand_total = round(

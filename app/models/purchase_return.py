@@ -65,7 +65,7 @@ class PurchaseReturn(Base):
     )
 
     items: Mapped[list["PurchaseReturnItem"]] = relationship(
-        back_populates="purchase_return", cascade="all, delete-orphan", lazy="joined"
+        back_populates="purchase_return", cascade="all, delete-orphan", lazy="selectin"
     )
     purchase: Mapped["PurchaseInvoice | None"] = relationship(foreign_keys=[purchase_id], lazy="joined")  # noqa: F821
     supplier: Mapped["Supplier | None"] = relationship(foreign_keys=[supplier_id], lazy="joined")  # noqa: F821

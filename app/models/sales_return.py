@@ -64,7 +64,7 @@ class SalesReturn(Base):
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     items: Mapped[list["ReturnItem"]] = relationship(
-        back_populates="sales_return", cascade="all, delete-orphan", lazy="joined"
+        back_populates="sales_return", cascade="all, delete-orphan", lazy="selectin"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined", primaryjoin="SalesReturn.customer_id == Customer.id")  # noqa: F821
     invoice: Mapped["Invoice | None"] = relationship(lazy="selectin", primaryjoin="SalesReturn.invoice_reference_id == Invoice.id")  # noqa: F821

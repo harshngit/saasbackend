@@ -370,6 +370,15 @@ def update_purchase(
     data = payload.model_dump(exclude_unset=True)
     items_raw = data.pop("items", None)
 
+    # The stored `discount` is item discounts + the order-level discount; recover the
+    # order-level part before anything changes, unless this request sends a new one.
+    if "discount" in data:
+        order_discount = data.pop("discount") or 0.0
+    else:
+        order_discount = max(
+            round((inv.discount or 0.0) - sum(round(i.discount or 0.0, 2) for i in inv.items), 2), 0.0
+        )
+
     for field, value in data.items():
         setattr(inv, field, value)
 
@@ -387,7 +396,7 @@ def update_purchase(
         subtotal=subtotal,
         item_discounts=item_discounts,
         item_taxes=item_taxes,
-        overall_discount=inv.discount,
+        overall_discount=order_discount,
         header_tax=inv.tax,
         freight_charges=inv.freight_charges,
         packing_charges=inv.packing_charges,

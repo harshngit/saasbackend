@@ -43,7 +43,7 @@ class VehicleLoading(Base):
         back_populates="loading", cascade="all, delete-orphan", lazy="selectin"
     )
     items: Mapped[list["VehicleLoadingItem"]] = relationship(
-        back_populates="loading", cascade="all, delete-orphan", lazy="joined"
+        back_populates="loading", cascade="all, delete-orphan", lazy="selectin"
     )
     delivery_partner: Mapped["User"] = relationship(foreign_keys=[delivery_partner_id], lazy="joined")  # noqa: F821
     vehicle: Mapped["Vehicle | None"] = relationship(foreign_keys=[vehicle_id], lazy="joined")  # noqa: F821
@@ -129,7 +129,7 @@ class VehicleStockReconciliation(Base):
     loading: Mapped["VehicleLoading"] = relationship(back_populates="reconciliations")
     reconciled_by: Mapped["User"] = relationship(foreign_keys=[reconciled_by_id], lazy="joined")  # noqa: F821
     items: Mapped[list["VehicleReconciliationItem"]] = relationship(
-        back_populates="reconciliation", cascade="all, delete-orphan", lazy="joined"
+        back_populates="reconciliation", cascade="all, delete-orphan", lazy="selectin"
     )
 
 
