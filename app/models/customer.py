@@ -258,10 +258,10 @@ class CustomerPayment(Base):
     )  # noqa: F821
 
     splits: Mapped[list["PaymentSplit"]] = relationship(
-        back_populates="payment", cascade="all, delete-orphan", lazy="joined"
+        back_populates="payment", cascade="all, delete-orphan", lazy="selectin"
     )
     allocations: Mapped[list["CustomerPaymentAllocation"]] = relationship(
-        back_populates="payment", cascade="all, delete-orphan", lazy="joined"
+        back_populates="payment", cascade="all, delete-orphan", lazy="selectin"
     )
 
     @property

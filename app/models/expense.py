@@ -126,7 +126,7 @@ class Expense(Base):
     )
 
     items: Mapped[list["ExpenseItem"]] = relationship(
-        back_populates="expense", cascade="all, delete-orphan", lazy="joined"
+        back_populates="expense", cascade="all, delete-orphan", lazy="selectin"
     )
     vendor: Mapped["Supplier | None"] = relationship(lazy="joined", primaryjoin="Expense.vendor_id == Supplier.id")  # noqa: F821
     # Names of the people behind the *_by ids. A list page fills `_crm_user_names` with

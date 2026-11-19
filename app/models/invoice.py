@@ -86,7 +86,7 @@ class Invoice(Base):
     vehicle_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     items: Mapped[list["InvoiceItem"]] = relationship(
-        back_populates="invoice", cascade="all, delete-orphan", lazy="joined"
+        back_populates="invoice", cascade="all, delete-orphan", lazy="selectin"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined")  # noqa: F821
     order: Mapped["SalesOrder | None"] = relationship(lazy="joined")  # noqa: F821
@@ -139,11 +139,30 @@ class Invoice(Base):
         )
 
     def gst_lines(self) -> dict[str, dict]:
-        """Per item id: taxable_value + the CGST / SGST / IGST split."""
+        """Per item id: taxable_value + the CGST / SGST / IGST split.
+
+        Memoised on the instance: every line's cgst/sgst/igst fields and the invoice totals
+        read this, so serialising one invoice used to recompute it (and look up the seller)
+        several times per line. The cache key holds every input except the seller, whose
+        state does not change while one request serialises an invoice."""
+        items = list(self.items or [])
+        c = self.customer
+        key = (
+            self.organization_id, self.discount, self.customer_id,
+            (c.gst_number, c.state) if c is not None else None,
+            tuple((i.id, i.line_total, i.tax_amount, i.tax, i.tax_rate) for i in items),
+        )
+        cached = self.__dict__.get("_gst_lines_cache")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        out = self._compute_gst_lines(items)
+        self.__dict__["_gst_lines_cache"] = (key, out)
+        return out
+
+    def _compute_gst_lines(self, items) -> dict[str, dict]:  # noqa: ANN001
         from app.services import gst_calc
 
-        items = list(self.items or [])
-        shares = gst_calc.split_discount([gst_calc.money(i.line_total) for i in items], self.discount or 0)
+        shares =gst_calc.split_discount([gst_calc.money(i.line_total) for i in items], self.discount or 0)
         intra = self._intra_state()
         out = {}
         odd_lines = 0

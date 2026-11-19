@@ -63,7 +63,7 @@ class Lead(Base):
     # by manipulating the Python-side collection, the same pattern already
     # used for Quotation.items.
     interested_product_links: Mapped[list["LeadInterestedProduct"]] = relationship(
-        back_populates="lead", cascade="all, delete-orphan", lazy="joined"
+        back_populates="lead", cascade="all, delete-orphan", lazy="selectin"
     )
 
     @property

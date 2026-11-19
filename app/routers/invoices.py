@@ -319,6 +319,10 @@ def generate_from_order(
         )
 
     issued = datetime.now(timezone.utc)
+    # Load the order's products in one query; _hsn_for's db.get() below then reads them from
+    # the session instead of one query per line. Kept in a local so they stay in the session.
+    product_ids = {i.product_id for i in order.items if i.product_id}
+    _products = db.query(Product).filter(Product.id.in_(product_ids)).all() if product_ids else []  # noqa: F841
     invoice = Invoice(
         organization_id=org_id,
         invoice_number=_next_invoice_number(db, org_id),

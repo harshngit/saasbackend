@@ -114,7 +114,7 @@ class SupplierPayment(Base):
 
     supplier: Mapped["Supplier"] = relationship(back_populates="payments")
     allocations: Mapped[list["SupplierPaymentAllocation"]] = relationship(  # noqa: F821
-        back_populates="supplier_payment", cascade="all, delete-orphan", lazy="joined"
+        back_populates="supplier_payment", cascade="all, delete-orphan", lazy="selectin"
     )
 
 

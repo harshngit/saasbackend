@@ -65,7 +65,7 @@ class Quotation(Base):
     )
 
     items: Mapped[list["QuotationItem"]] = relationship(
-        back_populates="quotation", cascade="all, delete-orphan", lazy="joined"
+        back_populates="quotation", cascade="all, delete-orphan", lazy="selectin"
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined", primaryjoin="Quotation.customer_id == Customer.id")  # noqa: F821
     lead: Mapped["Lead | None"] = relationship(lazy="joined", primaryjoin="Quotation.lead_id == Lead.id")  # noqa: F821

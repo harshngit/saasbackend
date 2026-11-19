@@ -44,7 +44,7 @@ class WarehouseTransfer(Base):
     )
 
     items: Mapped[list["WarehouseTransferItem"]] = relationship(
-        back_populates="transfer", cascade="all, delete-orphan", lazy="joined"
+        back_populates="transfer", cascade="all, delete-orphan", lazy="selectin"
     )
     source_warehouse: Mapped["Warehouse"] = relationship(foreign_keys=[source_warehouse_id], lazy="joined")  # noqa: F821
     destination_warehouse: Mapped["Warehouse"] = relationship(foreign_keys=[destination_warehouse_id], lazy="joined")  # noqa: F821
