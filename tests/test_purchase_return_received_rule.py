@@ -108,7 +108,7 @@ def _movements(ids, key):
 
 def _create(headers, pid, ids, lines):
     return client.post("/purchase-returns", headers=headers, json={
-        "purchase_id": pid, "items": [{"product_id": ids[k], "quantity": q} for k, q in lines]})
+        "purchase_id": pid, "reason": "Damaged", "items": [{"product_id": ids[k], "quantity": q} for k, q in lines]})
 
 
 def test_valid_confirm_moves_stock_balances_and_status_once(world):
@@ -136,12 +136,12 @@ def test_return_more_than_received_is_400_on_create_and_edit(world):
     pid = purchase([("p1", 10, 5)], {"p1": 50})
     r = _create(headers, pid, ids, [("p1", 6)])
     assert r.status_code == 400
-    assert "Electronics" in r.json()["detail"] and "only 5 allowed" in r.json()["detail"]
+    assert "Electronics" in r.json()["detail"] and "returnable 5" in r.json()["detail"]
     r = _create(headers, pid, ids, [("p1", 5)])
     assert r.status_code == 201
     r = client.patch(f"/purchase-returns/{r.json()['id']}", headers=headers,
                      json={"items": [{"product_id": ids["p1"], "quantity": 7}]})
-    assert r.status_code == 400 and "only 5 allowed" in r.json()["detail"]
+    assert r.status_code == 400 and "returnable 5" in r.json()["detail"]
 
 
 def test_return_more_than_stock_is_400_on_create_and_on_confirm_changes_nothing(world):
@@ -194,7 +194,7 @@ def test_exact_scenario_draft_with_received_zero(world):
     # 1. Such a draft can no longer be created.
     r = _create(headers, pid, ids, [("p1", 10), ("p2", 5)])
     assert r.status_code == 400
-    assert "Electronics" in r.json()["detail"] and "only 0 allowed" in r.json()["detail"]
+    assert "Electronics" in r.json()["detail"] and "returnable 0" in r.json()["detail"]
 
     # 2. The existing production draft (created under the old rule) is stored as-is.
     s = SessionLocal()
@@ -219,7 +219,7 @@ def test_exact_scenario_draft_with_received_zero(world):
     # 4. Confirm: a clear 400 (was an unhandled 500), nothing moves.
     r = client.post(f"/purchase-returns/{rid}/confirm", headers=headers)
     assert r.status_code == 400, r.text
-    assert "Electronics" in r.json()["detail"] and "only 0 allowed" in r.json()["detail"]
+    assert "Electronics" in r.json()["detail"] and "returnable 0" in r.json()["detail"]
     assert _on_hand(ids, "p1") == 20 and _movements(ids, "p1") == 0
 
     # 5. Recovery: the user can cancel the draft (no stock was ever deducted) ...

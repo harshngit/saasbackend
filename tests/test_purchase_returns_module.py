@@ -246,10 +246,11 @@ def main():
     # 7. Cumulative over-return rejected (ordered: 20, active draft: 4, requesting 17 -> exceeds 16 remaining)
     r_over = client.post("/purchase-returns", json={
         "purchase_id": base["purchase_id"],
+        "reason": "Over-return attempt",
         "items": [{"purchase_item_id": base["purchase_item1_id"], "quantity": 17}],
     }, headers=auth)
     check("7. Cumulative over-return rejected 400", r_over.status_code == 400)
-    check("7b. Detailed error message indicates eligible quantity", "exceeds eligible return quantity" in r_over.json()["detail"])
+    check("7b. Detailed error message indicates eligible quantity", "cannot exceed returnable quantity" in r_over.json()["detail"])
 
     # 8. Confirm transition (deducts stock exactly once)
     r_conf = client.post(f"/purchase-returns/{ret_id}/confirm", headers=auth)
@@ -289,11 +290,12 @@ def main():
 
     # 12. Invalid transition: cannot cancel completed return
     r_cancel_comp = client.post(f"/purchase-returns/{ret_id}/cancel", json={"reason": "Cannot cancel"}, headers=auth)
-    check("12. Cancel completed return rejected 400", r_cancel_comp.status_code == 400)
+    check("12. Cancel completed return rejected 409", r_cancel_comp.status_code == 409)
 
     # 13. Cancellation of confirmed return restores inventory
     r_new_ret = client.post("/purchase-returns", json={
         "purchase_id": base["purchase_id"],
+        "reason": "Supplier RMA",
         "items": [{"purchase_item_id": base["purchase_item1_id"], "quantity": 6}],
     }, headers=auth)
     assert r_new_ret.status_code == 201
