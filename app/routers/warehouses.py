@@ -141,6 +141,38 @@ WAREHOUSE_MOVEMENT_SORTABLE_FIELDS = {
 }
 
 
+def _stock_rows(db: Session, warehouse: Warehouse, products: list) -> list[StockRow]:  # noqa: ANN001
+    """One StockRow per product (or per variant), in the products' order. All figures
+    come from one stock_summaries() call -- two queries for the whole page -- instead
+    of stock_summary() per row, which cost ~2 database round trips each."""
+    items = [
+        (product, variant_id, variant_name)
+        for product in products
+        for variant_id, variant_name in (
+            [(v.id, v.name) for v in (product.variations or [])] or [(None, None)]
+        )
+    ]
+    figures = stock_service.stock_summaries(
+        db, [(warehouse.id, product.id, variant_id) for product, variant_id, _ in items]
+    )
+    rows = []
+    for product, variant_id, variant_name in items:
+        summary = figures[(warehouse.id, product.id, variant_id)]
+        rows.append(
+            StockRow(
+                warehouse_id=warehouse.id,
+                warehouse_name=warehouse.name,
+                product_id=product.id,
+                product_name=product.name,
+                variant_id=variant_id,
+                variant_name=variant_name,
+                minimum_stock_level=product.minimum_stock_level,
+                **{k: summary[k] for k in ("on_hand", "reserved", "available")},
+            )
+        )
+    return rows
+
+
 @router.get("/stock", response_model=PaginatedResponse[StockRow])
 def stock_positions(
     page: int = Query(1, ge=1),
@@ -220,54 +252,18 @@ def stock_positions(
 
     if not low_stock_only:
         p = paginate(products_query, page=page, page_size=page_size)
-        rows = []
-        for product in p.items:
-            items: list[tuple[str | None, str | None]] = [
-                (variant.id, variant.name) for variant in (product.variations or [])
-            ] or [(None, None)]
-            for variant_id, variant_name in items:
-                summary = stock_service.stock_summary(db, warehouse.id, product.id, variant_id)
-                minimum = product.minimum_stock_level
-                rows.append(
-                    StockRow(
-                        warehouse_id=warehouse.id,
-                        warehouse_name=warehouse.name,
-                        product_id=product.id,
-                        product_name=product.name,
-                        variant_id=variant_id,
-                        variant_name=variant_name,
-                        minimum_stock_level=minimum,
-                        **{k: summary[k] for k in ("on_hand", "reserved", "available")},
-                    )
-                )
         return PaginatedResponse(
-            items=rows,
+            items=_stock_rows(db, warehouse, p.items),
             total=p.total,
             page=p.page,
             page_size=p.page_size,
             total_pages=p.total_pages,
         )
     else:
-        all_prods = products_query.all()
-        matching_rows = []
-        for product in all_prods:
-            items = [(variant.id, variant.name) for variant in (product.variations or [])] or [(None, None)]
-            for variant_id, variant_name in items:
-                summary = stock_service.stock_summary(db, warehouse.id, product.id, variant_id)
-                minimum = product.minimum_stock_level
-                if minimum and summary["available"] <= minimum:
-                    matching_rows.append(
-                        StockRow(
-                            warehouse_id=warehouse.id,
-                            warehouse_name=warehouse.name,
-                            product_id=product.id,
-                            product_name=product.name,
-                            variant_id=variant_id,
-                            variant_name=variant_name,
-                            minimum_stock_level=minimum,
-                            **{k: summary[k] for k in ("on_hand", "reserved", "available")},
-                        )
-                    )
+        matching_rows = [
+            row for row in _stock_rows(db, warehouse, products_query.all())
+            if row.minimum_stock_level and row.available <= row.minimum_stock_level
+        ]
         total = len(matching_rows)
         effective_page_size = min(max(page_size, 1), 100)
         total_pages = math.ceil(total / effective_page_size) if total > 0 else 0
