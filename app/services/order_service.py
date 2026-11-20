@@ -117,10 +117,17 @@ def credit_warning(
 
 def _preload_products(db: Session, product_ids) -> list:  # noqa: ANN001
     """Load the order's products in one query, so the per-line db.get(Product, ...)
-    below is answered from the session instead of one query per line. The caller must
-    keep the returned list: the session holds loaded objects only weakly."""
+    below is answered from the session instead of one query per line. Products this
+    request already loaded this way are not queried again (order create preloads the same
+    products when placing, confirming and invoicing). They are kept in `db.info` because
+    the session itself holds loaded objects only weakly; the session lives for one request."""
     ids = {pid for pid in product_ids if pid}
-    return db.query(Product).filter(Product.id.in_(ids)).all() if ids else []
+    kept: dict = db.info.setdefault("preloaded_products", {})
+    missing = ids - kept.keys()
+    if missing:
+        for product in db.query(Product).filter(Product.id.in_(missing)):
+            kept[product.id] = product
+    return [kept[pid] for pid in ids if pid in kept]
 
 def place_order(
     db: Session,
@@ -406,8 +413,9 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
     if order.warehouse_id and wanted:
         stock_service.lock_stock_items(db, org_id, order.warehouse_id, wanted)
 
-    # Stock shortages
-    short = stock_service.shortages(db, order.warehouse_id, wanted)
+    # Stock shortages (the figures read are reused for the reservation events below)
+    figures: dict = {}
+    short = stock_service.shortages(db, order.warehouse_id, wanted, figures_out=figures)
     if short:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -416,7 +424,9 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
 
     # Reserve required warehouse stock for every confirmed normal Sales Order
     if order.warehouse_id:
-        for reservation in stock_service.reserve_for_order(db, order, order.warehouse_id):
+        for reservation in stock_service.reserve_for_order(
+            db, order, order.warehouse_id, figures_before=figures
+        ):
             item = db.get(SalesOrderItem, reservation.order_item_id)
             if item is not None:
                 item.reserved_quantity = reservation.reserved_quantity

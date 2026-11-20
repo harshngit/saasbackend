@@ -104,6 +104,9 @@ def owned_warehouse(
         wh = db.get(Warehouse, warehouse_id)
         if wh is None or wh.organization_id != org_id:
             return None
+        # Keep it for the rest of the request (the session holds objects only weakly), so
+        # the next lookup of the same warehouse is answered without a query.
+        db.info.setdefault("kept_warehouses", {})[wh.id] = wh
     if require_active and wh is not None and not wh.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -524,12 +527,15 @@ def _sync_catalog_counter(db: Session, org_id: str, product_id: str, variant_id:
 # ------------------------------ reservations -------------------------------
 
 
-def shortages(db: Session, warehouse_id: str, wanted: list[dict]) -> list[dict]:
+def shortages(db: Session, warehouse_id: str, wanted: list[dict], figures_out: dict | None = None) -> list[dict]:
     """Which of the wanted lines the warehouse cannot cover.
 
     `wanted` is [{product_id, variant_id, quantity, order_item_id?}]. Lines for the
     same item are summed first — two lines of the same product must not each be
     checked against the full availability.
+
+    `figures_out`, when given, receives the stock figures read for the check (keyed
+    (warehouse_id, product_id, variant_id)), for reserve_for_order to reuse.
     """
     needed: dict[tuple[str, str | None], float] = {}
     for line in wanted:
@@ -538,6 +544,8 @@ def shortages(db: Session, warehouse_id: str, wanted: list[dict]) -> list[dict]:
 
     # All figures in two queries (stock rows + active reservations), not two per item.
     figures = stock_summaries(db, [(warehouse_id, pid, vid) for pid, vid in needed])
+    if figures_out is not None:
+        figures_out.update(figures)
     short = []
     for (product_id, variant_id), quantity in needed.items():
         free = figures[(warehouse_id, product_id, variant_id)]["available"]
@@ -560,8 +568,14 @@ def shortages(db: Session, warehouse_id: str, wanted: list[dict]) -> list[dict]:
     return short
 
 
-def reserve_for_order(db: Session, order, warehouse_id: str) -> list[StockReservation]:  # noqa: ANN001
-    """Hold stock for every line of an order. No physical movement happens."""
+def reserve_for_order(
+    db: Session, order, warehouse_id: str, figures_before: dict | None = None,  # noqa: ANN001
+) -> list[StockReservation]:
+    """Hold stock for every line of an order. No physical movement happens.
+
+    `figures_before`: the figures shortages() read for these items just before (under the
+    stock row locks). The availability after the holds is then that minus what this order
+    holds, with no second read; without it the figures are read again."""
     held = []
     for item in order.items:
         if not item.product_id or not item.quantity:
@@ -580,8 +594,19 @@ def reserve_for_order(db: Session, order, warehouse_id: str) -> list[StockReserv
         held.append(reservation)
     db.flush()
     # One stock_updated event per item with the availability after this order's holds,
-    # read in two queries for all items instead of two per line.
-    figures = stock_summaries(db, [(warehouse_id, r.product_id, r.variant_id) for r in held])
+    # read in two queries for all items instead of two per line -- or none, from the
+    # figures shortages() just read: available falls by exactly what is held here.
+    keys = [(warehouse_id, r.product_id, r.variant_id) for r in held]
+    if figures_before is not None and all(k in figures_before for k in keys):
+        held_qty: dict[tuple, float] = {}
+        for r in held:
+            k = (warehouse_id, r.product_id, r.variant_id)
+            held_qty[k] = held_qty.get(k, 0.0) + float(r.reserved_quantity or 0)
+        figures = {
+            k: {"available": round(figures_before[k]["available"] - held_qty[k], 3)} for k in held_qty
+        }
+    else:
+        figures = stock_summaries(db, keys)
     seen: set[tuple] = set()
     for r in held:
         key = (warehouse_id, r.product_id, r.variant_id)

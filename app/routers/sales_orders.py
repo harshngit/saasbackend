@@ -924,8 +924,10 @@ def create_order(
             )
 
     # Automatic Invoice Generation
-    from app.routers.invoices import generate_from_order
-    generate_from_order(order.id, payload=None, user=user, db=db, allow_upfront=True)
+    # Not committed here: the order, its delivery, invoice, payment and stock moves are
+    # committed together at the end (one commit, and no re-read of the invoice).
+    from app.routers.invoices import invoice_order
+    invoice_order(db, user, order.id, allow_upfront=True, commit=False)
 
     # Automatic Payment Recording
     if paid_amt > 0:
@@ -989,8 +991,17 @@ def create_order(
     if customer:
         customer.recompute_outstanding()
 
-    db.commit()
-    db.refresh(order)
+    # One commit for the whole order. Objects are not expired by it: everything was just
+    # written by this request, so re-reading the order, its lines and the warehouse for the
+    # response (as refresh() did) only cost round trips.
+    db.expire_on_commit = False
+    try:
+        db.commit()
+    finally:
+        db.expire_on_commit = True
+    # The timestamps only, as stored (one query): the database returns them in its session
+    # time zone, which is what the response has always shown.
+    db.refresh(order, attribute_names=["created_at", "updated_at", "order_date", "collected_at"])
     return _order_out(db, order, warnings)
 
 
