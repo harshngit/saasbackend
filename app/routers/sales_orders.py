@@ -535,6 +535,8 @@ ORDER_SORTABLE_FIELDS = {
     "delivery_status": SalesOrder.fulfilment_status,
     "delivery_date": SalesOrder.delivery_date,
     "created_at": SalesOrder.created_at,
+    # Recent activity: last time the order row changed (status, edit, invoice/delivery sync).
+    "updated_at": SalesOrder.updated_at,
 }
 
 
