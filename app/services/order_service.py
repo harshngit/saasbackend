@@ -114,6 +114,14 @@ def credit_warning(
     return message
 
 
+
+def _preload_products(db: Session, product_ids) -> list:  # noqa: ANN001
+    """Load the order's products in one query, so the per-line db.get(Product, ...)
+    below is answered from the session instead of one query per line. The caller must
+    keep the returned list: the session holds loaded objects only weakly."""
+    ids = {pid for pid in product_ids if pid}
+    return db.query(Product).filter(Product.id.in_(ids)).all() if ids else []
+
 def place_order(
     db: Session,
     user: User,
@@ -225,6 +233,7 @@ def place_order(
     subtotal = 0.0
     priced: list[dict] = []
     wanted: list[dict] = []
+    _products = _preload_products(db, [line.product_id for line in lines])  # noqa: F841 (kept so the session holds them)
     for line in lines:
         product = db.get(Product, line.product_id)
         if product is None or product.organization_id != org_id:
@@ -371,6 +380,7 @@ def confirm_order(db: Session, user: User, order: SalesOrder) -> tuple[SalesOrde
 
     # Re-validate products/variants and build wanted list
     wanted: list[dict] = []
+    _products = _preload_products(db, [item.product_id for item in order.items])  # noqa: F841 (kept so the session holds them)
     for item in order.items:
         product = db.get(Product, item.product_id)
         if product is None or product.organization_id != org_id:

@@ -42,15 +42,35 @@ def _route(request: Request) -> str:
     return getattr(route, "path", None) or request.url.path
 
 
+def _trace_id(request: Request) -> str:
+    """The W3C trace id from a `traceparent` header (00-<trace id>-<span id>-<flags>), if any."""
+    parts = (request.headers.get("traceparent") or "").split("-")
+    return parts[1] if len(parts) >= 3 else "-"
+
+
 def log_unhandled(request: Request, exc: BaseException) -> None:
+    """One log line per unhandled error, traceback included, with the Cloudflare Ray ID and
+    trace id so it can be found from the 500 seen in the Worker's request log.
+
+    The traceback is folded onto the same line (newlines -> " | "): container stdout/stderr
+    reaches Cloudflare Observability line by line, so a multi-line traceback would become
+    many separate, unsearchable events. Content is the same as the old exc_info traceback
+    (a SQLAlchemy error message includes its [SQL: ...] and [parameters: ...]); only the
+    last 4000 characters are kept, which is where the raising frame and message are."""
+    import traceback
+
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    tb = tb.strip().replace("\r", "").replace("\n", " | ")[-4000:]
     logger.error(
-        "Unhandled exception: %s %s (path %s) user=%s: %s",
+        "Unhandled exception: %s %s (path %s) user=%s ray=%s trace=%s: %s :: %s",
         request.method,
         _route(request),
         request.url.path,
         _user_id(request) or "-",
+        request.headers.get("cf-ray") or "-",
+        _trace_id(request),
         type(exc).__name__,
-        exc_info=(type(exc), exc, exc.__traceback__),
+        tb,
     )
 
 

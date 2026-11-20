@@ -349,9 +349,34 @@ def create_product(
     )
     _mirror_tax_inclusive(product)
     db.add(product)
+    db.flush()
+    _post_opening_stock(db, org_id, product, user.id)
     db.commit()
     db.refresh(product)
     return product
+
+
+def _post_opening_stock(db: Session, org_id: str, product: Product, user_id: str | None) -> None:
+    """Opening stock of a new product goes into the firm's default warehouse as a real
+    stock row plus an "opening" stock movement (warehouse row, catalog counter and
+    ledger together, via stock_service). Create only: editing a product never posts it
+    again. Skipped for products with variants (stock is per variant), with inventory
+    tracking off, or tracked by serial number (each unit needs its serial)."""
+    from app.services import stock_service, tracking_service
+
+    qty = int(product.opening_stock or 0)
+    if qty <= 0 or not product.inventory_tracking or product.variations or tracking_service.tracks_serials(product):
+        return
+    # The catalog counter is rebuilt from the warehouse rows by the movement below. Zero
+    # it first: a counter sent alongside opening_stock would otherwise be seeded into the
+    # new warehouse row as untracked stock and counted twice.
+    product.total_inventory = 0
+    db.flush()
+    warehouse = stock_service.default_warehouse(db, org_id)
+    stock_service.adjust_on_hand(
+        db, org_id, warehouse.id, product.id, None, float(qty), "opening",
+        note="Opening stock", created_by=user_id,
+    )
 
 
 @router.post("/bulk-delete", response_model=BulkDeleteResult)

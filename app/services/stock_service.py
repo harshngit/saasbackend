@@ -186,15 +186,34 @@ def lock_stock_items(
     # Deterministic sorting to prevent cyclic lock dependency deadlocks
     sorted_pairs = sorted(unique_pairs, key=lambda p: (warehouse_id, p[0], p[1] or ""))
 
+    # Rows that already exist are locked with ONE `SELECT ... ORDER BY product_id,
+    # variant_id FOR UPDATE` (Postgres takes the row locks in that sorted order, so the
+    # deadlock-free ordering is kept). `WarehouseStock.warehouse` is lazy="joined" at
+    # the mapper level, which would otherwise pull a LEFT OUTER JOIN into the statement
+    # — Postgres refuses FOR UPDATE on the nullable side of an outer join — hence the
+    # lazyload(). The query may also lock other variants of the same products in this
+    # warehouse; that only narrows concurrency, never correctness.
+    wanted = set(sorted_pairs)
+    existing = (
+        db.query(WarehouseStock)
+        .filter(
+            WarehouseStock.warehouse_id == warehouse_id,
+            WarehouseStock.product_id.in_({pid for pid, _ in sorted_pairs}),
+        )
+        .options(lazyload(WarehouseStock.warehouse))
+        .order_by(WarehouseStock.product_id, WarehouseStock.variant_id)
+        .with_for_update(nowait=False)
+        .all()
+    )
+    by_pair = {(r.product_id, r.variant_id): r for r in existing if (r.product_id, r.variant_id) in wanted}
+
     locked_rows: list[WarehouseStock] = []
     for pid, vid in sorted_pairs:
-        # Ensure row exists in DB
+        if (pid, vid) in by_pair:
+            locked_rows.append(by_pair[(pid, vid)])
+            continue
+        # No row yet: create it (as before), then lock it on its own.
         _row(db, org_id, warehouse_id, pid, vid)
-        # Lock row with SELECT ... FOR UPDATE. `WarehouseStock.warehouse` is
-        # lazy="joined" at the mapper level, which would otherwise pull a LEFT
-        # OUTER JOIN into this statement — Postgres refuses FOR UPDATE on the
-        # nullable side of an outer join. lazyload() suppresses just that
-        # default for this one query so the lock targets warehouse_stock alone.
         query = (
             db.query(WarehouseStock)
             .filter(
@@ -511,9 +530,11 @@ def shortages(db: Session, warehouse_id: str, wanted: list[dict]) -> list[dict]:
         key = (line["product_id"], line.get("variant_id"))
         needed[key] = needed.get(key, 0) + (line.get("quantity") or 0)
 
+    # All figures in two queries (stock rows + active reservations), not two per item.
+    figures = stock_summaries(db, [(warehouse_id, pid, vid) for pid, vid in needed])
     short = []
     for (product_id, variant_id), quantity in needed.items():
-        free = available(db, warehouse_id, product_id, variant_id)
+        free = figures[(warehouse_id, product_id, variant_id)]["available"]
         if quantity > free:
             first = next(
                 line for line in wanted
@@ -551,19 +572,28 @@ def reserve_for_order(db: Session, order, warehouse_id: str) -> list[StockReserv
         )
         db.add(reservation)
         held.append(reservation)
+    db.flush()
+    # One stock_updated event per item with the availability after this order's holds,
+    # read in two queries for all items instead of two per line.
+    figures = stock_summaries(db, [(warehouse_id, r.product_id, r.variant_id) for r in held])
+    seen: set[tuple] = set()
+    for r in held:
+        key = (warehouse_id, r.product_id, r.variant_id)
+        if key in seen:
+            continue
+        seen.add(key)
         queue_event(
             db,
             org_id=order.organization_id,
             event_name="inventory.stock_updated",
             data={
-                "product_id": item.product_id,
-                "variant_id": item.variant_id,
+                "product_id": r.product_id,
+                "variant_id": r.variant_id,
                 "warehouse_id": warehouse_id,
-                "available_quantity": available(db, warehouse_id, item.product_id, item.variant_id),
+                "available_quantity": figures[key]["available"],
             },
             required_permission="inventory:view",
         )
-    db.flush()
     return held
 
 
