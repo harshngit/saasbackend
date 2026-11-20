@@ -129,7 +129,11 @@ class SupplierInvoiceItem(Base):
 
     supplier_invoice: Mapped["SupplierInvoice"] = relationship(back_populates="items")
     purchase_item: Mapped["PurchaseInvoiceItem"] = relationship(lazy="joined")  # noqa: F821
-    product: Mapped["Product | None"] = relationship(lazy="joined")  # noqa: F821
+    # Loaded only when read (product_name / sku fall back to it when the purchase line has
+    # none). Joined, it pulled the product's own joined graph (pricing, variants, two
+    # category levels, supplier, brand, type) -- ~220 columns, ~30 KB per item -- into
+    # every invoice items load, though nearly every response never touches it.
+    product: Mapped["Product | None"] = relationship(lazy="select")  # noqa: F821
 
     # Read from the linked purchase item (and its GRN roll-up) -- never copied or guessed.
     @property

@@ -219,7 +219,10 @@ def list_supplier_invoices(
 def get_supplier_invoice(
     id: str, user: User = Depends(_view), db: Session = Depends(get_db)
 ) -> SupplierInvoice:
-    return _owned(db, id, _org_id(user))
+    inv = _owned(db, id, _org_id(user))
+    # Each line's billed-elsewhere figure in one query (it was one query per line).
+    supplier_invoice_service.prefetch_verification(db, [inv])
+    return inv
 
 
 @router.put("/{id}", response_model=SupplierInvoiceOut)
