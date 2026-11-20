@@ -42,8 +42,7 @@ def _no_plan_gates(monkeypatch):
     monkeypatch.setattr(entitlement_service, "has_entitlement", lambda *a, **k: True)
 
 
-@pytest.fixture
-def firm():
+def _make_firm(lines: int = LINES, blank_purchase_names: bool = False) -> dict:
     db = SessionLocal()
     try:
         org = Organization(name=f"SI {uuid.uuid4().hex[:6]}", company_code=f"CMP-{uuid.uuid4().int % 90000 + 10000}",
@@ -59,7 +58,7 @@ def firm():
         db.add_all([admin, wh, sup])
         db.flush()
         pids = []
-        for i in range(LINES):
+        for i in range(lines):
             p = Product(organization_id=org.id, name=f"Line {i}", sku=f"L{i}-{uuid.uuid4().hex[:5]}", price=100,
                         tax_rate=18, hsn_code="8544", is_active=True)
             p.pricing = ProductPricing(selling_price=100, purchase_price=50, tax_inclusive=False, currency="INR")
@@ -79,9 +78,20 @@ def firm():
     client.post(f"/purchases/{r.json()['id']}/confirm", headers=out["h"])
     with SessionLocal() as s:
         inv = s.query(SupplierInvoice).filter(SupplierInvoice.organization_id == out["org"]).first()
-        assert inv is not None and len(inv.items) == LINES
+        assert inv is not None and len(inv.items) == lines
         out["inv"] = inv.id
+        if blank_purchase_names:
+            # Purchase lines with no name / code: product_name and sku must fall back to the product.
+            for item in inv.items:
+                item.purchase_item.product_name = ""
+                item.purchase_item.product_code = None
+            s.commit()
     return out
+
+
+@pytest.fixture
+def firm():
+    return _make_firm()
 
 
 def _run(fn):
@@ -115,3 +125,30 @@ def test_detail_has_names_and_a_fixed_query_count(firm):
     assert sorted(i["product_name"] for i in body["items"]) == sorted(f"Line {i}" for i in range(LINES))
     assert all(i["sku"] for i in body["items"])
     assert len(stmts) <= 8, len(stmts)            # used to grow by one query per line
+
+
+@pytest.mark.parametrize("path", ["/supplier-invoices/{inv}", "/supplier-invoices"])
+def test_fallback_products_load_in_one_batched_query(path):
+    """Lines whose purchase line has no name / code read them from the product: one query
+    for all such lines, so 20 blank lines cost the same as 2 (not 18 more)."""
+    counts = {}
+    for n in (2, 20):
+        f = _make_firm(n, blank_purchase_names=True)
+        body, stmts = _run(lambda: client.get(path.format(inv=f["inv"]), headers=f["h"]))
+        inv = body if "items" in body and "total" not in body else body["items"][0]
+        assert sorted(i["product_name"] for i in inv["items"]) == sorted(f"Line {i}" for i in range(n))
+        assert all(i["sku"] and i["sku"].startswith("L") for i in inv["items"])
+        product_loads = [s for s in stmts if re.search(r"FROM products\b", s)]
+        assert len(product_loads) == 1, product_loads
+        assert "JOIN" not in product_loads[0] and len(re.findall(r" AS \w+", product_loads[0].split(" FROM ")[0])) <= 4
+        counts[n] = len(stmts)
+    assert counts[20] == counts[2], counts
+
+
+def test_fallback_is_batched_on_routes_without_the_page_prefetch():
+    """Cancel returns the invoice without calling prefetch_verification: the model's own
+    guard still loads the fallback products for the whole invoice in one query."""
+    f = _make_firm(12, blank_purchase_names=True)
+    body, stmts = _run(lambda: client.post(f"/supplier-invoices/{f['inv']}/cancel", headers=f["h"]))
+    assert sorted(i["product_name"] for i in body["items"]) == sorted(f"Line {i}" for i in range(12))
+    assert len([s for s in stmts if re.search(r"FROM products\b", s)]) == 1

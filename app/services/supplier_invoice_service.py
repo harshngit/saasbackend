@@ -350,12 +350,38 @@ def billed_elsewhere_map(db: Session, items: list[SupplierInvoiceItem]) -> dict[
     return result
 
 
+def prefetch_fallback_products(db: Session | None, items: list[SupplierInvoiceItem]) -> None:
+    """Load, in ONE query, the products of every line whose purchase line has no product name
+    or code (product_name / sku fall back to the product then). Only id, name and sku are
+    read, and none of the product's own eager relationships. Lines that do not need the
+    fallback, or whose product is already loaded, are left alone."""
+    if db is None:
+        return
+    needing = [i for i in items if i.needs_product_fallback and "product" not in i.__dict__]
+    ids = {i.product_id for i in needing}
+    if not ids:
+        return
+    from sqlalchemy.orm import load_only
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    found = {
+        p.id: p
+        for p in db.query(Product)
+        .options(lazyload("*"), load_only(Product.id, Product.name, Product.sku))
+        .filter(Product.id.in_(ids))
+    }
+    for item in needing:
+        set_committed_value(item, "product", found.get(item.product_id))
+
+
 def prefetch_verification(db: Session, invoices: list[SupplierInvoice]) -> None:
     """Fill every item's billed-elsewhere figure for a page of invoices in one query, so
-    serializing quantity_match does not query per line."""
+    serializing quantity_match does not query per line; and load the fallback products of
+    lines without a name / code in one more query (only if any line needs one)."""
     items = [item for inv in invoices for item in inv.items]
     for item_id, qty in billed_elsewhere_map(db, items).items():
         next(i for i in items if i.id == item_id).__dict__["_billed_elsewhere"] = qty
+    prefetch_fallback_products(db, items)
 
 
 def refresh_verification(db: Session, invoice: SupplierInvoice) -> None:

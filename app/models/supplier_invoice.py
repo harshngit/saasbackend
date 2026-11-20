@@ -137,16 +137,47 @@ class SupplierInvoiceItem(Base):
 
     # Read from the linked purchase item (and its GRN roll-up) -- never copied or guessed.
     @property
+    def needs_product_fallback(self) -> bool:
+        """Whether product_name or sku has to be read from the product (the purchase line
+        lacks one of them)."""
+        return bool(self.product_id) and (
+            self.purchase_item is None
+            or not self.purchase_item.product_name
+            or not self.purchase_item.product_code
+        )
+
+    def _fallback_product(self):  # noqa: ANN202
+        """The product, loaded together with those of every other line of this invoice that
+        needs it (one query for the invoice, never one per line)."""
+        if "product" not in self.__dict__:
+            from app.services.supplier_invoice_service import prefetch_fallback_products
+
+            session = object_session(self)
+            # The parent is normally already in the session (its items were loaded through
+            # it), so this get() is answered from the identity map without a query.
+            invoice = self.__dict__.get("supplier_invoice") or (
+                session.get(SupplierInvoice, self.supplier_invoice_id)
+                if session is not None and self.supplier_invoice_id else None
+            )
+            siblings = list(invoice.items) if invoice is not None else [self]
+            if self not in siblings:
+                siblings.append(self)
+            prefetch_fallback_products(session, siblings)
+        return self.product
+
+    @property
     def product_name(self) -> str | None:
         if self.purchase_item is not None and self.purchase_item.product_name:
             return self.purchase_item.product_name
-        return self.product.name if self.product is not None else self.description
+        product = self._fallback_product()
+        return product.name if product is not None else self.description
 
     @property
     def sku(self) -> str | None:
         if self.purchase_item is not None and self.purchase_item.product_code:
             return self.purchase_item.product_code
-        return self.product.sku if self.product is not None else None
+        product = self._fallback_product()
+        return product.sku if product is not None else None
 
     @property
     def ordered_qty(self) -> int | None:
