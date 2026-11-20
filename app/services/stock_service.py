@@ -358,12 +358,18 @@ def stock_summaries(db: Session, keys, reservations_out: list | None = None) -> 
             reservations_out.append(row)
 
     out = {}
+    is_default: dict[str, bool] = {}
     for warehouse_id, product_id, variant_id in keys:
         tracked = stock_rows.get((product_id, variant_id))
         if tracked:
             held = round(sum(r.on_hand_quantity or 0 for r in tracked if r.warehouse_id == warehouse_id), 3)
         else:
-            held = on_hand(db, warehouse_id, product_id, variant_id)
+            # Same as on_hand() for an item no warehouse tracks (stock_rows already holds
+            # every row of these products, so none exists): the catalog counter, in the
+            # default warehouse only. The default check is made once per warehouse.
+            if warehouse_id not in is_default:
+                is_default[warehouse_id] = _is_default_warehouse(db, warehouse_id)
+            held = round(_catalog_stock(db, product_id, variant_id), 3) if is_default[warehouse_id] else 0.0
         promised = round(sum(r.outstanding_quantity for r in reservations.get((warehouse_id, product_id, variant_id), [])), 3)
         out[(warehouse_id, product_id, variant_id)] = {
             "product_id": product_id,
