@@ -425,6 +425,25 @@ def outstanding_for_order_item(db: Session, item: SalesOrderItem) -> float:
     return round(max((item.quantity or 0) - consumed, 0.0), 3)
 
 
+def outstanding_for_order_items(db: Session, items) -> dict[str, float]:  # noqa: ANN001
+    """outstanding_for_order_item for many lines in one query: {order_item_id: outstanding}."""
+    items = [i for i in items if i.id]
+    if not items:
+        return {}
+    in_flight_statuses = {"planned", "accepted", "ready", "loaded", "in_transit"}
+    consumed: dict[str, float] = {}
+    rows = (
+        db.query(DeliveryItem, Delivery.status)
+        .join(Delivery, DeliveryItem.delivery_id == Delivery.id)
+        .filter(DeliveryItem.order_item_id.in_([i.id for i in items]), Delivery.status != "cancelled")
+        .all()
+    )
+    for line, delivery_status in rows:
+        qty = line.planned_quantity if delivery_status in in_flight_statuses else line.delivered_quantity
+        consumed[line.order_item_id] = consumed.get(line.order_item_id, 0.0) + float(qty or 0.0)
+    return {i.id: round(max((i.quantity or 0) - consumed.get(i.id, 0.0), 0.0), 3) for i in items}
+
+
 def plan(
     db: Session,
     user: User,
@@ -467,9 +486,11 @@ def plan(
         if driver_vehicle is not None:
             vehicle_id = driver_vehicle.id
 
+    # What each line still has to plan, for all lines in one query.
+    outstanding_by_item = outstanding_for_order_items(db, order.items)
     if wanted is None:
         lines = [
-            {"order_item_id": item.id, "planned_quantity": outstanding_for_order_item(db, item)}
+            {"order_item_id": item.id, "planned_quantity": outstanding_by_item.get(item.id, 0.0)}
             for item in order.items
         ]
         lines = [line for line in lines if line["planned_quantity"] > 0]
@@ -512,13 +533,15 @@ def plan(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"order_item_id {line['order_item_id']} is not a line on this order",
             )
-        outstanding = outstanding_for_order_item(db, item)
+        outstanding = outstanding_by_item.get(item.id, 0.0)
         if line["planned_quantity"] > outstanding + 0.001:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"{item.product_name}: only {outstanding:g} left to plan "
                        f"(asked for {line['planned_quantity']:g})",
             )
+        # Two lines for the same order line in one request share its outstanding.
+        outstanding_by_item[item.id] = round(outstanding - line["planned_quantity"], 3)
         delivery.items.append(
             DeliveryItem(
                 order_item_id=item.id,
