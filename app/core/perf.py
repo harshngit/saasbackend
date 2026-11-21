@@ -70,6 +70,26 @@ def stage(name: str):  # noqa: ANN201
         stages[name] = (ms + (time.perf_counter() - started) * 1000, n + stats["queries"] - queries)
 
 
+def mark(name: str | None) -> None:
+    """Start stage `name` and end the one the previous mark() started -- for timing a long
+    function in consecutive stages without re-indenting it. mark(None) just ends the open
+    stage; one still open when the response is sent is ended then. No-op outside a request."""
+    stats = _request_stats.get()
+    if stats is not None:
+        _close_mark(stats)
+        if name:
+            stats["_mark"] = (name, time.perf_counter(), stats["queries"])
+
+
+def _close_mark(stats: dict) -> None:
+    open_mark = stats.pop("_mark", None)
+    if open_mark:
+        name, started, queries = open_mark
+        stages = stats.setdefault("stages", {})
+        ms, n = stages.get(name, (0.0, 0))
+        stages[name] = (ms + (time.perf_counter() - started) * 1000, n + stats["queries"] - queries)
+
+
 def install_middleware(app, log_lines: bool = True) -> None:  # noqa: ANN001
     """Count queries per request and add a Server-Timing header to every response.
     `log_lines` (PERF_LOG) also writes one `perf:` log line per request."""
@@ -82,6 +102,7 @@ def install_middleware(app, log_lines: bool = True) -> None:  # noqa: ANN001
         status = 500
         try:
             response = await call_next(request)
+            _close_mark(stats)
             status = response.status_code
             response.headers["Server-Timing"] = server_timing(stats, (time.perf_counter() - started) * 1000)
             return response
