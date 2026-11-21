@@ -14,7 +14,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import BigInteger, and_, case, cast, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -182,6 +182,28 @@ def _highest_issued(db: Session, org_id: str, column, stem: str, above: int = 0)
     return highest
 
 
+def _highest_issued_subquery(db: Session, org_id: str, column, stem: str):  # noqa: ANN001, ANN202
+    """SQL for _highest_issued: the highest all-digit suffix after exactly `stem` in this
+    organization's `column`, 0 when there is none. Numbers in any other format (a legacy
+    SO-1102 next to SO-10001-2026-1122) do not start with the stem and are ignored, as in
+    _highest_issued. Used inside the counter UPDATE so the check costs no round trip."""
+    model = column.parent.class_
+    suffix = func.substr(column, len(stem) + 1)
+    if db.get_bind().dialect.name == "postgresql":
+        all_digits = suffix.op("~")("^[0-9]+$")
+    else:  # SQLite (tests): no regex by default
+        all_digits = and_(suffix != "", ~suffix.op("GLOB")("*[^0-9]*"))
+    return (
+        select(func.coalesce(func.max(case((all_digits, cast(suffix, BigInteger)))), 0))
+        .where(
+            model.organization_id == org_id,
+            column.like(f"{stem}%"),
+            func.substr(column, 1, len(stem)) == stem,   # exact stem: '_' in a prefix is no wildcard
+        )
+        .scalar_subquery()
+    )
+
+
 def prefix_for(db: Session, org_id: str, series: str) -> str:
     """The firm's prefix for a series — its Company Settings override, else the
     canonical series name (CS, IN, SO, DO, PO, EMP, L, QT, SUP, PRD, VAR, CMP)."""
@@ -211,6 +233,24 @@ def _allocate_next(
         NumberSequence.series == series,
         NumberSequence.year == year,
     )
+
+    # Fast path, ONE round trip: when the counter row exists, raise it to the highest number
+    # already issued under this exact stem (the re-check below, done inside the same
+    # statement) and increment it. Returns no row only for the first number of a series /
+    # year, which takes the path below.
+    if column is not None:
+        highest = _highest_issued_subquery(db, org_id, column, stem)
+        row = db.execute(
+            sa_update(NumberSequence)
+            .where(*_match)
+            .values(last_number=case(
+                (highest > NumberSequence.last_number, highest), else_=NumberSequence.last_number,
+            ) + 1)
+            .returning(NumberSequence.last_number)
+        ).first()
+        if row is not None:
+            db.flush()
+            return f"{stem}{row[0]:04d}"
 
     exists = db.query(NumberSequence).filter(*_match).first()
     if exists is None:

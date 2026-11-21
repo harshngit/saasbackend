@@ -36,7 +36,17 @@ def install_query_counter(engine) -> None:  # noqa: ANN001
         stats["sql_ms"] += (time.perf_counter() - starts.pop()) * 1000
 
 
-def install_middleware(app) -> None:  # noqa: ANN001
+def server_timing(stats: dict, total_ms: float) -> str:
+    """The Server-Timing header value: numbers only (query count, SQL ms, total ms) -- no
+    SQL text, parameters or data. Standard syntax, so browser DevTools show it under the
+    request's Timing tab: `db;dur=<sql ms>;desc="queries=<count>", total;dur=<ms>`."""
+    return f'db;dur={stats["sql_ms"]:.1f};desc="queries={stats["queries"]}", total;dur={total_ms:.1f}'
+
+
+def install_middleware(app, log_lines: bool = True) -> None:  # noqa: ANN001
+    """Count queries per request and add a Server-Timing header to every response.
+    `log_lines` (PERF_LOG) also writes one `perf:` log line per request."""
+
     @app.middleware("http")
     async def _perf_log(request, call_next):  # noqa: ANN001, ANN202
         stats = {"queries": 0, "sql_ms": 0.0}
@@ -46,14 +56,16 @@ def install_middleware(app) -> None:  # noqa: ANN001
         try:
             response = await call_next(request)
             status = response.status_code
+            response.headers["Server-Timing"] = server_timing(stats, (time.perf_counter() - started) * 1000)
             return response
         finally:
             _request_stats.reset(token)
-            logger.info(
-                "perf: %s %s %s %.0fms sql=%d sql_ms=%.0f",
-                request.method, request.url.path, status, (time.perf_counter() - started) * 1000,
-                stats["queries"], stats["sql_ms"],
-            )
+            if log_lines:
+                logger.info(
+                    "perf: %s %s %s %.0fms sql=%d sql_ms=%.0f",
+                    request.method, request.url.path, status, (time.perf_counter() - started) * 1000,
+                    stats["queries"], stats["sql_ms"],
+                )
 
 
 def log_round_trip(engine) -> None:  # noqa: ANN001

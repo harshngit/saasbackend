@@ -58,6 +58,19 @@ def _allocate_journal_entry_number(
         NumberSequence.year == year,
     )
 
+    # Fast path, one round trip: the counter row exists (every entry after the first of a
+    # series / year). journal_entries has a unique (organization_id, entry_number), so no
+    # highest-issued re-check is needed here, as before.
+    row = db.execute(
+        sa_update(NumberSequence)
+        .where(*_match)
+        .values(last_number=NumberSequence.last_number + 1)
+        .returning(NumberSequence.last_number)
+    ).first()
+    if row is not None:
+        db.flush()
+        return f"{prefix}{row[0]:05d}"
+
     exists = db.query(NumberSequence).filter(*_match).first()
     if exists is None:
         highest = 0

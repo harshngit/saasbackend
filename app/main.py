@@ -125,11 +125,12 @@ app = FastAPI(
     openapi_url="/openapi.json" if settings.enable_docs else None,
 )
 
-if settings.perf_log:
-    from app.core import perf
+# Every response carries `Server-Timing: db;dur=<sql ms>;desc="queries=<n>", total;dur=<ms>`
+# (numbers only). PERF_LOG=true additionally logs one `perf:` line per request.
+from app.core import perf  # noqa: E402
 
-    perf.install_query_counter(engine)
-    perf.install_middleware(app)
+perf.install_query_counter(engine)
+perf.install_middleware(app, log_lines=settings.perf_log)
 
 from app.core.database import install_disconnect_retry  # noqa: E402
 
@@ -155,7 +156,9 @@ app.add_middleware(UnhandledErrorMiddleware)
 # With credentials enabled, browsers reject a wildcard "*" origin, so "*" becomes a
 # regex; explicit production origins (e.g. https://crm-saas.asynk.in) sit alongside
 # regex matching for localhost / 127.0.0.1 development ports.
-_cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+_cors_kwargs = dict(allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+                    # So the frontend can read the per-request timing (see app.core.perf).
+                    expose_headers=["Server-Timing"])
 if "*" in settings.cors_origin_list:
     _cors_kwargs.update(allow_origin_regex=".*")
 else:

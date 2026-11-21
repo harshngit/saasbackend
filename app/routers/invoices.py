@@ -187,6 +187,20 @@ def generate_from_order(
     Tax comes from the snapshot on the order line — the line's own rate, else the
     product's. Nothing is hardcoded.
     """
+    return invoice_order(db, user, order_id, payload, allow_upfront=allow_upfront)
+
+
+def invoice_order(
+    db: Session,
+    user: User,
+    order_id: str,
+    payload: InvoiceFromDelivery | None = None,
+    allow_upfront: bool = False,
+    commit: bool = True,
+) -> Invoice:
+    """The work of POST /orders/{order_id}/invoice (see generate_from_order). With
+    commit=False (order create, which commits once at its end) the invoice is only
+    flushed, and is not re-read from the database."""
     org_id = _org_id(user)
     order = db.get(SalesOrder, order_id)
     if order is None or order.organization_id != org_id:
@@ -321,8 +335,10 @@ def generate_from_order(
     issued = datetime.now(timezone.utc)
     # Load the order's products in one query; _hsn_for's db.get() below then reads them from
     # the session instead of one query per line. Kept in a local so they stay in the session.
-    product_ids = {i.product_id for i in order.items if i.product_id}
-    _products = db.query(Product).filter(Product.id.in_(product_ids)).all() if product_ids else []  # noqa: F841
+    # (Already loaded by order create in the same request: then no query at all.)
+    from app.services.order_service import _preload_products
+
+    _products = _preload_products(db, [i.product_id for i in order.items])  # noqa: F841
     invoice = Invoice(
         organization_id=org_id,
         invoice_number=_next_invoice_number(db, org_id),
@@ -423,6 +439,9 @@ def generate_from_order(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to post invoice to general ledger: {exc}",
         ) from exc
+    if not commit:
+        db.flush()
+        return invoice
     db.commit()
     db.refresh(invoice)
     return invoice
