@@ -123,6 +123,10 @@ def _clear_on_override_bulk_write(state) -> None:  # noqa: ANN001
 
 @event.listens_for(Session, "after_commit")
 def _clear_after_override_commit(session: Session) -> None:
+    if session.in_nested_transaction():
+        # A savepoint ending (begin_nested) also fires this hook; only the outermost
+        # transaction's end counts, or work queued for it would act too early.
+        return
     # Cleared again once committed: another request may have re-read the old rows
     # between this session's flush and its commit.
     if session.info.pop("crm_overrides_changed", False):

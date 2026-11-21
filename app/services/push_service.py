@@ -333,6 +333,10 @@ def _dispatch(notification_ids: list[str]) -> None:
 
 @event.listens_for(Session, "after_commit")
 def _send_queued_pushes(session: Session) -> None:
+    if session.in_nested_transaction():
+        # A savepoint ending (begin_nested) also fires this hook; only the outermost
+        # transaction's end counts, or work queued for it would act too early.
+        return
     pending = session.info.pop(_PENDING_KEY, None)
     if pending:
         try:
@@ -343,4 +347,8 @@ def _send_queued_pushes(session: Session) -> None:
 
 @event.listens_for(Session, "after_rollback")
 def _drop_queued_pushes(session: Session) -> None:
+    if session.in_nested_transaction():
+        # A savepoint ending (begin_nested) also fires this hook; only the outermost
+        # transaction's end counts, or work queued for it would act too early.
+        return
     session.info.pop(_PENDING_KEY, None)

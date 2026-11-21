@@ -92,6 +92,14 @@ def record(
     if amount is None or amount <= 0:
         raise ValueError("A payment must be more than zero")
 
+    if customer is not None and customer.id:
+        # Lock order: the customer row BEFORE any number counter. Order create updates the
+        # customer row and then takes the journal-entry counter; this flow used to take the
+        # receipt and journal counters first and the customer row after, so an order and a
+        # payment for the same customer at the same moment could deadlock (one aborted with
+        # a 500). Taking the customer first here gives both flows the same order.
+        db.query(Customer.id).filter(Customer.id == customer.id).with_for_update().first()
+
     if splits is not None:
         if len(splits) == 0:
             raise ValueError("Payment splits list cannot be empty")
