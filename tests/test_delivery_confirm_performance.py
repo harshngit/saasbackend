@@ -199,3 +199,42 @@ def test_two_identical_confirms_at_the_same_moment_apply_once(env):
         t.join(timeout=120)
     assert sorted(codes) == [200, 200], codes
     assert {q for _, q in _state(did)[0]} == {1.0}                 # delivered once, not twice
+
+
+def test_two_genuine_identical_partials_are_both_recorded(env, monkeypatch):
+    """2 + 2 of 6: a second, identical partial hand-over after the retry window is a real
+    one and is recorded; an identical confirm right after it (a retry) is not."""
+    import time
+    from datetime import timedelta
+
+    from app.services import delivery_service
+
+    monkeypatch.setattr(delivery_service, "PARTIAL_RETRY_WINDOW", timedelta(seconds=1))
+    did, lines = _dispatched(env, 2, qty=6)
+    two = {"items": [{"delivery_item_id": i, "delivered_quantity": 2} for i in lines]}
+    assert _confirm(env, did, two).status_code == 200
+    assert {q for _, q in _state(did)[0]} == {2.0}
+    time.sleep(1.5)                                             # the driver's second hand-over
+    second = _confirm(env, did, two)
+    assert second.status_code == 200 and second.json()["internal_status"] == "partially_delivered"
+    assert {q for _, q in _state(did)[0]} == {4.0}               # both recorded: 2 + 2
+    retry = _confirm(env, did, two)                              # immediate repeat = a retry
+    assert retry.status_code == 200
+    assert {q for _, q in _state(did)[0]} == {4.0}               # not 6
+
+
+def test_full_delivery_retry_is_still_deduplicated_after_the_partial_window(env, monkeypatch):
+    import time
+    from datetime import timedelta
+
+    from app.services import delivery_service
+
+    monkeypatch.setattr(delivery_service, "PARTIAL_RETRY_WINDOW", timedelta(seconds=1))
+    did, lines = _dispatched(env, 2, qty=2)
+    body = {"items": [{"delivery_item_id": i, "delivered_quantity": 2} for i in lines]}
+    assert _confirm(env, did, body).status_code == 200
+    before = _state(did)
+    time.sleep(1.5)
+    r = _confirm(env, did, body)
+    assert r.status_code == 200 and r.json()["internal_status"] == "delivered"
+    assert _state(did) == before
