@@ -272,7 +272,12 @@ class DeliveryHistoryOut(BaseModel):
                 "new_status": data.new_status,
                 "actor": {"id": actor_id, "name": actor_name} if actor_id else None,
                 "notes": data.notes,
-                "event_metadata": data.event_metadata,
+                # confirm_fingerprint is internal (recognises a retried confirm); not shown.
+                "event_metadata": (
+                    {k: v for k, v in data.event_metadata.items() if k != "confirm_fingerprint"} or None
+                    if isinstance(data.event_metadata, dict) and "confirm_fingerprint" in data.event_metadata
+                    else data.event_metadata
+                ),
                 "created_at": data.created_at,
             }
         return data

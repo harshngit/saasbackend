@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, document_filename
-from app.core import business_time, scoping, workflow
+from app.core import business_time, perf, scoping, workflow
 from app.core.sorting import apply_sorting
 from app.models.enums import UserRole
 from app.models import (
@@ -282,7 +282,11 @@ def _delivery_out(
     db: Session, delivery: Delivery, include_timeline: bool = False, ctx: dict | None = None
 ) -> DeliveryOut:
     """`ctx` (delivery_service.delivery_list_context) carries the per-delivery lookups
-    preloaded for a list page; without it every lookup is queried here, as for one delivery."""
+    preloaded for a list page. Without one, it is built here for this single delivery: the
+    same fixed handful of queries, instead of ~4 stock queries per line (a 20-line
+    delivery's response used to cost ~80 queries for the lines' `warehouse_available`)."""
+    if ctx is None:
+        ctx = delivery_service.delivery_list_context(db, [delivery])
     out = DeliveryOut.model_validate(delivery)
     # Raw internal status, before status's own public-mapping field_validator
     # ran — see DeliveryOut.internal_status: distinguishes "loaded" from
@@ -1033,7 +1037,12 @@ def confirm_delivery(
     POD photos and the signature are ordinary uploads: POST /files/upload and send the
     `file_id`s here.
     """
-    delivery = _owned_delivery(db, delivery_id, user)
+    # Stage timings go to the Server-Timing header and, for a request over 5 s, to one
+    # "slow request" log line (app.core.perf).
+    with perf.stage("load"):
+        delivery = _owned_delivery(db, delivery_id, user)
+    # An identical retry of a confirm already recorded (e.g. sent again after a client
+    # timeout) changes nothing and gets the recorded result back with 200.
     delivery_service.confirm(
         db, user, delivery,
         lines=[
@@ -1046,10 +1055,13 @@ def confirm_delivery(
         failed=payload.failed,
         failure_reason=payload.failure_reason,
         receiver_name=payload.receiver_name,
+        replay_check=True,
     )
-    db.commit()
-    db.refresh(delivery)
-    return _delivery_out(db, delivery)
+    with perf.stage("commit"):
+        db.commit()
+    with perf.stage("response"):
+        db.refresh(delivery)
+        return _delivery_out(db, delivery)
 
 
 @router.get("/{delivery_id}/app/delivery-capacity", response_model=DeliveryCapacityOut)

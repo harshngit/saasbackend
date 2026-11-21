@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 from sqlalchemy import event, text
@@ -40,7 +41,33 @@ def server_timing(stats: dict, total_ms: float) -> str:
     """The Server-Timing header value: numbers only (query count, SQL ms, total ms) -- no
     SQL text, parameters or data. Standard syntax, so browser DevTools show it under the
     request's Timing tab: `db;dur=<sql ms>;desc="queries=<count>", total;dur=<ms>`."""
-    return f'db;dur={stats["sql_ms"]:.1f};desc="queries={stats["queries"]}", total;dur={total_ms:.1f}'
+    value = f'db;dur={stats["sql_ms"]:.1f};desc="queries={stats["queries"]}", total;dur={total_ms:.1f}'
+    for name, (ms, queries) in (stats.get("stages") or {}).items():
+        value += f', {name};dur={ms:.1f};desc="queries={queries}"'
+    return value
+
+
+# A request slower than this logs one WARNING line with its stage timings, whatever
+# PERF_LOG says (production cannot rely on PERF_LOG being set).
+SLOW_REQUEST_MS = 5000
+
+
+@contextmanager
+def stage(name: str):  # noqa: ANN201
+    """Time one stage of a request: wall ms and queries, added to the request's
+    Server-Timing header (`<name>;dur=<ms>;desc="queries=<n>"`) and to the slow-request
+    log line. `name` must be a plain token (letters, digits, '_'). A no-op outside a request."""
+    stats = _request_stats.get()
+    if stats is None:
+        yield
+        return
+    started, queries = time.perf_counter(), stats["queries"]
+    try:
+        yield
+    finally:
+        stages = stats.setdefault("stages", {})
+        ms, n = stages.get(name, (0.0, 0))
+        stages[name] = (ms + (time.perf_counter() - started) * 1000, n + stats["queries"] - queries)
 
 
 def install_middleware(app, log_lines: bool = True) -> None:  # noqa: ANN001
@@ -60,11 +87,17 @@ def install_middleware(app, log_lines: bool = True) -> None:  # noqa: ANN001
             return response
         finally:
             _request_stats.reset(token)
+            total_ms = (time.perf_counter() - started) * 1000
             if log_lines:
                 logger.info(
                     "perf: %s %s %s %.0fms sql=%d sql_ms=%.0f",
-                    request.method, request.url.path, status, (time.perf_counter() - started) * 1000,
-                    stats["queries"], stats["sql_ms"],
+                    request.method, request.url.path, status, total_ms, stats["queries"], stats["sql_ms"],
+                )
+            if total_ms > SLOW_REQUEST_MS:
+                logger.warning(
+                    "slow request: %s %s %s %.0fms sql=%d sql_ms=%.0f stages=%s",
+                    request.method, request.url.path, status, total_ms, stats["queries"], stats["sql_ms"],
+                    " ".join(f"{k}={ms:.0f}ms/{n}q" for k, (ms, n) in (stats.get("stages") or {}).items()) or "-",
                 )
 
 
