@@ -13,12 +13,13 @@ dispatched. Each step is deliberately separate because each one is a different r
 event.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session, lazyload
 
+from app.core import perf
 from app.core.realtime import queue_event
 from app.core.workflow import DeliveryTransitionError, public_order_status, validate_delivery_transition
 from app.models import (
@@ -1034,6 +1035,50 @@ def lock_run_for_confirm(db: Session, delivery: Delivery) -> VehicleLoading | No
     return loading
 
 
+CONFIRM_FINGERPRINT_KEY = "confirm_fingerprint"
+CONFIRM_REPLAY_WINDOW = timedelta(minutes=30)
+
+
+def confirm_fingerprint(lines, pod_photo_file_ids, signature_file_id, notes, failed, failure_reason,  # noqa: ANN001
+                        receiver_name) -> str:
+    """sha256 of a confirm request's content (lines summed per delivery line, POD, notes,
+    outcome). Stored on the confirm's history entry so an identical retry can be recognised."""
+    import hashlib
+    import json
+
+    per_line: dict[str, float] = {}
+    for line in lines:
+        per_line[line["delivery_item_id"]] = round(per_line.get(line["delivery_item_id"], 0.0)
+                                                   + float(line["delivered_quantity"] or 0), 3)
+    payload = {
+        "lines": sorted(per_line.items()), "pod": sorted(pod_photo_file_ids or []), "signature": signature_file_id,
+        "notes": notes or None, "failed": bool(failed), "failure_reason": failure_reason or None,
+        "receiver_name": receiver_name or None,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _already_confirmed_with(db: Session, delivery: Delivery, fingerprint: str) -> bool:
+    """Whether this delivery's latest confirm outcome came from an identical request in the
+    last CONFIRM_REPLAY_WINDOW. One query. Older entries (written before fingerprints were
+    stored) never match, so they behave exactly as before."""
+    last = (
+        db.query(DeliveryHistory)
+        .filter(
+            DeliveryHistory.delivery_id == delivery.id,
+            DeliveryHistory.event_type.in_(["delivered", "partially_delivered", "failed"]),
+        )
+        .order_by(DeliveryHistory.created_at.desc())
+        .first()
+    )
+    if last is None or (last.event_metadata or {}).get(CONFIRM_FINGERPRINT_KEY) != fingerprint:
+        return False
+    created = last.created_at
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created is None or datetime.now(timezone.utc) - created <= CONFIRM_REPLAY_WINDOW
+
+
 def confirm(
     db: Session,
     user: User,
@@ -1045,7 +1090,8 @@ def confirm(
     failed: bool,
     failure_reason: str | None,
     receiver_name: str | None = None,
-) -> None:
+    replay_check: bool = False,
+) -> bool:
     """Record what was actually handed over. Does not commit.
 
     Vehicle stock falls by the **delivered** quantity only. Anything loaded but not
@@ -1057,7 +1103,15 @@ def confirm(
     # exactly the states that may reach "partially_delivered" too, so validating
     # against either representative target correctly gates the real outcome,
     # which is computed further down once the delivered quantity is known.
-    lock_run_for_confirm(db, delivery)
+    fingerprint = confirm_fingerprint(lines, pod_photo_file_ids, signature_file_id, notes, failed,
+                                      failure_reason, receiver_name)
+    with perf.stage("lock"):
+        loading = lock_run_for_confirm(db, delivery)
+    # A retry of a confirm that was already recorded (the client timed out while the first
+    # request was still running, then sent it again): the lock above waited for the first
+    # one to commit, so its history entry is visible now. Nothing is applied twice.
+    if replay_check and _already_confirmed_with(db, delivery, fingerprint):
+        return False
     previous = delivery.status
     _require_transition(delivery.status, "failed" if failed else "delivered")
 
@@ -1076,19 +1130,59 @@ def confirm(
         delivery.delivery_status = "failed"
         record_history(
             db, delivery, "failed", actor=user, previous_status=previous, new_status="failed",
-            notes=failure_reason,
+            notes=failure_reason, metadata={CONFIRM_FINGERPRINT_KEY: fingerprint},
         )
         order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
         if order is not None:
             order.fulfilment_status = "failed"
         notification_service.notify_delivery_status_changed(db, delivery, previous, actor_id=user.id)
-        return
+        return True
 
     by_id = {item.id: item for item in delivery.items}
-    loading = (
-        _open_loading(db, delivery.organization_id, delivery.delivery_partner_id)
-        if delivery.delivery_partner_id else None
-    )
+    # `loading` is the partner's active run, already locked and re-read above (the same row
+    # _open_loading() returns; it used to be loaded a second time here).
+    with perf.stage("lines"):
+        _apply_confirm_lines(db, delivery, by_id, lines, loading)
+
+    with perf.stage("order_fulfilment"):
+        delivered = delivery.delivered_total
+        planned = delivery.planned_total
+        delivery.status = "delivered" if delivered + 0.001 >= planned else "partially_delivered"
+        delivery.delivery_status = "delivered" if delivery.status == "delivered" else "partial"
+        order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
+        if order is not None:
+            _settle_order_fulfilment(db, order, actor_id=user.id)
+
+    with perf.stage("history_events"):
+        record_history(
+            db, delivery, delivery.status, actor=user, previous_status=previous, new_status=delivery.status,
+            metadata={
+                "pod_photo_file_ids": delivery.pod_photo_file_ids,
+                "pod_signature_file_id": delivery.pod_signature_file_id,
+                "receiver_name": delivery.receiver_name,
+                CONFIRM_FINGERPRINT_KEY: fingerprint,
+            },
+        )
+        notification_service.notify_delivery_status_changed(db, delivery, previous, actor_id=user.id)
+        queue_event(
+            db,
+            org_id=delivery.organization_id,
+            event_name="delivery.status_changed",
+            data={
+                "delivery_id": delivery.id,
+                "delivery_number": delivery.delivery_number,
+                "sales_order_id": delivery.sales_order_id,
+                "previous_status": previous,
+                "new_status": delivery.status,
+            },
+            required_permission="deliveries:view",
+        )
+    return True
+
+
+def _apply_confirm_lines(db: Session, delivery: Delivery, by_id: dict, lines: list[dict], loading) -> None:  # noqa: ANN001
+    """The per-line part of confirm(), unchanged: validate each line against what is still
+    on the vehicle, then move delivery line, vehicle run line and order line together."""
     for line in lines:
         item = by_id.get(line["delivery_item_id"])
         if item is None:
@@ -1125,38 +1219,6 @@ def confirm(
                 order_item.delivered_quantity = round(
                     (order_item.delivered_quantity or 0) + quantity, 3
                 )
-
-    delivered = delivery.delivered_total
-    planned = delivery.planned_total
-    delivery.status = "delivered" if delivered + 0.001 >= planned else "partially_delivered"
-    delivery.delivery_status = "delivered" if delivery.status == "delivered" else "partial"
-    record_history(
-        db, delivery, delivery.status, actor=user, previous_status=previous, new_status=delivery.status,
-        metadata={
-            "pod_photo_file_ids": delivery.pod_photo_file_ids,
-            "pod_signature_file_id": delivery.pod_signature_file_id,
-            "receiver_name": delivery.receiver_name,
-        },
-    )
-
-    order = db.get(SalesOrder, delivery.sales_order_id) if delivery.sales_order_id else None
-    if order is not None:
-        _settle_order_fulfilment(db, order, actor_id=user.id)
-    notification_service.notify_delivery_status_changed(db, delivery, previous, actor_id=user.id)
-
-    queue_event(
-        db,
-        org_id=delivery.organization_id,
-        event_name="delivery.status_changed",
-        data={
-            "delivery_id": delivery.id,
-            "delivery_number": delivery.delivery_number,
-            "sales_order_id": delivery.sales_order_id,
-            "previous_status": previous,
-            "new_status": delivery.status,
-        },
-        required_permission="deliveries:view",
-    )
 
 
 def _settle_order_fulfilment(db: Session, order: SalesOrder, actor_id: str | None = None) -> None:

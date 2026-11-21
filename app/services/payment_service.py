@@ -13,7 +13,7 @@ the one transaction the caller commits.
 
 from datetime import datetime, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, lazyload
 
 from app.models import Customer, CustomerPayment, CustomerPaymentAllocation, Invoice, PaymentSplit, SalesOrder
 from app.services import numbering_service
@@ -91,6 +91,23 @@ def record(
     """
     if amount is None or amount <= 0:
         raise ValueError("A payment must be more than zero")
+
+    if customer is not None and customer.id:
+        # Lock order: the customer row BEFORE any number counter. Order create updates the
+        # customer row and then takes the journal-entry counter; this flow used to take the
+        # receipt and journal counters first and the customer row after, so an order and a
+        # payment for the same customer at the same moment could deadlock (one aborted with
+        # a 500). Taking the customer first here gives both flows the same order.
+        # populate_existing: the customer object was usually loaded before the lock (by the
+        # route), so its balances may be stale -- a payment that committed meanwhile would
+        # otherwise be overwritten when total_received / outstanding are written back (two
+        # simultaneous payments left the balance reduced by only one of them). Flush first
+        # so this request's own pending changes to the customer are not discarded.
+        db.flush()
+        # lazyload("*"): Customer's eager joins would put outer joins into this statement, and
+        # PostgreSQL refuses FOR UPDATE on the nullable side of an outer join.
+        db.query(Customer).options(lazyload("*")).filter(Customer.id == customer.id) \
+            .with_for_update(of=Customer).populate_existing().first()
 
     if splits is not None:
         if len(splits) == 0:

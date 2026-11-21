@@ -838,6 +838,10 @@ def _clear_dashboard_cache_on_bulk_write(state) -> None:  # noqa: ANN001
 
 @event.listens_for(Session, "after_commit")
 def _clear_dashboard_cache_after_commit(session: Session) -> None:
+    if session.in_nested_transaction():
+        # A savepoint ending (begin_nested) also fires this hook; only the outermost
+        # transaction's end counts, or work queued for it would act too early.
+        return
     # Again once committed: a request between this session's flush and its commit may
     # have rebuilt the dashboard from the old figures.
     if session.info.pop("crm_dashboard_changed", False):

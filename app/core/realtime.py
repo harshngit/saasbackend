@@ -180,6 +180,10 @@ def queue_event(
 @event.listens_for(Session, "after_commit")
 def _on_session_after_commit(session: Session) -> None:
     """Trigger queued realtime events upon successful transaction commit."""
+    if session.in_nested_transaction():
+        # A savepoint ending (begin_nested) also fires this hook; only the outermost
+        # transaction's end counts, or work queued for it would act too early.
+        return
     if not hasattr(session, "info"):
         return
     pending = session.info.pop("_pending_realtime_events", None)
@@ -197,5 +201,9 @@ def _on_session_after_commit(session: Session) -> None:
 @event.listens_for(Session, "after_rollback")
 def _on_session_after_rollback(session: Session) -> None:
     """Discard pending events if the transaction rolls back."""
+    if session.in_nested_transaction():
+        # A savepoint ending (begin_nested) also fires this hook; only the outermost
+        # transaction's end counts, or work queued for it would act too early.
+        return
     if hasattr(session, "info"):
         session.info.pop("_pending_realtime_events", None)
