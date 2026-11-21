@@ -204,3 +204,44 @@ def test_two_simultaneous_payments_for_one_customer_both_succeed(firm):
         assert round(s.get(Customer, firm["cust"]).outstanding_balance, 2) == round(owed_before - 100, 2)
         paid = sorted(float(i.amount_paid or 0) for i in s.query(Invoice).filter(Invoice.id.in_(invoices)))
         assert paid == [50.0, 50.0]
+
+
+def test_order_payment_and_customer_payment_at_the_same_moment(firm):
+    """Two DIFFERENT routes for the same customer at once: POST /orders/{id}/payments and
+    POST /customers/{id}/payments. Both succeed and both reduce the balance."""
+    client = TestClient(app)
+    made = []
+    for _ in range(2):
+        r = client.post("/orders", headers=firm["h"], json={
+            "customer_id": firm["cust"], "warehouse_id": firm["wh"], "delivery_method": "home_delivery",
+            "payment_status": "pending", "items": [{"product_id": firm["prod"], "quantity": 1}]})
+        assert r.status_code == 201, r.text
+        made.append(r.json())
+    with SessionLocal() as s:
+        owed_before = s.get(Customer, firm["cust"]).outstanding_balance
+
+    start = threading.Barrier(2)
+    results = {}
+
+    def call(name, url, body):
+        c = TestClient(app, raise_server_exceptions=False)
+        start.wait()
+        results[name] = c.post(url, headers=firm["h"], json=body)
+
+    threads = [
+        threading.Thread(target=call, args=("order", f"/orders/{made[0]['id']}/payments",
+                                            {"amount": 40, "payment_method": "cash"})),
+        threading.Thread(target=call, args=("customer", f"/customers/{firm['cust']}/payments",
+                                            {"amount": 60, "payment_mode": "upi", "invoice_id": made[1]["invoice_id"]})),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert results["order"].status_code in (200, 201), results["order"].text[:300]
+    assert results["customer"].status_code == 201, results["customer"].text[:300]
+    with SessionLocal() as s:
+        assert round(s.get(Customer, firm["cust"]).outstanding_balance, 2) == round(owed_before - 100, 2)
+        paid = {i.id: float(i.amount_paid or 0) for i in s.query(Invoice).filter(
+            Invoice.id.in_([made[0]["invoice_id"], made[1]["invoice_id"]]))}
+        assert paid == {made[0]["invoice_id"]: 40.0, made[1]["invoice_id"]: 60.0}
