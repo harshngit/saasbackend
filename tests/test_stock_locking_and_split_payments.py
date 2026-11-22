@@ -267,7 +267,10 @@ def test_suite():
 
         # Re-fetch via GET /payment-receipts
         res_get_f = client.get(f"/payment-receipts", headers=headers)
-        found_in_list = any(r["id"] == pay_id and len(r.get("splits", [])) == 2 for r in res_get_f.json())
+        # GET /payment-receipts is paginated ({items, total, page, ...}) like the other lists.
+        listed = res_get_f.json()
+        rows = listed["items"] if isinstance(listed, dict) else listed
+        found_in_list = any(r["id"] == pay_id and len(r.get("splits", [])) == 2 for r in rows)
         if found_in_list:
             ok("TEST F.2: GET /payment-receipts re-fetches split details correctly")
         else:
@@ -421,10 +424,10 @@ def test_suite():
     # TEST L: Cash Collection Reporting with Split Cash Portions
     # Customer c_fin made a split payment with Rs 300 cash portion.
     # Run cash collection report
-    rep_data = report_service._cash_collection(db, org_id, None, None)
+    rep_data = report_service._cash_collection(db, org_id, None, None, {})  # params added to the signature later
     total_cash = rep_data["summary"]["total_cash"]
     # Ensure Rs 300 is captured in cash collection
-    has_300 = any(r["amount"] == 300.0 for r in rep_data["rows"])
+    has_300 = any(r.get("cash_amount", r.get("amount")) == 300.0 for r in rep_data["rows"])  # row key is cash_amount now
     if has_300:
         ok("TEST L: Cash Collection report successfully includes the Rs 300 cash portion of split payment without double-counting parent")
     else:
