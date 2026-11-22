@@ -585,8 +585,30 @@ def plan(
     return delivery
 
 
+def _lock_and_reread(db: Session, delivery: Delivery) -> None:
+    """Row-lock the delivery and re-read it (after flushing this request's own changes), so
+    a status check sees what a simultaneous request may just have committed. A SELECT ...
+    FOR UPDATE, not the no-op UPDATE of lock_delivery_row: it must not touch updated_at when
+    the action turns out to be a repeat."""
+    db.flush()
+    (
+        db.query(Delivery)
+        .options(lazyload("*"))
+        .filter(Delivery.id == delivery.id)
+        .with_for_update(of=Delivery)
+        .populate_existing()
+        .first()
+    )
+
+
 def accept(db: Session, user: User, delivery: Delivery) -> Delivery:
-    """Partner accepts a planned delivery. Does not commit."""
+    """Partner accepts a planned delivery. Does not commit.
+
+    A repeat by the assigned partner on a delivery already accepted (an app retry) is a
+    no-op: the delivery as it is, no new history entry or event."""
+    _lock_and_reread(db, delivery)
+    if delivery.status == "accepted" and delivery.delivery_partner_id == user.id:
+        return delivery
     _require_transition(delivery.status, "accepted")
     if delivery.delivery_partner_id != user.id:
         raise HTTPException(
@@ -1014,7 +1036,14 @@ def load(
 
 
 def dispatch(db: Session, user: User, delivery: Delivery) -> None:
-    """Send it out. Only now is the delivery live for the partner."""
+    """Send it out. Only now is the delivery live for the partner.
+
+    A repeat on a delivery already in transit ("Start Delivery" pressed again, an app
+    retry) is a no-op: dispatched_at / dispatched_by and the order are left as they are and
+    no new history entry is written. Any other invalid move is refused as before."""
+    _lock_and_reread(db, delivery)
+    if delivery.status == "in_transit":
+        return
     _require_transition(delivery.status, "in_transit")
     if delivery.loaded_total <= 0:
         raise HTTPException(
