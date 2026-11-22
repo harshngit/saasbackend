@@ -5,7 +5,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload, lazyload
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
+from app.core.deps import get_current_user, has_permission, require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, document_filename
 from app.core import business_time, perf, scoping, workflow
 from app.core.sorting import apply_sorting
@@ -1278,6 +1278,21 @@ def get_delivery_note_detail(
 
 # -------------------- Delivery Collection & Reconciliation --------------------
 
+COLLECTIONS_APPROVE_DETAIL = (
+    "You don't have permission to reconcile, void or approve delivery collections: this needs "
+    "the Deliveries > Approve permission on your role."
+)
+
+
+def require_collections_approve(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    """Reconcile / void a collection and approve a Day-End move money: the role needs the
+    `deliveries` module's `approve` right (Admins / owners are not permission-checked). On
+    top of each endpoint's existing check, never instead of it."""
+    if not has_permission(db, user, "deliveries", "approve"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTIONS_APPROVE_DETAIL)
+    return user
+
+
 def _lock_collection(db: Session, collection_id: str, org_id: str) -> DeliveryCollection:
     """Row-lock and re-read a collection before its state is checked.
 
@@ -1721,7 +1736,7 @@ def record_general_customer_collection(
 @router.patch("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
 def reconcile_delivery_collection(
     collection_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
@@ -1807,7 +1822,7 @@ def reconcile_delivery_collection(
 @router.patch("/collections/{collection_id}/void", response_model=DeliveryCollectionOut)
 def void_delivery_collection(
     collection_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:

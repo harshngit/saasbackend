@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core import scoping
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
+from app.routers.deliveries import require_collections_approve
 from app.core.pagination import paginate
 from app.models import User
 from app.models.delivery_day_end import DAY_END_STATUSES, DeliveryDayEnd
@@ -129,6 +130,7 @@ def approve_day_end(
     day_end_id: str,
     payload: DayEndApprove | None = None,
     user: User = Depends(_view),
+    _approver: User = Depends(require_collections_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DayEndOut:
