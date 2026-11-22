@@ -43,9 +43,12 @@ def default_warehouse(db: Session, org_id: str) -> Warehouse:
     screen, and a caller that never mentions a warehouse has to land somewhere
     real — so this is created lazily rather than demanded up front.
     """
+    # Deterministic: if (old data) more than one is flagged, the oldest flagged one is the
+    # default; the flags themselves are left as they are.
     existing = (
         db.query(Warehouse)
         .filter(Warehouse.organization_id == org_id, Warehouse.is_default.is_(True))
+        .order_by(Warehouse.created_at, Warehouse.id)
         .first()
     )
     if existing is not None:
@@ -55,7 +58,7 @@ def default_warehouse(db: Session, org_id: str) -> Warehouse:
     any_warehouse = (
         db.query(Warehouse)
         .filter(Warehouse.organization_id == org_id)
-        .order_by(Warehouse.created_at)
+        .order_by(Warehouse.created_at, Warehouse.id)
         .first()
     )
     if any_warehouse is not None:
@@ -242,8 +245,7 @@ def _is_default_warehouse(db: Session, warehouse_id: str | None) -> bool:
     wh = db.get(Warehouse, warehouse_id)
     if wh is None:
         return False
-    if wh.is_default:
-        return True
+    # Flagged or not, only THE default counts (the oldest flagged one if several are).
     return default_warehouse(db, wh.organization_id).id == wh.id
 
 
