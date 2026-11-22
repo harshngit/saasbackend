@@ -56,6 +56,11 @@ def lock_for_payment(db: Session, customer_id: str | None, invoice_ids) -> None:
     """Row-lock the customer, then the invoices a payment moves (id order, so concurrent
     payments always lock in the same order), and re-read them under the lock.
 
+    THE lock order for every payment path (customer payment, order payment, payment link,
+    void, collection reconcile / void, direct invoice): the document row first if there is
+    one (payment link, delivery collection), then this (customer, then invoices by id), and
+    only then the number / journal counters (record() and void() call this before any).
+
     Their figures are moved in Python (total_received, amount_paid += x). Loaded before the
     lock, a payment that committed meanwhile would be overwritten when they are written
     back: two receipts of 40 and 60 left amount_paid at 60. The re-read (populate_existing)
