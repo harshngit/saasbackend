@@ -942,20 +942,13 @@ def create_order(
     # committed together at the end (one commit, and no re-read of the invoice).
     from app.routers.invoices import invoice_order
     perf.mark("invoice")
-    invoice_order(db, user, order.id, allow_upfront=True, commit=False)
+    created_invoice = invoice_order(db, user, order.id, allow_upfront=True, commit=False)
     perf.mark("payment")
 
-    # Automatic Payment Recording
+    # Automatic Payment Recording -- against the invoice just made (it used to be read back
+    # with a query: the order's only invoice, the same row).
     if paid_amt > 0:
-        inv = (
-            db.query(Invoice)
-            .filter(
-                Invoice.order_id == order.id,
-                Invoice.organization_id == org_id,
-                Invoice.is_credit_note.is_(False),
-            )
-            .first()
-        )
+        inv = created_invoice
         if inv:
             pay_mode = payload.payment_method or payload.payment_type or "cash"
             try:
@@ -1021,7 +1014,9 @@ def create_order(
     # time zone, which is what the response has always shown.
     perf.mark("response")
     db.refresh(order, attribute_names=["created_at", "updated_at", "order_date", "collected_at"])
-    return _order_out(db, order, warnings)
+    # Built like GET /orders/{id}: one batched context (stock, collections, payments) for
+    # this order instead of the separate per-kind reads.
+    return _order_out(db, order, warnings, ctx=_order_context(db, [order]))
 
 
 @router.patch("/{order_id}", response_model=OrderOut)
