@@ -293,3 +293,30 @@ def test_order_create_reports_its_stages_in_server_timing(firm):
         # Every query of the request falls in exactly one stage, except the auth lookup
         # made by the dependencies before the endpoint starts.
         assert 0 <= total - sum(int(v) for v in stages.values()) <= 3, header
+
+
+def test_paid_order_does_not_read_its_invoice_back_before_paying(firm):
+    """The payment is recorded against the invoice object order create just made; reading it
+    back (invoice + its lines + order lines) cost 3 round trips."""
+    import re
+
+    stmts: list[str] = []
+
+    def _cap(conn, cur, statement, *a):
+        stmts.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", _cap)
+    try:
+        r = TestClient(app).post("/orders", headers=firm["h"], json=_order(
+            firm, 2, payment_status="paid", paid_amount=236, payment_method="cash"))
+    finally:
+        event.remove(engine, "before_cursor_execute", _cap)
+    assert r.status_code == 201, r.text
+    insert_invoice = next(i for i, s in enumerate(stmts) if s.startswith("INSERT INTO invoices "))
+    insert_payment = next(i for i, s in enumerate(stmts) if s.startswith("INSERT INTO customer_payments "))
+    between = stmts[insert_invoice:insert_payment]
+    # (a .first() with eager joins is wrapped in a subquery: "SELECT anon_1... FROM (SELECT ... FROM invoices")
+    # The payment's row lock on the invoice (SELECT ... FOR UPDATE, lock_for_payment) is
+    # wanted: it re-reads the committed figures under the lock. A plain read-back is not.
+    assert not [s for s in between if s.startswith("SELECT") and "FOR UPDATE" not in s
+                and re.search(r"\bFROM invoices\b", s)], between

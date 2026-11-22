@@ -714,6 +714,22 @@ def _open_loading(db: Session, org_id: str, partner_id: str) -> VehicleLoading |
     )
 
 
+def _consume_holds(holds: list, quantity: float) -> None:
+    """_consume_reservations() on holds already loaded (and row values not yet flushed):
+    the same arithmetic, oldest-loaded first, no query and no flush."""
+    remaining = quantity
+    for hold in holds:
+        if remaining <= 0:
+            break
+        if hold.status != "active":
+            continue
+        take = min(hold.outstanding_quantity, remaining)
+        if take <= 0:
+            continue
+        stock_service.consume_reservation(None, hold, take, flush=False)
+        remaining -= take
+
+
 def _consume_reservations(db: Session, order_id: str, item: DeliveryItem, quantity: float) -> None:
     """Take `quantity` out of the holds on this order line. The reservation closes
     once all of it has gone out; a partial load leaves the rest held."""
@@ -866,7 +882,31 @@ def load(
                 detail="The active vehicle loading session for this delivery partner belongs to a different vehicle",
             )
 
+    # All the warehouse rows these lines touch, created if missing and row-locked in one
+    # go, and the order lines' active holds in one query (instead of ~13 queries per line).
+    # The loop below is the same line-by-line logic, in the same order, on those rows.
+    with perf.stage("lock_stock"):
+        mover = stock_service.BatchStockMove(
+            db, org_id, warehouse.id,
+            [(by_id[ln["delivery_item_id"]].product_id, by_id[ln["delivery_item_id"]].variant_id)
+             for ln in lines if ln.get("delivery_item_id") in by_id],
+        )
+        order_item_ids = {by_id[ln["delivery_item_id"]].order_item_id for ln in lines
+                          if ln.get("delivery_item_id") in by_id and by_id[ln["delivery_item_id"]].order_item_id}
+        holds_by_item: dict[str, list] = {}
+        if delivery.sales_order_id and order_item_ids:
+            for hold in (
+                db.query(StockReservation)
+                .filter(
+                    StockReservation.order_id == delivery.sales_order_id,
+                    StockReservation.order_item_id.in_(order_item_ids),
+                    StockReservation.status == "active",
+                )
+            ):
+                holds_by_item.setdefault(hold.order_item_id, []).append(hold)
+
     results = []
+    perf.mark("lines")
     for line in lines:
         item = by_id.get(line["delivery_item_id"])
         if item is None:
@@ -887,7 +927,7 @@ def load(
         if not item.product_id:
             continue
 
-        on_hand = stock_service.on_hand(db, warehouse.id, item.product_id, item.variant_id)
+        on_hand = mover.on_hand(item.product_id, item.variant_id)
         if quantity > on_hand + 0.001:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -901,8 +941,8 @@ def load(
         requested_batch = getattr(order_line, "batch_number", None)
         requested_serials = getattr(order_line, "serial_numbers", None)
         try:
-            after, tracked = stock_service.move_tracked(
-                db, org_id, warehouse.id, item.product_id, item.variant_id,
+            after, tracked = mover.move(
+                item.product_id, item.variant_id,
                 -quantity, "delivery_out",
                 note=f"Loaded onto vehicle for {delivery.delivery_note_number}",
                 created_by=user.id,
@@ -921,7 +961,7 @@ def load(
             item.serial_numbers = (item.serial_numbers or []) + tracked["serial_numbers"]
         # The hold is now taken rather than promised.
         if delivery.sales_order_id:
-            _consume_reservations(db, delivery.sales_order_id, item, quantity)
+            _consume_holds(holds_by_item.get(item.order_item_id, []), quantity)
         # Vehicle ↑.
         match = next(
             (
@@ -942,7 +982,6 @@ def load(
         match.loaded_qty = int((match.loaded_qty or 0) + quantity)
 
         item.loaded_quantity = round((item.loaded_quantity or 0) + quantity, 3)
-        db.flush()
         results.append(
             {
                 "delivery_item_id": item.id,
@@ -951,6 +990,10 @@ def load(
                 "vehicle_stock_after": match.loaded_qty,
             }
         )
+    # One flush for every line's writes, then the catalog counters from one grouped sum.
+    perf.mark("flush")
+    mover.finish()
+    perf.mark(None)
 
     # Only when this call actually loaded something new -- a retry that finds
     # nothing left to load (results empty) writes no event, so calling this

@@ -52,6 +52,26 @@ def apply_to_invoice(invoice: Invoice, amount: float) -> None:
         invoice.invoice_status = "Issued"
 
 
+def lock_for_payment(db: Session, customer_id: str | None, invoice_ids) -> None:  # noqa: ANN001
+    """Row-lock the customer, then the invoices a payment moves (id order, so concurrent
+    payments always lock in the same order), and re-read them under the lock.
+
+    Their figures are moved in Python (total_received, amount_paid += x). Loaded before the
+    lock, a payment that committed meanwhile would be overwritten when they are written
+    back: two receipts of 40 and 60 left amount_paid at 60. The re-read (populate_existing)
+    makes every check and update below work from the committed figures. Pending changes of
+    this request are flushed first so they are not discarded. Customer first, before any
+    number counter: order create takes the customer row before the journal counter too.
+    lazyload("*"): eager joins would put outer joins into a FOR UPDATE, which PostgreSQL
+    refuses on the nullable side."""
+    db.flush()
+    if customer_id:
+        db.query(Customer).options(lazyload("*")).filter(Customer.id == customer_id)             .with_for_update(of=Customer).populate_existing().first()
+    ids = sorted({i for i in invoice_ids if i})
+    if ids:
+        db.query(Invoice).options(lazyload("*")).filter(Invoice.id.in_(ids)).order_by(Invoice.id)             .with_for_update(of=Invoice).populate_existing().all()
+
+
 def next_receipt_number(db: Session, org_id: str) -> str:
     """The next RCPT- number for this firm."""
     return numbering_service.next_number(db, org_id, CustomerPayment.receipt_number, "RCPT")
@@ -92,22 +112,17 @@ def record(
     if amount is None or amount <= 0:
         raise ValueError("A payment must be more than zero")
 
-    if customer is not None and customer.id:
-        # Lock order: the customer row BEFORE any number counter. Order create updates the
-        # customer row and then takes the journal-entry counter; this flow used to take the
-        # receipt and journal counters first and the customer row after, so an order and a
-        # payment for the same customer at the same moment could deadlock (one aborted with
-        # a 500). Taking the customer first here gives both flows the same order.
-        # populate_existing: the customer object was usually loaded before the lock (by the
-        # route), so its balances may be stale -- a payment that committed meanwhile would
-        # otherwise be overwritten when total_received / outstanding are written back (two
-        # simultaneous payments left the balance reduced by only one of them). Flush first
-        # so this request's own pending changes to the customer are not discarded.
-        db.flush()
-        # lazyload("*"): Customer's eager joins would put outer joins into this statement, and
-        # PostgreSQL refuses FOR UPDATE on the nullable side of an outer join.
-        db.query(Customer).options(lazyload("*")).filter(Customer.id == customer.id) \
-            .with_for_update(of=Customer).populate_existing().first()
+    # Lock + re-read the customer and every invoice this payment will move BEFORE the checks
+    # below (outstanding / overpayment) and the updates further down. See lock_for_payment.
+    alloc_invoice_ids = [
+        (getattr(a, "invoice_id", None) if hasattr(a, "invoice_id") else (a.get("invoice_id") if isinstance(a, dict) else None))
+        for a in (allocations or [])
+    ]
+    lock_for_payment(
+        db,
+        customer.id if customer is not None else None,
+        [invoice.id if invoice is not None else None, *alloc_invoice_ids],
+    )
 
     if splits is not None:
         if len(splits) == 0:
@@ -270,6 +285,11 @@ def record(
 
 def void(db: Session, payment: CustomerPayment) -> None:
     """Reverse a payment and delete it, leaving every balance as if it never happened."""
+    # Same locks as record(), first: the customer and the invoices whose figures move back.
+    lock_for_payment(
+        db, payment.customer_id,
+        [a.invoice_id for a in (payment.allocations or [])] + [payment.invoice_id],
+    )
     try:
         from app.models.accounting import JournalEntry
         from app.services import accounting_service

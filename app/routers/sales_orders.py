@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from sqlalchemy import or_
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session, joinedload, lazyload, selectinload
 
@@ -143,40 +144,48 @@ def _order_context(db: Session, orders: list[SalesOrder]) -> dict:
             stock_keys += [(order.warehouse_id, i.product_id, i.variant_id) for i in order.items if i.product_id]
     ctx["stock"] = stock_service.stock_summaries(db, stock_keys)
 
-    for c in (
-        db.query(DeliveryCollection)
+    id_set = set(ids)
+    # Collections, ONE query for both kinds: those taken against a page order directly, and
+    # those allocated to an invoice of a page order (outer join through the allocations).
+    seen_colls: set[str] = set()
+    for c, a, alloc_order_id in (
+        db.query(DeliveryCollection, DeliveryCollectionAllocation, Invoice.order_id)
         .options(lazyload("*"), selectinload(DeliveryCollection.allocations).lazyload("*"))
+        .outerjoin(DeliveryCollectionAllocation,
+                   DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id)
+        .outerjoin(Invoice, DeliveryCollectionAllocation.invoice_id == Invoice.id)
         .filter(
             DeliveryCollection.organization_id.in_(org_ids),
-            DeliveryCollection.sales_order_id.in_(ids),
             DeliveryCollection.reconciliation_status == "recorded",
+            or_(DeliveryCollection.sales_order_id.in_(ids), Invoice.order_id.in_(ids)),
         )
+        # Oldest first, as the two separate (unordered) reads returned them in practice.
+        .order_by(DeliveryCollection.created_at, DeliveryCollection.id)
     ):
-        ctx["direct_colls"].setdefault(c.sales_order_id, []).append(c)
-    for a, c, order_id in (
-        db.query(DeliveryCollectionAllocation, DeliveryCollection, Invoice.order_id)
-        .options(lazyload("*"))
-        .join(DeliveryCollection, DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id)
-        .join(Invoice, DeliveryCollectionAllocation.invoice_id == Invoice.id)
-        .filter(
-            DeliveryCollection.organization_id.in_(org_ids),
-            Invoice.order_id.in_(ids),
-            DeliveryCollection.reconciliation_status == "recorded",
-        )
-    ):
-        ctx["alloc_colls"].setdefault(order_id, []).append((a, c))
-    for pmt in db.query(CustomerPayment).options(*_PAYMENT_LOADING).filter(
-        CustomerPayment.organization_id.in_(org_ids), CustomerPayment.order_id.in_(ids)
-    ):
-        ctx["direct_payments"].setdefault(pmt.order_id, []).append(pmt)
-    for pmt, order_id in (
+        if c.sales_order_id in id_set and c.id not in seen_colls:
+            seen_colls.add(c.id)
+            ctx["direct_colls"].setdefault(c.sales_order_id, []).append(c)
+        if a is not None and alloc_order_id in id_set:
+            ctx["alloc_colls"].setdefault(alloc_order_id, []).append((a, c))
+    # Payments, ONE query for both kinds in the same way: paid against a page order, or
+    # allocated to an invoice of one.
+    seen_payments: set[str] = set()
+    for pmt, alloc_order_id in (
         db.query(CustomerPayment, Invoice.order_id)
         .options(*_PAYMENT_LOADING)
-        .join(CustomerPaymentAllocation, CustomerPaymentAllocation.customer_payment_id == CustomerPayment.id)
-        .join(Invoice, CustomerPaymentAllocation.invoice_id == Invoice.id)
-        .filter(CustomerPayment.organization_id.in_(org_ids), Invoice.order_id.in_(ids))
+        .outerjoin(CustomerPaymentAllocation, CustomerPaymentAllocation.customer_payment_id == CustomerPayment.id)
+        .outerjoin(Invoice, CustomerPaymentAllocation.invoice_id == Invoice.id)
+        .filter(
+            CustomerPayment.organization_id.in_(org_ids),
+            or_(CustomerPayment.order_id.in_(ids), Invoice.order_id.in_(ids)),
+        )
+        .order_by(CustomerPayment.created_at, CustomerPayment.id)
     ):
-        ctx["alloc_payments"].setdefault(order_id, []).append(pmt)
+        if pmt.order_id in id_set and pmt.id not in seen_payments:
+            seen_payments.add(pmt.id)
+            ctx["direct_payments"].setdefault(pmt.order_id, []).append(pmt)
+        if alloc_order_id in id_set:
+            ctx["alloc_payments"].setdefault(alloc_order_id, []).append(pmt)
     return ctx
 
 
@@ -933,20 +942,13 @@ def create_order(
     # committed together at the end (one commit, and no re-read of the invoice).
     from app.routers.invoices import invoice_order
     perf.mark("invoice")
-    invoice_order(db, user, order.id, allow_upfront=True, commit=False)
+    created_invoice = invoice_order(db, user, order.id, allow_upfront=True, commit=False)
     perf.mark("payment")
 
-    # Automatic Payment Recording
+    # Automatic Payment Recording -- against the invoice just made (it used to be read back
+    # with a query: the order's only invoice, the same row).
     if paid_amt > 0:
-        inv = (
-            db.query(Invoice)
-            .filter(
-                Invoice.order_id == order.id,
-                Invoice.organization_id == org_id,
-                Invoice.is_credit_note.is_(False),
-            )
-            .first()
-        )
+        inv = created_invoice
         if inv:
             pay_mode = payload.payment_method or payload.payment_type or "cash"
             try:
@@ -1012,7 +1014,9 @@ def create_order(
     # time zone, which is what the response has always shown.
     perf.mark("response")
     db.refresh(order, attribute_names=["created_at", "updated_at", "order_date", "collected_at"])
-    return _order_out(db, order, warnings)
+    # Built like GET /orders/{id}: one batched context (stock, collections, payments) for
+    # this order instead of the separate per-kind reads.
+    return _order_out(db, order, warnings, ctx=_order_context(db, [order]))
 
 
 @router.patch("/{order_id}", response_model=OrderOut)
