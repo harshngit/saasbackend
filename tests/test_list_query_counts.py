@@ -88,3 +88,27 @@ def test_invoice_list_does_not_load_the_deliveries():
         assert not [s for s in stmts if re.search(r"FROM (delivery_items|deliveries)\b", s)], stmts
         counts[n] = len(stmts)
     assert counts[12] == counts[2] and counts[12] <= 8, counts
+
+
+def _pay_some(auth):
+    """Part-pay every other order at creation and pay later against a few invoices, so the
+    page has both direct and allocated payments."""
+    orders = c.get("/orders", params={"page_size": 50}, headers=auth).json()["items"]
+    for k, o in enumerate(orders):
+        if k % 2 == 0 and o.get("invoice_id"):
+            r = c.post(f"/customers/{o['customer_id']}/payments", json={"amount": 10, "payment_mode": "upi",
+                       "invoice_id": o["invoice_id"]}, headers=auth)
+            assert r.status_code == 201, r.text
+
+
+def test_order_list_reads_payments_and_collections_once():
+    counts = {}
+    for n in (2, 12):
+        auth = _firm(n)
+        _pay_some(auth)
+        stmts = _statements("/orders", auth, page_size=25)
+        top_level_payment_reads = [s for s in stmts if s.startswith("SELECT customer_payments.")
+                                   and "customer_payment_allocations" in s and "LEFT OUTER JOIN" in s]
+        assert len(top_level_payment_reads) == 1, top_level_payment_reads
+        counts[n] = len(stmts)
+    assert counts[12] == counts[2] and counts[12] <= 16, counts
