@@ -316,4 +316,7 @@ def test_paid_order_does_not_read_its_invoice_back_before_paying(firm):
     insert_payment = next(i for i, s in enumerate(stmts) if s.startswith("INSERT INTO customer_payments "))
     between = stmts[insert_invoice:insert_payment]
     # (a .first() with eager joins is wrapped in a subquery: "SELECT anon_1... FROM (SELECT ... FROM invoices")
-    assert not [s for s in between if s.startswith("SELECT") and re.search(r"\bFROM invoices\b", s)], between
+    # The payment's row lock on the invoice (SELECT ... FOR UPDATE, lock_for_payment) is
+    # wanted: it re-reads the committed figures under the lock. A plain read-back is not.
+    assert not [s for s in between if s.startswith("SELECT") and "FOR UPDATE" not in s
+                and re.search(r"\bFROM invoices\b", s)], between
