@@ -218,6 +218,9 @@ def test_two_genuine_identical_partials_are_both_recorded(env, monkeypatch):
     second = _confirm(env, did, two)
     assert second.status_code == 200 and second.json()["internal_status"] == "partially_delivered"
     assert {q for _, q in _state(did)[0]} == {4.0}               # both recorded: 2 + 2
+    # Back to the real window for the retry, so a slow test machine cannot make the
+    # "immediate" repeat look like a genuine third hand-over.
+    monkeypatch.setattr(delivery_service, "PARTIAL_RETRY_WINDOW", timedelta(seconds=30))
     retry = _confirm(env, did, two)                              # immediate repeat = a retry
     assert retry.status_code == 200
     assert {q for _, q in _state(did)[0]} == {4.0}               # not 6
@@ -238,3 +241,41 @@ def test_full_delivery_retry_is_still_deduplicated_after_the_partial_window(env,
     r = _confirm(env, did, body)
     assert r.status_code == 200 and r.json()["internal_status"] == "delivered"
     assert _state(did) == before
+
+
+def _ready_for_load(env, n, qty=3):
+    r = c.post("/orders", json={"customer_id": env["cust"], "warehouse_id": env["wh"], "delivery_method": "home_delivery",
+               "payment_status": "pending", "items": [{"product_id": p, "quantity": qty} for p in env["pids"][:n]]},
+               headers=env["auth"])
+    assert r.status_code == 201, r.text
+    did = r.json()["delivery_id"]
+    a = env["auth"]
+    assert c.patch(f"/deliveries/by-id/{did}", json={"delivery_partner_id": env["partner"], "vehicle_id": env["veh"]},
+                   headers=a).status_code == 200
+    assert c.post(f"/deliveries/{did}/accept", headers=env["pauth"]).status_code == 200
+    lines = [i["id"] for i in c.get(f"/deliveries/by-id/{did}", headers=a).json()["items"]]
+    assert c.post(f"/deliveries/{did}/pick", json={"items": [{"delivery_item_id": i, "picked_quantity": qty}
+                  for i in lines]}, headers=a).status_code == 200
+    assert c.post(f"/deliveries/{did}/ready", headers=a).status_code == 200
+    return did
+
+
+def test_load_query_count_does_not_grow_with_lines(env):
+    """POST /deliveries/{id}/load used to cost ~13 queries per line (298 for 20 lines)."""
+    counts = {}
+    for n in (1, 20):
+        did = _ready_for_load(env, n)
+        seen = {"q": 0}
+
+        def _count(*_a):
+            seen["q"] += 1
+
+        event.listen(engine, "before_cursor_execute", _count)
+        try:
+            r = c.post(f"/deliveries/{did}/load", json={}, headers=env["auth"])
+        finally:
+            event.remove(engine, "before_cursor_execute", _count)
+        assert r.status_code == 200, r.text
+        assert r.json()["internal_status"] == "loaded"
+        counts[n] = seen["q"]
+    assert counts[20] <= counts[1] + 3 and counts[20] <= 55, counts

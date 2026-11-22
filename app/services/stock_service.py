@@ -501,6 +501,119 @@ def move_tracked(
     return row.on_hand_quantity, snapshot
 
 
+class BatchStockMove:
+    """move_tracked() for many lines of one warehouse with a fixed number of queries.
+
+    The same movement, line by line and in the caller's order -- warehouse row, ledger row
+    (balance_after), lots / serials, the stock_updated event and the low-stock alert -- but:
+      - the rows are created if missing and row-locked ALL AT ONCE (lock_stock_items: one
+        SELECT ... FOR UPDATE, deterministic order) instead of check + lock per line;
+      - the event's `available` is worked out from the locked rows and the warehouse's
+        active reservations loaded once, instead of two queries per line;
+      - nothing is flushed per line; finish() flushes once and then sets the catalog
+        counters from one grouped sum, instead of a sum + update per line.
+    on_hand() answers from the locked row (what stock_service.on_hand returns once the row
+    exists: _row seeds it from the catalog exactly as move_tracked's _row call did)."""
+
+    def __init__(self, db: Session, org_id: str, warehouse_id: str, keys) -> None:  # noqa: ANN001
+        self.db, self.org_id, self.warehouse_id = db, org_id, warehouse_id
+        keys = list(dict.fromkeys((pid, vid) for pid, vid in keys if pid))
+        self.rows = {
+            (r.product_id, r.variant_id): r
+            for r in lock_stock_items(db, org_id, warehouse_id, [{"product_id": p, "variant_id": v} for p, v in keys])
+        }
+        product_ids = {pid for pid, _ in keys}
+        self.holds = (
+            db.query(StockReservation)
+            .filter(
+                StockReservation.warehouse_id == warehouse_id,
+                StockReservation.product_id.in_(product_ids),
+                StockReservation.status == "active",
+            )
+            .all()
+        ) if product_ids else []
+        self.moved: set[tuple] = set()
+
+    def on_hand(self, product_id: str, variant_id: str | None) -> float:
+        row = self.rows.get((product_id, variant_id))
+        return round(row.on_hand_quantity or 0, 3) if row is not None else 0.0
+
+    def _available(self, product_id: str, variant_id: str | None, on_hand_now: float) -> float:
+        promised = sum(
+            h.outstanding_quantity for h in self.holds
+            if h.status == "active" and h.product_id == product_id and h.variant_id == variant_id
+        )
+        return round(on_hand_now - round(promised, 3), 3)
+
+    def move(self, product_id: str, variant_id: str | None, delta: float, movement_type: str, note: str | None = None,
+             created_by: str | None = None, batch: dict | None = None,
+             serial_numbers: list[str] | None = None) -> tuple[float, dict]:
+        db, org_id, warehouse_id = self.db, self.org_id, self.warehouse_id
+        row = self.rows[(product_id, variant_id)]
+        before = row.on_hand_quantity or 0
+        row.on_hand_quantity = round((row.on_hand_quantity or 0) + delta, 3)
+        db.add(StockMovement(
+            organization_id=org_id, warehouse_id=warehouse_id, product_id=product_id, variant_id=variant_id,
+            movement_type=movement_type, quantity=delta, balance_after=row.on_hand_quantity,
+            note=note, created_by=created_by,
+        ))
+        self.moved.add((product_id, variant_id))
+        snapshot = tracking_service.apply(
+            db, org_id, warehouse_id, product_id, variant_id, delta, batch=batch, serial_numbers=serial_numbers,
+        )
+        available_now = self._available(product_id, variant_id, row.on_hand_quantity)
+        queue_event(
+            db,
+            org_id=org_id,
+            event_name="inventory.stock_updated",
+            data={
+                "product_id": product_id,
+                "variant_id": variant_id,
+                "warehouse_id": warehouse_id,
+                "on_hand_quantity": row.on_hand_quantity,
+                "available_quantity": available_now,
+            },
+            required_permission="inventory:view",
+        )
+        if delta < 0:
+            from app.services import notification_service
+
+            notification_service.notify_stock_transition(
+                db, org_id, warehouse_id, product_id, variant_id, before, row.on_hand_quantity, available_now,
+            )
+        return row.on_hand_quantity, snapshot
+
+    def finish(self) -> None:
+        """One flush, then the catalog counters of everything moved from one grouped sum."""
+        db = self.db
+        db.flush()
+        if not self.moved:
+            return
+        totals = {
+            (pid, vid): total
+            for pid, vid, total in db.query(
+                WarehouseStock.product_id, WarehouseStock.variant_id,
+                func.coalesce(func.sum(WarehouseStock.on_hand_quantity), 0.0),
+            )
+            .filter(
+                WarehouseStock.organization_id == self.org_id,
+                WarehouseStock.product_id.in_({pid for pid, _ in self.moved}),
+            )
+            .group_by(WarehouseStock.product_id, WarehouseStock.variant_id)
+        }
+        for pid, vid in self.moved:
+            total = totals.get((pid, vid)) or 0
+            if vid:
+                variant = db.get(ProductVariant, vid)
+                if variant is not None:
+                    variant.inventory = int(total)
+            else:
+                product = db.get(Product, pid)
+                if product is not None:
+                    product.total_inventory = int(total)
+        db.flush()
+
+
 def _sync_catalog_counter(db: Session, org_id: str, product_id: str, variant_id: str | None) -> None:
     """Keep `product.total_inventory` / `variant.inventory` equal to the sum across
     warehouses, so every endpoint written against those still reports the truth."""
@@ -658,13 +771,15 @@ def release_for_order(db: Session, order_id: str) -> int:
     return len(rows)
 
 
-def consume_reservation(db: Session, reservation: StockReservation, quantity: float) -> None:
+def consume_reservation(db: Session, reservation: StockReservation, quantity: float, flush: bool = True) -> None:
     """Mark part of a hold as taken — called when goods are loaded onto a vehicle.
-    The hold closes once all of it has gone out."""
+    The hold closes once all of it has gone out. `flush=False` leaves the write to the
+    caller's next flush (BatchStockMove)."""
     reservation.consumed_quantity = round((reservation.consumed_quantity or 0) + quantity, 3)
     if reservation.consumed_quantity + 0.001 >= (reservation.reserved_quantity or 0):
         reservation.status = "consumed"
-    db.flush()
+    if flush:
+        db.flush()
 
 
 # ------------------------- startup migration -------------------------------
