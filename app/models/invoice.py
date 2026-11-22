@@ -90,7 +90,11 @@ class Invoice(Base):
     )
     customer: Mapped["Customer | None"] = relationship(lazy="joined")  # noqa: F821
     order: Mapped["SalesOrder | None"] = relationship(lazy="joined")  # noqa: F821
-    delivery: Mapped["Delivery | None"] = relationship(lazy="joined")  # noqa: F821
+    # Loaded only when read (the invoice PDF reads its vehicle). Joined, it pulled each linked
+    # delivery and that delivery's own eager relationships (lines, customer, order, vehicle,
+    # collections) into every invoice load: 5 extra queries on GET /invoices once invoices
+    # carry a delivery_id. Responses only use the delivery_id column.
+    delivery: Mapped["Delivery | None"] = relationship(lazy="select")  # noqa: F821
 
     # ---------------------------------------------------------------- GST breakdown
     # Derived, never stored: the taxable value of each line (its value before tax less its

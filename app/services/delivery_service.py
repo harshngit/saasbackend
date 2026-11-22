@@ -1037,6 +1037,12 @@ def lock_run_for_confirm(db: Session, delivery: Delivery) -> VehicleLoading | No
 
 CONFIRM_FINGERPRINT_KEY = "confirm_fingerprint"
 CONFIRM_REPLAY_WINDOW = timedelta(minutes=30)
+# A delivery still partially delivered can legitimately get a second, identical confirm (a
+# second hand-over of the same quantities). Only one that arrives this soon after the first
+# was recorded is treated as a retry: a retry sent after a client timeout either waited on
+# the run lock for the first to commit (a gap of milliseconds) or followed within seconds,
+# while a real second hand-over comes after the driver has seen the first result.
+PARTIAL_RETRY_WINDOW = timedelta(seconds=30)
 
 
 def confirm_fingerprint(lines, pod_photo_file_ids, signature_file_id, notes, failed, failure_reason,  # noqa: ANN001
@@ -1059,9 +1065,14 @@ def confirm_fingerprint(lines, pod_photo_file_ids, signature_file_id, notes, fai
 
 
 def _already_confirmed_with(db: Session, delivery: Delivery, fingerprint: str) -> bool:
-    """Whether this delivery's latest confirm outcome came from an identical request in the
-    last CONFIRM_REPLAY_WINDOW. One query. Older entries (written before fingerprints were
-    stored) never match, so they behave exactly as before."""
+    """Whether this request repeats the delivery's latest recorded confirm. One query.
+
+    Same content (fingerprint) is required, and the time since that confirm was recorded
+    must be within the window for the delivery's state now: CONFIRM_REPLAY_WINDOW when it is
+    delivered or failed (nothing is left to hand over, so an identical confirm can only be a
+    retry), PARTIAL_RETRY_WINDOW while it is partially delivered (an identical confirm later
+    than that is a genuine second hand-over and is applied). Entries written before
+    fingerprints were stored never match, so they behave exactly as before."""
     last = (
         db.query(DeliveryHistory)
         .filter(
@@ -1076,7 +1087,8 @@ def _already_confirmed_with(db: Session, delivery: Delivery, fingerprint: str) -
     created = last.created_at
     if created is not None and created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    return created is None or datetime.now(timezone.utc) - created <= CONFIRM_REPLAY_WINDOW
+    window = CONFIRM_REPLAY_WINDOW if delivery.status in ("delivered", "failed") else PARTIAL_RETRY_WINDOW
+    return created is None or datetime.now(timezone.utc) - created <= window
 
 
 def confirm(

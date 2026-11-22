@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, Up
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import Session, joinedload, lazyload, selectinload
 
-from app.core import business_time, scoping, workflow
+from app.core import business_time, perf, scoping, workflow
 from app.core.database import get_db
 from app.core.deps import require_entitlement, require_permission, require_unlocked_org
 from app.core.excel_import import ImportSummaryOut
@@ -745,6 +745,8 @@ def create_order(
     - Automatic Invoice Generation
     - Automatic Payment Recording
     """
+    # Stage timings -> Server-Timing header (and the slow-request log line); see app.core.perf.
+    perf.mark("validate")
     org_id = _org_id(user)
     customer = db.get(Customer, payload.customer_id)
     if customer is None or customer.organization_id != org_id:
@@ -825,6 +827,7 @@ def create_order(
                 )
 
     # Place draft order
+    perf.mark("place")
     order, warnings = order_service.place_order(
         db, user, customer,
         lines=[
@@ -876,8 +879,10 @@ def create_order(
         order.assigned_delivery_partner_id = payload.delivery_partner_id
 
     # Confirm order & reserve stock
+    perf.mark("reserve")
     order, confirm_warnings = order_service.confirm_order(db, user, order)
     warnings = (warnings or []) + (confirm_warnings or [])
+    perf.mark("delivery_plan")
 
     # Validate payment values against calculated order total
     paid_amt = payload.paid_amount or 0.0
@@ -927,7 +932,9 @@ def create_order(
     # Not committed here: the order, its delivery, invoice, payment and stock moves are
     # committed together at the end (one commit, and no re-read of the invoice).
     from app.routers.invoices import invoice_order
+    perf.mark("invoice")
     invoice_order(db, user, order.id, allow_upfront=True, commit=False)
+    perf.mark("payment")
 
     # Automatic Payment Recording
     if paid_amt > 0:
@@ -961,6 +968,7 @@ def create_order(
                     detail=str(err),
                 )
 
+    perf.mark("pickup")
     # Takeaway completion
     if fulfilment_method == "pickup":
         for item in order.items:
@@ -994,6 +1002,7 @@ def create_order(
     # One commit for the whole order. Objects are not expired by it: everything was just
     # written by this request, so re-reading the order, its lines and the warehouse for the
     # response (as refresh() did) only cost round trips.
+    perf.mark("commit")
     db.expire_on_commit = False
     try:
         db.commit()
@@ -1001,6 +1010,7 @@ def create_order(
         db.expire_on_commit = True
     # The timestamps only, as stored (one query): the database returns them in its session
     # time zone, which is what the response has always shown.
+    perf.mark("response")
     db.refresh(order, attribute_names=["created_at", "updated_at", "order_date", "collected_at"])
     return _order_out(db, order, warnings)
 

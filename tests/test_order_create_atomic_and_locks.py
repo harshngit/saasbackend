@@ -275,3 +275,21 @@ def test_order_and_payment_interleaved_at_the_worst_moment(firm):
     assert order_at_je.is_set(), "the order never reached the journal counter: the race was not set up"
     assert results["order"].status_code == 201, results["order"].text[:300]
     assert results["payment"].status_code == 201, results["payment"].text[:300]
+
+
+# ------------------------------------------------- stage timings in Server-Timing
+def test_order_create_reports_its_stages_in_server_timing(firm):
+    import re
+
+    for body in (_order(firm, 2), _order(firm, 1, payment_status="paid", paid_amount=118, payment_method="cash")):
+        r = TestClient(app).post("/orders", headers=firm["h"], json=body)
+        assert r.status_code == 201, r.text
+        header = r.headers["server-timing"]
+        stages = dict(re.findall(r'(\w+);dur=[\d.]+;desc="queries=(\d+)"', header))
+        total = int(stages.pop("db"))
+        for name in ("validate", "place", "reserve", "delivery_plan", "invoice", "payment", "pickup", "commit",
+                     "response"):
+            assert name in stages, (name, header)
+        # Every query of the request falls in exactly one stage, except the auth lookup
+        # made by the dependencies before the endpoint starts.
+        assert 0 <= total - sum(int(v) for v in stages.values()) <= 3, header
