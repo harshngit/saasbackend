@@ -37,6 +37,13 @@ class PendingSummary(BaseModel):
     currency: str
     payment_terms: str | None = Field(default=None, description="The customer's payment terms (e.g. net_30)")
     as_of: date = Field(description="Today in the organization's timezone; overdue is computed against it")
+    awaiting_approval_amount: float = Field(
+        default=0.0, description="Collected by delivery partners from this customer, waiting for admin approval "
+                                 "(whole customer, not filtered). Not yet deducted from outstanding")
+    awaiting_approval_count: int = Field(default=0, description="Number of those collections")
+    collectable_amount: float = Field(
+        default=0.0, description="Customer's outstanding balance less awaiting_approval_amount: the most that can "
+                                 "still be collected")
 
 
 class PendingPaymentsOut(BaseModel):
@@ -68,7 +75,8 @@ class CollectedPaymentOut(BaseModel):
     amount: float
     payment_mode: str
     reference: str | None = Field(default=None, description="Transaction / UTR / cheque reference")
-    status: str = Field(description="Always `recorded`: a voided payment is removed, never listed")
+    status: str = Field(description="`recorded` (a finalized payment). With payment_status=awaiting_approval: "
+                                    "`awaiting_approval` (a partner's collection waiting for admin approval)")
     source: str = Field(description="direct | delivery_collection (a reconciled field / delivery collection)")
     order_id: str | None = None
     allocated_amount: float = Field(description="Applied to invoices")
@@ -76,6 +84,10 @@ class CollectedPaymentOut(BaseModel):
     allocations: list[PaymentAllocationOut]
     splits: list[PaymentSplitBrief] = Field(default_factory=list, description="Tender breakdown of a split payment")
     currency: str
+    collection_id: str | None = Field(
+        default=None, description="The delivery collection behind this row: set for awaiting_approval rows (then "
+                                  "equal to payment_id); null for payments")
+    collected_by: str | None = Field(default=None, description="Delivery partner's name, for awaiting_approval rows")
 
 
 class CollectedSummary(BaseModel):
@@ -86,6 +98,10 @@ class CollectedSummary(BaseModel):
     total_allocated: float
     total_unallocated: float
     currency: str
+    awaiting_approval_amount: float = Field(
+        default=0.0, description="Collections waiting for admin approval for this customer (whole customer, not "
+                                 "filtered); list them with payment_status=awaiting_approval")
+    awaiting_approval_count: int = Field(default=0, description="Number of those collections")
 
 
 class CollectedPaymentsOut(BaseModel):

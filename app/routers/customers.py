@@ -523,7 +523,7 @@ def list_collected_payments(
     from_date: str | None = Query(default=None, description="Payment date from (YYYY-MM-DD, organization's timezone)"),
     to_date: str | None = Query(default=None, description="Payment date to (YYYY-MM-DD, inclusive)"),
     payment_mode: str | None = Query(default=None, description="cash | upi | card | … (also matches a split's tender)"),
-    payment_status: str | None = Query(default=None, description="recorded (the only state a listed payment has)"),
+    payment_status: str | None = Query(default=None, description="recorded (default: finalized payments) or awaiting_approval (collections a delivery partner submitted that an admin has not approved yet)"),
     search: str | None = Query(default=None, description="Receipt number, transaction reference or invoice number contains"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
