@@ -173,3 +173,51 @@ def test_per_delivery_collection_on_uninvoiced_order_is_not_blocked_by_customer_
     d = _delivery(firm, 500, False)                               # not invoiced: not in the balance
     assert _collect_on_delivery(firm["a"], d, 500).status_code == 201
     assert _collect_on_delivery(firm["a"], d, 1).status_code == 400          # the order check still applies
+
+
+def test_two_partners_collecting_at_the_same_moment_only_one_is_recorded(firm):
+    """The Flutter double-collection case with no stale screen at all: two partners send
+    the full balance at the same instant. The customer row lock serialises them, so one is
+    recorded and the other gets 409 -- never two collections for the same money."""
+    import threading
+
+    from app.models import DeliveryCollection
+
+    start = threading.Barrier(2)
+    codes = []
+
+    def go(h):
+        c = TestClient(app, raise_server_exceptions=False)
+        start.wait()
+        codes.append(c.post("/deliveries/collections/customer", headers=h,
+                            json={"customer_id": firm["cust"], "amount": 5000, "payment_method": "cash"}).status_code)
+
+    threads = [threading.Thread(target=go, args=(firm[k],)) for k in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert sorted(codes) == [201, 409], codes
+    with SessionLocal() as s:
+        assert s.query(DeliveryCollection).filter(DeliveryCollection.customer_id == firm["cust"],
+                                                  DeliveryCollection.reconciliation_status == "recorded").count() == 1
+    c = _listed(firm, firm["cust"])
+    assert c["collection_status"] == "pending_approval" and c["collectable_amount"] == 0.0
+
+
+def test_delivery_partner_gets_the_status_on_the_customer_list(firm):
+    """The Flutter Pending tab calls GET /customers?is_active=true as the delivery partner:
+    with the firm's built-in Delivery Partner role it is allowed and carries the fields."""
+    from app.models import Role
+
+    r = _collect(firm["b"], firm["cust"], 2000)           # another partner's collection, pending
+    assert r.status_code == 201, r.text
+    with SessionLocal() as s:                            # partner A on the firm's built-in role
+        role = s.query(Role).filter(Role.organization_id == firm["org"], Role.name == "Delivery Partner").one()
+        s.get(User, firm["a_id"]).role_id = role.id
+        s.commit()
+    r = client.get("/customers", headers=firm["a"], params={"is_active": True, "page_size": 100})
+    assert r.status_code == 200, r.text
+    row = next(c for c in r.json()["items"] if c["id"] == firm["cust"])
+    assert row["collection_status"] == "pending_approval"
+    assert row["collectable_amount"] == 3000.0 and row["outstanding_balance"] == 5000.0
