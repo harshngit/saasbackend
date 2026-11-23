@@ -2,10 +2,10 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, lazyload
 
 from app.core.database import get_db
-from app.core.deps import get_current_user, require_entitlement, require_permission, require_unlocked_org
+from app.core.deps import get_current_user, has_permission, require_entitlement, require_permission, require_unlocked_org
 from app.core.files import content_disposition, document_filename
 from app.core import business_time, perf, scoping, workflow
 from app.core.sorting import apply_sorting
@@ -1278,6 +1278,41 @@ def get_delivery_note_detail(
 
 # -------------------- Delivery Collection & Reconciliation --------------------
 
+COLLECTIONS_APPROVE_DETAIL = (
+    "You don't have permission to reconcile, void or approve delivery collections: this needs "
+    "the Deliveries > Approve permission on your role."
+)
+
+
+def require_collections_approve(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    """Reconcile / void a collection and approve a Day-End move money: the role needs the
+    `deliveries` module's `approve` right (Admins / owners are not permission-checked). On
+    top of each endpoint's existing check, never instead of it."""
+    if not has_permission(db, user, "deliveries", "approve"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTIONS_APPROVE_DETAIL)
+    return user
+
+
+def _lock_collection(db: Session, collection_id: str, org_id: str) -> DeliveryCollection:
+    """Row-lock and re-read a collection before its state is checked.
+
+    First step of the payment lock order (collection -> customer -> invoices, id order ->
+    number / journal counters; payment_service.lock_for_payment does the middle two). Without
+    it two simultaneous reconciles (or voids) of one collection both saw "recorded" and both
+    recorded (or voided) its payment. 404 when it is not this firm's."""
+    coll = (
+        db.query(DeliveryCollection)
+        .options(lazyload("*"))
+        .filter(DeliveryCollection.id == collection_id)
+        .with_for_update(of=DeliveryCollection)
+        .populate_existing()
+        .first()
+    )
+    if coll is None or coll.organization_id != org_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+    return coll
+
+
 def _is_accountant_or_admin(user: User) -> bool:
     if user.system_role == "admin" or user.effective_system_role == "admin":
         return True
@@ -1701,7 +1736,7 @@ def record_general_customer_collection(
 @router.patch("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
 def reconcile_delivery_collection(
     collection_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
@@ -1716,9 +1751,7 @@ def reconcile_delivery_collection(
             detail="Only Accountants or Admins can reconcile delivery collections",
         )
 
-    coll = db.get(DeliveryCollection, collection_id)
-    if coll is None or coll.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+    coll = _lock_collection(db, collection_id, org_id)
 
     if coll.reconciliation_status != "recorded":
         raise HTTPException(
@@ -1746,6 +1779,12 @@ def reconcile_delivery_collection(
                 .first()
             )
 
+        # Lock + re-read the customer and the candidate invoices (same order as record()) so
+        # the choice below is made on committed figures, not on a copy read before the lock.
+        payment_service.lock_for_payment(
+            db, customer.id if customer is not None else None,
+            [invoice.id if invoice is not None else None] + [a["invoice_id"] for a in (alloc_list or [])],
+        )
         try:
             inv_to_use = invoice if (invoice and payment_service.outstanding(invoice) >= coll.amount) else None
             payment = payment_service.record(
@@ -1783,7 +1822,7 @@ def reconcile_delivery_collection(
 @router.patch("/collections/{collection_id}/void", response_model=DeliveryCollectionOut)
 def void_delivery_collection(
     collection_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
@@ -1798,9 +1837,7 @@ def void_delivery_collection(
             detail="Only Accountants or Admins can void delivery collections",
         )
 
-    coll = db.get(DeliveryCollection, collection_id)
-    if coll is None or coll.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found")
+    coll = _lock_collection(db, collection_id, org_id)
 
     if coll.reconciliation_status not in ("recorded", "reconciled"):
         raise HTTPException(

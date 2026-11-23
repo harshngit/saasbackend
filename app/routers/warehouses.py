@@ -111,9 +111,13 @@ def create_warehouse(
         **payload.model_dump(exclude={"code"}),
         code=code,
     )
+    # A firm's first warehouse is its default, whatever was sent.
+    if wh_count == 0:
+        warehouse.is_default = True
     db.add(warehouse)
     db.flush()
-    if payload.is_default:
+    if warehouse.is_default:
+        # One default per firm: the previous one is cleared in this same transaction.
         _clear_other_defaults(db, org_id, warehouse.id)
     db.commit()
     db.refresh(warehouse)
@@ -306,9 +310,22 @@ def update_warehouse(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A warehouse with this code already exists",
             )
+    if warehouse.is_default and (data.get("is_default") is False or data.get("is_active") is False):
+        other_defaults = db.query(Warehouse.id).filter(
+            Warehouse.organization_id == org_id,
+            Warehouse.is_default.is_(True),
+            Warehouse.id != warehouse.id,
+        ).first()
+        if other_defaults is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This is the default warehouse. Choose another default first, then "
+                       "un-tick or deactivate this one.",
+            )
     for field, value in data.items():
         setattr(warehouse, field, value)
     if data.get("is_default"):
+        # One default per firm: the previous one is cleared in this same transaction.
         _clear_other_defaults(db, org_id, warehouse.id)
     db.commit()
     db.refresh(warehouse)
