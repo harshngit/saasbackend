@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 
 from app.core.permissions import (
     DEFAULT_ROLE_SETTINGS,
+    NEW_ORG_ONLY_MODULES,
     default_role_matrices,
     normalize_permissions,
 )
@@ -46,6 +47,8 @@ def seed_default_roles(db: Session, organization_id: str) -> None:
             current_perms = dict(role.permissions)
             normalized_matrix = normalize_permissions(matrix)
             for mod, acts in normalized_matrix.items():
+                if (name, mod) in NEW_ORG_ONLY_MODULES:
+                    continue
                 if mod not in current_perms:
                     current_perms[mod] = acts
                     role.permissions = current_perms

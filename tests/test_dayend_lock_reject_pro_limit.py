@@ -119,8 +119,7 @@ def test_approve_still_works(review):
 
 
 # ------------------------------------------------------------------- closed day
-@pytest.fixture(scope="module")
-def day():
+def _new_day():
     org_id, admin = _org()
     wh = c.post("/warehouses", json={"name": "Main", "code": f"WH-{uuid.uuid4().hex[:6]}", "is_default": True},
                 headers=admin).json()["id"]
@@ -135,6 +134,19 @@ def day():
                  headers=admin).json()["id"]
     return {"org": org_id, "admin": admin, "wh": wh, "cust": cust, "pid": pid, "partner": partner, "pauth": pauth,
             "veh": veh}
+
+
+@pytest.fixture(scope="module")
+def day():
+    return _new_day()
+
+
+def _approved_day_end(d, partner, days_back=0):
+    from datetime import timedelta
+    with SessionLocal() as s:
+        s.add(DeliveryDayEnd(organization_id=d["org"], delivery_partner_id=partner, status="approved",
+                             business_date=day_end_service.today(s, d["org"]) - timedelta(days=days_back)))
+        s.commit()
 
 
 def _ready(d, qty=3):
@@ -254,3 +266,112 @@ def test_pro_enforces_five_users_and_keeps_existing_users():
     r = c.post("/users", json={"name": "S", "email": f"x_{uuid.uuid4().hex[:6]}@example.com",
                                "password": "Password123!", "role": "sales_officer"}, headers=admin)
     assert r.status_code == 403 and r.json()["detail"]["code"] == "PLAN_LIMIT_REACHED"
+
+
+# ------------------------------------- the lock is only that partner's closed day (addendum B)
+def test_next_day_and_other_partner_and_other_firm_can_still_load():
+    d = _new_day()
+    _approved_day_end(d, d["partner"], days_back=1)            # yesterday approved and closed
+    did, _ = _ready(d)
+    r = c.post(f"/deliveries/{did}/load", json={}, headers=d["admin"])
+    assert r.status_code == 200, r.text                        # today's load works
+    partner_2, _ = _staff(d["admin"])                         # a partner has one active run, so a second one
+    _approved_day_end(d, partner_2, days_back=1)
+    r = c.post("/vehicle-stock/loading", json={"delivery_partner_id": partner_2,
+                                               "items": [{"product_id": d["pid"], "loaded_qty": 1}]}, headers=d["admin"])
+    assert r.status_code in (200, 201), r.text                 # "Add Vehicle" / plain load today works
+
+    # Partner A's day today is closed; partner B (same firm) and another firm are not affected.
+    e = _new_day()
+    _approved_day_end(e, e["partner"])
+    partner_b, pauth_b = _staff(e["admin"])
+    veh_b = c.post("/vehicles", json={"vehicle_number": f"MH{uuid.uuid4().hex[:6].upper()}", "vehicle_type": "Van"},
+                   headers=e["admin"]).json()["id"]
+    b = {**e, "partner": partner_b, "pauth": pauth_b, "veh": veh_b}
+    did_b, _ = _ready(b)
+    assert c.post(f"/deliveries/{did_b}/load", json={}, headers=e["admin"]).status_code == 200
+    did_a, _ = _ready(e)
+    assert _closed(c.post(f"/deliveries/{did_a}/load", json={}, headers=e["admin"]))
+    other = _new_day()
+    did_o, _ = _ready(other)
+    assert c.post(f"/deliveries/{did_o}/load", json={}, headers=other["admin"]).status_code == 200
+
+
+# ------------------------------------------------------------------- plans (more)
+def test_basic_blocks_second_user():
+    _, admin = _org("Basic")
+    r = c.post("/users", json={"name": "S", "email": f"b_{uuid.uuid4().hex[:8]}@example.com",
+                               "password": "Password123!", "role": "sales_officer"}, headers=admin)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "PLAN_LIMIT_REACHED", r.text
+
+
+def test_grandfathered_pro_firm_keeps_working_and_seed_does_not_rewrite_live_row():
+    org_id, admin = _org("Pro")
+    with SessionLocal() as s:                                   # a firm already on 9 users (before the change)
+        for k in range(8):
+            s.add(User(email=f"gf{k}.{uuid.uuid4().hex[:6]}@example.com", name="Old", organization_id=org_id,
+                       system_role="staff", role=UserRole.SALES_OFFICER, password_hash=hash_password("Password123!"),
+                       is_active=True))
+        s.commit()
+        emails = [u.email for u in s.query(User).filter(User.organization_id == org_id, User.name == "Old")]
+    # Every existing user can still log in; nobody is deactivated; only adding is blocked.
+    assert c.post("/auth/login", json={"email": emails[0], "password": "Password123!"}).status_code == 200
+    assert c.get("/auth/me", headers=admin).status_code == 200
+    with SessionLocal() as s:
+        assert s.query(User).filter(User.organization_id == org_id, User.is_active.is_(True)).count() == 9
+    r = c.post("/users", json={"name": "S", "email": f"n_{uuid.uuid4().hex[:6]}@example.com",
+                               "password": "Password123!", "role": "sales_officer"}, headers=admin)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "PLAN_LIMIT_REACHED"
+
+    # A live Pro row still at 10 is left alone by the seed (the change is the pending SQL file).
+    with SessionLocal() as s:
+        pro = s.query(Plan).filter(Plan.name == "Pro").one()
+        pro.max_users = 10
+        s.commit()
+        try:
+            seed_plans(s)
+            s.refresh(pro)
+            assert pro.max_users == 10
+        finally:
+            pro.max_users = 5
+            s.commit()
+
+
+# ------------------------------------------------- seeded roles: new firms only (gap 3 / E)
+def _role_perms(org_id):
+    from app.models import Role as R
+    with SessionLocal() as s:
+        return {r.name: dict(r.permissions or {}) for r in s.query(R).filter(R.organization_id == org_id)}
+
+
+def test_new_firm_seeded_roles():
+    org_id, _ = _org()
+    perms = _role_perms(org_id)
+    dp = perms["Delivery Partner"]["deliveries"]
+    assert dp["approve"] is False and dp["delete"] is False
+    assert dp["view"] and dp["create"] and dp["edit"]                 # partner flows unchanged
+    assert perms["Delivery Partner"]["vehicle_stock"]["create"] is True
+    assert perms["Accountant"]["deliveries"] == {"view": True, "create": False, "edit": False, "delete": False,
+                                                 "approve": True, "export": False, "download": False}
+    assert not perms["Sales Officer"].get("deliveries", {}).get("approve")
+
+
+def test_existing_firm_roles_are_not_touched_by_reseed():
+    from app.models import Role as R
+    from app.services import role_service
+    org_id, _ = _org()
+    old_dp = {"view": True, "create": True, "edit": True, "delete": True, "approve": True, "export": True, "download": True}
+    with SessionLocal() as s:                                   # an existing firm, seeded before this change
+        for r in s.query(R).filter(R.organization_id == org_id):
+            p = dict(r.permissions)
+            if r.name == "Delivery Partner":
+                p["deliveries"] = old_dp
+            if r.name == "Accountant":
+                p.pop("deliveries", None)
+            r.permissions = p
+        s.commit()
+        before = _role_perms(org_id)
+        role_service.seed_default_roles_for_all_orgs(s)
+    after = _role_perms(org_id)
+    assert after == before
+    assert after["Delivery Partner"]["deliveries"] == old_dp and "deliveries" not in after["Accountant"]

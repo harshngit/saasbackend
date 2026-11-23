@@ -55,6 +55,14 @@ def _firm():
         db.flush()
         role_service.seed_default_roles(db, org.id)
         roles = {r.name: r for r in db.query(Role).filter(Role.organization_id == org.id)}
+        # A firm seeded before the Accountant got Deliveries > View + Approve by default: its
+        # Accountant role has no deliveries rights (existing firms' roles are never rewritten).
+        new_default_acct = Role(organization_id=org.id, name=f"Accountant (new default) {uuid.uuid4().hex[:4]}",
+                                permissions=dict(roles["Accountant"].permissions))
+        old_perms = dict(roles["Accountant"].permissions)
+        old_perms.pop("deliveries", None)
+        roles["Accountant"].permissions = old_perms
+        db.add(new_default_acct)
         clerk = Role(organization_id=org.id, name=f"Collections Clerk {uuid.uuid4().hex[:4]}",
                      permissions={"deliveries": {"view": True, "approve": True}, "payments": {"view": True}})
         db.add(clerk)
@@ -63,11 +71,12 @@ def _firm():
         dp = _user(db, org, "Driver", "staff", UserRole.DELIVERY_PARTNER, roles["Delivery Partner"].id)
         acct = _user(db, org, "Accountant", "staff", UserRole.ACCOUNTANT, roles["Accountant"].id)
         clerk_user = _user(db, org, "Clerk", "staff", UserRole.ACCOUNTANT, clerk.id)
+        new_acct = _user(db, org, "New Accountant", "staff", UserRole.ACCOUNTANT, new_default_acct.id)
         cust = Customer(organization_id=org.id, name="Shop", state="Maharashtra")
         db.add(cust)
         db.flush()
         colls = []
-        for _ in range(4):
+        for _ in range(5):
             coll = DeliveryCollection(organization_id=org.id, customer_id=cust.id, delivery_partner_id=dp.id,
                                       amount=10, payment_mode="cash")
             db.add(coll)
@@ -82,7 +91,7 @@ def _firm():
             return {"Authorization": f"Bearer {create_access_token(u.id, sr, org.id)}"}
 
         return {"admin": tok(admin, "admin"), "dp": tok(dp, "staff"), "acct": tok(acct, "staff"),
-                "clerk": tok(clerk_user, "staff"), "colls": colls, "day_end": day_end.id}
+                "clerk": tok(clerk_user, "staff"), "new_acct": tok(new_acct, "staff"), "colls": colls, "day_end": day_end.id}
 
 
 @pytest.fixture(scope="module")
@@ -108,6 +117,8 @@ def test_reconcile_and_void(firms):
     assert c.post(f"/deliveries/collections/{f['colls'][2]}/void", headers=other["admin"]).status_code == 404
     assert c.post(f"/deliveries/collections/{f['colls'][2]}/void", headers=f["clerk"]).status_code == 200
     assert c.post(f"/deliveries/collections/{f['colls'][3]}/void", headers=f["admin"]).status_code == 200
+    # A new firm's seeded Accountant has Deliveries > Approve and can approve collections.
+    assert _reconcile(f, 4, "new_acct").status_code == 200
 
 
 def test_day_end_approve(firms):

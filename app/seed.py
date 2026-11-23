@@ -75,10 +75,9 @@ def seed_plans(db: Session) -> Plan:
                 plan.max_warehouses = spec["max_warehouses"]
             if plan.name in ("Free", "Basic") and (plan.max_users is None or plan.max_users > 1):
                 plan.max_users = 1
-            # Client-approved: Pro is 5 users (Basic 1, Enterprise unlimited). max_storage_gb is
-            # deliberately not touched here (under business review).
-            if plan.name == "Pro" and (plan.max_users is None or plan.max_users > 5):
-                plan.max_users = 5
+            # Pro is 5 users (Basic 1, Enterprise unlimited), but an existing Pro row is NOT
+            # rewritten here: the seed can run against production on boot. The live row is
+            # changed by alembic/pending/pro_plan_max_users_5.sql (or a Super Admin plan edit).
 
     db.commit()
     default = db.query(Plan).filter(Plan.is_default.is_(True)).first()

@@ -87,7 +87,9 @@ def test_default_accountant_access_matches_the_permission_table(tokens, path):
 
 
 def test_none_of_the_seven_is_granted_by_default_today():
-    assert not any(_default_has(req) for req in REQUIRED.values())
+    # Deliveries > View (+ Approve) is now part of a new firm's default Accountant; the rest are not.
+    assert _default_has(REQUIRED["/delivery-day-ends"])
+    assert not any(_default_has(req) for path, req in REQUIRED.items() if path != "/delivery-day-ends")
     # what the default Accountant does have, for comparison
     granted = default_role_matrices()["Accountant"]
     assert granted["purchases"]["view"] and granted["grn"]["view"] and granted["suppliers"]["view"]
