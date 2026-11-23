@@ -130,6 +130,7 @@ def pending(
     page_size: int = 10,
     sort_by: str | None = None,
     sort_order: str | None = None,
+    exclude_awaiting_approval: bool = False,
 ) -> PendingPaymentsOut:
     org_id = customer.organization_id
     tz = business_time.org_timezone(db, org_id)
@@ -149,10 +150,24 @@ def pending(
         .group_by(note.credit_note_for_invoice_id)
         .subquery()
     )
+    # Per invoice: collections submitted by delivery partners and not yet approved.
+    awaiting_q = (
+        select(DeliveryCollectionAllocation.invoice_id.label("invoice_id"),
+               func.sum(_money(DeliveryCollectionAllocation.amount)).label("awaiting"))
+        .join(DeliveryCollection, DeliveryCollection.id == DeliveryCollectionAllocation.delivery_collection_id)
+        .where(DeliveryCollectionAllocation.organization_id == org_id,
+               DeliveryCollection.organization_id == org_id,
+               DeliveryCollection.customer_id == customer.id,
+               DeliveryCollection.reconciliation_status == AWAITING_APPROVAL)
+        .group_by(DeliveryCollectionAllocation.invoice_id)
+        .subquery()
+    )
     total = _money(Invoice.total)
     paid = _money(Invoice.amount_paid)
     credit = cast(func.coalesce(credited.c.credited, 0), MONEY)
     outstanding = total - paid - credit
+    awaiting = cast(func.coalesce(awaiting_q.c.awaiting, 0), MONEY)
+    collectable = case((outstanding - awaiting > 0, outstanding - awaiting), else_=cast(0, MONEY))
     is_overdue = and_(Invoice.due_date.isnot(None), Invoice.due_date < today_start)
     status_expr = case((paid + credit > 0, literal("partial")), else_=literal("unpaid"))
 
@@ -163,8 +178,10 @@ def pending(
             total.label("total"), paid.label("amount_paid"), credit.label("credited_amount"),
             outstanding.label("outstanding"), status_expr.label("payment_status"),
             case((is_overdue, literal(True)), else_=literal(False)).label("is_overdue"),
+            awaiting.label("awaiting_approval_amount"), collectable.label("collectable_outstanding"),
         )
         .outerjoin(credited, credited.c.invoice_id == Invoice.id)
+        .outerjoin(awaiting_q, awaiting_q.c.invoice_id == Invoice.id)
         .filter(
             Invoice.organization_id == org_id,
             Invoice.customer_id == customer.id,
@@ -187,6 +204,8 @@ def pending(
         query = query.filter(or_(Invoice.due_date.is_(None), Invoice.due_date >= today_start))
     if payment_status is not None:
         query = query.filter(status_expr == payment_status)
+    if exclude_awaiting_approval:
+        query = query.filter(outstanding - awaiting > 0)
     if search and search.strip():
         query = query.filter(Invoice.invoice_number.ilike(_like(search), escape="\\"))
 
@@ -221,6 +240,8 @@ def pending(
             amount_paid=_amount(r.amount_paid), credited_amount=_amount(r.credited_amount),
             outstanding=_amount(r.outstanding), currency=currency, payment_status=r.payment_status,
             invoice_status=r.invoice_status, is_overdue=bool(r.is_overdue), days_overdue=days,
+            awaiting_approval_amount=_amount(r.awaiting_approval_amount),
+            collectable_outstanding=_amount(r.collectable_outstanding),
         ))
     awaiting_amount, awaiting_count = _awaiting_totals(db, customer)
     return PendingPaymentsOut(

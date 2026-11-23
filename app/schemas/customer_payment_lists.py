@@ -25,6 +25,12 @@ class PendingInvoiceOut(BaseModel):
     invoice_status: str = Field(description="The invoice's stored status")
     is_overdue: bool = Field(description="The due date (a calendar day in the organization's timezone) is before today")
     days_overdue: int = Field(description="Whole days past the due date; 0 when not overdue")
+    awaiting_approval_amount: float = Field(
+        default=0.0, description="Collected against this invoice by delivery partners, waiting for admin approval "
+                                 "(not yet deducted from outstanding)")
+    collectable_outstanding: float = Field(
+        default=0.0, description="outstanding - awaiting_approval_amount (never below 0): what can still be collected "
+                                 "on this invoice")
 
 
 class PendingSummary(BaseModel):

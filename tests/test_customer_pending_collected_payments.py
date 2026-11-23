@@ -454,3 +454,60 @@ def test_awaiting_approval_is_scoped_to_the_customer_and_firm(firm):
     r = client.get(f"/customers/{firm['cust']}/payments/collected", headers=other_firm["admin"],
                    params={"payment_status": "awaiting_approval"})
     assert r.status_code == 404
+
+
+# ------------------------- one place for a collection: Pending (still collectable) or Completed
+def _balance(f, customer, billed):
+    with SessionLocal() as s:
+        c = s.get(Customer, customer)
+        c.total_billed = billed
+        c.recompute_outstanding()
+        s.commit()
+
+
+def test_pending_can_leave_out_invoices_fully_awaiting_approval(firm):
+    full = _invoice(firm, 400.0, number="INV-FULL")
+    part = _invoice(firm, 1000.0, number="INV-PART")
+    untouched = _invoice(firm, 250.0, number="INV-NONE")
+    _submitted(firm, 400.0, invoice_id=full)                   # whole invoice collected, waiting
+    _submitted(firm, 300.0, invoice_id=part)                   # part collected, waiting
+
+    rows = {r["invoice_number"]: r for r in _pending(firm).json()["items"]}
+    assert set(rows) == {"INV-FULL", "INV-PART", "INV-NONE"}   # default unchanged
+    assert (rows["INV-FULL"]["outstanding"], rows["INV-FULL"]["awaiting_approval_amount"],
+            rows["INV-FULL"]["collectable_outstanding"]) == (400.0, 400.0, 0.0)
+    assert (rows["INV-PART"]["awaiting_approval_amount"], rows["INV-PART"]["collectable_outstanding"]) == (300.0, 700.0)
+    assert (rows["INV-NONE"]["awaiting_approval_amount"], rows["INV-NONE"]["collectable_outstanding"]) == (0.0, 250.0)
+
+    body = _pending(firm, exclude_awaiting_approval="true").json()
+    assert [r["invoice_number"] for r in body["items"]] and {r["invoice_number"] for r in body["items"]} == {"INV-PART", "INV-NONE"}
+    assert body["total"] == 2 and body["summary"]["pending_invoices"] == 2
+    # The fully-collected invoice is in Completed (waiting for approval) only.
+    waiting = _collected(firm, payment_status="awaiting_approval").json()["items"]
+    assert {a["invoice_id"] for w in waiting for a in w["allocations"]} == {full, part}
+    assert untouched not in {a["invoice_id"] for w in waiting for a in w["allocations"]}
+
+
+def test_customer_list_has_collectable_filter(firm):
+    _balance(firm, firm["cust"], 500.0)                        # owes 500, 500 collected -> nothing left
+    _balance(firm, firm["other"], 800.0)                       # owes 800, 300 collected -> 500 left
+    _submitted(firm, 500.0)
+    with SessionLocal() as s:
+        s.add(DeliveryCollection(organization_id=firm["org"], customer_id=firm["other"], amount=300.0,
+                                 payment_mode="cash", reconciliation_status="recorded"))
+        s.commit()
+    other_firm = _firm("Other")
+    _balance(other_firm, other_firm["cust"], 900.0)
+
+    def ids(**params):
+        r = client.get("/customers", headers=firm["admin"], params={"page_size": 100, **params})
+        assert r.status_code == 200, r.text
+        return {c["id"]: c for c in r.json()["items"]}
+
+    assert {firm["cust"], firm["other"]} <= set(ids(has_outstanding="true"))   # old filter unchanged
+    yes = ids(has_collectable="true")
+    assert firm["other"] in yes and firm["cust"] not in yes and other_firm["cust"] not in yes
+    assert yes[firm["other"]]["collectable_amount"] == 500.0
+    no = ids(has_collectable="false")
+    assert firm["cust"] in no and firm["other"] not in no
+    assert no[firm["cust"]]["collection_status"] == "pending_approval"
