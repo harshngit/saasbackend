@@ -36,6 +36,7 @@ from app.models import (
     CustomerPayment,
     CustomerPaymentAllocation,
     DeliveryCollection,
+    DeliveryCollectionAllocation,
     Invoice,
     Organization,
     PaymentSplit,
@@ -54,7 +55,11 @@ from app.schemas.customer_payment_lists import (
 MONEY = Numeric(18, 2)
 _EXCLUDED_INVOICE_STATUSES = ("void", "cancelled")
 PENDING_PAYMENT_STATUSES = ("unpaid", "partial")
-COLLECTED_PAYMENT_STATUSES = ("recorded",)
+COLLECTED_PAYMENT_STATUSES = ("recorded", "awaiting_approval")
+# The stored state of a delivery collection a partner has submitted and an admin has not yet
+# approved (reconciled). Approval records a CustomerPayment; until then it is only this row.
+AWAITING_APPROVAL = "recorded"
+ESCAPE = chr(92)  # LIKE escape character, as _like() escapes with it
 
 
 def _money(column):  # noqa: ANN001, ANN202
@@ -97,6 +102,19 @@ def _like(text: str) -> str:
 
 
 # ------------------------------------------------------------------------------ pending
+def _awaiting_totals(db: Session, customer: Customer) -> tuple[float, int]:
+    """(amount, count) of this customer's collections waiting for admin approval -- the
+    whole customer, whatever the list filters. One query."""
+    amount, count = db.query(
+        func.coalesce(func.sum(_money(DeliveryCollection.amount)), 0), func.count(DeliveryCollection.id),
+    ).filter(
+        DeliveryCollection.organization_id == customer.organization_id,
+        DeliveryCollection.customer_id == customer.id,
+        DeliveryCollection.reconciliation_status == AWAITING_APPROVAL,
+    ).one()
+    return _amount(amount), int(count or 0)
+
+
 def pending(
     db: Session,
     customer: Customer,
@@ -112,6 +130,7 @@ def pending(
     page_size: int = 10,
     sort_by: str | None = None,
     sort_order: str | None = None,
+    exclude_awaiting_approval: bool = False,
 ) -> PendingPaymentsOut:
     org_id = customer.organization_id
     tz = business_time.org_timezone(db, org_id)
@@ -131,10 +150,24 @@ def pending(
         .group_by(note.credit_note_for_invoice_id)
         .subquery()
     )
+    # Per invoice: collections submitted by delivery partners and not yet approved.
+    awaiting_q = (
+        select(DeliveryCollectionAllocation.invoice_id.label("invoice_id"),
+               func.sum(_money(DeliveryCollectionAllocation.amount)).label("awaiting"))
+        .join(DeliveryCollection, DeliveryCollection.id == DeliveryCollectionAllocation.delivery_collection_id)
+        .where(DeliveryCollectionAllocation.organization_id == org_id,
+               DeliveryCollection.organization_id == org_id,
+               DeliveryCollection.customer_id == customer.id,
+               DeliveryCollection.reconciliation_status == AWAITING_APPROVAL)
+        .group_by(DeliveryCollectionAllocation.invoice_id)
+        .subquery()
+    )
     total = _money(Invoice.total)
     paid = _money(Invoice.amount_paid)
     credit = cast(func.coalesce(credited.c.credited, 0), MONEY)
     outstanding = total - paid - credit
+    awaiting = cast(func.coalesce(awaiting_q.c.awaiting, 0), MONEY)
+    collectable = case((outstanding - awaiting > 0, outstanding - awaiting), else_=cast(0, MONEY))
     is_overdue = and_(Invoice.due_date.isnot(None), Invoice.due_date < today_start)
     status_expr = case((paid + credit > 0, literal("partial")), else_=literal("unpaid"))
 
@@ -145,8 +178,10 @@ def pending(
             total.label("total"), paid.label("amount_paid"), credit.label("credited_amount"),
             outstanding.label("outstanding"), status_expr.label("payment_status"),
             case((is_overdue, literal(True)), else_=literal(False)).label("is_overdue"),
+            awaiting.label("awaiting_approval_amount"), collectable.label("collectable_outstanding"),
         )
         .outerjoin(credited, credited.c.invoice_id == Invoice.id)
+        .outerjoin(awaiting_q, awaiting_q.c.invoice_id == Invoice.id)
         .filter(
             Invoice.organization_id == org_id,
             Invoice.customer_id == customer.id,
@@ -169,6 +204,8 @@ def pending(
         query = query.filter(or_(Invoice.due_date.is_(None), Invoice.due_date >= today_start))
     if payment_status is not None:
         query = query.filter(status_expr == payment_status)
+    if exclude_awaiting_approval:
+        query = query.filter(outstanding - awaiting > 0)
     if search and search.strip():
         query = query.filter(Invoice.invoice_number.ilike(_like(search), escape="\\"))
 
@@ -203,13 +240,18 @@ def pending(
             amount_paid=_amount(r.amount_paid), credited_amount=_amount(r.credited_amount),
             outstanding=_amount(r.outstanding), currency=currency, payment_status=r.payment_status,
             invoice_status=r.invoice_status, is_overdue=bool(r.is_overdue), days_overdue=days,
+            awaiting_approval_amount=_amount(r.awaiting_approval_amount),
+            collectable_outstanding=_amount(r.collectable_outstanding),
         ))
+    awaiting_amount, awaiting_count = _awaiting_totals(db, customer)
     return PendingPaymentsOut(
         items=items, total=count, page=page, page_size=page_size, total_pages=total_pages,
         summary=PendingSummary(
             total_outstanding=_amount(agg[1]), total_overdue=_amount(agg[2]),
             pending_invoices=int(agg[0] or 0), overdue_invoices=int(agg[3] or 0),
             currency=currency, payment_terms=customer.payment_terms, as_of=today,
+            awaiting_approval_amount=awaiting_amount, awaiting_approval_count=awaiting_count,
+            collectable_amount=_amount(max(float(customer.outstanding_balance or 0) - awaiting_amount, 0.0)),
         ),
     )
 
@@ -238,6 +280,11 @@ def collected(
                    "(a voided payment is deleted, so no other state exists)",
         )
     pay_from, pay_to = _day_range(from_date, to_date, "from_date", "to_date", tz)
+    if payment_status == "awaiting_approval":
+        return _awaiting_approval(
+            db, customer, pay_from=pay_from, pay_to=pay_to, payment_mode=payment_mode, search=search,
+            page=page, page_size=page_size, sort_by=sort_by, sort_order=sort_order,
+        )
 
     alloc = (
         select(CustomerPaymentAllocation.customer_payment_id.label("payment_id"),
@@ -347,10 +394,117 @@ def collected(
         )
         for r in page_rows
     ]
+    awaiting_amount, awaiting_count = _awaiting_totals(db, customer)
     return CollectedPaymentsOut(
         items=items, total=count, page=page, page_size=page_size, total_pages=total_pages,
         summary=CollectedSummary(
             total_collected=_amount(agg[1]), payment_count=int(agg[0] or 0),
             total_allocated=_amount(agg[2]), total_unallocated=_amount(agg[3]), currency=currency,
+            awaiting_approval_amount=awaiting_amount, awaiting_approval_count=awaiting_count,
+        ),
+    )
+
+
+def _awaiting_approval(
+    db: Session, customer: Customer, *, pay_from, pay_to, payment_mode, search,  # noqa: ANN001
+    page: int, page_size: int, sort_by: str | None, sort_order: str | None,
+) -> CollectedPaymentsOut:
+    """payment_status=awaiting_approval: this customer's delivery / field collections a
+    partner has submitted and an admin has not approved yet, in the same row shape as a
+    payment (status `awaiting_approval`, no receipt number yet). Read-only."""
+    from app.models import User
+
+    org_id = customer.organization_id
+    calloc = (
+        select(DeliveryCollectionAllocation.delivery_collection_id.label("collection_id"),
+               func.sum(_money(DeliveryCollectionAllocation.amount)).label("allocated"))
+        .where(DeliveryCollectionAllocation.organization_id == org_id)
+        .group_by(DeliveryCollectionAllocation.delivery_collection_id)
+        .subquery()
+    )
+    amount = _money(DeliveryCollection.amount)
+    allocated = func.coalesce(calloc.c.allocated, _money(literal(0)))
+    query = (
+        db.query(
+            DeliveryCollection.id.label("collection_id"), DeliveryCollection.collected_at,
+            amount.label("amount"), DeliveryCollection.payment_mode, DeliveryCollection.reference,
+            DeliveryCollection.sales_order_id, allocated.label("allocated_amount"),
+            (amount - allocated).label("unallocated_amount"), User.name.label("collected_by"),
+        )
+        .outerjoin(calloc, calloc.c.collection_id == DeliveryCollection.id)
+        .outerjoin(User, User.id == DeliveryCollection.delivery_partner_id)
+        .filter(
+            DeliveryCollection.organization_id == org_id,
+            DeliveryCollection.customer_id == customer.id,
+            DeliveryCollection.reconciliation_status == AWAITING_APPROVAL,
+        )
+    )
+    if pay_from is not None:
+        query = query.filter(DeliveryCollection.collected_at >= pay_from)
+    if pay_to is not None:
+        query = query.filter(DeliveryCollection.collected_at <= pay_to)
+    if payment_mode and payment_mode.strip():
+        query = query.filter(func.lower(DeliveryCollection.payment_mode) == payment_mode.strip().lower())
+    if search and search.strip():
+        like = _like(search)
+        inv = aliased(Invoice)
+        query = query.filter(or_(
+            DeliveryCollection.reference.ilike(like, escape=ESCAPE),
+            exists().where(
+                DeliveryCollectionAllocation.delivery_collection_id == DeliveryCollection.id,
+                DeliveryCollectionAllocation.invoice_id == inv.id,
+                inv.invoice_number.ilike(like, escape=ESCAPE),
+            ),
+        ))
+
+    rows = query.subquery()
+    agg = db.query(
+        func.count(rows.c.collection_id),
+        func.coalesce(func.sum(rows.c.amount), 0),
+        func.coalesce(func.sum(rows.c.allocated_amount), 0),
+        func.coalesce(func.sum(rows.c.unallocated_amount), 0),
+    ).one()
+    query = apply_sorting(
+        query, sort_by=sort_by, sort_order=sort_order,
+        allowed_fields={"payment_date": DeliveryCollection.collected_at, "amount": amount,
+                        # no receipt number before approval: the collection id keeps the order stable
+                        "receipt_number": DeliveryCollection.id},
+        default_order=[DeliveryCollection.collected_at.desc(), DeliveryCollection.id.desc()],
+        secondary_key=DeliveryCollection.id.desc(),
+    )
+    page_rows, count, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
+    currency = _currency(db, customer)
+
+    allocations: dict[str, list[PaymentAllocationOut]] = {}
+    ids = [r.collection_id for r in page_rows]
+    if ids:
+        for a in (
+            db.query(DeliveryCollectionAllocation.delivery_collection_id, DeliveryCollectionAllocation.invoice_id,
+                     Invoice.invoice_number, _money(DeliveryCollectionAllocation.amount))
+            .outerjoin(Invoice, Invoice.id == DeliveryCollectionAllocation.invoice_id)
+            .filter(DeliveryCollectionAllocation.delivery_collection_id.in_(ids))
+            .order_by(DeliveryCollectionAllocation.delivery_collection_id, Invoice.invoice_number,
+                      DeliveryCollectionAllocation.id)
+        ):
+            allocations.setdefault(a[0], []).append(
+                PaymentAllocationOut(invoice_id=a[1], invoice_number=a[2], amount=_amount(a[3])))
+    items = [
+        CollectedPaymentOut(
+            payment_id=r.collection_id, collection_id=r.collection_id, receipt_number=None,
+            payment_date=r.collected_at, amount=_amount(r.amount), payment_mode=r.payment_mode,
+            reference=r.reference, status="awaiting_approval", source="delivery_collection",
+            order_id=r.sales_order_id, allocated_amount=_amount(r.allocated_amount),
+            unallocated_amount=_amount(r.unallocated_amount), allocations=allocations.get(r.collection_id, []),
+            splits=[], currency=currency, collected_by=r.collected_by,
+        )
+        for r in page_rows
+    ]
+    awaiting_amount, awaiting_count = _awaiting_totals(db, customer)
+    return CollectedPaymentsOut(
+        items=items, total=count, page=page, page_size=page_size, total_pages=total_pages,
+        summary=CollectedSummary(
+            total_collected=_amount(agg[1]), payment_count=int(agg[0] or 0),
+            total_allocated=_amount(agg[2]), total_unallocated=_amount(agg[3]), currency=currency,
+            awaiting_approval_amount=awaiting_amount, awaiting_approval_count=awaiting_count,
         ),
     )

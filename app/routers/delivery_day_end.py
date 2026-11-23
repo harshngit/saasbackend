@@ -148,6 +148,8 @@ def reject_day_end(
     day_end_id: str,
     payload: DayEndReject,
     user: User = Depends(_view),
+    # Same privileged right as approve (deliveries.approve); admins are not permission-checked.
+    _approver: User = Depends(require_collections_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DayEndOut:

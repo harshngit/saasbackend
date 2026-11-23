@@ -256,7 +256,8 @@ def test_collected_payments_allocations_and_summary(firm):
     assert all(r["status"] == "recorded" and r["source"] == "direct" and r["receipt_number"] for r in body["items"])
     s = body["summary"]
     assert s == {"total_collected": 695.5, "payment_count": 3, "total_allocated": 600.0,
-                 "total_unallocated": 95.5, "currency": "INR"}
+                 "total_unallocated": 95.5, "currency": "INR",
+                 "awaiting_approval_amount": 0.0, "awaiting_approval_count": 0}
 
     # filters: mode, search (receipt / reference / invoice number), status, dates
     assert [r["reference"] for r in _collected(firm, payment_mode="UPI").json()["items"]] == ["UTR-111"]
@@ -307,7 +308,8 @@ def test_delivery_collection_appears_only_after_reconciliation_and_once(firm):
     old = client.get(f"/customers/{firm['cust']}/payments", headers=firm["admin"]).json()
     assert [r["status"] for r in old] == ["awaiting_reconciliation"]
 
-    r = client.post(f"/deliveries/collections/{coll_id}/reconcile", headers=firm["acct"])
+    # Admin: since 076b116 reconcile also needs Deliveries > Approve, which the built-in Accountant lacks.
+    r = client.post(f"/deliveries/collections/{coll_id}/reconcile", headers=firm["admin"])
     assert r.status_code == 200, r.text
     body = _collected(firm).json()
     assert body["total"] == 1 and body["items"][0]["source"] == "delivery_collection"
@@ -382,3 +384,130 @@ def test_query_count_does_not_grow_with_the_page(firm):
         assert all(len(r["splits"]) == 2 and len(r["allocations"]) == 1 for r in coll["items"])
         counts[size] = len(statements)
     assert counts[2] == counts[8], counts
+
+
+# ------------------------------------------- collections waiting for admin approval
+def _submitted(f, amount, *, invoice_id=None, reference=None, mode="cash"):
+    db = SessionLocal()
+    try:
+        coll = DeliveryCollection(organization_id=f["org"], customer_id=f["cust"], amount=amount,
+                                  payment_mode=mode, reference=reference, reconciliation_status="recorded")
+        db.add(coll)
+        db.flush()
+        if invoice_id:
+            from app.models import DeliveryCollectionAllocation
+            db.add(DeliveryCollectionAllocation(organization_id=f["org"], delivery_collection_id=coll.id,
+                                                invoice_id=invoice_id, amount=amount))
+        db.commit()
+        return coll.id
+    finally:
+        db.close()
+
+
+def test_awaiting_approval_list_and_summaries(firm):
+    inv = _invoice(firm, 1000.0, due_in=5)
+    with SessionLocal() as s:                                  # the invoice is on the customer's balance
+        cust = s.get(Customer, firm["cust"])
+        cust.total_billed = 1000.0
+        cust.recompute_outstanding()
+        s.commit()
+    first = _submitted(firm, 300.0, invoice_id=inv, reference="COD-7")
+    _submitted(firm, 200.0, mode="upi")
+
+    # Default list unchanged: no payment yet. Summary tells what is waiting.
+    body = _collected(firm).json()
+    assert body["total"] == 0
+    assert body["summary"]["awaiting_approval_amount"] == 500.0 and body["summary"]["awaiting_approval_count"] == 2
+
+    body = _collected(firm, payment_status="awaiting_approval").json()
+    assert body["total"] == 2 and body["summary"]["total_collected"] == 500.0
+    row = next(r for r in body["items"] if r["collection_id"] == first)
+    assert row["status"] == "awaiting_approval" and row["source"] == "delivery_collection"
+    assert row["payment_id"] == first and row["receipt_number"] is None and row["reference"] == "COD-7"
+    assert row["allocations"] == [{"invoice_id": inv, "invoice_number": row["allocations"][0]["invoice_number"],
+                                   "amount": 300.0}]
+    assert row["allocated_amount"] == 300.0 and row["unallocated_amount"] == 0.0
+    assert _collected(firm, payment_status="awaiting_approval", payment_mode="UPI").json()["total"] == 1
+    assert _collected(firm, payment_status="awaiting_approval", search="COD-7").json()["total"] == 1
+
+    pend = _pending(firm).json()["summary"]
+    assert pend["awaiting_approval_amount"] == 500.0 and pend["awaiting_approval_count"] == 2
+    assert pend["collectable_amount"] == 500.0                   # outstanding 1000 - 500 waiting
+
+    # Approved: leaves the waiting list, appears once as a payment.
+    assert client.post(f"/deliveries/collections/{first}/reconcile", headers=firm["admin"]).status_code == 200
+    assert _collected(firm, payment_status="awaiting_approval").json()["total"] == 1
+    body = _collected(firm).json()
+    assert body["total"] == 1 and body["items"][0]["source"] == "delivery_collection"
+    assert body["summary"]["awaiting_approval_amount"] == 200.0
+
+
+def test_unknown_payment_status_still_400(firm):
+    r = _collected(firm, payment_status="pending")
+    assert r.status_code == 400 and "awaiting_approval" in r.json()["detail"]
+
+
+def test_awaiting_approval_is_scoped_to_the_customer_and_firm(firm):
+    other_firm = _firm("Other")
+    _submitted(firm, 50.0)
+    assert _collected(firm, customer=firm["other"], payment_status="awaiting_approval").json()["total"] == 0
+    r = client.get(f"/customers/{firm['cust']}/payments/collected", headers=other_firm["admin"],
+                   params={"payment_status": "awaiting_approval"})
+    assert r.status_code == 404
+
+
+# ------------------------- one place for a collection: Pending (still collectable) or Completed
+def _balance(f, customer, billed):
+    with SessionLocal() as s:
+        c = s.get(Customer, customer)
+        c.total_billed = billed
+        c.recompute_outstanding()
+        s.commit()
+
+
+def test_pending_can_leave_out_invoices_fully_awaiting_approval(firm):
+    full = _invoice(firm, 400.0, number="INV-FULL")
+    part = _invoice(firm, 1000.0, number="INV-PART")
+    untouched = _invoice(firm, 250.0, number="INV-NONE")
+    _submitted(firm, 400.0, invoice_id=full)                   # whole invoice collected, waiting
+    _submitted(firm, 300.0, invoice_id=part)                   # part collected, waiting
+
+    rows = {r["invoice_number"]: r for r in _pending(firm).json()["items"]}
+    assert set(rows) == {"INV-FULL", "INV-PART", "INV-NONE"}   # default unchanged
+    assert (rows["INV-FULL"]["outstanding"], rows["INV-FULL"]["awaiting_approval_amount"],
+            rows["INV-FULL"]["collectable_outstanding"]) == (400.0, 400.0, 0.0)
+    assert (rows["INV-PART"]["awaiting_approval_amount"], rows["INV-PART"]["collectable_outstanding"]) == (300.0, 700.0)
+    assert (rows["INV-NONE"]["awaiting_approval_amount"], rows["INV-NONE"]["collectable_outstanding"]) == (0.0, 250.0)
+
+    body = _pending(firm, exclude_awaiting_approval="true").json()
+    assert [r["invoice_number"] for r in body["items"]] and {r["invoice_number"] for r in body["items"]} == {"INV-PART", "INV-NONE"}
+    assert body["total"] == 2 and body["summary"]["pending_invoices"] == 2
+    # The fully-collected invoice is in Completed (waiting for approval) only.
+    waiting = _collected(firm, payment_status="awaiting_approval").json()["items"]
+    assert {a["invoice_id"] for w in waiting for a in w["allocations"]} == {full, part}
+    assert untouched not in {a["invoice_id"] for w in waiting for a in w["allocations"]}
+
+
+def test_customer_list_has_collectable_filter(firm):
+    _balance(firm, firm["cust"], 500.0)                        # owes 500, 500 collected -> nothing left
+    _balance(firm, firm["other"], 800.0)                       # owes 800, 300 collected -> 500 left
+    _submitted(firm, 500.0)
+    with SessionLocal() as s:
+        s.add(DeliveryCollection(organization_id=firm["org"], customer_id=firm["other"], amount=300.0,
+                                 payment_mode="cash", reconciliation_status="recorded"))
+        s.commit()
+    other_firm = _firm("Other")
+    _balance(other_firm, other_firm["cust"], 900.0)
+
+    def ids(**params):
+        r = client.get("/customers", headers=firm["admin"], params={"page_size": 100, **params})
+        assert r.status_code == 200, r.text
+        return {c["id"]: c for c in r.json()["items"]}
+
+    assert {firm["cust"], firm["other"]} <= set(ids(has_outstanding="true"))   # old filter unchanged
+    yes = ids(has_collectable="true")
+    assert firm["other"] in yes and firm["cust"] not in yes and other_firm["cust"] not in yes
+    assert yes[firm["other"]]["collectable_amount"] == 500.0
+    no = ids(has_collectable="false")
+    assert firm["cust"] in no and firm["other"] not in no
+    assert no[firm["cust"]]["collection_status"] == "pending_approval"

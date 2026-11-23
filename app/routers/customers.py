@@ -239,6 +239,8 @@ def list_customers(
     is_active: bool | None = Query(default=None),
     assigned_sales_officer_id: str | None = Query(default=None),
     has_outstanding: bool | None = Query(default=None, description="Filter customers with outstanding balance > 0"),
+    has_collectable: bool | None = Query(default=None, description="true = only customers with collectable_amount > 0 "
+                                         "(something left to collect after collections awaiting approval); false = the rest"),
     page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     sort_by: str | None = Query(default=None, description="Field to sort by"),
@@ -268,6 +270,16 @@ def list_customers(
         query = query.filter(Customer.outstanding_balance > 0)
     elif has_outstanding is False:
         query = query.filter(or_(Customer.outstanding_balance <= 0, Customer.outstanding_balance.is_(None)))
+    if has_collectable is not None:
+        # collectable_amount = outstanding_balance - collections awaiting approval (same as the row field).
+        from sqlalchemy import func as sa_func, select as sa_select
+        awaiting = sa_select(sa_func.coalesce(sa_func.sum(DeliveryCollection.amount), 0)).where(
+            DeliveryCollection.organization_id == Customer.organization_id,
+            DeliveryCollection.customer_id == Customer.id,
+            DeliveryCollection.reconciliation_status == "recorded",
+        ).correlate(Customer).scalar_subquery()
+        collectable = sa_func.coalesce(Customer.outstanding_balance, 0) - awaiting
+        query = query.filter(collectable >= 0.005 if has_collectable else collectable < 0.005)
     if not _is_delivery_partner(user):
         query = scoping.owned_by(query, db, user, Customer.assigned_sales_officer_id)
 
@@ -495,6 +507,9 @@ def list_pending_payments(
     overdue: bool | None = Query(default=None, description="true = only overdue, false = only not overdue"),
     payment_status: str | None = Query(default=None, description="unpaid | partial"),
     search: str | None = Query(default=None, description="Invoice number contains"),
+    exclude_awaiting_approval: bool = Query(default=False, description="true = leave out invoices whose whole "
+                                            "outstanding is already collected and waiting for admin approval "
+                                            "(only invoices with collectable_outstanding > 0)"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
     sort_by: str | None = Query(default=None, description="invoice_date | due_date | invoice_number | total | outstanding"),
@@ -513,7 +528,7 @@ def list_pending_payments(
     return customer_payment_lists.pending(
         db, customer, from_date=from_date, to_date=to_date, due_from=due_from, due_to=due_to, overdue=overdue,
         payment_status=payment_status, search=search, page=page, page_size=page_size,
-        sort_by=sort_by, sort_order=sort_order,
+        sort_by=sort_by, sort_order=sort_order, exclude_awaiting_approval=exclude_awaiting_approval,
     )
 
 
@@ -523,7 +538,7 @@ def list_collected_payments(
     from_date: str | None = Query(default=None, description="Payment date from (YYYY-MM-DD, organization's timezone)"),
     to_date: str | None = Query(default=None, description="Payment date to (YYYY-MM-DD, inclusive)"),
     payment_mode: str | None = Query(default=None, description="cash | upi | card | … (also matches a split's tender)"),
-    payment_status: str | None = Query(default=None, description="recorded (the only state a listed payment has)"),
+    payment_status: str | None = Query(default=None, description="recorded (default: finalized payments) or awaiting_approval (collections a delivery partner submitted that an admin has not approved yet)"),
     search: str | None = Query(default=None, description="Receipt number, transaction reference or invoice number contains"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),

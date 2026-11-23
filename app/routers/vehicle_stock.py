@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
+from app.services import day_end_service
 from app.services import delivery_service, stock_service
 from app.schemas.vehicle_stock import (
     DeliveryLoadOut,
@@ -172,6 +173,7 @@ def load_vehicle(
     partner = db.get(User, payload.delivery_partner_id)
     if partner is None or partner.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="delivery_partner_id is not a user in your firm")
+    day_end_service.require_stock_day_open(db, org_id, partner.id)
     # An "own"-scope user may only start a loading session for themselves —
     # not stock a van "for" a colleague.
     if scoping.scope_to_own(db, user) and partner.id != user.id:
@@ -298,6 +300,8 @@ def add_extra_load(
     loading = _owned(db, id, org_id, user)
     if loading.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Loading session is not active")
+    # A submitted / approved Day-End freezes that day's vehicle stock: refuse before any write.
+    day_end_service.require_stock_day_open(db, org_id, loading.delivery_partner_id)
 
     wh_id = loading.warehouse_id or stock_service.default_warehouse(db, org_id).id
     warehouse = stock_service.owned_warehouse(db, wh_id, org_id, require_active=True)
@@ -373,6 +377,8 @@ def record_returns(
     loading = _owned(db, id, org_id, user)
     if loading.status != "active":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Loading session is not active")
+    # A submitted / approved Day-End freezes that day's vehicle stock: refuse before any write.
+    day_end_service.require_stock_day_open(db, org_id, loading.delivery_partner_id)
 
     wh_id = loading.warehouse_id or stock_service.default_warehouse(db, org_id).id
     warehouse = stock_service.owned_warehouse(db, wh_id, org_id, require_active=True)

@@ -520,7 +520,7 @@ def default_limits_for_plan(plan_name: str | None) -> dict[str, Any]:
         }
     if name == "pro":
         return {
-            "max_users": 50,
+            "max_users": 5,
             "max_warehouses": None,
             "max_orders": None,
             "max_storage_gb": None,

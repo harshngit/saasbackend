@@ -192,7 +192,9 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
         },
         "Delivery Partner": {
             "dashboard": _view_only(),
-            "deliveries": _full(),
+            # No approve (collections reconcile/void, Day-End review) and no delete: those are
+            # back-office rights. New firms only -- existing roles are never rewritten.
+            "deliveries": _perm(view=True, create=True, edit=True, export=True, download=True),
             "vehicle_stock": _full(),
             "attendance": _full(),
             "customers": _view_only(),
@@ -216,8 +218,16 @@ def default_role_matrices() -> dict[str, dict[str, dict[str, bool]]]:
             "suppliers": _view_only(),
             "inventory": _view_only(),
             "leaves": _perm(view=True, create=True, edit=True, delete=True),
+            # Approves delivery-partner collections. New firms only (see NEW_ORG_ONLY_MODULES).
+            "deliveries": _perm(view=True, approve=True),
         },
     }
+
+
+# (role, module) pairs of the default matrices that are given only to roles created for a
+# new firm. seed_default_roles' backfill (which adds modules missing from an existing firm's
+# default roles) skips them, so existing firms' roles are left exactly as their Admin set them.
+NEW_ORG_ONLY_MODULES: frozenset[tuple[str, str]] = frozenset({("Accountant", "deliveries")})
 
 
 def normalize_permissions(permissions: dict | None) -> dict[str, dict[str, bool]]:
