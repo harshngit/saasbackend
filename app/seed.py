@@ -43,8 +43,8 @@ _DEFAULT_PLANS = [
     {
         "name": "Pro", "price_monthly": 999, "price_yearly": 9999,
         "original_price_monthly": 1499, "original_price_yearly": 14999,
-        "max_users": 50, "max_orders": None, "max_warehouses": None,
-        "features": ["Up to 50 users", "Unlimited orders", "Leads & Quotations", "Vehicles & Vehicle Stock", "Advanced analytics", "Priority support"],
+        "max_users": 5, "max_orders": None, "max_warehouses": None,
+        "features": ["Up to 5 users", "Unlimited orders", "Leads & Quotations", "Vehicles & Vehicle Stock", "Advanced analytics", "Priority support"],
         "entitlements": default_entitlements_for_plan("Pro"),
     },
     {
@@ -75,6 +75,10 @@ def seed_plans(db: Session) -> Plan:
                 plan.max_warehouses = spec["max_warehouses"]
             if plan.name in ("Free", "Basic") and (plan.max_users is None or plan.max_users > 1):
                 plan.max_users = 1
+            # Client-approved: Pro is 5 users (Basic 1, Enterprise unlimited). max_storage_gb is
+            # deliberately not touched here (under business review).
+            if plan.name == "Pro" and (plan.max_users is None or plan.max_users > 5):
+                plan.max_users = 5
 
     db.commit()
     default = db.query(Plan).filter(Plan.is_default.is_(True)).first()

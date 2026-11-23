@@ -322,6 +322,28 @@ def reject(db: Session, user: User, day_end: DeliveryDayEnd, reason: str | None)
     return day_end
 
 
+def require_stock_day_open(db: Session, org_id: str, partner_id: str | None, moment: datetime | None = None) -> None:
+    """Vehicle stock (loading, extra load, end-of-day return, a delivery confirm that takes
+    goods off the vehicle) cannot change for a day whose Day-End is submitted or approved:
+    the Admin reviews (and approves) a fixed day. The day is the business date of the action
+    (now, in the firm's timezone) -- not the vehicle run's start date, so a run left open
+    can still be returned on the next day. Raises before anything is written; 409
+    DAY_END_CLOSED, the same error collections use."""
+    if not partner_id:
+        return
+    moment = moment or datetime.now(timezone.utc)
+    day_end = find(db, org_id, partner_id, business_date_of(db, org_id, moment))
+    if day_end is not None and day_end.status in LOCKED_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DAY_END_CLOSED",
+                "message": f"The delivery partner's Day-End for {day_end.business_date.isoformat()} is "
+                           f"{day_end.status}; vehicle stock for that day can no longer change.",
+            },
+        )
+
+
 def require_day_open(db: Session, org_id: str, partner_id: str | None, moment: datetime) -> None:
     """Collections cannot be added to, or voided out of, a day whose Day-End is
     submitted or approved: the Admin reviews (and approves) a fixed set."""

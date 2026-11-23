@@ -807,6 +807,9 @@ def load(
     this one to commit. The assignment is a no-op (`status` set to its own
     current value); its only purpose is to be a write.
     """
+    # A submitted / approved Day-End freezes that day's vehicle stock: refuse before any write.
+    from app.services import day_end_service
+    day_end_service.require_stock_day_open(db, delivery.organization_id, delivery.delivery_partner_id)
     org_id = delivery.organization_id
     db.execute(sa_update(Delivery).where(Delivery.id == delivery.id).values(status=Delivery.status))
     db.refresh(delivery)
@@ -1187,6 +1190,9 @@ def confirm(
     # exactly the states that may reach "partially_delivered" too, so validating
     # against either representative target correctly gates the real outcome,
     # which is computed further down once the delivered quantity is known.
+    # A submitted / approved Day-End freezes that day's vehicle stock: refuse before any write.
+    from app.services import day_end_service
+    day_end_service.require_stock_day_open(db, delivery.organization_id, delivery.delivery_partner_id)
     fingerprint = confirm_fingerprint(lines, pod_photo_file_ids, signature_file_id, notes, failed,
                                       failure_reason, receiver_name)
     with perf.stage("lock"):

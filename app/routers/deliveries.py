@@ -1101,6 +1101,8 @@ def app_confirm_delivery(
     409 when an item's `expected_max` no longer matches the server's figure.
     """
     delivery = _owned_delivery(db, delivery_id, user)
+    # Before the spare units are moved between deliveries (not only in the confirm itself).
+    day_end_service.require_stock_day_open(db, delivery.organization_id, delivery.delivery_partner_id)
     reallocations = delivery_redistribution_service.confirm(
         db, user, delivery,
         lines=[
