@@ -661,6 +661,93 @@ class DeliveryCollectionOut(BaseModel):
         return self
 
 
+# ------------------------------------------- GET /deliveries/collections?view=pending|collected
+# Canonical collection status for the app. Stored reconciliation_status -> collection_status:
+#   recorded   -> pending_approval  (submitted by the partner, waiting for an admin)
+#   reconciled -> approved          (admin approved; the payment / receipt is recorded)
+#   voided     -> voided            (cancelled / rejected; in neither view)
+CANONICAL_COLLECTION_STATUS = {"recorded": "pending_approval", "reconciled": "approved", "voided": "voided"}
+
+
+class CollectionsPagination(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class CollectionsViewSummary(BaseModel):
+    """Over every record matching the view and filters, not just this page."""
+
+    total_pending: int = Field(default=0, description="view=pending: customers that can be collected from")
+    total_pending_amount: float = Field(default=0.0, description="view=pending: their total outstanding")
+    total_collected: float = Field(default=0.0, description="view=collected: pending_approval + approved amount")
+    collected_count: int = 0
+    awaiting_approval_amount: float = 0.0
+    awaiting_approval_count: int = 0
+    approved_amount: float = 0.0
+    approved_count: int = 0
+    cash_total: float = 0.0
+    bank_transfer_total: float = Field(default=0.0, description="bank_transfer / bank / neft / rtgs / imps")
+    upi_total: float = 0.0
+    cheque_total: float = 0.0
+    other_total: float = 0.0
+    by_payment_mode: dict[str, float] = Field(default_factory=dict)
+
+
+class PendingCollectionCustomerOut(BaseModel):
+    customer_id: str
+    customer_code: str | None = None
+    customer_name: str
+    business_name: str | None = None
+    contact_name: str | None = None
+    phone: str | None = None
+    address: str | None = None
+    outstanding_amount: float
+    collectable_amount: float = Field(description="Same as outstanding_amount: nothing is awaiting approval")
+    collection_status: str | None = Field(default=None, description="Always null in this view")
+    status: str = "pending"
+
+
+class CollectedCollectionOut(DeliveryCollectionOut):
+    """A collection row (same fields as GET /deliveries/collections) plus the names the
+    Collected tab shows."""
+
+    collection_id: str | None = None
+    customer_name: str | None = None
+    amount_collected: float | None = None
+    collection_status: str | None = Field(default=None, description="pending_approval | approved")
+
+    @model_validator(mode="after")
+    def _collected_fields(self) -> "CollectedCollectionOut":
+        self.collection_id = self.id
+        self.amount_collected = self.amount
+        self.collection_status = CANONICAL_COLLECTION_STATUS.get(self.reconciliation_status, self.reconciliation_status)
+        return self
+
+
+class PendingCollectionsViewOut(BaseModel):
+    view: str = "pending"
+    items: list[PendingCollectionCustomerOut]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    pagination: CollectionsPagination
+    summary: CollectionsViewSummary
+
+
+class CollectedCollectionsViewOut(BaseModel):
+    view: str = "collected"
+    items: list[CollectedCollectionOut]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    pagination: CollectionsPagination
+    summary: CollectionsViewSummary
+
+
 class DeliveryBatchLoadRequest(BaseModel):
     delivery_ids: list[str] = Field(min_length=1)
 
