@@ -1,6 +1,8 @@
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from typing import Union
+
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload, lazyload
 
@@ -70,6 +72,12 @@ from app.schemas.delivery import (
     DeliveryStatusUpdate,
     DeliveryWarehouseBrief,
     VehicleBrief,
+    CollectedCollectionOut,
+    CollectedCollectionsViewOut,
+    CollectionsPagination,
+    CollectionsViewSummary,
+    PendingCollectionCustomerOut,
+    PendingCollectionsViewOut,
 )
 from app.core.pagination import paginate
 from app.schemas.pagination import PaginatedResponse
@@ -139,6 +147,9 @@ _COLLECTION_STATUS_FILTER = {
     "recorded": "recorded",
     "reconciled": "reconciled",
     "voided": "voided",
+    # Canonical names (collection_status) -- same stored states.
+    "pending_approval": "recorded",
+    "approved": "reconciled",
 }
 
 DELIVERY_COLLECTION_SORTABLE_FIELDS = {
@@ -1467,9 +1478,157 @@ def delivery_collections_summary(
     )
 
 
-@router.get("/collections", response_model=PaginatedResponse[DeliveryCollectionOut])
-@router.get("/collections/all", response_model=PaginatedResponse[DeliveryCollectionOut])
+_COLLECTIONS_RESPONSE = Union[
+    PaginatedResponse[DeliveryCollectionOut], PendingCollectionsViewOut, CollectedCollectionsViewOut,
+]
+_BANK_MODES = ("bank_transfer", "bank", "neft", "rtgs", "imps", "netbanking", "net_banking", "online")
+
+
+def _view_page(page: int, page_size: int, total: int) -> tuple[int, int, int]:
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    return page, page_size, total_pages
+
+
+def _pending_collections_view(db, user, *, search, customer_id, page, page_size, sort_by, sort_order):  # noqa: ANN001
+    """Customers a new collection can be taken from: active, outstanding > 0, and nothing
+    awaiting approval (those are in view=collected). Same customers GET /customers shows
+    this user, filtered in SQL before the count, the summary and the page."""
+    if not has_permission(db, user, "customers", "view"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to view customers")
+    org_id = _org_id(user)
+    awaiting = (
+        select(DeliveryCollection.id)
+        .where(DeliveryCollection.organization_id == Customer.organization_id,
+               DeliveryCollection.customer_id == Customer.id,
+               DeliveryCollection.reconciliation_status == "recorded")
+        .correlate(Customer)
+        .exists()
+    )
+    q = db.query(Customer).filter(
+        Customer.organization_id == org_id,
+        Customer.is_active.is_(True),
+        Customer.outstanding_balance > 0.005,
+        ~awaiting,
+    )
+    if not _is_delivery_partner(user):
+        q = scoping.owned_by(q, db, user, Customer.assigned_sales_officer_id)
+    if customer_id:
+        q = q.filter(Customer.id == customer_id)
+    if search and search.strip():
+        s = f"%{search.strip()}%"
+        q = q.filter(or_(Customer.name.ilike(s), Customer.business_name.ilike(s), Customer.phone.ilike(s),
+                         Customer.customer_id.ilike(s), Customer.primary_contact_person.ilike(s)))
+
+    ids = q.with_entities(Customer.id).order_by(None).subquery()
+    count, amount = db.query(
+        func.count(Customer.id), func.coalesce(func.sum(Customer.outstanding_balance), 0.0),
+    ).filter(Customer.id.in_(select(ids.c.id))).one()
+    total = int(count or 0)
+
+    q = apply_sorting(
+        q, sort_by=sort_by, sort_order=sort_order,
+        sortable_fields={"customer_name": Customer.name, "name": Customer.name,
+                         "outstanding_amount": Customer.outstanding_balance,
+                         "collectable_amount": Customer.outstanding_balance,
+                         "outstanding_balance": Customer.outstanding_balance},
+        default_order=[Customer.name.asc(), Customer.id.asc()],
+        secondary_key=Customer.id.asc(),
+    )
+    q = q.options(lazyload("*"))
+    rows = q.offset((page - 1) * page_size).limit(page_size).all()
+    page, page_size, total_pages = _view_page(page, page_size, total)
+    items = [
+        PendingCollectionCustomerOut(
+            customer_id=c.id, customer_code=c.customer_id, customer_name=c.name, business_name=c.business_name,
+            contact_name=c.primary_contact_person, phone=c.phone,
+            address=getattr(c, "delivery_address", None) or getattr(c, "billing_address", None),
+            outstanding_amount=round(float(c.outstanding_balance or 0.0), 2),
+            collectable_amount=round(float(c.outstanding_balance or 0.0), 2),
+        )
+        for c in rows
+    ]
+    return PendingCollectionsViewOut(
+        items=items, total=total, page=page, page_size=page_size, total_pages=total_pages,
+        pagination=CollectionsPagination(page=page, page_size=page_size, total=total, total_pages=total_pages),
+        summary=CollectionsViewSummary(total_pending=total, total_pending_amount=round(float(amount or 0.0), 2)),
+    )
+
+
+def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_order):  # noqa: ANN001
+    """Collection records awaiting approval or approved (voided are in neither view). `q` is
+    the history query with the caller's scope and filters already applied."""
+    q = q.filter(DeliveryCollection.reconciliation_status.in_(("recorded", "reconciled")))
+    ids = q.with_entities(DeliveryCollection.id).order_by(None).subquery()
+    mode = func.lower(func.coalesce(DeliveryCollection.payment_mode, "other"))
+    agg = (
+        db.query(DeliveryCollection.reconciliation_status, mode, func.count(DeliveryCollection.id),
+                 func.coalesce(func.sum(DeliveryCollection.amount), 0.0))
+        .filter(DeliveryCollection.id.in_(select(ids.c.id)))
+        .group_by(DeliveryCollection.reconciliation_status, mode)
+        .all()
+    )
+    summary = CollectionsViewSummary()
+    by_mode: dict[str, float] = {}
+    for stored, m, n, amt in agg:
+        amt = float(amt or 0.0)
+        summary.collected_count += int(n)
+        summary.total_collected += amt
+        if stored == "recorded":
+            summary.awaiting_approval_count += int(n)
+            summary.awaiting_approval_amount += amt
+        else:
+            summary.approved_count += int(n)
+            summary.approved_amount += amt
+        by_mode[m] = by_mode.get(m, 0.0) + amt
+        if m == "cash":
+            summary.cash_total += amt
+        elif m in _BANK_MODES:
+            summary.bank_transfer_total += amt
+        elif m == "upi":
+            summary.upi_total += amt
+        elif m == "cheque":
+            summary.cheque_total += amt
+        else:
+            summary.other_total += amt
+    for f in ("total_collected", "awaiting_approval_amount", "approved_amount", "cash_total",
+              "bank_transfer_total", "upi_total", "cheque_total", "other_total"):
+        setattr(summary, f, round(getattr(summary, f), 2))
+    summary.by_payment_mode = {k: round(v, 2) for k, v in sorted(by_mode.items())}
+    total = summary.collected_count
+
+    q = apply_sorting(
+        q, sort_by=sort_by, sort_order=sort_order,
+        sortable_fields=DELIVERY_COLLECTION_SORTABLE_FIELDS,
+        default_order=[DeliveryCollection.collected_at.desc().nullslast(), DeliveryCollection.id.desc()],
+        secondary_key=DeliveryCollection.id.desc(),
+    )
+    rows = q.offset((page - 1) * page_size).limit(page_size).all()
+    names = dict(
+        db.query(Customer.id, Customer.name).filter(Customer.id.in_({r.customer_id for r in rows if r.customer_id})).all()
+    ) if rows else {}
+    items = []
+    for r in rows:
+        item = CollectedCollectionOut.model_validate(r)
+        item.customer_name = names.get(r.customer_id)
+        items.append(item)
+    page, page_size, total_pages = _view_page(page, page_size, total)
+    return CollectedCollectionsViewOut(
+        items=items, total=total, page=page, page_size=page_size, total_pages=total_pages,
+        pagination=CollectionsPagination(page=page, page_size=page_size, total=total, total_pages=total_pages),
+        summary=summary,
+    )
+
+
+@router.get("/collections", response_model=_COLLECTIONS_RESPONSE)
+@router.get("/collections/all", response_model=_COLLECTIONS_RESPONSE)
 def list_delivery_collections(
+    view: str | None = Query(
+        default=None,
+        description="Omit for the full history (unchanged). `pending`: customers a new collection can be "
+                    "taken from (outstanding > 0, nothing awaiting approval). `collected`: collections "
+                    "awaiting approval (pending_approval) or approved; voided in neither. Each view has its "
+                    "own total / pagination / summary, computed after its filters.",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     sort_by: str | None = Query(default=None, description="Field to sort by"),
@@ -1494,6 +1653,21 @@ def list_delivery_collections(
     Delivery Partners only see collections where they are the assigned partner.
     Accountants and Admins see all collections for their organization.
     """
+    if view is not None:
+        v = view.strip().lower()
+        if v not in ("pending", "collected"):
+            # (`status` here is the query parameter, not fastapi.status)
+            raise HTTPException(status_code=400, detail="view must be one of: pending, collected")
+        if v == "pending":
+            return _pending_collections_view(db, user, search=search, customer_id=customer_id, page=page,
+                                             page_size=page_size, sort_by=sort_by, sort_order=sort_order)
+        q = _filtered_collections(
+            db, user, status_filter=status, search=search, delivery_partner_id=delivery_partner_id,
+            collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
+            date_from=date_from, date_to=date_to,
+        )
+        return _collected_collections_view(db, user, q, page=page, page_size=page_size,
+                                           sort_by=sort_by, sort_order=sort_order)
     q = _filtered_collections(
         db, user, status_filter=status, search=search, delivery_partner_id=delivery_partner_id,
         collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
