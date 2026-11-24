@@ -7,8 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core import scoping
 from app.core.database import get_db
-from app.core.deps import require_entitlement, require_permission, require_unlocked_org
-from app.routers.deliveries import require_collections_approve
+from app.core.deps import get_current_user, has_permission, require_entitlement, require_permission, require_unlocked_org
 from app.core.pagination import paginate
 from app.models import User
 from app.models.delivery_day_end import DAY_END_STATUSES, DeliveryDayEnd
@@ -23,6 +22,19 @@ router = APIRouter(
 )
 
 _view = require_permission("deliveries", "view")
+
+DAY_END_APPROVE_DETAIL = (
+    "You don't have permission to approve or reject a Day-End: this needs the "
+    "Deliveries > Approve permission on your role."
+)
+
+
+def require_day_end_approve(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    """Approve / reject a Day-End: the role needs Deliveries > Approve (Admins are not
+    permission-checked). Same rule as collections reconcile / void, with a Day-End message."""
+    if not has_permission(db, user, "deliveries", "approve"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=DAY_END_APPROVE_DETAIL)
+    return user
 
 
 def _org_id(user: User) -> str:
@@ -130,7 +142,7 @@ def approve_day_end(
     day_end_id: str,
     payload: DayEndApprove | None = None,
     user: User = Depends(_view),
-    _approver: User = Depends(require_collections_approve),
+    _approver: User = Depends(require_day_end_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DayEndOut:
@@ -149,7 +161,7 @@ def reject_day_end(
     payload: DayEndReject,
     user: User = Depends(_view),
     # Same privileged right as approve (deliveries.approve); admins are not permission-checked.
-    _approver: User = Depends(require_collections_approve),
+    _approver: User = Depends(require_day_end_approve),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DayEndOut:
