@@ -164,6 +164,11 @@ class PaymentReceiptOut(BaseModel):
         default=None, description="The invoice's status after this payment: unpaid | partial | paid"
     )
 
+    receipt_status: str = Field(
+        default="active", description="active | void. A void receipt keeps its number; it is listed only with "
+                                      "include_voided=true and counts in no total or balance")
+    voided_at: datetime | None = None
+
     # Snapshot foundation fields
     order_amount: float | None = None
     previous_pending: float | None = None

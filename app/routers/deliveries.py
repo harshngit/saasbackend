@@ -1706,11 +1706,37 @@ def get_delivery_collection(
     return coll
 
 
+COLLECTION_CREATE_DETAIL = (
+    "You don't have permission to record a collection: this needs Deliveries > Create or "
+    "Payments > Create on your role."
+)
+
+
+def require_collection_create(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    """Record a field collection: Deliveries > Create (delivery partners) or Payments > Create
+    (accounts staff). Admins / owners are not permission-checked."""
+    if has_permission(db, user, "deliveries", "create") or has_permission(db, user, "payments", "create"):
+        return user
+    if not user.role_id:
+        # A legacy account with no role assigned (predates roles): judge it by the default
+        # matrix of its legacy role (Delivery Partner / Accountant / ...), so it keeps working.
+        from app.core.permissions import default_role_matrices
+        from app.models.enums import STAFF_ROLE_NAME
+        try:
+            legacy = UserRole(user.role) if user.role else None
+        except ValueError:
+            legacy = None
+        matrix = default_role_matrices().get(STAFF_ROLE_NAME.get(legacy, ""), {})
+        if matrix.get("deliveries", {}).get("create") or matrix.get("payments", {}).get("create"):
+            return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTION_CREATE_DETAIL)
+
+
 @customer_payments_router.post("/collections", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
 @router.post("/collections/customer", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
 def record_general_customer_collection(
     payload: CustomerCollectionCreate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collection_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
@@ -2038,7 +2064,7 @@ def void_delivery_collection(
     if coll.customer_payment_id:
         payment = db.get(CustomerPayment, coll.customer_payment_id)
         if payment:
-            payment_service.void(db, payment)
+            payment_service.void(db, payment, voided_by_id=user.id, source="delivery_collection")
             coll.customer_payment_id = None
 
     coll.reconciliation_status = "voided"

@@ -351,3 +351,34 @@ class CustomerDocument(Base):
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
     customer: Mapped["Customer"] = relationship(back_populates="documents")
+
+
+class VoidedCustomerPayment(Base):
+    """A receipt that was voided. Voiding still deletes the customer_payments row (so every
+    total, balance, ledger and report that reads payments is unchanged), but first copies it
+    here: the receipt number is kept and the receipt register can show it as "Void".
+
+    The table is created by alembic/pending/..._voided_customer_payments.py. Until that is
+    released, payment_service.void skips the copy and behaves exactly as before."""
+
+    __tablename__ = "voided_customer_payments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)          # the voided payment's id
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    customer_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    receipt_number: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    payment_mode: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    invoice_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    order_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    received_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    voided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    voided_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    void_source: Mapped[str | None] = mapped_column(
+        String(30), nullable=True)                 # customer_payment | payment_receipt | delivery_collection
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # the row + allocations + splits

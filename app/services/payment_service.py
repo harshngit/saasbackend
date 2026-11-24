@@ -288,8 +288,50 @@ def record(
     return payment
 
 
-def void(db: Session, payment: CustomerPayment) -> None:
-    """Reverse a payment and delete it, leaving every balance as if it never happened."""
+_ARCHIVE_READY = False
+
+
+def voided_archive_available(db: Session) -> bool:
+    """True once the voided_customer_payments table exists (alembic/pending migration). Only a
+    positive answer is cached, so the archive starts working as soon as the table appears."""
+    global _ARCHIVE_READY
+    if not _ARCHIVE_READY:
+        from sqlalchemy import inspect
+        try:
+            _ARCHIVE_READY = inspect(db.connection()).has_table("voided_customer_payments")
+        except Exception:
+            return False
+    return _ARCHIVE_READY
+
+
+def _archive_voided(db: Session, payment: CustomerPayment, voided_by_id: str | None, source: str | None) -> None:
+    """Keep the voided receipt (number and all) in voided_customer_payments. Nothing that
+    reads payments looks at that table, so totals and balances are as if it never happened."""
+    if not voided_archive_available(db):
+        return
+    from app.models import VoidedCustomerPayment
+
+    def _iso(v):  # noqa: ANN001, ANN202
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    snapshot = {c.name: _iso(getattr(payment, c.key, None)) for c in CustomerPayment.__table__.columns}
+    snapshot["allocations"] = [{"invoice_id": a.invoice_id, "amount": a.amount} for a in (payment.allocations or [])]
+    snapshot["splits"] = [{"method": getattr(sp, "method", None), "amount": getattr(sp, "amount", None),
+                           "reference": getattr(sp, "reference", None)}
+                          for sp in (getattr(payment, "splits", None) or [])]
+    db.add(VoidedCustomerPayment(
+        id=payment.id, organization_id=payment.organization_id, customer_id=payment.customer_id,
+        receipt_number=payment.receipt_number, amount=payment.amount, payment_mode=payment.payment_mode,
+        reference=payment.reference, note=payment.note, invoice_id=payment.invoice_id, order_id=payment.order_id,
+        received_on=payment.received_on or datetime.now(timezone.utc),
+        created_at=payment.created_at or datetime.now(timezone.utc),
+        voided_at=datetime.now(timezone.utc), voided_by_id=voided_by_id, void_source=source, snapshot=snapshot,
+    ))
+
+
+def void(db: Session, payment: CustomerPayment, *, voided_by_id: str | None = None, source: str | None = None) -> None:
+    """Reverse a payment and delete it, leaving every balance as if it never happened. The
+    receipt itself is kept in voided_customer_payments (when that table exists)."""
     # Same locks as record(), first: the customer and the invoices whose figures move back.
     lock_for_payment(
         db, payment.customer_id,
@@ -331,5 +373,6 @@ def void(db: Session, payment: CustomerPayment) -> None:
             customer.total_received = round((customer.total_received or 0) - payment.amount, 2)
             customer.recompute_outstanding()
 
+    _archive_voided(db, payment, voided_by_id, source)
     db.delete(payment)
 

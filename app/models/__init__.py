@@ -18,7 +18,9 @@ from app.models.activity_log import ActivityLog
 from app.models.attendance import ATTENDANCE_TYPES, Attendance
 from app.models.brand import Brand
 from app.models.category import Category
-from app.models.customer import Customer, CustomerDocument, CustomerPayment, CustomerPaymentAllocation, PaymentSplit
+from app.models.customer import (
+    Customer, CustomerDocument, CustomerPayment, CustomerPaymentAllocation, PaymentSplit, VoidedCustomerPayment,
+)
 from app.models.expense import EXPENSE_CATEGORIES, EXPENSE_STATUSES, Expense, ExpenseItem
 from app.models.notification import Notification
 from app.models.push_device import PUSH_PLATFORMS, PushDevice
@@ -170,6 +172,7 @@ __all__ = [
     "ATTENDANCE_TYPES",
     "CustomerPayment",
     "PaymentSplit",
+    "VoidedCustomerPayment",
     "PurchaseInvoice",
     "PurchaseInvoiceItem",
     "SupplierInvoice",
