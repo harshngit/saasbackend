@@ -950,6 +950,7 @@ def load_deliveries_batch(
                             delivery_id=d_id,
                             ok=True,
                             detail="Delivery is already loaded",
+                            message="Delivery is already loaded",
                             delivery=_delivery_out(db, delivery),
                         )
                     )
@@ -963,16 +964,26 @@ def load_deliveries_batch(
                         delivery_id=d_id,
                         ok=True,
                         detail="Loaded successfully",
+                        message="Loaded successfully",
                         delivery=_delivery_out(db, delivery),
                     )
                 )
         except HTTPException as exc:
+            # A structured error ({"code", "message"}, e.g. DAY_END_CLOSED) keeps its code and
+            # readable message instead of a stringified dict.
+            code, message = None, exc.detail
+            if isinstance(exc.detail, dict):
+                code = exc.detail.get("code")
+                message = exc.detail.get("message") or exc.detail.get("detail") or str(exc.detail)
+            message = str(message)
             results.append(
                 DeliveryBatchLoadItemOut(
                     delivery_id=d_id,
                     ok=False,
-                    detail=str(exc.detail),
+                    detail=message,
                     delivery=None,
+                    code=code,
+                    message=message,
                 )
             )
         except Exception as exc:
@@ -981,6 +992,7 @@ def load_deliveries_batch(
                     delivery_id=d_id,
                     ok=False,
                     detail=str(exc) if str(exc) else "An unexpected error occurred while loading this delivery",
+                    message=str(exc) if str(exc) else "An unexpected error occurred while loading this delivery",
                     delivery=None,
                 )
             )

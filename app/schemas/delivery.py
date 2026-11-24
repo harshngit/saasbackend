@@ -668,8 +668,12 @@ class DeliveryBatchLoadRequest(BaseModel):
 class DeliveryBatchLoadItemOut(BaseModel):
     delivery_id: str
     ok: bool
-    detail: str
+    detail: str = Field(description="Human-readable outcome (same text as `message`)")
     delivery: DeliveryOut | None = None
+    code: str | None = Field(
+        default=None, description="Machine-readable error code when the backend gives one, e.g. DAY_END_CLOSED; "
+                                  "null on success and for errors without a code")
+    message: str | None = Field(default=None, description="Human-readable outcome; same as `detail`")
 
 
 class DeliveryBatchLoadResponse(BaseModel):
