@@ -622,7 +622,7 @@ def void_customer_payment(
     if payment is None or payment.customer_id != customer_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
     # Undo whatever this payment did: the invoice it settled, or the advance balance.
-    payment_service.void(db, payment)
+    payment_service.void(db, payment, voided_by_id=user.id, source="customer_payment")
     db.commit()
     db.refresh(customer)
     return customer

@@ -696,6 +696,7 @@ class CollectionsViewSummary(BaseModel):
 
 
 class PendingCollectionCustomerOut(BaseModel):
+    id: str = Field(description="The customer's id (same as customer_id) -- what the Collect action takes")
     customer_id: str
     customer_code: str | None = None
     customer_name: str
@@ -703,6 +704,9 @@ class PendingCollectionCustomerOut(BaseModel):
     contact_name: str | None = None
     phone: str | None = None
     address: str | None = None
+    profile_photo_url: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
     outstanding_amount: float
     collectable_amount: float = Field(description="Same as outstanding_amount: nothing is awaiting approval")
     collection_status: str | None = Field(default=None, description="Always null in this view")
@@ -715,6 +719,13 @@ class CollectedCollectionOut(DeliveryCollectionOut):
 
     collection_id: str | None = None
     customer_name: str | None = None
+    customer_code: str | None = None
+    contact_name: str | None = None
+    phone: str | None = None
+    profile_photo_url: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    order_number: str | None = Field(default=None, description="The linked sales order's number, if any")
     amount_collected: float | None = None
     collection_status: str | None = Field(default=None, description="pending_approval | approved")
 

@@ -1484,6 +1484,19 @@ _COLLECTIONS_RESPONSE = Union[
 _BANK_MODES = ("bank_transfer", "bank", "neft", "rtgs", "imps", "netbanking", "net_banking", "online")
 
 
+def _customer_card(c: Customer | None) -> dict:
+    """Name, contact, photo and location of a customer, as both collection views show them."""
+    if c is None:
+        return {}
+    from app.core.files import normalize_file_url
+    photo = str(c.profile_image_id).strip() if c.profile_image_id else None
+    return {
+        "customer_name": c.name, "customer_code": c.customer_id, "contact_name": c.primary_contact_person,
+        "phone": c.phone, "profile_photo_url": normalize_file_url(photo) if photo else None,
+        "latitude": c.maps_latitude, "longitude": c.maps_longitude,
+    }
+
+
 def _view_page(page: int, page_size: int, total: int) -> tuple[int, int, int]:
     total_pages = max((total + page_size - 1) // page_size, 1)
     return page, page_size, total_pages
@@ -1539,8 +1552,7 @@ def _pending_collections_view(db, user, *, search, customer_id, page, page_size,
     page, page_size, total_pages = _view_page(page, page_size, total)
     items = [
         PendingCollectionCustomerOut(
-            customer_id=c.id, customer_code=c.customer_id, customer_name=c.name, business_name=c.business_name,
-            contact_name=c.primary_contact_person, phone=c.phone,
+            id=c.id, customer_id=c.id, business_name=c.business_name, **_customer_card(c),
             address=getattr(c, "delivery_address", None) or getattr(c, "billing_address", None),
             outstanding_amount=round(float(c.outstanding_balance or 0.0), 2),
             collectable_amount=round(float(c.outstanding_balance or 0.0), 2),
@@ -1603,13 +1615,20 @@ def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_o
         secondary_key=DeliveryCollection.id.desc(),
     )
     rows = q.offset((page - 1) * page_size).limit(page_size).all()
-    names = dict(
-        db.query(Customer.id, Customer.name).filter(Customer.id.in_({r.customer_id for r in rows if r.customer_id})).all()
+    customers = {
+        c.id: c for c in db.query(Customer).options(lazyload("*"))
+        .filter(Customer.id.in_({r.customer_id for r in rows if r.customer_id})).all()
+    } if rows else {}
+    order_numbers = dict(
+        db.query(SalesOrder.id, SalesOrder.order_number)
+        .filter(SalesOrder.id.in_({r.sales_order_id for r in rows if r.sales_order_id})).all()
     ) if rows else {}
     items = []
     for r in rows:
         item = CollectedCollectionOut.model_validate(r)
-        item.customer_name = names.get(r.customer_id)
+        for k, v in _customer_card(customers.get(r.customer_id)).items():
+            setattr(item, k, v)
+        item.order_number = order_numbers.get(r.sales_order_id)
         items.append(item)
     page, page_size, total_pages = _view_page(page, page_size, total)
     return CollectedCollectionsViewOut(
@@ -1706,11 +1725,37 @@ def get_delivery_collection(
     return coll
 
 
+COLLECTION_CREATE_DETAIL = (
+    "You don't have permission to record a collection: this needs Deliveries > Create or "
+    "Payments > Create on your role."
+)
+
+
+def require_collection_create(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    """Record a field collection: Deliveries > Create (delivery partners) or Payments > Create
+    (accounts staff). Admins / owners are not permission-checked."""
+    if has_permission(db, user, "deliveries", "create") or has_permission(db, user, "payments", "create"):
+        return user
+    if not user.role_id:
+        # A legacy account with no role assigned (predates roles): judge it by the default
+        # matrix of its legacy role (Delivery Partner / Accountant / ...), so it keeps working.
+        from app.core.permissions import default_role_matrices
+        from app.models.enums import STAFF_ROLE_NAME
+        try:
+            legacy = UserRole(user.role) if user.role else None
+        except ValueError:
+            legacy = None
+        matrix = default_role_matrices().get(STAFF_ROLE_NAME.get(legacy, ""), {})
+        if matrix.get("deliveries", {}).get("create") or matrix.get("payments", {}).get("create"):
+            return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTION_CREATE_DETAIL)
+
+
 @customer_payments_router.post("/collections", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
 @router.post("/collections/customer", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
 def record_general_customer_collection(
     payload: CustomerCollectionCreate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collection_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
@@ -2038,7 +2083,7 @@ def void_delivery_collection(
     if coll.customer_payment_id:
         payment = db.get(CustomerPayment, coll.customer_payment_id)
         if payment:
-            payment_service.void(db, payment)
+            payment_service.void(db, payment, voided_by_id=user.id, source="delivery_collection")
             coll.customer_payment_id = None
 
     coll.reconciliation_status = "voided"

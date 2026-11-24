@@ -7,7 +7,7 @@ invoice, the same balance and the same ledger.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -207,6 +207,51 @@ def create_receipt(
     return _out(db, payment)
 
 
+def _voided_out(db: Session, row) -> PaymentReceiptOut:  # noqa: ANN001
+    customer = db.get(Customer, row.customer_id) if row.customer_id else None
+    snap = row.snapshot or {}
+    return PaymentReceiptOut(
+        id=row.id, organization_id=row.organization_id, receipt_number=row.receipt_number,
+        receipt_date=row.received_on, customer_id=row.customer_id, invoice_reference_id=row.invoice_id,
+        invoice_id=row.invoice_id, amount_received=row.amount, amount_collected=row.amount,
+        payment_method=row.payment_mode, transaction_reference=row.reference, note=row.note,
+        upi_id=snap.get("upi_id"), card_type=snap.get("card_type"), card_last_four=snap.get("card_last_four"),
+        created_at=row.created_at, customer=customer, collected_by_user_id=snap.get("collected_by_user_id"),
+        receipt_status="void", voided_at=row.voided_at,
+    )
+
+
+def _list_with_voided(db: Session, org_id: str, *, customer_id, invoice_id, search, page, page_size):  # noqa: ANN001
+    """Live and voided receipts in one register, newest first; voided ones count in no total."""
+    from sqlalchemy import literal, select, union_all
+    from app.models import VoidedCustomerPayment as V
+
+    live = select(CustomerPayment.id.label("id"), CustomerPayment.received_on.label("at"),
+                  literal("active").label("kind")).where(CustomerPayment.organization_id == org_id)
+    dead = select(V.id.label("id"), V.received_on.label("at"), literal("void").label("kind")).where(
+        V.organization_id == org_id)
+    if customer_id:
+        live = live.where(CustomerPayment.customer_id == customer_id)
+        dead = dead.where(V.customer_id == customer_id)
+    if invoice_id:
+        live = live.where(CustomerPayment.invoice_id == invoice_id)
+        dead = dead.where(V.invoice_id == invoice_id)
+    if search:
+        s = f"%{search}%"
+        live = live.where(or_(CustomerPayment.receipt_number.ilike(s), CustomerPayment.reference.ilike(s),
+                              CustomerPayment.note.ilike(s)))
+        dead = dead.where(or_(V.receipt_number.ilike(s), V.reference.ilike(s), V.note.ilike(s)))
+    both = union_all(live, dead).subquery()
+    total = db.execute(select(func.count()).select_from(both)).scalar() or 0
+    rows = db.execute(select(both.c.id, both.c.kind).order_by(both.c.at.desc(), both.c.id.desc())
+                      .offset((page - 1) * page_size).limit(page_size)).all()
+    items = []
+    for rid, kind in rows:
+        items.append(_out(db, db.get(CustomerPayment, rid)) if kind == "active" else _voided_out(db, db.get(V, rid)))
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    return PaginatedResponse(items=items, total=total, page=page, page_size=page_size, total_pages=total_pages)
+
+
 @router.get("", response_model=PaginatedResponse[PaymentReceiptOut])
 def list_receipts(
     user: User = Depends(_view),
@@ -217,10 +262,15 @@ def list_receipts(
     page_size: int = Query(default=10, ge=1, le=100, description="Items per page (default 10)"),
     sort_by: str | None = Query(default=None, description="Field to sort by"),
     sort_order: str = Query(default="asc", description="Sort order: asc or desc"),
+    include_voided: bool = Query(default=False, description="true = also list voided receipts (receipt_status "
+                                 "'void', number kept), newest first; sort_by is ignored then"),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[PaymentReceiptOut]:
     """Every payment this firm has received, newest first."""
     org_id = _org_id(user)
+    if include_voided and payment_service.voided_archive_available(db):
+        return _list_with_voided(db, org_id, customer_id=customer_id, invoice_id=invoice_id, search=search,
+                                 page=page, page_size=page_size)
     query = db.query(CustomerPayment).filter(CustomerPayment.organization_id == org_id)
     if customer_id:
         query = query.filter(CustomerPayment.customer_id == customer_id)
@@ -327,5 +377,5 @@ def void_receipt(
     """Void a receipt — the money is taken back off the invoice and the customer's
     balance, leaving both exactly as they were before it."""
     receipt = _owned(db, id, _org_id(user))
-    payment_service.void(db, receipt)
+    payment_service.void(db, receipt, voided_by_id=user.id, source="payment_receipt")
     db.commit()
