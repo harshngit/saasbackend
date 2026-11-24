@@ -71,7 +71,8 @@ def _firm(extra_customers=0):
         }
         rows = {
             "abc": Customer(organization_id=org.id, name="ABC Traders", phone="9999999999",
-                            primary_contact_person="John", opening_balance=1000.0, outstanding_balance=1000.0),
+                            primary_contact_person="John", opening_balance=1000.0, outstanding_balance=1000.0,
+                            maps_latitude=18.52, maps_longitude=73.85),
             "bee": Customer(organization_id=org.id, name="Bee Stores", opening_balance=500.0, outstanding_balance=500.0),
             "paid": Customer(organization_id=org.id, name="Paid Up"),
             "inactive": Customer(organization_id=org.id, name="Closed Shop", is_active=False,
@@ -117,8 +118,10 @@ def test_awaiting_approval_is_in_exactly_one_tab():
     body = _view(f["a"], "pending")
     assert {i["customer_id"] for i in body["items"]} == {f["abc"], f["bee"]}       # no paid-up / inactive
     abc = next(i for i in body["items"] if i["customer_id"] == f["abc"])
-    assert abc == {"customer_id": f["abc"], "customer_code": abc["customer_code"], "customer_name": "ABC Traders",
-                   "business_name": None, "contact_name": "John", "phone": "9999999999", "address": None,
+    assert abc == {"id": f["abc"], "customer_id": f["abc"], "customer_code": abc["customer_code"],
+                   "customer_name": "ABC Traders", "business_name": None, "contact_name": "John",
+                   "phone": "9999999999", "address": None, "profile_photo_url": None,
+                   "latitude": 18.52, "longitude": 73.85,
                    "outstanding_amount": 1000.0, "collectable_amount": 1000.0, "collection_status": None,
                    "status": "pending"}
     assert body["summary"]["total_pending"] == 2 and body["summary"]["total_pending_amount"] == 1500.0
@@ -137,6 +140,9 @@ def test_awaiting_approval_is_in_exactly_one_tab():
     assert (row["collection_id"], row["customer_name"], row["amount_collected"], row["collection_status"]) == \
            (coll_id, "ABC Traders", 300.0, "pending_approval")
     assert row["reconciliation_status"] == "recorded"                              # old field kept
+    assert (row["contact_name"], row["phone"], row["latitude"], row["longitude"], row["order_number"]) == \
+           ("John", "9999999999", 18.52, 73.85, None)
+    assert row["id"] == coll_id and row["customer_id"] == f["abc"]                 # Collected: id = collection
     s = coll["summary"]
     assert (s["total_collected"], s["awaiting_approval_amount"], s["awaiting_approval_count"], s["upi_total"],
             s["cash_total"]) == (300.0, 300.0, 1, 300.0, 0.0)

@@ -1484,6 +1484,19 @@ _COLLECTIONS_RESPONSE = Union[
 _BANK_MODES = ("bank_transfer", "bank", "neft", "rtgs", "imps", "netbanking", "net_banking", "online")
 
 
+def _customer_card(c: Customer | None) -> dict:
+    """Name, contact, photo and location of a customer, as both collection views show them."""
+    if c is None:
+        return {}
+    from app.core.files import normalize_file_url
+    photo = str(c.profile_image_id).strip() if c.profile_image_id else None
+    return {
+        "customer_name": c.name, "customer_code": c.customer_id, "contact_name": c.primary_contact_person,
+        "phone": c.phone, "profile_photo_url": normalize_file_url(photo) if photo else None,
+        "latitude": c.maps_latitude, "longitude": c.maps_longitude,
+    }
+
+
 def _view_page(page: int, page_size: int, total: int) -> tuple[int, int, int]:
     total_pages = max((total + page_size - 1) // page_size, 1)
     return page, page_size, total_pages
@@ -1539,8 +1552,7 @@ def _pending_collections_view(db, user, *, search, customer_id, page, page_size,
     page, page_size, total_pages = _view_page(page, page_size, total)
     items = [
         PendingCollectionCustomerOut(
-            customer_id=c.id, customer_code=c.customer_id, customer_name=c.name, business_name=c.business_name,
-            contact_name=c.primary_contact_person, phone=c.phone,
+            id=c.id, customer_id=c.id, business_name=c.business_name, **_customer_card(c),
             address=getattr(c, "delivery_address", None) or getattr(c, "billing_address", None),
             outstanding_amount=round(float(c.outstanding_balance or 0.0), 2),
             collectable_amount=round(float(c.outstanding_balance or 0.0), 2),
@@ -1603,13 +1615,20 @@ def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_o
         secondary_key=DeliveryCollection.id.desc(),
     )
     rows = q.offset((page - 1) * page_size).limit(page_size).all()
-    names = dict(
-        db.query(Customer.id, Customer.name).filter(Customer.id.in_({r.customer_id for r in rows if r.customer_id})).all()
+    customers = {
+        c.id: c for c in db.query(Customer).options(lazyload("*"))
+        .filter(Customer.id.in_({r.customer_id for r in rows if r.customer_id})).all()
+    } if rows else {}
+    order_numbers = dict(
+        db.query(SalesOrder.id, SalesOrder.order_number)
+        .filter(SalesOrder.id.in_({r.sales_order_id for r in rows if r.sales_order_id})).all()
     ) if rows else {}
     items = []
     for r in rows:
         item = CollectedCollectionOut.model_validate(r)
-        item.customer_name = names.get(r.customer_id)
+        for k, v in _customer_card(customers.get(r.customer_id)).items():
+            setattr(item, k, v)
+        item.order_number = order_numbers.get(r.sales_order_id)
         items.append(item)
     page, page_size, total_pages = _view_page(page, page_size, total)
     return CollectedCollectionsViewOut(
