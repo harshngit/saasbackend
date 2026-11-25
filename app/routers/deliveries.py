@@ -1375,6 +1375,8 @@ def _filtered_collections(
     order_id: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
+    collection_status_filter: str | None = None,
+    payment_mode: str | None = None,
 ):
     """The collections the history (or its summary) covers. A Delivery Partner / own-scope
     user only ever gets their own; the collector filters apply to everyone else."""
@@ -1409,30 +1411,129 @@ def _filtered_collections(
     # These filters used to name columns the model does not have (status,
     # collection_number, payment_reference), so any call with ?status= or ?search=
     # failed with a 500 and the history screen showed nothing.
-    if status_filter:
-        stored = _COLLECTION_STATUS_FILTER.get(status_filter.strip().lower())
-        if stored is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="status must be one of: awaiting_reconciliation, recorded, reconciled, voided",
-            )
+    stored = _stored_collection_status(status_filter, collection_status_filter)
+    if stored:
         q = q.filter(DeliveryCollection.reconciliation_status == stored)
 
+    if payment_mode and payment_mode.strip():
+        m = payment_mode.strip().lower()
+        mode = func.lower(func.coalesce(DeliveryCollection.payment_mode, "other"))
+        if m in _BANK_MODES:            # the same grouping as the summary's bank_transfer_total
+            q = q.filter(mode.in_(_BANK_MODES))
+        elif m == "other":              # the same set as the summary's other_total
+            q = q.filter(mode.notin_(("cash", "upi", "cheque") + _BANK_MODES))
+        else:
+            q = q.filter(mode == m)
+
     if search and search.strip():
+        # One term over the collection, its customer, order, delivery and collector. Each
+        # lookup is an org-scoped IN subquery, so this stays one SQL statement.
         s = f"%{search.strip()}%"
         q = q.filter(
             or_(
                 DeliveryCollection.reference.ilike(s),
                 DeliveryCollection.notes.ilike(s),
                 DeliveryCollection.customer_id.in_(
-                    select(Customer.id).where(Customer.organization_id == org_id, Customer.name.ilike(s))
+                    select(Customer.id).where(
+                        Customer.organization_id == org_id,
+                        or_(Customer.name.ilike(s), Customer.business_name.ilike(s),
+                            Customer.primary_contact_person.ilike(s), Customer.customer_id.ilike(s)),
+                    )
+                ),
+                DeliveryCollection.sales_order_id.in_(
+                    select(SalesOrder.id).where(SalesOrder.organization_id == org_id, SalesOrder.order_number.ilike(s))
+                ),
+                DeliveryCollection.delivery_id.in_(
+                    select(Delivery.id).where(Delivery.organization_id == org_id,
+                                              Delivery.delivery_note_number.ilike(s))
+                ),
+                DeliveryCollection.delivery_partner_id.in_(
+                    select(User.id).where(User.organization_id == org_id, User.name.ilike(s))
                 ),
             )
         )
     return q
 
 
+def _stored_collection_status(status_filter: str | None, collection_status_filter: str | None) -> str | None:
+    """?status= and ?collection_status= are the same filter (any of the accepted names). Both
+    given and meaning different states -> 400; an unknown name -> 422 (as before)."""
+    stored = []
+    for value in (status_filter, collection_status_filter):
+        if value is None or not value.strip():
+            continue
+        s = _COLLECTION_STATUS_FILTER.get(value.strip().lower())
+        if s is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="status must be one of: awaiting_reconciliation, recorded, reconciled, voided",
+            )
+        stored.append(s)
+    if len(set(stored)) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"status={status_filter} and collection_status={collection_status_filter} conflict; "
+                   "send one of them (they are the same filter)",
+        )
+    return stored[0] if stored else None
+
+
+def _collections_out(db: Session, rows: list, cls=DeliveryCollectionOut) -> list:
+    """Collection rows with their display names, in a fixed number of queries per page.
+    Customer, order, collector and confirmer come from the row's relationships (loaded for
+    the whole page at once); deliveries, assigned partners and receipt numbers are one
+    batched lookup each. Everything is checked against the row's organization."""
+    if not rows:
+        return []
+    org_id = rows[0].organization_id
+    dlv_ids = {r.delivery_id for r in rows if r.delivery_id}
+    deliveries = {
+        d_id: (number, partner)
+        for d_id, number, partner in db.query(Delivery.id, Delivery.delivery_note_number, Delivery.delivery_partner_id)
+        .filter(Delivery.organization_id == org_id, Delivery.id.in_(dlv_ids)).all()
+    } if dlv_ids else {}
+    partner_ids = {p for _, p in deliveries.values() if p}
+    names = dict(
+        db.query(User.id, User.name).filter(User.organization_id == org_id, User.id.in_(partner_ids)).all()
+    ) if partner_ids else {}
+    pay_ids = {r.customer_payment_id for r in rows if r.customer_payment_id}
+    receipts = dict(
+        db.query(CustomerPayment.id, CustomerPayment.receipt_number)
+        .filter(CustomerPayment.organization_id == org_id, CustomerPayment.id.in_(pay_ids)).all()
+    ) if pay_ids else {}
+    fields = cls.model_fields
+
+    def same_org(obj):  # noqa: ANN001, ANN202
+        return obj if obj is not None and getattr(obj, "organization_id", None) == org_id else None
+
+    out = []
+    for r in rows:
+        item = cls.model_validate(r)
+        cust = same_org(r.customer)
+        if cust is not None:
+            card = {**_customer_card(cust), "business_name": cust.business_name}
+            for k, v in card.items():
+                if k in fields:
+                    setattr(item, k, v)
+        collector, confirmer, order = same_org(r.delivery_partner), same_org(r.reconciled_by), same_org(r.sales_order)
+        item.collected_by_name = collector.name if collector else None
+        item.reconciled_by_name = confirmer.name if confirmer else None
+        item.order_number = order.order_number if order else None
+        number, partner = deliveries.get(r.delivery_id, (None, None))
+        item.delivery_number = number
+        item.assigned_delivery_partner_id = partner
+        item.delivery_partner_name = names.get(partner) if partner else None
+        item.receipt_number = receipts.get(r.customer_payment_id)
+        out.append(item)
+    return out
+
+
 _DATE_DOC = "YYYY-MM-DD, inclusive, in the firm's business timezone (by collected_at)"
+_COLLECTION_STATUS_DOC = ("Same filter as `status`: collected | completed | voided (or any name `status` takes). "
+                          "Both given and meaning different states -> 400")
+_PAYMENT_MODE_DOC = ("cash | upi | cheque | card | bank_transfer (also matches bank / neft / rtgs / imps / "
+                     "netbanking / online) | other (anything else, as the summary's other_total); "
+                     "any other value matches that stored mode exactly. Case-insensitive")
 
 
 @router.get("/collections/summary", response_model=CollectionSummaryOut)
@@ -1445,6 +1546,8 @@ def delivery_collections_summary(
     order_id: str | None = None,
     date_from: date | None = Query(default=None, description=_DATE_DOC),
     date_to: date | None = Query(default=None, description=_DATE_DOC),
+    collection_status_q: str | None = Query(default=None, alias="collection_status", description=_COLLECTION_STATUS_DOC),
+    payment_mode: str | None = Query(default=None, description=_PAYMENT_MODE_DOC),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CollectionSummaryOut:
@@ -1453,7 +1556,7 @@ def delivery_collections_summary(
     q = _filtered_collections(
         db, user, status_filter=status_filter, search=search, delivery_partner_id=delivery_partner_id,
         collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
-        date_from=date_from, date_to=date_to,
+        date_from=date_from, date_to=date_to, collection_status_filter=collection_status_q, payment_mode=payment_mode,
     ).order_by(None)
     amount = func.coalesce(func.sum(DeliveryCollection.amount), 0.0)
     by_status = {key: CollectionTotals(count=0, amount=0.0) for key in COLLECTION_STATUS_BY_RECONCILIATION.values()}
@@ -1633,32 +1736,7 @@ def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_o
         secondary_key=DeliveryCollection.id.desc(),
     )
     rows = q.offset((page - 1) * page_size).limit(page_size).all()
-    customers = {
-        c.id: c for c in db.query(Customer).options(lazyload("*"))
-        .filter(Customer.id.in_({r.customer_id for r in rows if r.customer_id})).all()
-    } if rows else {}
-    order_numbers = dict(
-        db.query(SalesOrder.id, SalesOrder.order_number)
-        .filter(SalesOrder.id.in_({r.sales_order_id for r in rows if r.sales_order_id})).all()
-    ) if rows else {}
-    delivery_numbers = dict(
-        db.query(Delivery.id, Delivery.delivery_note_number)
-        .filter(Delivery.organization_id == _org_id(user),
-                Delivery.id.in_({r.delivery_id for r in rows if r.delivery_id})).all()
-    ) if rows else {}
-    collector_names = dict(
-        db.query(User.id, User.name)
-        .filter(User.id.in_({r.delivery_partner_id for r in rows if r.delivery_partner_id})).all()
-    ) if rows else {}
-    items = []
-    for r in rows:
-        item = CollectedCollectionOut.model_validate(r)
-        for k, v in _customer_card(customers.get(r.customer_id)).items():
-            setattr(item, k, v)
-        item.order_number = order_numbers.get(r.sales_order_id)
-        item.delivery_number = delivery_numbers.get(r.delivery_id)
-        item.collected_by_name = collector_names.get(r.delivery_partner_id)
-        items.append(item)
+    items = _collections_out(db, rows, CollectedCollectionOut)
     page, page_size, total_pages = _view_page(page, page_size, total)
     return CollectedCollectionsViewOut(
         items=items, total=total, page=page, page_size=page_size, total_pages=total_pages,
@@ -1685,9 +1763,11 @@ def list_delivery_collections(
     search: str | None = None,
     status: str | None = Query(
         default=None,
-        description="awaiting_reconciliation | reconciled | voided (or the stored "
-                    "reconciliation_status: recorded | reconciled | voided)",
+        description="collected | completed | voided, or the older names awaiting_reconciliation | "
+                    "pending_approval | approved and the stored reconciliation_status recorded | reconciled",
     ),
+    collection_status_q: str | None = Query(default=None, alias="collection_status", description=_COLLECTION_STATUS_DOC),
+    payment_mode: str | None = Query(default=None, description=_PAYMENT_MODE_DOC),
     delivery_partner_id: str | None = None,
     collected_by_user_id: str | None = Query(default=None, description="The collector (same as delivery_partner_id)"),
     customer_id: str | None = Query(default=None, description="Only this customer's collections"),
@@ -1713,14 +1793,16 @@ def list_delivery_collections(
         q = _filtered_collections(
             db, user, status_filter=status, search=search, delivery_partner_id=delivery_partner_id,
             collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
-            date_from=date_from, date_to=date_to,
+            date_from=date_from, date_to=date_to, collection_status_filter=collection_status_q,
+            payment_mode=payment_mode,
         )
         return _collected_collections_view(db, user, q, page=page, page_size=page_size,
                                            sort_by=sort_by, sort_order=sort_order)
     q = _filtered_collections(
         db, user, status_filter=status, search=search, delivery_partner_id=delivery_partner_id,
         collected_by_user_id=collected_by_user_id, customer_id=customer_id, order_id=order_id,
-        date_from=date_from, date_to=date_to,
+        date_from=date_from, date_to=date_to, collection_status_filter=collection_status_q,
+        payment_mode=payment_mode,
     )
 
     q = apply_sorting(
@@ -1731,7 +1813,9 @@ def list_delivery_collections(
         default_order=[DeliveryCollection.collected_at.desc().nullslast(), DeliveryCollection.id.desc()],
         secondary_key=DeliveryCollection.id.desc(),
     )
-    return paginate(q, page=page, page_size=page_size)
+    result = paginate(q, page=page, page_size=page_size)
+    result.items = _collections_out(db, list(result.items))
+    return result
 
 
 @router.get("/collections/{collection_id}", response_model=DeliveryCollectionOut)
@@ -1752,7 +1836,7 @@ def get_delivery_collection(
             if coll.delivery_partner_id != user.id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access to this collection is unauthorized")
 
-    return coll
+    return _collections_out(db, [coll])[0]   # with names, confirmer and receipt number (detail drawer)
 
 
 COLLECTION_CREATE_DETAIL = (
