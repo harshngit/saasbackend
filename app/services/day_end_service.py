@@ -64,14 +64,15 @@ def business_date_of(db: Session, org_id: str, moment: datetime) -> date:
 
 
 def collections_for(db: Session, org_id: str, partner_id: str, business_date: date) -> list[DeliveryCollection]:
-    start, end = get_business_day_utc_range(db, org_id, business_date)
+    from app.services import collection_dates
+
     return (
         db.query(DeliveryCollection)
         .filter(
             DeliveryCollection.organization_id == org_id,
             DeliveryCollection.delivery_partner_id == partner_id,
-            DeliveryCollection.collected_at >= start,
-            DeliveryCollection.collected_at <= end,
+            # The collection's business day (payment_date; collected_at's day for old rows).
+            collection_dates.day_range_filter(db, org_id, business_date, business_date),
             DeliveryCollection.reconciliation_status != "voided",
         )
         .order_by(DeliveryCollection.collected_at.asc(), DeliveryCollection.id.asc())

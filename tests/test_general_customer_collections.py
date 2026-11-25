@@ -906,8 +906,8 @@ def test_23_delivery_partner_history_only_own(collection_setup):
 
 
 def test_24_payment_date_parsed_or_refused(collection_setup):
-    """TEST 24 — payment_date sets collected_at; an unreadable one is a 422 and saves nothing
-    (it used to be ignored silently and the collection dated "now")."""
+    """TEST 24 — payment_date is the business day (returned as payment_date; collected_at stays the
+    real record time); an unreadable one is a 422 and saves nothing."""
     s = collection_setup
     db = s["db"]
     base = {"customer_id": s["cust2"].id, "amount": 10}
@@ -924,7 +924,7 @@ def test_24_payment_date_parsed_or_refused(collection_setup):
     for good, day in (("2026-11-08", "2026-11-08"), ("2026-11-08T10:30:00+05:30", "2026-11-08")):
         r = client.post("/customer-payments/collections", json={**base, "payment_date": good}, headers=s["partner_headers"])
         assert r.status_code == 201, (good, r.text)
-        assert r.json()["collected_at"].startswith(day)
+        assert r.json()["payment_date"] == day and not r.json()["collected_at"].startswith(day)
 
 
 def test_25_history_date_and_collector_filters_and_summary(collection_setup):
