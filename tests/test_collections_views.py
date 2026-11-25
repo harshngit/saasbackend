@@ -1,11 +1,10 @@
 """GET /deliveries/collections?view=pending|collected (Flutter collection screen, 24 Nov).
 
-* view=pending: customers a new collection can be taken from (active, outstanding > 0, nothing
-  awaiting approval). view=collected: collections awaiting approval (pending_approval) or
-  approved; voided in neither. An awaiting-approval collection is in exactly one tab.
+* view=pending (To Collect): customers with collectable_amount = outstanding - collections not
+  completed yet > 0; id = customer id. view=collected: records with collection_status
+  `collected` (taken, not completed) or `completed` (reconciled); voided in neither.
 * Each view filters first, then computes total / pagination / summary over every matching row.
-* The collect rule is unchanged: a collection above what is left after those awaiting approval
-  is refused (409); a further one within it (another order) is allowed.
+* The collect rule is unchanged: a collection above collectable_amount is refused (409).
 * Without `view` the endpoint is unchanged. Two firms.
 """
 
@@ -112,76 +111,128 @@ def test_default_list_is_unchanged():
     assert client.get("/deliveries/collections", headers=f["admin"], params={"view": "bogus"}).status_code == 400
 
 
-def test_awaiting_approval_is_in_exactly_one_tab():
+def test_to_collect_collected_completed():
     f = _firm()
     other = _firm()
     body = _view(f["a"], "pending")
     assert {i["customer_id"] for i in body["items"]} == {f["abc"], f["bee"]}       # no paid-up / inactive
     abc = next(i for i in body["items"] if i["customer_id"] == f["abc"])
+    # 1 + 5: no collection -> collectable = outstanding; name / contact / image / location.
     assert abc == {"id": f["abc"], "customer_id": f["abc"], "customer_code": abc["customer_code"],
                    "customer_name": "ABC Traders", "business_name": None, "contact_name": "John",
                    "phone": "9999999999", "address": None, "profile_photo_url": None,
                    "latitude": 18.52, "longitude": 73.85,
-                   "outstanding_amount": 1000.0, "collectable_amount": 1000.0, "collection_status": None,
-                   "status": "pending"}
+                   "outstanding_amount": 1000.0, "pending_collection_amount": 0.0, "collectable_amount": 1000.0,
+                   "collection_status": None, "status": "to_collect"}
     assert body["summary"]["total_pending"] == 2 and body["summary"]["total_pending_amount"] == 1500.0
     assert body["pagination"] == {"page": 1, "page_size": 100, "total": 2, "total_pages": 1}
-    assert other["abc"] not in _pending_ids(f["a"])                                 # firm isolation
+    assert other["abc"] not in _pending_ids(f["a"])                                 # 17: firm isolation
 
-    r = _collect(f["a"], f["abc"], 300.0, mode="upi")
+    # 2 + 6: collect 400 of 1000 with the id the view gave -> still To Collect, 600 left.
+    r = _collect(f["a"], abc["id"], 400.0, mode="upi")
     assert r.status_code == 201, r.text
     coll_id = r.json()["id"]
-    # Pending tab: ABC is gone for every partner (and the admin). Collected tab: the row.
-    assert _pending_ids(f["a"]) == {f["bee"]} and _pending_ids(f["b"]) == {f["bee"]}
-    assert _pending_ids(f["admin"]) == {f["bee"]}
+    for who in ("a", "b", "admin"):
+        abc = next(i for i in _view(f[who], "pending")["items"] if i["customer_id"] == f["abc"])
+        assert (abc["outstanding_amount"], abc["pending_collection_amount"], abc["collectable_amount"]) == \
+               (1000.0, 400.0, 600.0)
+    s = _view(f["a"], "pending")["summary"]
+    assert (s["total_pending_amount"], s["total_outstanding_amount"], s["total_pending_collection_amount"]) == \
+           (1100.0, 1500.0, 400.0)
+
+    # 7: the record is in Collected as `collected`, with the customer's details.
     coll = _view(f["a"], "collected")
     assert coll["total"] == 1
     row = coll["items"][0]
     assert (row["collection_id"], row["customer_name"], row["amount_collected"], row["collection_status"]) == \
-           (coll_id, "ABC Traders", 300.0, "pending_approval")
-    assert row["reconciliation_status"] == "recorded"                              # old field kept
+           (coll_id, "ABC Traders", 400.0, "collected")
+    assert row["reconciliation_status"] == "recorded" and row["status"] == "awaiting_reconciliation"   # kept
     assert (row["contact_name"], row["phone"], row["latitude"], row["longitude"], row["order_number"]) == \
            ("John", "9999999999", 18.52, 73.85, None)
-    assert row["id"] == coll_id and row["customer_id"] == f["abc"]                 # Collected: id = collection
+    assert row["collected_by_name"] == "staff" and row["delivery_number"] is None
+    assert row["id"] == coll_id and row["customer_id"] == f["abc"]
     s = coll["summary"]
-    assert (s["total_collected"], s["awaiting_approval_amount"], s["awaiting_approval_count"], s["upi_total"],
-            s["cash_total"]) == (300.0, 300.0, 1, 300.0, 0.0)
-    assert _view(f["b"], "collected")["total"] == 0                                # partner B sees only own
+    assert (s["total_collected"], s["collected_amount"], s["completed_amount"], s["upi_total"], s["cash_total"]) == \
+           (400.0, 400.0, 0.0, 400.0, 0.0)
+    assert _view(f["b"], "collected")["total"] == 0                                # 18: partner B sees only own
     assert _view(other["admin"], "collected")["total"] == 0
 
-    # Collect rule unchanged (business decision): more than what is left is refused (existing
-    # 409 text); a second collection within the rest (e.g. another order) is still allowed and
-    # ABC stays out of Pending while anything is awaiting approval.
-    r = _collect(f["b"], f["abc"], 800.0)
-    assert r.status_code == 409 and "awaiting admin approval; at most 700.00" in r.json()["detail"]
-    r = _collect(f["b"], f["abc"], 200.0, mode="bank_transfer")
+    # 16: more than what is left -> existing 409; 3: the rest taken -> not To Collect.
+    r = _collect(f["b"], f["abc"], 700.0)
+    assert r.status_code == 409 and "awaiting admin approval; at most 600.00" in r.json()["detail"]
+    r = _collect(f["b"], f["abc"], 600.0, mode="bank_transfer")
     assert r.status_code == 201, r.text
     second_id = r.json()["id"]
     assert f["abc"] not in _pending_ids(f["a"])
-    assert _view(f["admin"], "collected")["summary"]["awaiting_approval_amount"] == 500.0
 
-    # Both approved: they stay in Collected (approved); ABC returns to Pending with the rest.
-    for cid in (coll_id, second_id):
-        assert client.post(f"/deliveries/collections/{cid}/reconcile", headers=f["admin"]).status_code == 200
-    assert {i["collection_status"] for i in _view(f["a"], "collected")["items"]} == {"approved"}
-    abc = next(i for i in _view(f["a"], "pending")["items"] if i["customer_id"] == f["abc"])
-    assert abc["outstanding_amount"] == 500.0 and abc["collectable_amount"] == 500.0
-    assert _collect(f["a"], f["abc"], 50.0).status_code == 201
+    # 8: reconciled -> `completed`; outstanding drops, collectable follows.
+    assert client.post(f"/deliveries/collections/{coll_id}/reconcile", headers=f["admin"]).status_code == 200
+    by_id = {i["id"]: i["collection_status"] for i in _view(f["admin"], "collected")["items"]}
+    assert by_id == {coll_id: "completed", second_id: "collected"}
+    assert f["abc"] not in _pending_ids(f["a"])                    # 600 outstanding, 600 in hand
+    assert client.post(f"/deliveries/collections/{second_id}/reconcile", headers=f["admin"]).status_code == 200
     s = _view(f["admin"], "collected")["summary"]
-    assert (s["approved_amount"], s["awaiting_approval_amount"], s["bank_transfer_total"], s["upi_total"],
-            s["cash_total"], s["collected_count"]) == (500.0, 50.0, 200.0, 300.0, 50.0, 3)
+    assert (s["completed_amount"], s["completed_count"], s["collected_amount"], s["bank_transfer_total"]) == \
+           (1000.0, 2, 0.0, 600.0)
+    assert f["abc"] not in _pending_ids(f["a"])                    # fully paid
 
-    # Voided: in neither view; the customer is collectable again.
-    r = _collect(f["b"], f["bee"], 500.0)
+    # 4 + 9: a voided collection does not reduce collectable and is not in Collected.
+    r = _collect(f["b"], f["bee"], 200.0)
     assert r.status_code == 201
-    assert f["bee"] not in _pending_ids(f["a"])
+    bee = next(i for i in _view(f["a"], "pending")["items"] if i["customer_id"] == f["bee"])
+    assert bee["collectable_amount"] == 300.0
     assert client.post(f"/deliveries/collections/{r.json()['id']}/void", headers=f["admin"]).status_code == 200
-    assert f["bee"] in _pending_ids(f["a"])
+    bee = next(i for i in _view(f["a"], "pending")["items"] if i["customer_id"] == f["bee"])
+    assert (bee["pending_collection_amount"], bee["collectable_amount"]) == (0.0, 500.0)
     assert all(i["collection_status"] != "voided" for i in _view(f["admin"], "collected")["items"])
     assert _view(f["admin"], "collected", status="voided")["total"] == 0
-    # The canonical names also work as a status filter on the plain list.
-    r = client.get("/deliveries/collections", headers=f["admin"], params={"status": "pending_approval"})
-    assert r.status_code == 200 and r.json()["total"] == 1
+    # The app's status names also work as a status filter (plain list and view).
+    for name, n in (("collected", 0), ("completed", 2), ("pending_approval", 0), ("approved", 2)):
+        r = client.get("/deliveries/collections", headers=f["admin"], params={"status": name})
+        assert r.status_code == 200 and r.json()["total"] == n, name
+    assert _view(f["admin"], "collected", status="completed")["total"] == 2
+
+
+def test_collected_row_shows_order_delivery_and_allocations_and_posts_once():
+    """10 + 13-15: order / delivery numbers and allocations on the row; completing it writes
+    exactly one payment, takes it off outstanding and pays the invoice."""
+    from datetime import datetime, timezone
+    from app.models import CustomerPayment, Delivery, Invoice, SalesOrder
+    f = _firm()
+    with SessionLocal() as db:
+        so = SalesOrder(organization_id=f["org"], customer_id=f["abc"], order_number=f"SO-{uuid.uuid4().hex[:6]}",
+                        total=1000.0, status="confirmed")
+        db.add(so)
+        db.flush()
+        inv = Invoice(organization_id=f["org"], customer_id=f["abc"], order_id=so.id,
+                      invoice_number=f"INV-{uuid.uuid4().hex[:6]}", invoice_date=datetime.now(timezone.utc),
+                      total=1000.0, amount_paid=0.0, status="unpaid", payment_status="Unpaid")
+        dlv = Delivery(organization_id=f["org"], customer_id=f["abc"], sales_order_id=so.id,
+                       delivery_note_number=f"DO-{uuid.uuid4().hex[:6]}", status="pending")
+        db.add_all([inv, dlv])
+        db.commit()
+        ids = {"so": so.id, "so_no": so.order_number, "inv": inv.id, "dlv": dlv.id, "dlv_no": dlv.delivery_note_number}
+    r = client.post("/deliveries/collections/customer", headers=f["admin"], json={
+        "customer_id": f["abc"], "amount": 250.0, "payment_method": "cash", "order_id": ids["so"],
+        "delivery_id": ids["dlv"], "allocations": [{"invoice_id": ids["inv"], "amount": 250.0}]})
+    assert r.status_code == 201, r.text
+    cid = r.json()["id"]
+    row = _view(f["admin"], "collected")["items"][0]
+    assert (row["order_id"], row["order_number"], row["delivery_id"], row["delivery_number"]) == \
+           (ids["so"], ids["so_no"], ids["dlv"], ids["dlv_no"])
+    assert [(a["invoice_id"], a["amount"]) for a in row["allocations"]] == [(ids["inv"], 250.0)]
+    assert row["collected_by_name"] == "admin"
+    assert client.post(f"/deliveries/collections/{cid}/reconcile", headers=f["admin"]).status_code == 200
+    again = client.post(f"/deliveries/collections/{cid}/reconcile", headers=f["admin"])
+    assert again.status_code in (200, 400, 409), again.text
+    with SessionLocal() as db:
+        assert db.query(CustomerPayment).filter(CustomerPayment.customer_id == f["abc"]).count() == 1
+        assert round(db.get(Customer, f["abc"]).outstanding_balance, 2) == 750.0
+        assert round(db.get(Invoice, ids["inv"]).amount_paid, 2) == 250.0
+    abc = next(i for i in _view(f["a"], "pending")["items"] if i["customer_id"] == f["abc"])
+    assert (abc["outstanding_amount"], abc["pending_collection_amount"], abc["collectable_amount"]) == \
+           (750.0, 0.0, 750.0)
+    assert _view(f["admin"], "collected")["items"][0]["collection_status"] == "completed"
 
 
 def test_pagination_and_summary_are_per_view_and_filter_first():
@@ -201,6 +252,10 @@ def test_pagination_and_summary_are_per_view_and_filter_first():
                       params={"view": "collected", "page": 2, "page_size": 2}).json()
     assert body["pagination"] == {"page": 2, "page_size": 2, "total": 3, "total_pages": 2}
     assert len(body["items"]) == 1 and body["summary"]["total_collected"] == 30.0   # whole set, not the page
+    pages = [client.get("/deliveries/collections", headers=f["a"],
+                        params={"view": "collected", "page": p, "page_size": 2}).json()["items"] for p in (1, 2)]
+    got = [i["collection_id"] for pg in pages for i in pg]
+    assert len(got) == 3 and len(set(got)) == 3                   # 12: no duplicates, none missing
     assert _view(f["a"], "pending", search="ABC")["total"] == 1
     assert _view(f["a"], "pending", customer_id=f["bee"])["total"] == 1
 
