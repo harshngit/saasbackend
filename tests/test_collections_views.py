@@ -107,7 +107,8 @@ def test_default_list_is_unchanged():
     body = client.get("/deliveries/collections", headers=f["admin"]).json()
     assert set(body) == {"items", "total", "page", "page_size", "total_pages"}
     assert body["total"] == 1 and body["items"][0]["reconciliation_status"] == "recorded"
-    assert "collection_status" not in body["items"][0] and "customer_name" not in body["items"][0]
+    # Old fields as before; display names and collection_status added (Nov 25).
+    assert (body["items"][0]["customer_name"], body["items"][0]["collection_status"]) == ("ABC Traders", "collected")
     assert client.get("/deliveries/collections", headers=f["admin"], params={"view": "bogus"}).status_code == 400
 
 

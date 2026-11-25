@@ -639,6 +639,29 @@ class DeliveryCollectionOut(BaseModel):
     allocations: list[CollectionAllocationOut] | None = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+    # The app's status: collected (taken, not completed yet) | completed (reconciled) | voided.
+    collection_status: str | None = Field(default=None, description="collected | completed | voided")
+    # Display fields. The collection list (plain and views) and GET /collections/{id} fill
+    # them; other endpoints may leave them null. Null also when the related record is gone.
+    customer_name: str | None = None
+    customer_code: str | None = None
+    business_name: str | None = None
+    contact_name: str | None = None
+    collected_by_user_id: str | None = Field(
+        default=None, description="Who recorded the collection (same as delivery_partner_id / collector_id, "
+                                  "which keep that meaning for older clients); may be an Admin or Accountant")
+    collected_by_name: str | None = None
+    assigned_delivery_partner_id: str | None = Field(
+        default=None, description="The partner assigned to the linked delivery; null for a general collection")
+    delivery_partner_name: str | None = Field(default=None, description="Name of assigned_delivery_partner_id")
+    delivery_number: str | None = Field(default=None, description="The linked delivery's number, if any")
+    order_number: str | None = Field(default=None, description="The linked sales order's number, if any")
+    reconciled_by_user_id: str | None = Field(default=None, description="Who confirmed it (same as reconciled_by_id)")
+    reconciled_by_name: str | None = None
+    completed_at: datetime | None = Field(default=None, description="When it was confirmed (reconciled_at); "
+                                                                     "null unless completed")
+    receipt_number: str | None = Field(default=None, description="Receipt number of customer_payment_id, the "
+                                                                 "payment the confirmation created")
 
     @field_validator("payment_proof_url", mode="after")
     @classmethod
@@ -651,6 +674,10 @@ class DeliveryCollectionOut(BaseModel):
         if not self.collector_id and self.delivery_partner_id:
             self.collector_id = self.delivery_partner_id
         self.status = collection_status(self.reconciliation_status)
+        self.collection_status = CANONICAL_COLLECTION_STATUS.get(self.reconciliation_status, self.reconciliation_status)
+        self.collected_by_user_id = self.delivery_partner_id
+        self.reconciled_by_user_id = self.reconciled_by_id
+        self.completed_at = self.reconciled_at if self.reconciliation_status == "reconciled" else None
         if self.allocations:
             alloc_sum = sum(a.amount for a in self.allocations)
             self.allocated_amount = round(alloc_sum, 2)
@@ -730,24 +757,16 @@ class CollectedCollectionOut(DeliveryCollectionOut):
     Collected tab shows."""
 
     collection_id: str | None = None
-    customer_name: str | None = None
-    customer_code: str | None = None
-    contact_name: str | None = None
     phone: str | None = None
     profile_photo_url: str | None = None
     latitude: float | None = None
     longitude: float | None = None
-    order_number: str | None = Field(default=None, description="The linked sales order's number, if any")
-    delivery_number: str | None = Field(default=None, description="The linked delivery's number, if any")
-    collected_by_name: str | None = Field(default=None, description="Who collected it (delivery_partner_id's name)")
     amount_collected: float | None = None
-    collection_status: str | None = Field(default=None, description="collected | completed")
 
     @model_validator(mode="after")
     def _collected_fields(self) -> "CollectedCollectionOut":
         self.collection_id = self.id
         self.amount_collected = self.amount
-        self.collection_status = CANONICAL_COLLECTION_STATUS.get(self.reconciliation_status, self.reconciliation_status)
         return self
 
 
