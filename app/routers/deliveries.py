@@ -150,6 +150,9 @@ _COLLECTION_STATUS_FILTER = {
     # Canonical names (collection_status) -- same stored states.
     "pending_approval": "recorded",
     "approved": "reconciled",
+    # The app's collection_status names (To Collect -> Collected -> Completed).
+    "collected": "recorded",
+    "completed": "reconciled",
 }
 
 DELIVERY_COLLECTION_SORTABLE_FIELDS = {
@@ -1503,25 +1506,29 @@ def _view_page(page: int, page_size: int, total: int) -> tuple[int, int, int]:
 
 
 def _pending_collections_view(db, user, *, search, customer_id, page, page_size, sort_by, sort_order):  # noqa: ANN001
-    """Customers a new collection can be taken from: active, outstanding > 0, and nothing
-    awaiting approval (those are in view=collected). Same customers GET /customers shows
-    this user, filtered in SQL before the count, the summary and the page."""
+    """Customers something can still be collected from (To Collect): active, and
+    collectable_amount = outstanding - collections awaiting completion > 0. The same
+    amount the collect endpoints cap at (409 above it). Same customers GET /customers
+    shows this user, filtered in SQL before the count, the summary and the page."""
     if not has_permission(db, user, "customers", "view"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to view customers")
     org_id = _org_id(user)
-    awaiting = (
-        select(DeliveryCollection.id)
+    # Collected but not completed yet (voided and completed ones do not count: a completed
+    # one is already off outstanding_balance).
+    in_hand = (
+        select(func.coalesce(func.sum(DeliveryCollection.amount), 0.0))
         .where(DeliveryCollection.organization_id == Customer.organization_id,
                DeliveryCollection.customer_id == Customer.id,
                DeliveryCollection.reconciliation_status == "recorded")
         .correlate(Customer)
-        .exists()
+        .scalar_subquery()
     )
+    outstanding = func.coalesce(Customer.outstanding_balance, 0.0)
+    collectable = outstanding - in_hand
     q = db.query(Customer).filter(
         Customer.organization_id == org_id,
         Customer.is_active.is_(True),
-        Customer.outstanding_balance > 0.005,
-        ~awaiting,
+        collectable > 0.005,
     )
     if not _is_delivery_partner(user):
         q = scoping.owned_by(q, db, user, Customer.assigned_sales_officer_id)
@@ -1532,37 +1539,45 @@ def _pending_collections_view(db, user, *, search, customer_id, page, page_size,
         q = q.filter(or_(Customer.name.ilike(s), Customer.business_name.ilike(s), Customer.phone.ilike(s),
                          Customer.customer_id.ilike(s), Customer.primary_contact_person.ilike(s)))
 
-    ids = q.with_entities(Customer.id).order_by(None).subquery()
-    count, amount = db.query(
-        func.count(Customer.id), func.coalesce(func.sum(Customer.outstanding_balance), 0.0),
-    ).filter(Customer.id.in_(select(ids.c.id))).one()
+    agg = q.with_entities(
+        Customer.id.label("cid"), outstanding.label("out"), in_hand.label("in_hand"),
+    ).order_by(None).subquery()
+    count, sum_out, sum_in_hand = db.query(
+        func.count(agg.c.cid), func.coalesce(func.sum(agg.c.out), 0.0), func.coalesce(func.sum(agg.c.in_hand), 0.0),
+    ).one()
     total = int(count or 0)
+    sum_out, sum_in_hand = float(sum_out or 0.0), float(sum_in_hand or 0.0)
 
     q = apply_sorting(
         q, sort_by=sort_by, sort_order=sort_order,
         sortable_fields={"customer_name": Customer.name, "name": Customer.name,
                          "outstanding_amount": Customer.outstanding_balance,
-                         "collectable_amount": Customer.outstanding_balance,
+                         "collectable_amount": collectable,
+                         "pending_collection_amount": in_hand,
                          "outstanding_balance": Customer.outstanding_balance},
         default_order=[Customer.name.asc(), Customer.id.asc()],
         secondary_key=Customer.id.asc(),
     )
     q = q.options(lazyload("*"))
-    rows = q.offset((page - 1) * page_size).limit(page_size).all()
+    rows = q.add_columns(in_hand).offset((page - 1) * page_size).limit(page_size).all()
     page, page_size, total_pages = _view_page(page, page_size, total)
-    items = [
-        PendingCollectionCustomerOut(
+    items = []
+    for c, held in rows:
+        out_amt = round(float(c.outstanding_balance or 0.0), 2)
+        held = round(float(held or 0.0), 2)
+        items.append(PendingCollectionCustomerOut(
             id=c.id, customer_id=c.id, business_name=c.business_name, **_customer_card(c),
             address=getattr(c, "delivery_address", None) or getattr(c, "billing_address", None),
-            outstanding_amount=round(float(c.outstanding_balance or 0.0), 2),
-            collectable_amount=round(float(c.outstanding_balance or 0.0), 2),
-        )
-        for c in rows
-    ]
+            outstanding_amount=out_amt, pending_collection_amount=held,
+            collectable_amount=round(max(out_amt - held, 0.0), 2),
+        ))
     return PendingCollectionsViewOut(
         items=items, total=total, page=page, page_size=page_size, total_pages=total_pages,
         pagination=CollectionsPagination(page=page, page_size=page_size, total=total, total_pages=total_pages),
-        summary=CollectionsViewSummary(total_pending=total, total_pending_amount=round(float(amount or 0.0), 2)),
+        summary=CollectionsViewSummary(
+            total_pending=total, total_pending_amount=round(sum_out - sum_in_hand, 2),
+            total_outstanding_amount=round(sum_out, 2), total_pending_collection_amount=round(sum_in_hand, 2),
+        ),
     )
 
 
@@ -1605,6 +1620,9 @@ def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_o
     for f in ("total_collected", "awaiting_approval_amount", "approved_amount", "cash_total",
               "bank_transfer_total", "upi_total", "cheque_total", "other_total"):
         setattr(summary, f, round(getattr(summary, f), 2))
+    # Same numbers under the app's status names (collected = not completed yet).
+    summary.collected_amount, summary.collected_only_count = summary.awaiting_approval_amount, summary.awaiting_approval_count
+    summary.completed_amount, summary.completed_count = summary.approved_amount, summary.approved_count
     summary.by_payment_mode = {k: round(v, 2) for k, v in sorted(by_mode.items())}
     total = summary.collected_count
 
@@ -1623,12 +1641,23 @@ def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_o
         db.query(SalesOrder.id, SalesOrder.order_number)
         .filter(SalesOrder.id.in_({r.sales_order_id for r in rows if r.sales_order_id})).all()
     ) if rows else {}
+    delivery_numbers = dict(
+        db.query(Delivery.id, Delivery.delivery_note_number)
+        .filter(Delivery.organization_id == _org_id(user),
+                Delivery.id.in_({r.delivery_id for r in rows if r.delivery_id})).all()
+    ) if rows else {}
+    collector_names = dict(
+        db.query(User.id, User.name)
+        .filter(User.id.in_({r.delivery_partner_id for r in rows if r.delivery_partner_id})).all()
+    ) if rows else {}
     items = []
     for r in rows:
         item = CollectedCollectionOut.model_validate(r)
         for k, v in _customer_card(customers.get(r.customer_id)).items():
             setattr(item, k, v)
         item.order_number = order_numbers.get(r.sales_order_id)
+        item.delivery_number = delivery_numbers.get(r.delivery_id)
+        item.collected_by_name = collector_names.get(r.delivery_partner_id)
         items.append(item)
     page, page_size, total_pages = _view_page(page, page_size, total)
     return CollectedCollectionsViewOut(
@@ -1643,10 +1672,11 @@ def _collected_collections_view(db, user, q, *, page, page_size, sort_by, sort_o
 def list_delivery_collections(
     view: str | None = Query(
         default=None,
-        description="Omit for the full history (unchanged). `pending`: customers a new collection can be "
-                    "taken from (outstanding > 0, nothing awaiting approval). `collected`: collections "
-                    "awaiting approval (pending_approval) or approved; voided in neither. Each view has its "
-                    "own total / pagination / summary, computed after its filters.",
+        description="Omit for the full history (unchanged). `pending` (To Collect): one row per customer "
+                    "with collectable_amount = outstanding - collections not completed yet > 0; `id` is the "
+                    "customer id. `collected`: collection records with collection_status `collected` (money "
+                    "taken, not completed yet) or `completed` (reconciled); voided in neither. Each view has "
+                    "its own total / pagination / summary, computed after its filters.",
     ),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
