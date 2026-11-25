@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.workflow import public_delivery_status, public_order_status
@@ -528,6 +528,9 @@ class DeliveryCollectionCreate(BaseModel):
     reference: str | None = Field(default=None, max_length=150)
     notes: str | None = Field(default=None, max_length=1000)
     payment_proof_url: str | None = Field(default=None, description="Proof of payment screenshot URL or file_id")
+    payment_date: datetime | str | None = Field(
+        default=None, description="Business day of the payment (YYYY-MM-DD); default today. Not the record time."
+    )
 
 
 class CollectionAllocationIn(BaseModel):
@@ -627,6 +630,7 @@ class DeliveryCollectionOut(BaseModel):
     notes: str | None = None
     payment_proof_url: str | None = None
     collected_at: datetime
+    payment_date: date | None = Field(default=None, description="Business day of the payment (YYYY-MM-DD); collected_at is when it was recorded")
     reconciliation_status: str = Field(description="recorded | reconciled | voided")
     status: str | None = Field(
         default=None,

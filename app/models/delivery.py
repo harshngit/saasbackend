@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, String, Text
+from sqlalchemy import JSON, Date, DateTime, Float, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -240,6 +240,9 @@ class DeliveryCollection(Base):
     reference: Mapped[str | None] = mapped_column(String(150), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    # Business day the payment belongs to (payment_date in the API). Deferred and only touched
+    # once the column exists (app/services/collection_dates.py; pending migration).
+    payment_date_value: Mapped[date | None] = mapped_column("payment_date", Date, nullable=True, deferred=True)
 
     # recorded | reconciled | voided
     reconciliation_status: Mapped[str] = mapped_column(String(30), default="recorded", nullable=False, index=True)

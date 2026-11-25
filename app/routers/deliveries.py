@@ -31,7 +31,7 @@ from app.models import (
     DeliveryItem,
 )
 from app.core import notification_types as nt
-from app.services import day_end_service
+from app.services import collection_dates, day_end_service
 from app.services import (
     delivery_redistribution_service,
     delivery_service,
@@ -1402,11 +1402,8 @@ def _filtered_collections(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="date_from is after date_to")
     if date_from or date_to:
         # Whole days in the firm's business timezone, both ends inclusive.
-        tz = business_time.org_timezone(db, org_id)
-        if date_from:
-            q = q.filter(DeliveryCollection.collected_at >= business_time.day_start(date_from, tz))
-        if date_to:
-            q = q.filter(DeliveryCollection.collected_at <= business_time.day_end(date_to, tz))
+        # By the business day (payment_date); rows without one fall back to collected_at.
+        q = q.filter(collection_dates.day_range_filter(db, org_id, date_from, date_to))
 
     # These filters used to name columns the model does not have (status,
     # collection_number, payment_reference), so any call with ?status= or ?search=
@@ -1485,6 +1482,7 @@ def _collections_out(db: Session, rows: list, cls=DeliveryCollectionOut) -> list
     batched lookup each. Everything is checked against the row's organization."""
     if not rows:
         return []
+    pay_days = collection_dates.payment_dates(db, rows)
     org_id = rows[0].organization_id
     dlv_ids = {r.delivery_id for r in rows if r.delivery_id}
     deliveries = {
@@ -1524,6 +1522,7 @@ def _collections_out(db: Session, rows: list, cls=DeliveryCollectionOut) -> list
         item.assigned_delivery_partner_id = partner
         item.delivery_partner_name = names.get(partner) if partner else None
         item.receipt_number = receipts.get(r.customer_payment_id)
+        item.payment_date = pay_days.get(r.id)
         out.append(item)
     return out
 
@@ -2029,24 +2028,11 @@ def record_general_customer_collection(
 
     mode = payload.payment_mode or payload.payment_method or "cash"
 
-    collected_at = datetime.now(timezone.utc)
-    if payload.payment_date:
-        if isinstance(payload.payment_date, datetime):
-            collected_at = payload.payment_date
-        elif isinstance(payload.payment_date, str) and payload.payment_date.strip():
-            # An unreadable date used to be dropped silently and the collection dated "now",
-            # which put it on the wrong day (and the wrong Day-End). Refuse it instead.
-            try:
-                collected_at = datetime.fromisoformat(payload.payment_date.strip())
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="payment_date must be an ISO 8601 date or date-time, e.g. 2026-11-09 or "
-                           "2026-11-09T10:30:00+05:30",
-                ) from None
+    # collected_at = when it is recorded (now); payment_date = the business day picked.
+    collected_at, pay_day = collection_dates.stamp(db, org_id, payload.payment_date)
 
     # A day whose Day-End is submitted / approved takes no new collections.
-    day_end_service.require_day_open(db, org_id, user.id, collected_at)
+    day_end_service.require_day_open(db, org_id, user.id, collection_dates.day_moment(db, org_id, pay_day))
 
     coll = DeliveryCollection(
         organization_id=org_id,
@@ -2062,6 +2048,7 @@ def record_general_customer_collection(
         reconciliation_status="recorded",
         collected_at=collected_at,
     )
+    collection_dates.apply(db, coll, pay_day)
     db.add(coll)
     db.flush()
 
@@ -2076,7 +2063,7 @@ def record_general_customer_collection(
 
     db.commit()
     db.refresh(coll)
-    return coll
+    return _collections_out(db, [coll])[0]
 
 
 @router.post("/collections/{collection_id}/reconcile", response_model=DeliveryCollectionOut)
@@ -2144,7 +2131,7 @@ def reconcile_delivery_collection(
                 reference=coll.reference,
                 note=f"Reconciled Delivery Collection {coll.id}" + (f" ({coll.notes})" if coll.notes else ""),
                 order_id=coll.sales_order_id,
-                received_on=coll.collected_at or datetime.now(timezone.utc),
+                received_on=collection_dates.moment_of(db, coll),
                 allocations=alloc_list,
                 collected_by_user_id=coll.delivery_partner_id,
                 payment_proof_url=coll.payment_proof_url,
@@ -2162,7 +2149,7 @@ def reconcile_delivery_collection(
 
     db.commit()
     db.refresh(coll)
-    return coll
+    return _collections_out(db, [coll])[0]
 
 
 @router.post("/collections/{collection_id}/void", response_model=DeliveryCollectionOut)
@@ -2192,7 +2179,9 @@ def void_delivery_collection(
             detail=f"Cannot void collection in state '{coll.reconciliation_status}'. Only 'recorded' or 'reconciled' collections can be voided.",
         )
     # Part of a submitted / approved Day-End: the reviewed figures must stay true.
-    day_end_service.require_day_open(db, org_id, coll.delivery_partner_id, coll.collected_at)
+    day_end_service.require_day_open(
+        db, org_id, coll.delivery_partner_id, collection_dates.day_moment(db, org_id, collection_dates.day_of(db, coll))
+    )
 
     if coll.customer_payment_id:
         payment = db.get(CustomerPayment, coll.customer_payment_id)
@@ -2204,7 +2193,7 @@ def void_delivery_collection(
 
     db.commit()
     db.refresh(coll)
-    return coll
+    return _collections_out(db, [coll])[0]
 
 
 @router.post("/{delivery_id}/collections", response_model=DeliveryCollectionOut, status_code=status.HTTP_201_CREATED)
@@ -2311,8 +2300,9 @@ def record_delivery_collection(
                     )
 
     # A day whose Day-End is submitted / approved takes no new collections.
+    collected_at, pay_day = collection_dates.stamp(db, org_id, payload.payment_date)
     day_end_service.require_day_open(
-        db, org_id, delivery.delivery_partner_id or user.id, datetime.now(timezone.utc)
+        db, org_id, delivery.delivery_partner_id or user.id, collection_dates.day_moment(db, org_id, pay_day)
     )
 
     # Derive audit links directly from Delivery & User (never trust client)
@@ -2328,13 +2318,14 @@ def record_delivery_collection(
         notes=payload.notes,
         payment_proof_url=payload.payment_proof_url,
         reconciliation_status="recorded",
-        collected_at=datetime.now(timezone.utc),
+        collected_at=collected_at,
     )
+    collection_dates.apply(db, coll, pay_day)
 
     db.add(coll)
     db.commit()
     db.refresh(coll)
-    return coll
+    return _collections_out(db, [coll])[0]
 
 
 @router.get("/{delivery_id}/collections", response_model=list[DeliveryCollectionOut])
