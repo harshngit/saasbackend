@@ -1321,6 +1321,27 @@ def require_collections_approve(user: User = Depends(get_current_user), db: Sess
     return user
 
 
+def require_collections_view(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    """Read collections: Deliveries > View/Create or Payments > View/Create (Admins / owners are
+    not permission-checked). Row scoping (own records for Delivery Partners) still applies."""
+    for module, action in (("deliveries", "view"), ("deliveries", "create"), ("payments", "view"),
+                           ("payments", "create")):
+        if has_permission(db, user, module, action):
+            return user
+    if not user.role_id:
+        # Legacy account without a role: judge it by its legacy role's default matrix.
+        from app.core.permissions import default_role_matrices
+        from app.models.enums import STAFF_ROLE_NAME
+        try:
+            legacy = UserRole(user.role) if user.role else None
+        except ValueError:
+            legacy = None
+        matrix = default_role_matrices().get(STAFF_ROLE_NAME.get(legacy, ""), {})
+        if any(matrix.get(m, {}).get(a) for m in ("deliveries", "payments") for a in ("view", "create")):
+            return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to view collections")
+
+
 def _lock_collection(db: Session, collection_id: str, org_id: str) -> DeliveryCollection:
     """Row-lock and re-read a collection before its state is checked.
 
@@ -1547,7 +1568,7 @@ def delivery_collections_summary(
     date_to: date | None = Query(default=None, description=_DATE_DOC),
     collection_status_q: str | None = Query(default=None, alias="collection_status", description=_COLLECTION_STATUS_DOC),
     payment_mode: str | None = Query(default=None, description=_PAYMENT_MODE_DOC),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_view),
     db: Session = Depends(get_db),
 ) -> CollectionSummaryOut:
     """Count and amount of the collections GET /deliveries/collections would list with the
@@ -1773,7 +1794,7 @@ def list_delivery_collections(
     order_id: str | None = Query(default=None, description="Only collections linked to this sales order"),
     date_from: date | None = Query(default=None, description=_DATE_DOC),
     date_to: date | None = Query(default=None, description=_DATE_DOC),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_view),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[DeliveryCollectionOut]:
     """List organization delivery collections.
@@ -1820,7 +1841,7 @@ def list_delivery_collections(
 @router.get("/collections/{collection_id}", response_model=DeliveryCollectionOut)
 def get_delivery_collection(
     collection_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_view),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
     """Retrieve a single delivery collection by ID."""
@@ -2200,7 +2221,7 @@ def void_delivery_collection(
 def record_delivery_collection(
     delivery_id: str,
     payload: DeliveryCollectionCreate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collection_create),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryCollection:
@@ -2301,9 +2322,9 @@ def record_delivery_collection(
 
     # A day whose Day-End is submitted / approved takes no new collections.
     collected_at, pay_day = collection_dates.stamp(db, org_id, payload.payment_date)
-    day_end_service.require_day_open(
-        db, org_id, delivery.delivery_partner_id or user.id, collection_dates.day_moment(db, org_id, pay_day)
-    )
+    # The collector (and so the Day-End it belongs to) is whoever records it, not the partner
+    # the delivery is assigned to; the assignment stays on the delivery.
+    day_end_service.require_day_open(db, org_id, user.id, collection_dates.day_moment(db, org_id, pay_day))
 
     # Derive audit links directly from Delivery & User (never trust client)
     coll = DeliveryCollection(
@@ -2311,7 +2332,7 @@ def record_delivery_collection(
         delivery_id=delivery.id,
         sales_order_id=delivery.sales_order_id,
         customer_id=delivery.customer_id,
-        delivery_partner_id=delivery.delivery_partner_id or user.id,
+        delivery_partner_id=user.id,
         amount=payload.amount,
         payment_mode=payload.payment_mode,
         reference=payload.reference,
@@ -2331,7 +2352,7 @@ def record_delivery_collection(
 @router.get("/{delivery_id}/collections", response_model=list[DeliveryCollectionOut])
 def get_collections_for_delivery(
     delivery_id: str,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_collections_view),
     db: Session = Depends(get_db),
 ) -> list[DeliveryCollection]:
     """Retrieve all collections recorded against a specific delivery."""

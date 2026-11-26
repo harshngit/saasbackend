@@ -264,7 +264,9 @@ def test_page_of_25_query_count_is_constant():
             db.add(DeliveryCollection(organization_id=f["org"], customer_id=f["laxmi"] if i % 2 else f["ganesh"],
                                       delivery_partner_id=f["ids"]["a" if i % 3 else "b"], amount=5.0 + i,
                                       payment_mode="cash", delivery_id=f["dlv"] if i % 4 == 0 else None,
-                                      sales_order_id=f["so"] if i % 4 == 0 else None))
+                                      sales_order_id=f["so"] if i % 4 == 0 else None,
+                                      # Fixed order, so both page sizes hold every kind of row.
+                                      collected_at=datetime(2026, 11, 30, 6, i, tzinfo=timezone.utc)))
         db.commit()
     counts = {}
 
