@@ -20,6 +20,7 @@ Only presentation: rows, their order and their values are exactly what the repor
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -213,6 +214,26 @@ def format_summary(key: str, value) -> str:  # noqa: ANN001
 class _Doc(FPDF):
     footer_text = ""
 
+    def normalize_text(self, text):  # noqa: ANN001, ANN201
+        """Every string fpdf draws or measures passes here. A character the font has no glyph
+        for (Telugu, Devanagari, emoji...) becomes "?" instead of crashing the export; the
+        marks / joiners attached to it are dropped so one syllable gives one "?"."""
+        text = super().normalize_text(text)
+        font = self.current_font
+        glyphs = getattr(font, "cmap", None)
+        if not glyphs or all(ord(ch) in glyphs for ch in text):
+            return text
+        out = []
+        for ch in text:
+            cat = unicodedata.category(ch)
+            if ord(ch) in glyphs or ch.isspace():
+                out.append(ch)
+            elif cat in ("Mn", "Mc", "Me", "Cf") or (cat == "Sk" and out and out[-1] == "?"):
+                continue  # vowel sign / virama / variation selector / ZWJ / skin tone of a replaced character
+            elif not (out and out[-1] == "?" and cat.startswith("S")):
+                out.append("?")  # one "?" per unsupported letter; an emoji sequence gives one "?"
+        return "".join(out)
+
     def footer(self) -> None:  # noqa: D401
         self.set_y(-MARGIN + 1)
         self.set_font(FAMILY, "", 7)
@@ -386,7 +407,13 @@ def render(report: dict, org_name: str | None = None, stats: dict | None = None)
         widths = _natural_widths(m, cols, cells, 6.0)
         mins = [w[0] for w in widths]
         avail = 297.0 - 2 * MARGIN
-        flex = [i for i, col in enumerate(cols) if col["type"] in WRAPPING]
+        # Short single-token codes (GSTIN, HSN, SKU) keep their width: breaking a 15-character
+        # GSTIN over two lines makes it unreadable.
+        def _code_column(i: int) -> bool:
+            vals = [row[i] for row in cells if row[i]]
+            return bool(vals) and all(len(v) <= 16 and " " not in v for v in vals)
+
+        flex = [i for i, col in enumerate(cols) if col["type"] in WRAPPING and not _code_column(i)]
         fixed = sum(mins[i] for i in range(len(cols)) if i not in flex)
         room = avail - fixed
         if flex and room > 10.0 * len(flex):
