@@ -113,9 +113,6 @@ def _s(text) -> str:
 
 
 def _to_pdf(report: dict, org_name: str | None = None) -> bytes:
-    from fpdf import FPDF
-    from fpdf.enums import XPos, YPos
-
     rows = report.get("rows", [])
     if len(rows) > 2500:
         raise HTTPException(
@@ -123,66 +120,11 @@ def _to_pdf(report: dict, org_name: str | None = None) -> bytes:
             detail=f"PDF export limit exceeded ({len(rows)} rows). Please use Excel export or filter by date range.",
         )
 
-    pdf = FPDF(orientation="L")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
+    # Shared, content-aware layout (app/core/report_pdf.py): wrapped cells, fitted column
+    # widths, repeated headers, formatted values. Same rows and values as the report.
+    from app.core import report_pdf
 
-    if org_name:
-        pdf.set_font("Helvetica", "B", 14)
-        pdf.cell(0, 8, _s(org_name), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    title = report.get("meta", {}).get("title") or report.get("type", "Report").replace("-", " ").title()
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 7, _s(f"{title} Report"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    pdf.set_font("Helvetica", size=9)
-    if report.get("as_of_date"):
-        period = f"As of Date: {report.get('as_of_date')}"
-    else:
-        period = f"Period: {report.get('date_from') or 'All Time'} to {report.get('date_to') or 'Present'}"
-    pdf.cell(0, 6, _s(period), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    # Summary
-    summary = report.get("summary", {})
-    if summary:
-        pdf.ln(2)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(0, 6, _s("Summary Metrics:"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("Helvetica", size=8)
-        summary_str = "  |  ".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in summary.items())
-        pdf.multi_cell(0, 5, _s(summary_str))
-
-    pdf.ln(4)
-
-    meta = report.get("meta", {})
-    columns = meta.get("columns", [])
-
-    if columns:
-        headers = [c["label"] for c in columns]
-        keys = [c["key"] for c in columns]
-    elif rows:
-        keys = list(rows[0].keys())
-        headers = [k.replace("_", " ").title() for k in keys]
-    else:
-        keys = []
-        headers = []
-
-    if headers:
-        col_w = max(18, min(65, 275 // max(1, len(headers))))
-        pdf.set_font("Helvetica", "B", 8)
-        pdf.set_fill_color(220, 230, 245)
-        for h in headers:
-            pdf.cell(col_w, 6, _s(str(h)[:20]), border=1, fill=True)
-        pdf.ln()
-
-        pdf.set_font("Helvetica", size=7)
-        for r in rows:
-            for k in keys:
-                val = r.get(k)
-                pdf.cell(col_w, 5, _s(str(val if val is not None else ""))[:20], border=1)
-            pdf.ln()
-
-    return bytes(pdf.output())
+    return report_pdf.render(report, org_name=org_name)
 
 
 def _report_filters(

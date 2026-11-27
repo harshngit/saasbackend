@@ -869,8 +869,10 @@ def _purchase(db: Session, org_id: str, df: datetime | None, dt: datetime | None
                 if product_id and item.product_id != product_id:
                     continue
                 p_name = item.product_name or (item.product.name if item.product else "Unknown Product")
-                qty = float(item.quantity or 0)
-                val = float(item.total_amount or (qty * (item.unit_price or 0)))
+                # SupplierInvoiceItem has billed_qty / line_total (it never had quantity /
+                # total_amount, so this view raised AttributeError -> 500 on any invoice line).
+                qty = float(item.billed_qty or 0)
+                val = float(item.line_total or (qty * (item.unit_price or 0)))
                 prod_map[p_name]["quantity_purchased"] = round(prod_map[p_name]["quantity_purchased"] + qty, 2)
                 prod_map[p_name]["purchase_value"] = round(prod_map[p_name]["purchase_value"] + val, 2)
 
