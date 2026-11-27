@@ -299,3 +299,60 @@ def test_balance_sheet_still_gated_by_plan(monkeypatch):
         for path in (f"/reports/{rtype}", f"/reports/{rtype}/export"):
             r = c.get(path, headers=f["h"], params={"format": "pdf"} if path.endswith("export") else {})
             assert r.status_code in (402, 403), (path, r.status_code)
+
+
+NON_LATIN = {
+    "telugu": "పీటర్8 ట్రేడర్స్",
+    "hindi": "राम किराना स्टोर",
+    "marathi": "श्री गणेश व्यापारी मंडळ",
+    "emoji": "Chai ☕ & snacks 😀👨‍👩‍👧👍🏽",
+}
+
+
+def test_non_latin_and_emoji_text_never_breaks_pdf(entitled, capture):
+    """Telugu / Hindi / Marathi / emoji in names and descriptions: every report's PDF is 200.
+    The bundled font has no glyphs for them, so each such word prints as "?" (as the old
+    export did) instead of a 500; Latin text and ₹ are untouched."""
+    f = _firm()
+    with SessionLocal() as db:
+        org = db.get(Organization, f["org"])
+        org.name = f"{NON_LATIN['marathi']} {f['tag']}"
+        for model, field in ((Expense, "description"), (Expense, "category"), (Expense, "payee_name"),
+                             (Customer, "name"), (Customer, "business_name"), (Supplier, "name"),
+                             (Product, "name"), (StockMovement, "note")):
+            for i, row in enumerate(db.query(model).filter(model.organization_id == f["org"]).all()):
+                setattr(row, field, f"{list(NON_LATIN.values())[i % 4]} {list(NON_LATIN.values())[(i + 1) % 4]} {i}")
+        db.commit()
+    for rtype, group in _views():
+        params = {**RANGE, **group}
+        r = c.get(f"/reports/{rtype}/export", headers=f["h"], params={**params, "format": "pdf"})
+        assert r.status_code == 200, (rtype, group, r.text[:300])
+        assert r.content[:5] == b"%PDF-"
+        report, st = capture[-1]
+        _check_layout(st, len(report["rows"]))
+    exp = c.get("/reports/expense/export", headers=f["h"], params={**RANGE, "format": "pdf"})
+    assert exp.status_code == 200
+
+    doc = report_pdf._Doc()
+    doc.add_font(report_pdf.FAMILY, "", str(report_pdf.FONT_DIR / "DMSans-Regular.ttf"))
+    doc.set_font(report_pdf.FAMILY, "", 8)
+    assert doc.normalize_text("పీటర్8") == "???8"  # one "?" per letter, vowel signs / virama dropped
+    assert doc.normalize_text("Chai ☕ 😀👨‍👩‍👧 ok") == "Chai ? ? ok"
+    assert doc.normalize_text("Café ₹ 1,180.00 – ok?") == "Café ₹ 1,180.00 – ok?"  # supported text unchanged
+
+
+def test_gstin_stays_on_one_line_in_wide_gst_summary(entitled):
+    cols = c.get("/reports/gst-summary", headers=_firm()["h"],
+                 params={**RANGE, "group_by": "transaction"}).json()["meta"]["columns"]
+    row = {col["key"]: {"currency": 123456.78, "date": "2026-11-20", "status": "partially_paid",
+                        "reference": "INV/2026-27/000123"}.get(col["type"], "Very Long Customer Trading Company")
+           for col in cols}
+    row["gst_number"] = "27AAACV1234F1Z5"
+    st = {}
+    report_pdf.render({"type": "gst-summary", "meta": {"columns": cols}, "rows": [row] * 40}, stats=st)
+    _check_layout(st, 40)
+    i = [col["key"] for col in cols].index("gst_number")
+    doc = report_pdf._Doc()
+    doc.add_font(report_pdf.FAMILY, "", str(report_pdf.FONT_DIR / "DMSans-Regular.ttf"))
+    doc.set_font(report_pdf.FAMILY, "", st["font_size"])
+    assert st["col_widths"][i] >= doc.get_string_width("27AAACV1234F1Z5") + 2 * report_pdf.PAD_X
