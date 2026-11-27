@@ -248,12 +248,38 @@ def list_assigned_deliveries(
     )
 
 
+# Who may load the Delivery Partner picker: whoever can place / edit an order (Create Order ->
+# Home Delivery) or create / edit a delivery (assign a partner). Not a staff directory.
+_PARTNER_PICKER = (("sales_orders", "create"), ("sales_orders", "edit"), ("deliveries", "create"),
+                   ("deliveries", "edit"))
+
+
+def require_partner_picker(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    if any(has_permission(db, user, module, action) for module, action in _PARTNER_PICKER):
+        return user
+    if not user.role_id:
+        # Legacy account without a role: judge it by its legacy role's default matrix.
+        from app.core.permissions import default_role_matrices
+        from app.models.enums import STAFF_ROLE_NAME
+        try:
+            legacy = UserRole(user.role) if user.role else None
+        except ValueError:
+            legacy = None
+        matrix = default_role_matrices().get(STAFF_ROLE_NAME.get(legacy, ""), {})
+        if any(matrix.get(m, {}).get(a) for m, a in _PARTNER_PICKER):
+            return user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You don't have permission to load delivery partners")
+
+
 @router.get("/partners", response_model=list[DeliveryPartnerOption])
 def list_delivery_partners(
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_partner_picker),
     db: Session = Depends(get_db),
 ) -> list[DeliveryPartnerOption]:
-    """List active delivery partners in the current organization for assignment dropdowns."""
+    """Delivery Partner picker (Create Order -> Home Delivery, delivery assignment): active
+    delivery partners of the caller's own organization -- id, name, is_active, role only.
+    Needs Sales Orders > Create/Edit or Deliveries > Create/Edit (Admins always)."""
     org_id = _org_id(user)
     users = (
         db.query(User)
@@ -264,8 +290,9 @@ def list_delivery_partners(
         )
         .all()
     )
-    partners = [u for u in users if delivery_service.is_delivery_partner(db, u)]
-    return [DeliveryPartnerOption(id=u.id, name=u.name) for u in partners]
+    partners = sorted((u for u in users if delivery_service.is_delivery_partner(db, u)),
+                      key=lambda u: ((u.name or "").lower(), u.id))
+    return [DeliveryPartnerOption(id=u.id, name=u.name, is_active=True, role="delivery_partner") for u in partners]
 
 
 _create = require_permission("deliveries", "create")

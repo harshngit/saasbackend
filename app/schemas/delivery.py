@@ -205,6 +205,8 @@ class DeliveryPartnerOption(BaseModel):
 
     id: str
     name: str
+    is_active: bool = True
+    role: str = "delivery_partner"
 
 
 class DeliveryPartnerBrief(BaseModel):
