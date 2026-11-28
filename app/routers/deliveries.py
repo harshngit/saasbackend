@@ -861,36 +861,10 @@ def update_delivery(
     return _delivery_out(db, delivery)
 
 
-def _require_delivery_perm(action: str):  # noqa: ANN202
-    """Deliveries > `action` (Admins / owners are not permission-checked). A legacy account
-    with no role is judged by its legacy role's default matrix, as for collections."""
-
-    def _guard(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
-        if has_permission(db, user, "deliveries", action):
-            return user
-        if not user.role_id:
-            from app.core.permissions import default_role_matrices
-            from app.models.enums import STAFF_ROLE_NAME
-            try:
-                legacy = UserRole(user.role) if user.role else None
-            except ValueError:
-                legacy = None
-            if default_role_matrices().get(STAFF_ROLE_NAME.get(legacy, ""), {}).get("deliveries", {}).get(action):
-                return user
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                            detail=f"You don't have permission to {action} deliveries")
-
-    return _guard
-
-
-_accept_reject_guard = _require_delivery_perm("edit")
-_note_create_guard = _require_delivery_perm("create")
-
-
 @router.post("/{delivery_id}/accept", response_model=DeliveryOut)
 def accept_delivery(
     delivery_id: str,
-    user: User = Depends(_accept_reject_guard),
+    user: User = Depends(get_current_user),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryOut:
@@ -906,7 +880,7 @@ def accept_delivery(
 def reject_delivery(
     delivery_id: str,
     payload: DeliveryRejectBody = DeliveryRejectBody(),
-    user: User = Depends(_accept_reject_guard),
+    user: User = Depends(get_current_user),
     _unlocked: User = Depends(require_unlocked_org),
     db: Session = Depends(get_db),
 ) -> DeliveryOut:
@@ -1247,7 +1221,7 @@ from app.schemas.delivery import DeliveryNoteCreate, DeliveryNoteOut
 @router.post("/notes", response_model=DeliveryNoteOut, status_code=status.HTTP_201_CREATED)
 def create_delivery_note(
     payload: DeliveryNoteCreate,
-    user: User = Depends(_note_create_guard),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Delivery:
     org_id = _org_id(user)

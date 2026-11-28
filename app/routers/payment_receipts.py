@@ -110,15 +110,6 @@ def _out(db: Session, payment: CustomerPayment) -> PaymentReceiptOut:
     )
 
 
-def _preload(db: Session, model, ids) -> list:  # noqa: ANN001
-    """Load these rows (and their eager relationships) in one query, so the per-row
-    db.get() calls in _out / _voided_out are answered from the session instead of one
-    round trip each. The response is built exactly as before. The caller keeps the
-    returned list alive while it builds the page: the session only holds weak refs."""
-    ids = list({i for i in ids if i})
-    return db.query(model).filter(model.id.in_(ids)).all() if ids else []
-
-
 @router.post("", response_model=PaymentReceiptOut, status_code=status.HTTP_201_CREATED)
 def create_receipt(
     payload: PaymentReceiptCreate,
@@ -254,9 +245,6 @@ def _list_with_voided(db: Session, org_id: str, *, customer_id, invoice_id, sear
     total = db.execute(select(func.count()).select_from(both)).scalar() or 0
     rows = db.execute(select(both.c.id, both.c.kind).order_by(both.c.at.desc(), both.c.id.desc())
                       .offset((page - 1) * page_size).limit(page_size)).all()
-    loaded = _preload(db, CustomerPayment, [rid for rid, kind in rows if kind == "active"])
-    loaded += _preload(db, V, [rid for rid, kind in rows if kind != "active"])
-    loaded += _preload(db, Customer, [r.customer_id for r in loaded])
     items = []
     for rid, kind in rows:
         items.append(_out(db, db.get(CustomerPayment, rid)) if kind == "active" else _voided_out(db, db.get(V, rid)))
@@ -306,7 +294,6 @@ def list_receipts(
         secondary_key=CustomerPayment.id.desc(),
     )
     items, total, page, page_size, total_pages = paginate(query, page=page, page_size=page_size)
-    customers = _preload(db, Customer, [row.customer_id for row in items])  # noqa: F841 (kept alive)
     return PaginatedResponse(
         items=[_out(db, row) for row in items],
         total=total,
