@@ -146,5 +146,14 @@ def delete_file(
     caller believes is gone still sitting in the database.
     """
     stored = _stored_file(db, file_id)
+    # Only the uploader, or an Admin of the same firm (another firm's file stays 404 in
+    # delete_stored_file, as before). A file with no recorded uploader (older uploads,
+    # per-field routes) is never guessed: Admin only.
+    if user.organization_id is not None and stored.organization_id != user.organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    if user.effective_system_role not in ("admin", "super_admin") and (
+            stored.uploaded_by_user_id is None or stored.uploaded_by_user_id != user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="You can only delete files you uploaded")
     delete_stored_file(db, stored, user.organization_id)
     db.commit()
