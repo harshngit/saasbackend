@@ -17,6 +17,8 @@ model metadata rather than duplicating either:
   a second engine from alembic.ini.
 """
 
+import os
+import re
 from logging.config import fileConfig
 
 from alembic import context
@@ -95,7 +97,20 @@ def run_migrations_online() -> None:
         )
 
         with context.begin_transaction():
+            if connection.dialect.name == "postgresql":
+                # Never wait forever for a table lock (ALTER TABLE needs ACCESS EXCLUSIVE; one
+                # open transaction on the table would otherwise block it -- and every query
+                # queued behind it -- indefinitely). SET LOCAL lasts only for this migration
+                # transaction, so it is also safe through a transaction-mode pooler.
+                connection.exec_driver_sql(f"SET LOCAL lock_timeout = '{_timeout('MIGRATION_LOCK_TIMEOUT', '5s')}'")
+                connection.exec_driver_sql(
+                    f"SET LOCAL statement_timeout = '{_timeout('MIGRATION_STATEMENT_TIMEOUT', '60s')}'")
             context.run_migrations()
+
+
+def _timeout(name: str, default: str) -> str:
+    value = os.environ.get(name, default).strip()
+    return value if re.fullmatch(r"\d+(ms|s|min)?", value) else default
 
 
 if context.is_offline_mode():
